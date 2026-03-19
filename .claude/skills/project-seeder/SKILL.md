@@ -1,0 +1,1 @@
+../../../octobots/skills/project-seeder/SKILL.md

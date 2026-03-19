@@ -1,0 +1,19 @@
+{
+  "title": "Guide",
+  "pages": [
+    "introduction",
+    "quickstart",
+    "---Using Wikis---",
+    "dashboard",
+    "generating-a-wiki",
+    "reading-your-wiki",
+    "asking-questions",
+    "sharing-wikis",
+    "---Settings & Integrations---",
+    "api-keys",
+    "mcp-integration",
+    "---Self-Hosting---",
+    "self-hosting",
+    "llm-providers"
+  ]
+}

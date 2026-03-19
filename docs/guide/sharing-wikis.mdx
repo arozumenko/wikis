@@ -1,0 +1,49 @@
+---
+title: "Sharing Wikis"
+description: "Control who can see your wikis — keep them private or share with your whole team."
+---
+
+Every wiki has one of two visibility states:
+
+| State | Icon | Who can see it |
+|-------|------|---------------|
+| **Personal** | 🔒 | Only you (the owner) |
+| **Shared** | 🌐 | All authenticated users on the instance |
+
+<Note>
+  There is no per-user or per-team sharing — a wiki is either private to you or visible to everyone on the instance. Role-based access control is on the roadmap.
+</Note>
+
+## Sharing from the dashboard
+
+Hover over any wiki card you own. In the bottom-right, you will see two action icons:
+
+- **Share icon** (⇶) — appears when the wiki is Personal; click to make it Shared
+- **Lock icon** (🔒) — appears when the wiki is Shared; click to make it Personal
+
+The badge on the card updates immediately.
+
+## Sharing from the wiki viewer
+
+Click the **↗ Share link** button in the top-right corner of any page to copy a direct deep-link to that page. Recipients must be logged in to view it — if they aren't, they will be redirected to the login page first.
+
+## Ownership and permissions
+
+| Action | Owner | Other authenticated user |
+|--------|-------|--------------------------|
+| View (Shared wiki) | ✅ | ✅ |
+| View (Personal wiki) | ✅ | ❌ |
+| Edit visibility | ✅ | ❌ |
+| Refresh / re-generate | ✅ | ❌ |
+| Delete | ✅ | ❌ |
+| Ask questions | ✅ | ✅ (on shared wikis) |
+
+## Deleting a wiki
+
+1. On the dashboard, hover the wiki card and click the **trash** (🗑) icon
+2. A confirmation dialog asks you to confirm — deletion is permanent
+3. All pages and indexed artifacts are removed from storage
+
+<Warning>
+  Deletion cannot be undone. If you want to regenerate the same repository later, you will need to re-run generation from scratch.
+</Warning>

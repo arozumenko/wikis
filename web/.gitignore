@@ -1,0 +1,5 @@
+node_modules/
+.next/
+data/
+prisma/migrations-active/
+prisma/_migrations_orig/

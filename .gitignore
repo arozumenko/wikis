@@ -1,0 +1,49 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+.keys/
+.mcp.json
+web/keys/*.pem
+
+# Python
+backend/.venv/
+backend/wikis_backend.egg-info/
+__pycache__/
+*.pyc
+.coverage
+.pytest_cache/
+
+# Node
+node_modules/
+*.tsbuildinfo
+
+# Next.js
+.next/
+out/
+
+# Backend data
+backend/data/
+data/
+
+# Claude Code
+.claude/.claude.json
+.claude/backups/
+.claude/cache/
+.claude/sessions/
+.claude/*.json
+.claude/plugins/
+.claude/memory/
+.claude/shell-snapshots/
+.claude/history.jsonl
+.claude/projects
+.claude/session-env
+.claude/file-history
+.claude/paste-cache
+.claude/plans
+
+# Playwright
+.playwright-mcp/
+
+# OS
+.DS_Store

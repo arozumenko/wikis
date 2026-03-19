@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: lint and format staged files.
+# Runs ruff (Python) and eslint+prettier (TypeScript/React).
+#
+# Install: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+FAILED=0
+
+# ─── Collect staged files (NUL-delimited for safe path handling) ───
+STAGED_PY=$(git diff --cached --name-only -z --diff-filter=ACMR -- '*.py' | tr '\0' '\n' | grep -v deepwiki_plugin/ || true)
+STAGED_TS=$(git diff --cached --name-only -z --diff-filter=ACMR -- '*.ts' '*.tsx' '*.js' '*.jsx' | tr '\0' '\n' | grep -v node_modules/ || true)
+
+# ─── Python: ruff ───────────────────────────────────────────────────
+if [ -n "$STAGED_PY" ]; then
+    echo "🔍 Checking Python files with ruff..."
+
+    # Try to find ruff
+    RUFF=""
+    if [ -x "$REPO_ROOT/backend/.venv/bin/ruff" ]; then
+        RUFF="$REPO_ROOT/backend/.venv/bin/ruff"
+    elif [ -x "$REPO_ROOT/venv/bin/ruff" ]; then
+        RUFF="$REPO_ROOT/venv/bin/ruff"
+    elif command -v ruff &>/dev/null; then
+        RUFF="ruff"
+    fi
+
+    if [ -n "$RUFF" ]; then
+        # Lint check (no auto-fix in hook — just report)
+        if ! echo "$STAGED_PY" | xargs "$RUFF" check --config "$REPO_ROOT/backend/pyproject.toml" --no-fix; then
+            echo "❌ ruff lint failed. Run: cd backend && ruff check --fix ."
+            FAILED=1
+        fi
+
+        # Format check
+        if ! echo "$STAGED_PY" | xargs "$RUFF" format --check --config "$REPO_ROOT/backend/pyproject.toml"; then
+            echo "❌ ruff format check failed. Run: cd backend && ruff format ."
+            FAILED=1
+        fi
+    else
+        echo "⚠️  ruff not found — skipping Python lint. Install: pip install ruff"
+    fi
+fi
+
+# ─── TypeScript/React: eslint + prettier ────────────────────────────
+if [ -n "$STAGED_TS" ]; then
+    echo "🔍 Checking TypeScript files with eslint + prettier..."
+
+    WEB_DIR="$REPO_ROOT/web"
+
+    # Filter to only web/ files and strip the web/ prefix
+    WEB_FILES=$(echo "$STAGED_TS" | grep '^web/' | sed 's|^web/||' || true)
+
+    if [ -n "$WEB_FILES" ]; then
+        # Build full paths for batch invocation
+        WEB_FULL_PATHS=$(echo "$WEB_FILES" | sed "s|^|$WEB_DIR/|")
+
+        # ESLint (batch mode — all files in one invocation)
+        if [ -x "$WEB_DIR/node_modules/.bin/eslint" ]; then
+            if ! echo "$WEB_FULL_PATHS" | xargs "$WEB_DIR/node_modules/.bin/eslint" --no-error-on-unmatched-pattern; then
+                echo "❌ eslint failed. Run: cd web && npx eslint src/ --fix"
+                FAILED=1
+            fi
+        else
+            echo "⚠️  eslint not found — skipping. Run: cd web && npm install"
+        fi
+
+        # Prettier (batch mode — all files in one invocation)
+        if [ -x "$WEB_DIR/node_modules/.bin/prettier" ]; then
+            if ! echo "$WEB_FULL_PATHS" | xargs "$WEB_DIR/node_modules/.bin/prettier" --check; then
+                echo "❌ prettier check failed. Run: cd web && npx prettier --write src/"
+                FAILED=1
+            fi
+        else
+            echo "⚠️  prettier not found — skipping. Run: cd web && npm install"
+        fi
+    fi
+fi
+
+# ─── Result ─────────────────────────────────────────────────────────
+if [ "$FAILED" -ne 0 ]; then
+    echo ""
+    echo "Commit blocked by lint errors. Fix the issues above and try again."
+    exit 1
+fi
+
+exit 0

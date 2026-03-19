@@ -1,0 +1,83 @@
+---
+title: "Quickstart"
+description: "Generate your first wiki in under five minutes."
+---
+
+<img
+  src="/images/dashboard.png"
+  alt="Wikis dashboard"
+  style={{ borderRadius: '0.5rem', border: '1px solid #e5e7eb' }}
+/>
+
+## Prerequisites
+
+- A running Wikis instance (see [Self-hosting](/guide/self-hosting) if you need to set one up)
+- An account — default admin credentials are `admin@wikis.dev` / `changeme123` (change these immediately after first login)
+- An LLM API key configured in your `.env` (e.g. `LLM_PROVIDER=openai` + `LLM_API_KEY=sk-…`)
+
+## Steps
+
+<Steps>
+  <Step title="Open the dashboard">
+    Navigate to your Wikis instance (default: `http://localhost:3000`). You will see the main dashboard with a search bar and any existing wikis.
+  </Step>
+
+  <Step title="Click Add a repository">
+    Click the **+ Add a repository** card. A dialog appears asking for:
+
+    - **Repository URL or Local Path** — paste any public repo URL, e.g. `https://github.com/octocat/Hello-World`
+    - **Branch** — defaults to `main`
+    - **Access Token** — only needed for private repositories
+
+    <img
+      src="/images/generate-form-filled.png"
+      alt="Generate Wiki dialog with a repo URL filled in"
+      style={{ borderRadius: '0.5rem', border: '1px solid #e5e7eb', marginTop: '1rem' }}
+    />
+
+    Wikis auto-detects the provider from the URL and shows a confirmation below the field.
+  </Step>
+
+  <Step title="Click Generate Wiki">
+    Click the **Generate Wiki** button. Wikis will:
+
+    1. Clone and index the repository
+    2. Plan the wiki structure
+    3. Write all pages in parallel
+
+    You are redirected to the wiki viewer where you can watch progress in real time. Generation typically takes 2–10 minutes depending on repository size and your LLM provider.
+  </Step>
+
+  <Step title="Browse your wiki">
+    Once generation completes, browse pages in the left sidebar. Click any page to read its content. Use the **On This Page** panel on the right to jump between headings.
+
+    <img
+      src="/images/wiki-page-content.png"
+      alt="A generated wiki page"
+      style={{ borderRadius: '0.5rem', border: '1px solid #e5e7eb', marginTop: '1rem' }}
+    />
+  </Step>
+
+  <Step title="Ask a question">
+    Type a question in the **Ask** bar at the bottom of the screen and press Enter. Wikis searches the indexed codebase and returns a grounded answer.
+
+    Try: *"What is the overall architecture of this project?"*
+  </Step>
+</Steps>
+
+## What's next?
+
+<CardGroup cols={2}>
+  <Card title="Private repositories" href="/guide/generating-a-wiki" icon="lock">
+    Learn how to use access tokens for GitHub, GitLab, Bitbucket, and Azure DevOps.
+  </Card>
+  <Card title="Ask & Deep Research" href="/guide/asking-questions" icon="bolt">
+    Get the most out of the Q&A bar with Fast mode and Deep Research.
+  </Card>
+  <Card title="MCP integration" href="/guide/mcp-integration" icon="plug">
+    Connect your AI editor to browse all your wikis with natural language.
+  </Card>
+  <Card title="Share your wiki" href="/guide/sharing-wikis" icon="share-nodes">
+    Make a wiki visible to everyone on your team.
+  </Card>
+</CardGroup>

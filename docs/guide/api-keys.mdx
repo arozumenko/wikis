@@ -1,0 +1,70 @@
+---
+title: "API Keys"
+description: "Create personal access tokens for programmatic API access and MCP integrations."
+---
+
+API keys (personal access tokens) let you authenticate against the Wikis API without a session cookie — essential for MCP integrations, CI/CD pipelines, and any programmatic use.
+
+<img
+  src="/images/settings-api-keys.png"
+  alt="Settings page showing the API Keys tab"
+  style={{ borderRadius: '0.5rem', border: '1px solid #e5e7eb' }}
+/>
+
+## Navigating to API Keys
+
+Click the **user avatar** in the top-right corner → **Settings** → **API Keys** tab.
+
+## Creating a key
+
+1. Click **+ Generate New Key**
+2. Optionally give the key a descriptive name (e.g. `Claude Code local`, `CI pipeline`)
+3. Click **Generate**
+4. **Copy the full key immediately** — it is displayed only once
+
+<Warning>
+  The full key value is shown only at creation time. If you lose it, revoke the key and generate a new one. Wikis stores only a hashed version of the key.
+</Warning>
+
+## Key format
+
+All keys are prefixed with `wikis_` for easy identification in config files and logs:
+
+```
+wikis_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+## Key table columns
+
+| Column | Description |
+|--------|-------------|
+| **Name** | The label you gave the key (editable) |
+| **Key** | Masked prefix (`wikis_•••`) |
+| **Created** | Creation date |
+| **Expires** | Expiry date — far-future by default (no expiry) |
+| **Last Used** | When this key last made an authenticated request |
+
+## Using a key
+
+Pass the key as a Bearer token in the `Authorization` header:
+
+```bash
+curl https://your-wikis-instance.com/api/v1/wikis \
+  -H "Authorization: Bearer wikis_YOUR_KEY_HERE"
+```
+
+Or use it in an MCP config (see [MCP Integration](/guide/mcp-integration)).
+
+## Revoking a key
+
+Click the **red trash** (🗑) icon on any key row. Revocation is immediate — requests using that key will return `401 Unauthorized`.
+
+## Security best practices
+
+<Tip>
+  Create one key per integration (e.g. one for Claude Code, one for your CI pipeline). This way you can revoke a compromised key without affecting other tools.
+</Tip>
+
+<Tip>
+  Name keys clearly so you know where each one is used: `Claude Code - MacBook`, `GitHub Actions`, `Cursor - Work laptop`.
+</Tip>

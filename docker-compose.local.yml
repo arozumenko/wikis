@@ -1,0 +1,14 @@
+# Override file for local Ollama usage.
+# Start with: docker compose --profile ollama -f docker-compose.yml -f docker-compose.local.yml up
+#
+# This configures the backend to use the Ollama service defined in docker-compose.yml.
+services:
+  backend:
+    environment:
+      LLM_PROVIDER: ollama
+      LLM_MODEL: llama3
+      EMBEDDING_MODEL: nomic-embed-text
+      OLLAMA_BASE_URL: http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy

@@ -1,0 +1,76 @@
+---
+title: "What is Wikis?"
+description: "AI-powered documentation that understands your codebase — generated automatically, browsable instantly."
+---
+
+Wikis turns any Git repository into a rich, searchable knowledge base in minutes. Point it at a GitHub, GitLab, Bitbucket, or Azure DevOps repo, and Wikis will:
+
+1. **Clone and index** the codebase using tree-sitter parsers and semantic embeddings
+2. **Generate structured documentation** — pages, sections, architecture diagrams — via LangGraph agents
+3. **Let you ask questions** in natural language against the actual code, with two modes: fast Q&A and deep multi-step research
+
+No config files. No YAML. Just a URL.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Automatic wiki generation" icon="book-open">
+    From a single repo URL, Wikis generates dozens of interconnected documentation pages covering architecture, APIs, data flows, and more.
+  </Card>
+  <Card title="AI Q&A on your code" icon="bolt">
+    Ask anything about the codebase directly inside the wiki viewer. Answers are grounded in the actual source code, not hallucinated.
+  </Card>
+  <Card title="Deep Research mode" icon="magnifying-glass">
+    For complex questions, Deep Research runs a multi-step agent that cross-references files, follows dependencies, and synthesises a thorough answer.
+  </Card>
+  <Card title="MCP integration" icon="plug">
+    Connect Claude Code, Cursor, Windsurf, or VS Code to Wikis via the Model Context Protocol. Your AI editor gets live access to every indexed repo.
+  </Card>
+  <Card title="Architecture diagrams" icon="diagram-project">
+    Wikis generates Mermaid diagrams embedded directly in wiki pages — sequence diagrams, component graphs, data flow charts.
+  </Card>
+  <Card title="Sharing & collaboration" icon="share-nodes">
+    Keep wikis private or share them with your whole team with a single click. Shared wikis are readable by every authenticated user.
+  </Card>
+</CardGroup>
+
+## How it works
+
+```
+Your repo URL
+     │
+     ▼
+Clone & parse (tree-sitter, 14+ languages)
+     │
+     ▼
+Build index (FAISS vector store + BM25 + SQLite FTS5)
+     │
+     ▼
+Plan structure (LLM outlines sections & pages)
+     │
+     ▼
+Generate pages (LangGraph parallel writer agents)
+     │
+     ▼
+Browsable wiki with Q&A ⚡
+```
+
+The entire pipeline runs server-side. Progress streams to your browser in real time via SSE — you watch pages appear as they are written.
+
+## Supported repository sources
+
+| Platform | URL format | Notes |
+|---|---|---|
+| GitHub | `github.com/owner/repo` | Public and private; PAT (`ghp_…`) for private |
+| GitLab | `gitlab.com/owner/repo` | Personal access tokens (`glpat-…`) |
+| Bitbucket | `bitbucket.org/owner/repo` | Username + app password |
+| Azure DevOps | `dev.azure.com/org/project/_git/repo` | Personal access token |
+| Local path | `/home/user/my-project` | Must be in `ALLOWED_LOCAL_PATHS` |
+
+## Supported LLM providers
+
+OpenAI · Anthropic · Google Gemini · Ollama (local) · AWS Bedrock · any OpenAI-compatible endpoint
+
+---
+
+Ready? Jump to the [Quickstart](/guide/quickstart) to generate your first wiki in under five minutes.

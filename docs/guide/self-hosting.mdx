@@ -1,0 +1,155 @@
+---
+title: "Self-Hosting"
+description: "Run Wikis on your own infrastructure with Docker Compose."
+---
+
+Wikis is a two-service application:
+
+| Service | Port | Description |
+|---------|------|-------------|
+| **Web App** | 3000 | Next.js — auth pages, SPA frontend, MCP endpoint |
+| **Backend** | 8000 | FastAPI — wiki generation, Q&A, REST API |
+
+Both services are packaged as Docker images and orchestrated with Docker Compose.
+
+## Prerequisites
+
+- Docker and Docker Compose v2
+- An LLM provider API key (OpenAI, Anthropic, Gemini, Ollama, or Bedrock)
+
+## Quick start
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/arozumenko/wikis.git
+cd wikis
+
+# 2. Copy and configure environment
+cp .env.example .env
+# Edit .env — minimum required: LLM_PROVIDER, LLM_API_KEY, AUTH_SECRET, JWT keys
+
+# 3. Generate JWT keys
+openssl genrsa -out web/keys/private.pem 2048
+openssl rsa -in web/keys/private.pem -pubout -out web/keys/public.pem
+
+# 4. Set JWT keys in .env
+# JWT_PRIVATE_KEY=$(cat web/keys/private.pem)
+# JWT_PUBLIC_KEY=$(cat web/keys/public.pem)
+
+# 5. Start all services
+docker compose up -d
+
+# 6. Apply database migrations and seed admin user
+docker compose exec web npx prisma migrate deploy
+docker compose exec web npx prisma db seed
+
+# 7. Open http://localhost:3000
+```
+
+Default admin credentials: `admin@wikis.dev` / `changeme123` — **change these immediately**.
+
+## Environment variables
+
+Copy `.env.example` to `.env` and set these variables:
+
+### Required
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `LLM_PROVIDER` | `openai` | LLM provider. See [LLM Providers](/guide/llm-providers) |
+| `LLM_API_KEY` | `sk-…` | API key for the chosen provider |
+| `AUTH_SECRET` | `a-long-random-string` | Secret for session signing (run `openssl rand -hex 32`) |
+| `JWT_PRIVATE_KEY` | Contents of `private.pem` | RS256 private key for JWT issuance |
+| `JWT_PUBLIC_KEY` | Contents of `public.pem` | RS256 public key for JWT validation |
+
+### Optional but common
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_MODEL` | `gpt-4o-mini` | Model name to use for generation |
+| `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model for vector search |
+| `LLM_API_BASE` | _(empty)_ | Custom base URL for OpenAI-compatible endpoints |
+| `STORAGE_BACKEND` | `local` | `local` or `s3` |
+| `STORAGE_PATH` | `/app/data/artifacts` | Local path for wiki artifact storage |
+| `CACHE_DIR` | `/app/data/cache` | Local path for repository clones |
+| `ALLOWED_LOCAL_PATHS` | _(empty)_ | Comma-separated paths for local repo access |
+| `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+### Optional OAuth (social login)
+
+| Variable | Description |
+|----------|-------------|
+| `GITHUB_CLIENT_ID` | GitHub OAuth app client ID |
+| `GITHUB_CLIENT_SECRET` | GitHub OAuth app client secret |
+| `GOOGLE_CLIENT_ID` | Google OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
+
+### Analytics
+
+| Variable | Description |
+|----------|-------------|
+| `NEXT_PUBLIC_GA_MEASUREMENT_ID` | Google Analytics 4 measurement ID (`G-XXXXXXXXXX`) |
+
+## Docker Compose commands
+
+```bash
+docker compose up -d             # Start all services in background
+docker compose up -d --build     # Rebuild images and start
+docker compose ps                # Check health and ports
+docker compose logs -f web       # Stream web app logs
+docker compose logs -f backend   # Stream backend logs
+docker compose down              # Stop all services
+docker compose down -v           # Stop and remove volumes (destructive)
+```
+
+## S3 storage
+
+For production deployments, use S3 instead of local filesystem:
+
+```env
+STORAGE_BACKEND=s3
+AWS_ACCESS_KEY_ID=…
+AWS_SECRET_ACCESS_KEY=…
+AWS_DEFAULT_REGION=us-east-1
+S3_BUCKET=my-wikis-artifacts
+```
+
+## Local repository access
+
+To allow Wikis to index repositories from the local filesystem (not just remote URLs):
+
+```env
+ALLOWED_LOCAL_PATHS=/home/user/projects,/opt/repos
+```
+
+Only paths explicitly listed here can be indexed. Attempting to use any other path returns an error.
+
+## Running without authentication (dev only)
+
+For local development without setting up JWT keys:
+
+```bash
+AUTH_ENABLED=false uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+<Warning>
+  Never run with `AUTH_ENABLED=false` in production. This disables all authentication on the backend API.
+</Warning>
+
+## Health checks
+
+```bash
+# Backend health (LLM provider, embeddings, version)
+curl http://localhost:8000/api/v1/health
+
+# Web app
+curl -I http://localhost:3000
+```
+
+## Updating
+
+```bash
+git pull
+docker compose up -d --build
+docker compose exec web npx prisma migrate deploy
+```

@@ -1,0 +1,1 @@
+../../../octobots/skills/playwright-testing/SKILL.md

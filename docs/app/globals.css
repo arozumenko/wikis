@@ -1,0 +1,47 @@
+/* Theme-aware screenshots */
+.wikis-img-dark { display: none !important; }
+.wikis-img-light { display: block !important; }
+.dark .wikis-img-dark { display: block !important; }
+.dark .wikis-img-light { display: none !important; }
+
+/* Typography — match Wikis app fonts */
+:root {
+  --fd-font-body: var(--font-inter), "Inter", "Roboto", sans-serif;
+  --fd-font-mono: var(--font-jetbrains), "JetBrains Mono", "Fira Code", monospace;
+}
+
+h1 {
+  font-family: var(--font-playfair), "Playfair Display", Georgia, serif;
+}
+
+/* Light theme — Wikis brand colors */
+:root {
+  --color-fd-primary: #FF6B4A;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-background: #F8FAFC;
+  --color-fd-card: #FFFFFF;
+  --color-fd-border: #E2E8F0;
+  --color-fd-muted: #E2E8F0;
+  --color-fd-muted-foreground: #64748B;
+  --color-fd-foreground: #0F172A;
+  --color-fd-secondary: #F1F5F9;
+  --color-fd-secondary-foreground: #0F172A;
+  --color-fd-accent: #FFF0EC;
+  --color-fd-accent-foreground: #FF6B4A;
+}
+
+/* Dark theme — Wikis dark palette */
+.dark {
+  --color-fd-primary: #FF8A6E;
+  --color-fd-primary-foreground: #1a0800;
+  --color-fd-background: #0B1120;
+  --color-fd-card: #111827;
+  --color-fd-border: #1E293B;
+  --color-fd-muted: #1E293B;
+  --color-fd-muted-foreground: #94A3B8;
+  --color-fd-foreground: #F1F5F9;
+  --color-fd-secondary: #111827;
+  --color-fd-secondary-foreground: #F1F5F9;
+  --color-fd-accent: #1E2D3D;
+  --color-fd-accent-foreground: #FF8A6E;
+}
