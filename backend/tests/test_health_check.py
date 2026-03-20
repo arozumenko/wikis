@@ -139,6 +139,30 @@ def test_validate_credentials_ollama_no_creds_needed():
     assert validate_credentials(s) is None
 
 
+def test_validate_credentials_copilot_missing_key():
+    s = Settings(llm_provider="copilot", llm_api_key=SecretStr(""), auth_enabled=False)
+    result = validate_credentials(s)
+    assert result is not None
+    assert "LLM_API_KEY" in result
+
+
+def test_validate_credentials_copilot_with_key():
+    s = Settings(llm_provider="copilot", llm_api_key=SecretStr("gho_test"), auth_enabled=False)
+    assert validate_credentials(s) is None
+
+
+def test_validate_credentials_github_missing_key():
+    s = Settings(llm_provider="github", llm_api_key=SecretStr(""), auth_enabled=False)
+    result = validate_credentials(s)
+    assert result is not None
+    assert "LLM_API_KEY" in result
+
+
+def test_validate_credentials_github_with_key():
+    s = Settings(llm_provider="github", llm_api_key=SecretStr("ghp_test"), auth_enabled=False)
+    assert validate_credentials(s) is None
+
+
 def test_validate_credentials_bedrock_partial_aws_key():
     s = Settings(
         llm_provider="bedrock",
