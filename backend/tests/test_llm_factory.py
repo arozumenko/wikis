@@ -49,6 +49,11 @@ class TestCreateLLM:
         llm = create_llm(_settings(llm_model="gpt-4o-mini"))
         assert llm.temperature == 0.1
 
+    def test_temperature_heuristic_namespaced_model(self):
+        """Namespaced models like openai/gpt-4o should not trigger reasoning temp."""
+        llm = create_llm(_settings(llm_model="openai/gpt-4o"))
+        assert llm.temperature == 0.1
+
     def test_override_kwargs(self):
         llm = create_llm(_settings(), temperature=0.5, max_tokens=1024)
         assert llm.temperature == 0.5

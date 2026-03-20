@@ -41,7 +41,7 @@ class TestLifespanInitialization:
     @pytest.mark.asyncio
     async def test_settings_loaded(self, test_app):
         assert test_app.state.settings is not None
-        assert test_app.state.settings.llm_provider in ("openai", "anthropic", "custom", "ollama", "gemini", "bedrock")
+        assert test_app.state.settings.llm_provider in ("openai", "anthropic", "custom", "ollama", "gemini", "bedrock", "copilot", "github")
 
     @pytest.mark.asyncio
     async def test_storage_initialized(self, test_app):

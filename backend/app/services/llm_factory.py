@@ -53,8 +53,10 @@ def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> Base
     api_key = settings.llm_api_key.get_secret_value()
     base_url = overrides.pop("base_url", settings.llm_api_base)
 
-    # Temperature heuristic: reasoning models (o*) need temperature=1.0
-    default_temp = 1.0 if model.startswith("o") else 0.1
+    # Temperature heuristic: reasoning models (o1, o3, etc.) need temperature=1.0
+    # Use basename to handle namespaced models like "openai/gpt-4o"
+    model_basename = model.rsplit("/", 1)[-1]
+    default_temp = 1.0 if model_basename.startswith("o") else 0.1
     temperature = overrides.pop("temperature", default_temp)
     max_tokens = overrides.pop("max_tokens", 64000)
     streaming = overrides.pop("streaming", False)
@@ -157,7 +159,13 @@ def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> Base
     else:
         raise ValueError(f"Unknown LLM provider: {provider}")
 
-    logger.info(f"Created LLM: provider={provider}, model={model}, base_url={base_url}")
+    # Resolve effective base_url for logging
+    effective_base_url = base_url
+    if provider == "copilot":
+        effective_base_url = settings.github_copilot_base_url
+    elif provider == "github":
+        effective_base_url = settings.github_models_base_url
+    logger.info(f"Created LLM: provider={provider}, model={model}, base_url={effective_base_url}")
 
     # Add retry with exponential backoff for transient errors
     # Skip for ask/research engines — RunnableRetry breaks _llm_type access
