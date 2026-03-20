@@ -31,6 +31,7 @@ class Settings(BaseSettings):
 
     # Provider-specific
     ollama_base_url: str = "http://localhost:11434"
+    ollama_num_ctx: int = 32768  # context window for Ollama models
     gemini_api_key: SecretStr | None = None
     aws_region: str = "us-east-1"
     aws_access_key_id: str | None = None

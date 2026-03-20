@@ -82,7 +82,14 @@ def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> Base
     elif provider == "ollama":
         from langchain_ollama import ChatOllama
 
-        llm = ChatOllama(model=model, base_url=settings.ollama_base_url, temperature=temperature, **overrides)
+        llm = ChatOllama(
+            model=model,
+            base_url=settings.ollama_base_url,
+            temperature=temperature,
+            num_ctx=settings.ollama_num_ctx,
+            num_predict=max_tokens,
+            **overrides,
+        )
     elif provider == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
 
