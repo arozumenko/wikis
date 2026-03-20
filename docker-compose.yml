@@ -21,7 +21,6 @@ services:
     env_file: .env
     environment:
       BACKEND_URL: http://backend:8000
-      BETTER_AUTH_URL: http://localhost:3000
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/api/auth/health"]
       interval: 30s

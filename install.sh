@@ -33,6 +33,13 @@ prompt() {
   IFS= read -r "$_var" <&${INPUT_FD}
 }
 
+prompt_secret() {
+  local _prompt="$1" _var="$2"
+  printf "%s" "$_prompt"
+  IFS= read -rs "$_var" <&${INPUT_FD}
+  echo ""
+}
+
 # ── Preflight ───────────────────────────────────────────────────────
 header "🔍 Checking prerequisites..."
 
@@ -84,6 +91,11 @@ if ! [[ "$WEB_PORT" =~ ^[0-9]+$ ]] || ! [[ "$API_PORT" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+if [ "$WEB_PORT" -lt 1 ] || [ "$WEB_PORT" -gt 65535 ] || [ "$API_PORT" -lt 1 ] || [ "$API_PORT" -gt 65535 ]; then
+  err "Ports must be between 1 and 65535."
+  exit 1
+fi
+
 if lsof -i :"$WEB_PORT" &>/dev/null; then
   warn "Port $WEB_PORT is already in use."
   prompt "   Continue anyway? [y/N] " port_continue
@@ -114,7 +126,7 @@ echo "  5) Azure OpenAI  (OpenAI-compatible endpoint)"
 echo "  6) Ollama        (local, no API key needed)"
 echo "  7) Skip          (configure later in .env)"
 echo ""
-prompt "Choose provider [1-7]: " provider_choice
+prompt "Choose provider [1-7, default: 7]: " provider_choice
 
 LLM_PROVIDER=""
 LLM_API_KEY=""
@@ -130,7 +142,7 @@ case "${provider_choice:-7}" in
     LLM_PROVIDER="openai"
     LLM_MODEL="gpt-4o-mini"
     EMBEDDING_MODEL="text-embedding-3-large"
-    prompt "OpenAI API key: " LLM_API_KEY
+    prompt_secret "OpenAI API key: " LLM_API_KEY
     if [ -z "$LLM_API_KEY" ]; then
       warn "No API key provided. Edit .env later to add it."
     fi
@@ -139,7 +151,7 @@ case "${provider_choice:-7}" in
     LLM_PROVIDER="anthropic"
     LLM_MODEL="claude-sonnet-4-6"
     EMBEDDING_MODEL="text-embedding-3-large"
-    prompt "Anthropic API key: " LLM_API_KEY
+    prompt_secret "Anthropic API key: " LLM_API_KEY
     if [ -z "$LLM_API_KEY" ]; then
       warn "No API key provided. Edit .env later to add it."
     fi
@@ -149,7 +161,7 @@ case "${provider_choice:-7}" in
     LLM_PROVIDER="gemini"
     LLM_MODEL="gemini-2.5-pro"
     EMBEDDING_MODEL="models/text-embedding-004"
-    prompt "Google AI API key: " LLM_API_KEY
+    prompt_secret "Google AI API key: " LLM_API_KEY
     if [ -z "$LLM_API_KEY" ]; then
       warn "No API key provided. Edit .env later to add it."
     fi
@@ -165,7 +177,7 @@ case "${provider_choice:-7}" in
     info "Bedrock can use IAM roles, instance profiles, or explicit keys."
     prompt "AWS access key ID (leave empty for IAM role): " AWS_ACCESS_KEY_ID
     if [ -n "$AWS_ACCESS_KEY_ID" ]; then
-      prompt "AWS secret access key: " AWS_SECRET_ACCESS_KEY
+      prompt_secret "AWS secret access key: " AWS_SECRET_ACCESS_KEY
     else
       info "Using default AWS credential chain (IAM role, env vars, ~/.aws/credentials)."
     fi
@@ -175,7 +187,7 @@ case "${provider_choice:-7}" in
     echo ""
     info "Azure OpenAI uses an OpenAI-compatible endpoint."
     prompt "Azure OpenAI endpoint (e.g. https://YOUR.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT/): " LLM_API_BASE
-    prompt "Azure OpenAI API key: " LLM_API_KEY
+    prompt_secret "Azure OpenAI API key: " LLM_API_KEY
     prompt "Model deployment name [gpt-4o-mini]: " LLM_MODEL
     LLM_MODEL="${LLM_MODEL:-gpt-4o-mini}"
     EMBEDDING_MODEL="text-embedding-3-large"
@@ -236,13 +248,25 @@ cat > .env <<ENVFILE
 LLM_PROVIDER=${LLM_PROVIDER}
 LLM_API_KEY=${LLM_API_KEY}
 LLM_MODEL=${LLM_MODEL}
-LLM_API_BASE=${LLM_API_BASE}
 EMBEDDING_MODEL=${EMBEDDING_MODEL}
+ENVFILE
+
+# Conditional provider-specific vars
+if [ -n "$LLM_API_BASE" ]; then
+  echo "LLM_API_BASE=${LLM_API_BASE}" >> .env
+fi
+
+if [ "$LLM_PROVIDER" = "bedrock" ]; then
+  cat >> .env <<ENVFILE
 
 # AWS (Bedrock)
-AWS_REGION=${AWS_REGION:-us-east-1}
+AWS_REGION=${AWS_REGION}
 AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
 AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+ENVFILE
+fi
+
+cat >> .env <<ENVFILE
 
 # Storage
 STORAGE_BACKEND=local
@@ -250,7 +274,7 @@ STORAGE_PATH=/app/data/artifacts
 CACHE_DIR=/app/data/cache
 
 # Auth
-NEXTAUTH_URL=http://localhost:${WEB_PORT}
+BETTER_AUTH_URL=http://localhost:${WEB_PORT}
 AUTH_SECRET=${AUTH_SECRET}
 # Uncomment to enable OAuth:
 # GITHUB_CLIENT_ID=
@@ -269,12 +293,15 @@ LOG_LEVEL=INFO
 NODE_ENV=production
 ENVFILE
 
+chmod 600 .env
 ok "Configuration written to .env"
 
 # ── Start services ─────────────────────────────────────────────────
 header "🚀 Starting Wikis..."
 
-docker compose pull
+if ! docker compose pull; then
+  warn "Failed to pull images. Will try to start with cached images..."
+fi
 docker compose up -d
 
 info "Waiting for services to be healthy..."

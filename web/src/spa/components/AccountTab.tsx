@@ -98,7 +98,11 @@ export function AccountTab() {
         </Typography>
       )}
 
-      {hasPassword === false ? (
+      {hasPassword === null ? (
+        <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+          <CircularProgress size={28} />
+        </Box>
+      ) : hasPassword === false ? (
         <Box>
           <Typography variant="subtitle1" sx={{ mb: 1 }}>
             Password
