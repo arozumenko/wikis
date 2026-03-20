@@ -2,7 +2,8 @@
 Configurable LLM and embedding model factory.
 
 Creates LangChain-compatible LLM and embedding instances from app settings,
-supporting multiple providers (OpenAI, Anthropic, custom OpenAI-compatible).
+supporting multiple providers (OpenAI, Anthropic, custom OpenAI-compatible,
+GitHub Copilot, GitHub Models).
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ def _bedrock_credentials(settings: Settings) -> dict[str, str]:
 def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> BaseChatModel:
     """Create an LLM instance from settings.
 
-    Supports providers: openai, anthropic, custom, ollama, gemini, bedrock.
+    Supports providers: openai, anthropic, custom, ollama, gemini, bedrock, copilot, github.
     Tier: "high" (default, page generation) or "low" (quality check, enhancement).
     Overrides: model, temperature, max_tokens, streaming.
     """
@@ -52,8 +53,10 @@ def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> Base
     api_key = settings.llm_api_key.get_secret_value()
     base_url = overrides.pop("base_url", settings.llm_api_base)
 
-    # Temperature heuristic: reasoning models (o*) need temperature=1.0
-    default_temp = 1.0 if model.startswith("o") else 0.1
+    # Temperature heuristic: reasoning models (o1, o3, etc.) need temperature=1.0
+    # Use basename to handle namespaced models like "openai/gpt-4o"
+    model_basename = model.rsplit("/", 1)[-1]
+    default_temp = 1.0 if model_basename.startswith("o") else 0.1
     temperature = overrides.pop("temperature", default_temp)
     max_tokens = overrides.pop("max_tokens", 64000)
     streaming = overrides.pop("streaming", False)
@@ -102,6 +105,40 @@ def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> Base
             max_output_tokens=max_tokens,
             **overrides,
         )
+    elif provider == "copilot":
+        llm = ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            base_url=settings.github_copilot_base_url,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            streaming=streaming,
+            **overrides,
+        )
+    elif provider == "github":
+        # GitHub Models: Claude models use Anthropic API, everything else OpenAI-compatible
+        if model.startswith(("claude-", "anthropic/")):
+            from langchain_anthropic import ChatAnthropic
+
+            llm = ChatAnthropic(
+                model=model,
+                api_key=api_key,
+                base_url=settings.github_models_base_url,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                streaming=streaming,
+                **overrides,
+            )
+        else:
+            llm = ChatOpenAI(
+                model=model,
+                api_key=api_key,
+                base_url=settings.github_models_base_url,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                streaming=streaming,
+                **overrides,
+            )
     elif provider == "bedrock":
         import botocore.config
         from langchain_aws import ChatBedrock
@@ -122,7 +159,13 @@ def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> Base
     else:
         raise ValueError(f"Unknown LLM provider: {provider}")
 
-    logger.info(f"Created LLM: provider={provider}, model={model}, base_url={base_url}")
+    # Resolve effective base_url for logging
+    effective_base_url = base_url
+    if provider == "copilot":
+        effective_base_url = settings.github_copilot_base_url
+    elif provider == "github":
+        effective_base_url = settings.github_models_base_url
+    logger.info(f"Created LLM: provider={provider}, model={model}, base_url={effective_base_url}")
 
     # Add retry with exponential backoff for transient errors
     # Skip for ask/research engines — RunnableRetry breaks _llm_type access
@@ -167,15 +210,15 @@ def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> Base
 def create_embeddings(settings: Settings, **overrides: Any) -> Embeddings:
     """Create an embeddings instance from settings.
 
-    Supports providers: openai, custom, ollama, gemini, bedrock.
+    Supports providers: openai, custom, ollama, gemini, bedrock, github.
     Raises ValueError for unsupported providers or missing credentials.
     """
     model = overrides.pop("model", settings.embedding_model)
     provider = overrides.pop("provider", settings.llm_provider)
 
-    # Anthropic has no embedding API
-    if provider == "anthropic":
-        raise ValueError("Anthropic has no embedding API — use a dedicated embedding provider")
+    # Anthropic and Copilot have no embedding API
+    if provider in ("anthropic", "copilot"):
+        raise ValueError(f"{provider.title()} has no embedding API — use a dedicated embedding provider")
 
     # Resolve embedding API key (falls back to LLM key)
     embedding_key = settings.embedding_api_key
@@ -212,6 +255,16 @@ def create_embeddings(settings: Settings, **overrides: Any) -> Embeddings:
             **overrides,
         )
         logger.info(f"Created embeddings: Bedrock model={model}")
+    elif provider == "github":
+        from langchain_openai.embeddings import OpenAIEmbeddings
+
+        embeddings = OpenAIEmbeddings(
+            model=model or "text-embedding-3-small",
+            api_key=api_key,
+            base_url=settings.github_models_base_url,
+            **overrides,
+        )
+        logger.info(f"Created embeddings: GitHub Models model={model}")
     elif api_key:
         from langchain_openai.embeddings import OpenAIEmbeddings
 

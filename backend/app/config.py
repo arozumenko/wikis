@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     )
 
     # LLM
-    llm_provider: str = "openai"  # openai | anthropic | custom | ollama | gemini | bedrock
+    llm_provider: str = "openai"  # openai | anthropic | custom | ollama | gemini | bedrock | copilot | github
     llm_api_key: SecretStr = SecretStr("")
     llm_api_base: str | None = None
     llm_model: str = "gpt-4o-mini"  # HIGH tier (page generation, analysis)
@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     aws_region: str = "us-east-1"
     aws_access_key_id: str | None = None
     aws_secret_access_key: SecretStr | None = None
+    github_copilot_base_url: str = "https://api.githubcopilot.com"
+    github_models_base_url: str = "https://models.inference.ai.azure.com"
 
     # Auth
     auth_enabled: bool = True  # set False for local dev without auth service

@@ -49,6 +49,11 @@ class TestCreateLLM:
         llm = create_llm(_settings(llm_model="gpt-4o-mini"))
         assert llm.temperature == 0.1
 
+    def test_temperature_heuristic_namespaced_model(self):
+        """Namespaced models like openai/gpt-4o should not trigger reasoning temp."""
+        llm = create_llm(_settings(llm_model="openai/gpt-4o"))
+        assert llm.temperature == 0.1
+
     def test_override_kwargs(self):
         llm = create_llm(_settings(), temperature=0.5, max_tokens=1024)
         assert llm.temperature == 0.5
@@ -71,6 +76,24 @@ class TestCreateLLM:
     def test_gemini_missing_key_raises(self):
         with pytest.raises(ValueError, match="GEMINI_API_KEY"):
             create_llm(_settings(llm_provider="gemini", gemini_api_key=None))
+
+    def test_copilot_provider(self):
+        llm = create_llm(_settings(llm_provider="copilot", llm_model="gpt-4o"))
+        assert type(llm).__name__ == "ChatOpenAI"
+        assert llm.openai_api_base == "https://api.githubcopilot.com"
+
+    def test_github_provider_openai_model(self):
+        llm = create_llm(_settings(llm_provider="github", llm_model="openai/gpt-4o"))
+        assert type(llm).__name__ == "ChatOpenAI"
+        assert llm.openai_api_base == "https://models.inference.ai.azure.com"
+
+    def test_github_provider_claude_model(self):
+        llm = create_llm(_settings(llm_provider="github", llm_model="claude-sonnet-4-5"))
+        assert type(llm).__name__ == "ChatAnthropic"
+
+    def test_github_provider_anthropic_prefixed_model(self):
+        llm = create_llm(_settings(llm_provider="github", llm_model="anthropic/claude-sonnet-4-5"))
+        assert type(llm).__name__ == "ChatAnthropic"
 
     @pytest.mark.skipif(not _has_bedrock, reason="langchain-aws not installed")
     def test_bedrock_provider(self):
@@ -121,5 +144,13 @@ class TestCreateEmbeddings:
         assert type(emb).__name__ == "BedrockEmbeddings"
 
     def test_anthropic_raises(self):
-        with pytest.raises(ValueError, match="Anthropic has no embedding API"):
+        with pytest.raises(ValueError, match="no embedding API"):
             create_embeddings(_settings(llm_provider="anthropic"))
+
+    def test_copilot_raises(self):
+        with pytest.raises(ValueError, match="no embedding API"):
+            create_embeddings(_settings(llm_provider="copilot"))
+
+    def test_github_embeddings(self):
+        emb = create_embeddings(_settings(llm_provider="github"))
+        assert type(emb).__name__ == "OpenAIEmbeddings"

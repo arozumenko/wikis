@@ -31,7 +31,7 @@ def validate_credentials(settings: Settings) -> str | None:
     """
     provider = settings.llm_provider
 
-    if provider in ("openai", "anthropic", "custom"):
+    if provider in ("openai", "anthropic", "custom", "copilot", "github"):
         api_key = settings.llm_api_key.get_secret_value()
         if not api_key:
             return "LLM_API_KEY is not set"
