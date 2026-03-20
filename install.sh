@@ -131,45 +131,53 @@ prompt "Choose provider [1-7, default: 7]: " provider_choice
 LLM_PROVIDER=""
 LLM_API_KEY=""
 LLM_MODEL=""
+LLM_MODEL_LOW=""
 EMBEDDING_MODEL=""
 AWS_REGION=""
 AWS_ACCESS_KEY_ID=""
 AWS_SECRET_ACCESS_KEY=""
 LLM_API_BASE=""
 
+# Helper: prompt for model names with defaults
+prompt_models() {
+  local default_model="$1" default_low="$2" default_embed="$3"
+  echo ""
+  prompt "LLM model [${default_model}]: " LLM_MODEL
+  LLM_MODEL="${LLM_MODEL:-$default_model}"
+  prompt "LLM model low tier (quality checks) [${default_low}]: " LLM_MODEL_LOW
+  LLM_MODEL_LOW="${LLM_MODEL_LOW:-$default_low}"
+  prompt "Embedding model [${default_embed}]: " EMBEDDING_MODEL
+  EMBEDDING_MODEL="${EMBEDDING_MODEL:-$default_embed}"
+}
+
 case "${provider_choice:-7}" in
   1)
     LLM_PROVIDER="openai"
-    LLM_MODEL="gpt-4o-mini"
-    EMBEDDING_MODEL="text-embedding-3-large"
     prompt_secret "OpenAI API key: " LLM_API_KEY
     if [ -z "$LLM_API_KEY" ]; then
       warn "No API key provided. Edit .env later to add it."
     fi
+    prompt_models "gpt-4o-mini" "gpt-4o-mini" "text-embedding-3-large"
     ;;
   2)
     LLM_PROVIDER="anthropic"
-    LLM_MODEL="claude-sonnet-4-6"
-    EMBEDDING_MODEL="text-embedding-3-large"
     prompt_secret "Anthropic API key: " LLM_API_KEY
     if [ -z "$LLM_API_KEY" ]; then
       warn "No API key provided. Edit .env later to add it."
     fi
     warn "Anthropic doesn't provide embeddings — set OPENAI_API_KEY in .env for embeddings, or use Ollama."
+    prompt_models "claude-sonnet-4-6" "claude-haiku-4-5" "text-embedding-3-large"
     ;;
   3)
     LLM_PROVIDER="gemini"
-    LLM_MODEL="gemini-2.5-pro"
-    EMBEDDING_MODEL="models/text-embedding-004"
     prompt_secret "Google AI API key: " LLM_API_KEY
     if [ -z "$LLM_API_KEY" ]; then
       warn "No API key provided. Edit .env later to add it."
     fi
+    prompt_models "gemini-2.5-pro" "gemini-2.0-flash" "models/text-embedding-004"
     ;;
   4)
     LLM_PROVIDER="bedrock"
-    LLM_MODEL="us.anthropic.claude-sonnet-4-6-20250514-v1:0"
-    EMBEDDING_MODEL="amazon.titan-embed-text-v2:0"
     LLM_API_KEY="not-needed"
     prompt "AWS region [us-east-1]: " AWS_REGION
     AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -181,6 +189,7 @@ case "${provider_choice:-7}" in
     else
       info "Using default AWS credential chain (IAM role, env vars, ~/.aws/credentials)."
     fi
+    prompt_models "us.anthropic.claude-sonnet-4-6-20250514-v1:0" "us.anthropic.claude-haiku-4-5-20251001-v1:0" "amazon.titan-embed-text-v2:0"
     ;;
   5)
     LLM_PROVIDER="custom"
@@ -188,19 +197,16 @@ case "${provider_choice:-7}" in
     info "Azure OpenAI uses an OpenAI-compatible endpoint."
     prompt "Azure OpenAI endpoint (e.g. https://YOUR.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT/): " LLM_API_BASE
     prompt_secret "Azure OpenAI API key: " LLM_API_KEY
-    prompt "Model deployment name [gpt-4o-mini]: " LLM_MODEL
-    LLM_MODEL="${LLM_MODEL:-gpt-4o-mini}"
-    EMBEDDING_MODEL="text-embedding-3-large"
     if [ -z "$LLM_API_BASE" ] || [ -z "$LLM_API_KEY" ]; then
       warn "Missing endpoint or key. Edit .env later to complete setup."
     fi
+    prompt_models "gpt-4o-mini" "gpt-4o-mini" "text-embedding-3-large"
     ;;
   6)
     LLM_PROVIDER="ollama"
-    LLM_MODEL="llama3.2"
-    EMBEDDING_MODEL="nomic-embed-text"
     LLM_API_KEY="not-needed"
-    info "Make sure Ollama is running: ollama pull llama3.2 && ollama pull nomic-embed-text"
+    info "Make sure Ollama is running: ollama pull <model>"
+    prompt_models "llama3.2" "llama3.2" "nomic-embed-text"
     ;;
   7|"")
     info "Skipping LLM config — edit .env before generating wikis."
@@ -248,6 +254,7 @@ cat > .env <<ENVFILE
 LLM_PROVIDER=${LLM_PROVIDER}
 LLM_API_KEY=${LLM_API_KEY}
 LLM_MODEL=${LLM_MODEL}
+LLM_MODEL_LOW=${LLM_MODEL_LOW}
 EMBEDDING_MODEL=${EMBEDDING_MODEL}
 ENVFILE
 

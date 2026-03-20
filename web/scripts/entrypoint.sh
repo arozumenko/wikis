@@ -22,5 +22,8 @@ else
   npx prisma migrate deploy 2>/dev/null || true
 fi
 
-# 4. Start the app
+# 4. Seed default admin user (skips if users already exist)
+npx prisma db seed 2>/dev/null || true
+
+# 5. Start the app
 exec npm start
