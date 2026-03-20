@@ -87,7 +87,6 @@ def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> Base
             base_url=settings.ollama_base_url,
             temperature=temperature,
             num_ctx=settings.ollama_num_ctx,
-            num_predict=max_tokens,
             **overrides,
         )
     elif provider == "gemini":
