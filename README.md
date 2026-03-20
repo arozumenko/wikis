@@ -1,5 +1,7 @@
 # Wikis
 
+[![Known Vulnerabilities](https://snyk.io/test/github/arozumenko/wikis/badge.svg)](https://snyk.io/test/github/arozumenko/wikis)
+
 AI-powered documentation generator that turns any code repository into a browsable, searchable wiki with architecture diagrams, code explanations, and an AI Q&A assistant.
 
 <p align="center">
