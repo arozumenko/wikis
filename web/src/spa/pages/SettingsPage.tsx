@@ -25,6 +25,7 @@ import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import { IntegrationsTab } from '../components/IntegrationsTab';
+import { AccountTab } from '../components/AccountTab';
 
 const AUTH_URL = ''; // Same origin
 
@@ -122,12 +123,16 @@ export function SettingsPage() {
           '& .MuiTab-root': { textTransform: 'none', fontSize: '0.95rem' },
         }}
       >
+        <Tab label="Account" />
         <Tab label="API Keys" />
         <Tab label="Integrations" />
       </Tabs>
 
+      {/* Account tab */}
+      {tab === 0 && <AccountTab />}
+
       {/* API Keys tab */}
-      {tab === 0 && (
+      {tab === 1 && (
         <Box>
           <Typography variant="h6" sx={{ mb: 1 }}>
             API Keys
@@ -206,7 +211,7 @@ export function SettingsPage() {
       )}
 
       {/* Integrations tab */}
-      {tab === 1 && <IntegrationsTab />}
+      {tab === 2 && <IntegrationsTab />}
 
       {/* Create dialog */}
       <Dialog open={showCreate} onClose={() => setShowCreate(false)}>
