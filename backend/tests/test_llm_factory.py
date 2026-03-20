@@ -143,13 +143,26 @@ class TestCreateEmbeddings:
         emb = create_embeddings(_settings(llm_provider="bedrock"))
         assert type(emb).__name__ == "BedrockEmbeddings"
 
-    def test_anthropic_raises(self):
+    def test_anthropic_raises_without_embedding_key(self):
         with pytest.raises(ValueError, match="no embedding API"):
-            create_embeddings(_settings(llm_provider="anthropic"))
+            create_embeddings(_settings(llm_provider="anthropic", embedding_api_key=None))
 
-    def test_copilot_raises(self):
+    def test_anthropic_falls_back_to_openai_with_embedding_key(self):
+        emb = create_embeddings(_settings(llm_provider="anthropic", embedding_api_key=SecretStr("emb-key")))
+        assert type(emb).__name__ == "OpenAIEmbeddings"
+
+    def test_copilot_raises_without_embedding_key(self):
         with pytest.raises(ValueError, match="no embedding API"):
-            create_embeddings(_settings(llm_provider="copilot"))
+            create_embeddings(_settings(llm_provider="copilot", embedding_api_key=None))
+
+    def test_copilot_falls_back_to_openai_with_embedding_key(self):
+        emb = create_embeddings(_settings(llm_provider="copilot", embedding_api_key=SecretStr("emb-key")))
+        assert type(emb).__name__ == "OpenAIEmbeddings"
+
+    def test_embedding_provider_override(self):
+        """EMBEDDING_PROVIDER overrides LLM_PROVIDER for embeddings."""
+        emb = create_embeddings(_settings(llm_provider="anthropic", embedding_provider="openai", embedding_api_key=SecretStr("emb-key")))
+        assert type(emb).__name__ == "OpenAIEmbeddings"
 
     def test_github_embeddings(self):
         emb = create_embeddings(_settings(llm_provider="github"))

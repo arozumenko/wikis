@@ -214,11 +214,17 @@ def create_embeddings(settings: Settings, **overrides: Any) -> Embeddings:
     Raises ValueError for unsupported providers or missing credentials.
     """
     model = overrides.pop("model", settings.embedding_model)
-    provider = overrides.pop("provider", settings.llm_provider)
+    provider = overrides.pop("provider", settings.embedding_provider or settings.llm_provider)
 
-    # Anthropic and Copilot have no embedding API
+    # Anthropic and Copilot have no embedding API — auto-fallback to openai if embedding_api_key is set
     if provider in ("anthropic", "copilot"):
-        raise ValueError(f"{provider.title()} has no embedding API — use a dedicated embedding provider")
+        if settings.embedding_api_key:
+            logger.info(f"Provider {provider} has no embedding API — falling back to openai for embeddings")
+            provider = "openai"
+        else:
+            raise ValueError(
+                f"{provider.title()} has no embedding API — set EMBEDDING_PROVIDER and EMBEDDING_API_KEY (e.g. openai)"
+            )
 
     # Resolve embedding API key (falls back to LLM key)
     embedding_key = settings.embedding_api_key

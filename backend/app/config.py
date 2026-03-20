@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     llm_model_low: str | None = None  # LOW tier (quality check, enhancement) — falls back to llm_model
 
     # Embeddings
+    embedding_provider: str | None = None  # defaults to llm_provider; set to "openai" when using anthropic LLM
     embedding_model: str = "text-embedding-3-large"
     embedding_api_key: SecretStr | None = None  # falls back to llm_api_key
     embedding_api_base: str | None = None
