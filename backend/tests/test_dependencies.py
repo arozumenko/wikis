@@ -9,6 +9,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.main import create_app
 from app.models.api import AskResponse, ResearchResponse
+from app.models.qa_api import AskResult
 from app.models.invocation import Invocation
 from app.services.ask_service import AskService
 from app.services.research_service import ResearchService
@@ -60,7 +61,9 @@ class TestDependencyInjection:
     @pytest.mark.asyncio
     async def test_ask_route_resolves_service(self, client):
         c, app = client
-        app.state.ask_service.ask_sync = AsyncMock(return_value=AskResponse(answer="test", sources=[]))
+        app.state.ask_service.ask_sync = AsyncMock(
+            return_value=AskResult(response=AskResponse(answer="test", sources=[]), recording=None)
+        )
         resp = await c.post("/api/v1/ask", json={"wiki_id": "w1", "question": "test"})
         assert resp.status_code == 200
 

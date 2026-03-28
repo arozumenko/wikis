@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+from unittest.mock import patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -36,6 +38,27 @@ def mock_settings() -> Settings:
 def mock_storage(tmp_path) -> LocalArtifactStorage:
     """Local artifact storage backed by a temporary directory."""
     return LocalArtifactStorage(str(tmp_path))
+
+
+@contextlib.asynccontextmanager
+async def _noop_run(self):
+    """No-op replacement for StreamableHTTPSessionManager.run().
+
+    pytest-asyncio runs fixture setup/teardown in separate tasks, which
+    conflicts with anyio's cancel-scope requirement that entry and exit
+    happen in the same task.  REST API tests don't need the MCP session
+    manager, so we bypass it here.
+    """
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _patch_mcp_session_manager():
+    """Globally disable MCP session manager in all tests."""
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    with patch.object(StreamableHTTPSessionManager, "run", _noop_run):
+        yield
 
 
 @pytest.fixture

@@ -9,6 +9,9 @@ Prerequisites:
   - Admin user seeded (admin / changeme123)
 """
 
+import httpx
+import pytest
+
 # Service URLs
 AUTH_URL = "http://localhost:3000"
 BACKEND_URL = "http://localhost:8000"
@@ -21,3 +24,18 @@ ADMIN_PASSWORD = "changeme123"
 # Test data
 TEST_REPO_URL = "https://github.com/octocat/Spoon-Knife"
 TEST_REPO_BRANCH = "main"
+
+
+def _services_reachable() -> bool:
+    """Check whether the required services are running."""
+    try:
+        httpx.get(f"{AUTH_URL}/api/auth/health", timeout=2)
+        return True
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _services_reachable(),
+    reason="E2E services not running (need web app on :3000 and backend on :8000)",
+)

@@ -153,7 +153,18 @@ export type AskSSEEvent =
       }>;
       steps?: number;
     })
-  | ({ type: 'task_complete' } & { taskId?: string; status: string })
+  | ({ type: 'task_complete' } & {
+      taskId?: string;
+      status: string;
+      answer?: string;
+      sources?: Array<{
+        file_path: string;
+        snippet?: string;
+        line_start?: number;
+        line_end?: number;
+      }>;
+      steps?: number;
+    })
   | ({ type: 'task_failed' } & { taskId?: string; status: string; error: string; recoverable?: boolean })
   | ({ type: 'ask_error' } & { error: string });
 
