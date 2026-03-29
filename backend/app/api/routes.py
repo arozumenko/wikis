@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+import json as _json
+from dataclasses import asdict
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from app.auth import CurrentUser, get_current_user
 from app.dependencies import (
     get_ask_service,
+    get_qa_service,
     get_research_service,
     get_wiki_management,
     get_wiki_service,
@@ -29,7 +33,9 @@ from app.models import (
     WikiSummary,
 )
 from app.models.invocation import Invocation
+from app.models.qa_api import QAListResponse, QARecordResponse, QAStatsResponse, QAStatus
 from app.services.ask_service import AskService
+from app.services.qa_service import QAService
 from app.services.research_service import ResearchService
 from app.services.wiki_management import WikiManagementService
 from app.services.wiki_service import WikiService
@@ -130,22 +136,27 @@ async def stream_invocation(
 @router.post("/ask", response_model=AskResponse)
 async def ask(
     request: AskRequest,
+    background_tasks: BackgroundTasks,
     user: CurrentUser = Depends(get_current_user),
     service: AskService = Depends(get_ask_service),
+    qa_service: QAService = Depends(get_qa_service),
     accept: str = "application/json",
 ) -> AskResponse | StreamingResponse:
     try:
         if "text/event-stream" in accept:
-
+            # SSE: generator handles its own recording via try/finally
             async def stream():
                 async for event in service.ask_stream(request):
                     event_type = event.get("event_type", "message")
-                    import json as _json
-
                     yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
 
             return StreamingResponse(stream(), media_type="text/event-stream")
-        return await service.ask_sync(request)
+
+        # Sync: BackgroundTask for recording
+        result = await service.ask_sync(request)
+        if result.recording:
+            background_tasks.add_task(qa_service.record_interaction, **asdict(result.recording))
+        return result.response
     except FileNotFoundError as e:
         raise HTTPException(404, f"Wiki not found: {request.wiki_id}") from e
     except RuntimeError as e:
@@ -165,8 +176,6 @@ async def research(
             async def stream():
                 async for event in service.research_stream(request):
                     event_type = event.get("event_type", "message")
-                    import json as _json
-
                     yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
 
             return StreamingResponse(stream(), media_type="text/event-stream")
@@ -357,8 +366,6 @@ async def get_wiki(
     all_artifacts = await management.storage.list_artifacts("wiki_artifacts", prefix=wiki_id)
 
     # Load wiki structure JSON for section/page ordering
-    import json as _json
-
     wiki_title = wiki_meta.title
     sections = []
     structure_files = [a for a in all_artifacts if "wiki_structure" in a and a.endswith(".json")]
@@ -489,9 +496,56 @@ async def resume_wiki(
     )
 
 
+# ---------------------------------------------------------------------------
+# Q&A Knowledge Flywheel endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/wikis/{wiki_id}/qa", response_model=QAListResponse)
+async def list_qa(
+    wiki_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    qa_service: QAService = Depends(get_qa_service),
+    management: WikiManagementService = Depends(get_wiki_management),
+    limit: int = Query(default=20, le=100),
+    offset: int = Query(default=0, ge=0),
+    status: QAStatus | None = Query(default=None),
+) -> QAListResponse:
+    """Paginated Q&A history for a wiki."""
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if not wiki:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+    records, total = await qa_service.list_qa(wiki_id, status=status, limit=limit, offset=offset)
+    items = [QARecordResponse.model_validate(r) for r in records]
+    return QAListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.get("/wikis/{wiki_id}/qa/stats", response_model=QAStatsResponse)
+async def qa_stats(
+    wiki_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    qa_service: QAService = Depends(get_qa_service),
+    management: WikiManagementService = Depends(get_wiki_management),
+) -> QAStatsResponse:
+    """QA statistics for a wiki."""
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if not wiki:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+    stats = await qa_service.get_stats(wiki_id)
+    return QAStatsResponse(**stats)
+
+
+# ---------------------------------------------------------------------------
+# Wiki lifecycle
+# ---------------------------------------------------------------------------
+
+
 @router.post("/wikis/{wiki_id}/refresh", response_model=GenerateWikiResponse, status_code=202)
 async def refresh_wiki(
     wiki_id: str,
+    request: Request,
     body: RefreshWikiRequest = RefreshWikiRequest(),
     user: CurrentUser = Depends(get_current_user),
     service: WikiService = Depends(get_wiki_service),
@@ -502,9 +556,21 @@ async def refresh_wiki(
     wiki_record = await management.get_wiki(wiki_id, user_id=user_id or None)
     if wiki_record and wiki_record.owner_id and wiki_record.owner_id != user_id:
         raise HTTPException(403, "Only the wiki owner can perform this action")
+
     invocation = await service.refresh(wiki_id, management, owner_id=user_id, access_token=body.access_token)
     if not invocation:
         raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    # Evict Ask/Research component caches so stale indexes aren't served post-refresh
+    ask_service: AskService = request.app.state.ask_service
+    research_service: ResearchService = request.app.state.research_service
+    ask_service.evict_cache(wiki_id)
+    research_service.evict_cache(wiki_id)
+
+    # Invalidate QA cache only after refresh is confirmed to have started
+    qa_service: QAService = request.app.state.qa_service
+    await qa_service.invalidate_wiki(wiki_id, delete=False)
+
     return GenerateWikiResponse(
         wiki_id=invocation.wiki_id,
         invocation_id=invocation.id,
@@ -544,6 +610,10 @@ async def delete_wiki(
     research_service: ResearchService = request.app.state.research_service
     ask_service.evict_cache(wiki_id)
     research_service.evict_cache(wiki_id)
+
+    # Invalidate QA data: remove all QARecords and FAISS file
+    qa_service: QAService = request.app.state.qa_service
+    await qa_service.invalidate_wiki(wiki_id, delete=True)
 
     if not result.deleted and not inv_ids:
         raise HTTPException(404, f"Wiki not found: {wiki_id}")

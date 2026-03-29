@@ -11,6 +11,7 @@ from pydantic import SecretStr
 from app.config import Settings
 from app.main import create_app
 from app.models.api import AskRequest, AskResponse, ChatMessage
+from app.models.qa_api import AskResult
 from app.services.ask_service import AskService
 from app.storage.local import LocalArtifactStorage
 
@@ -66,10 +67,10 @@ class TestAskServiceUnit:
         ):
             result = await service.ask_sync(ask_request)
 
-        assert isinstance(result, AskResponse)
-        assert result.answer == "Auth uses JWT tokens."
-        assert len(result.sources) == 1
-        assert result.sources[0].file_path == "src/auth.py"
+        assert isinstance(result, AskResult)
+        assert result.response.answer == "Auth uses JWT tokens."
+        assert len(result.response.sources) == 1
+        assert result.response.sources[0].file_path == "src/auth.py"
 
     @pytest.mark.asyncio
     async def test_ask_stream_yields_events(self, service, ask_request):
@@ -118,7 +119,7 @@ class TestAskServiceUnit:
         ):
             result = await service.ask_sync(req)
 
-        assert result.answer == "Auth uses JWT tokens."
+        assert result.response.answer == "Auth uses JWT tokens."
 
 
 class TestAskEndpoint:
@@ -132,12 +133,15 @@ class TestAskEndpoint:
     @pytest.mark.asyncio
     async def test_ask_json_mode(self, client):
         c, app = client
-        mock_response = AskResponse(answer="JWT tokens.", sources=[])
+        mock_result = AskResult(
+            response=AskResponse(answer="JWT tokens.", sources=[]),
+            recording=None,
+        )
         with patch.object(
             app.state.ask_service,
             "ask_sync",
             new_callable=AsyncMock,
-            return_value=mock_response,
+            return_value=mock_result,
         ):
             resp = await c.post("/api/v1/ask", json={"wiki_id": "w1", "question": "How?"})
             assert resp.status_code == 200

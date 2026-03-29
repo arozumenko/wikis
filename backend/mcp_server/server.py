@@ -6,6 +6,7 @@ Can be mounted into FastAPI app or run standalone.
 from __future__ import annotations
 
 import contextvars
+import json as _json
 import logging
 import os
 from typing import Any
@@ -21,21 +22,28 @@ mcp = FastMCP("wikis", streamable_http_path="/")
 _wiki_management = None
 _ask_service = None
 _research_service = None
+_qa_service = None
 _storage = None
 _settings = None
 
 # Per-request user context (populated by auth middleware)
-_current_user_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "_current_user_id", default=None
-)
+_current_user_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_user_id", default=None)
 
 
-def set_services(wiki_management: Any, ask_service: Any, storage: Any, settings: Any = None, research_service: Any = None) -> None:
+def set_services(
+    wiki_management: Any,
+    ask_service: Any,
+    storage: Any,
+    settings: Any = None,
+    research_service: Any = None,
+    qa_service: Any = None,
+) -> None:
     """Inject service references for direct calls (no HTTP round-trip)."""
-    global _wiki_management, _ask_service, _research_service, _storage, _settings
+    global _wiki_management, _ask_service, _research_service, _qa_service, _storage, _settings
     _wiki_management = wiki_management
     _ask_service = ask_service
     _research_service = research_service
+    _qa_service = qa_service
     _storage = storage
     _settings = settings
 
@@ -82,14 +90,9 @@ class MCPAuthMiddleware:
             return
 
         raw_token = auth.split(" ", 1)[1]
-        user_id = await _validate_token(raw_token)
+        user_id, error_reason = await _validate_token(raw_token)
         if not user_id:
-            await self._send_401(
-                send,
-                "Invalid or revoked API key. Generate a new one in Wikis Settings → API Keys, "
-                "update your MCP config headers, then run /mcp to reconnect. "
-                "This server uses API key auth — the re-authenticate OAuth flow does not apply.",
-            )
+            await self._send_401(send, error_reason)
             return
 
         ctx_token = _current_user_id.set(user_id)
@@ -100,22 +103,34 @@ class MCPAuthMiddleware:
 
     @staticmethod
     async def _send_401(send: Send, message: str) -> None:
-        body = f'{{"error": "{message}"}}'.encode()
-        await send({
-            "type": "http.response.start",
-            "status": 401,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-        })
+        body = _json.dumps({"error": message}).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
         await send({"type": "http.response.body", "body": body})
 
 
-async def _validate_token(token: str) -> str | None:
-    """Validate a wikis_ PAT and return the user_id, or None on failure."""
+_AUTH_ERR_GENERIC = (
+    "Invalid or revoked API key. Generate a new one in Wikis Settings → API Keys, "
+    "update your MCP config headers, then run /mcp to reconnect. "
+    "This server uses API key auth — the re-authenticate OAuth flow does not apply."
+)
+
+
+async def _validate_token(token: str) -> tuple[str | None, str]:
+    """Validate a wikis_ PAT and return (user_id, error_reason).
+
+    Returns (user_id, "") on success, or (None, reason) on failure.
+    """
     if not _settings:
-        return "anon"
+        return "anon", ""
     try:
         import httpx
 
@@ -123,13 +138,21 @@ async def _validate_token(token: str) -> str | None:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(verify_url, json={"key": token})
             if resp.status_code != 200:
-                return None
+                return None, f"API key verification failed (HTTP {resp.status_code}). {_AUTH_ERR_GENERIC}"
             data = resp.json()
             if not data.get("valid", False):
-                return None
-            return data.get("userId") or data.get("user_id") or "unknown"
-    except Exception:
-        return None
+                err = data.get("error", {})
+                if err.get("code") == "RATE_LIMITED":
+                    retry_ms = err.get("details", {}).get("tryAgainIn", 0)
+                    retry_min = max(1, retry_ms // 60000)
+                    return None, (
+                        f"API key rate limit exceeded ({data.get('error', {}).get('message', 'Rate limited')}). "
+                        f"Try again in ~{retry_min} minutes, or increase the rate limit in Wikis Settings → API Keys."
+                    )
+                return None, _AUTH_ERR_GENERIC
+            return data.get("userId") or data.get("user_id") or "unknown", ""
+    except Exception as e:
+        return None, f"API key verification error: {e}. Is the web app running?"
 
 
 def get_mcp_app() -> ASGIApp:
@@ -166,10 +189,7 @@ async def search_wikis(query: str = "") -> dict[str, Any]:
         ]
         if query:
             q = query.lower()
-            wikis = [
-                w for w in wikis
-                if q in (w["repo_url"] or "").lower() or q in (w["title"] or "").lower()
-            ]
+            wikis = [w for w in wikis if q in (w["repo_url"] or "").lower() or q in (w["title"] or "").lower()]
         return {"wikis": wikis, "count": len(wikis)}
     return await _http_search_wikis(query)
 
@@ -204,12 +224,19 @@ async def list_wiki_pages(wiki_id: str) -> dict[str, Any]:
                         page_id = path.rsplit("/", 1)[-1].replace(".md", "")
                         section = ""
                         name = page_id
-                    pages.append({"page_id": page_id, "title": name.replace("-", " ").replace("_", " ").title(), "section": section})
+                    pages.append(
+                        {
+                            "page_id": page_id,
+                            "title": name.replace("-", " ").replace("_", " ").title(),
+                            "section": section,
+                        }
+                    )
 
                 # Load structure JSON for ordering/descriptions
                 struct_files = [a for a in artifacts if "wiki_structure" in a and a.endswith(".json")]
                 if struct_files:
                     import json as _json
+
                     data = await _storage.download("wiki_artifacts", struct_files[-1])
                     structure = _json.loads(data)
             except Exception:
@@ -247,7 +274,14 @@ async def get_wiki_page(wiki_id: str, page_id: str, offset: int = 0, limit: int 
     if _storage:
         try:
             name = page_id if page_id.endswith(".md") else f"{page_id}.md"
-            data = await _storage.download("wiki_artifacts", f"{wiki_id}/{name}")
+            # Storage path has extra segments between wiki_id and wiki_pages/
+            # (e.g. {wiki_id}/owner--repo--branch/wiki_pages/{page}.md)
+            # Search artifacts to find the matching file.
+            artifacts = await _storage.list_artifacts("wiki_artifacts", prefix=wiki_id)
+            match = next((a for a in artifacts if a.endswith(f"/wiki_pages/{name}") or a.endswith(f"/{name}")), None)
+            if not match:
+                return {"error": f"Page not found: {page_id}. Use list_wiki_pages('{wiki_id}') to see available pages."}
+            data = await _storage.download("wiki_artifacts", match)
             all_lines = data.decode("utf-8").splitlines(keepends=True)
             total = len(all_lines)
             chunk = all_lines[offset : offset + limit]
@@ -275,11 +309,19 @@ async def ask_codebase(wiki_id: str, question: str) -> dict[str, Any]:
     """
     if _ask_service:
         try:
+            from dataclasses import asdict
+
             from app.models.api import AskRequest
 
             request = AskRequest(wiki_id=wiki_id, question=question)
-            response = await _ask_service.ask_sync(request)
-            return response.model_dump()
+            result = await _ask_service.ask_sync(request)
+            # Record QA interaction (direct await — no HTTP lifecycle)
+            if result.recording and _qa_service:
+                try:
+                    await _qa_service.record_interaction(**asdict(result.recording))
+                except Exception:
+                    logger.error("MCP QA recording failed", exc_info=True)
+            return result.response.model_dump()
         except FileNotFoundError:
             return {"error": f"Wiki not found: {wiki_id}. Use search_wikis() to find available wiki IDs."}
         except Exception as e:
@@ -346,7 +388,10 @@ async def _http_list_wiki_pages(wiki_id: str) -> dict[str, Any]:
             "repo_url": data.get("repo_url"),
             "branch": data.get("branch"),
             "page_count": data.get("page_count"),
-            "pages": [{"page_id": p["id"], "title": p["title"], "section": p.get("section", "")} for p in data.get("pages", [])],
+            "pages": [
+                {"page_id": p["id"], "title": p["title"], "section": p.get("section", "")}
+                for p in data.get("pages", [])
+            ],
         }
 
 
@@ -390,7 +435,9 @@ async def _http_research_codebase(wiki_id: str, question: str, research_type: st
 
     url = os.getenv("WIKIS_BACKEND_URL", "http://localhost:8000")
     async with httpx.AsyncClient(base_url=url, timeout=300) as client:
-        resp = await client.post("/api/v1/research", json={"wiki_id": wiki_id, "question": question, "research_type": research_type})
+        resp = await client.post(
+            "/api/v1/research", json={"wiki_id": wiki_id, "question": question, "research_type": research_type}
+        )
         if resp.status_code == 404:
             return {"error": f"Wiki not found: {wiki_id}"}
         resp.raise_for_status()

@@ -32,16 +32,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     wiki_management = WikiManagementService(storage, get_session_factory())
     app.state.wiki_management = wiki_management
     app.state.wiki_service = WikiService(settings, storage, wiki_management=wiki_management)
-    app.state.ask_service = AskService(settings, storage)
+    # QA Knowledge Flywheel: init QACacheManager + QAService (degraded-mode)
+    from app.services.qa_cache_manager import QACacheManager
+    from app.services.qa_service import QAService
+
+    qa_cache: QACacheManager | None = None
+    if settings.qa_cache_enabled:
+        try:
+            from app.services.llm_factory import create_embeddings
+
+            embeddings = create_embeddings(settings)
+            qa_cache = QACacheManager(settings.cache_dir, embeddings, max_wikis=settings.qa_cache_max_wikis)
+            logger.info("QA cache initialized")
+        except Exception as e:
+            logger.error("QA cache disabled — embedding init failed: %s", e)
+
+    qa_service = QAService(get_session_factory(), qa_cache, settings)
+    app.state.qa_service = qa_service
+
+    app.state.ask_service = AskService(settings, storage, qa_service=qa_service)
     app.state.research_service = ResearchService(settings, storage)
 
     # Load persisted invocations from storage
     await app.state.wiki_service.load_persisted_invocations()
 
-    logger.info("Services initialized: wiki, ask, research, wiki_management")
+    logger.info("Services initialized: wiki, ask, research, wiki_management, qa")
 
     # Wire MCP tools to services (direct calls, no HTTP)
-    from mcp_server.server import mcp as mcp_server, set_services
+    from mcp_server.server import mcp as mcp_server
+    from mcp_server.server import set_services
 
     set_services(
         wiki_management=wiki_management,
@@ -49,6 +68,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         research_service=app.state.research_service,
         storage=storage,
         settings=settings,
+        qa_service=qa_service,
     )
     logger.info("MCP tools wired to services")
 
@@ -66,6 +86,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    # Reset MCP session manager so each app instance gets a fresh one
+    # (the MCP library's StreamableHTTPSessionManager forbids re-entry)
+    from mcp_server.server import mcp as _mcp
+
+    _mcp._session_manager = None
+
     app = FastAPI(
         title="Wikis API",
         version="0.1.0",

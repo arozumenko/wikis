@@ -1,4 +1,4 @@
-"""Tests for MCP server tools."""
+"""Tests for MCP server tools (HTTP fallback path)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_server.server import ask_question, read_wiki_contents, read_wiki_structure
+from mcp_server.server import ask_codebase, get_wiki_page, search_wikis
 
 
 def _mock_response(status_code=200, json_data=None):
@@ -35,18 +35,21 @@ def _reset_mcp_globals():
     orig_storage = srv._storage
     orig_ask = srv._ask_service
     orig_mgmt = srv._wiki_management
+    orig_qa = srv._qa_service
     srv._storage = None
     srv._ask_service = None
     srv._wiki_management = None
+    srv._qa_service = None
     yield
     srv._storage = orig_storage
     srv._ask_service = orig_ask
     srv._wiki_management = orig_mgmt
+    srv._qa_service = orig_qa
 
 
-class TestReadWikiStructure:
+class TestSearchWikis:
     @pytest.mark.asyncio
-    async def test_returns_wiki_metadata(self):
+    async def test_returns_matching_wikis(self):
         wikis_resp = _mock_response(
             json_data={
                 "wikis": [
@@ -65,21 +68,23 @@ class TestReadWikiStructure:
         mock_client.get = AsyncMock(return_value=wikis_resp)
 
         with _patch_httpx(mock_client):
-            result = await read_wiki_structure("w1")
-            assert "wiki_id" in result
+            result = await search_wikis("")
+            assert result["count"] == 1
+            assert result["wikis"][0]["wiki_id"] == "w1"
 
     @pytest.mark.asyncio
-    async def test_wiki_not_found(self):
+    async def test_empty_result_for_no_match(self):
         wikis_resp = _mock_response(json_data={"wikis": []})
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=wikis_resp)
 
         with _patch_httpx(mock_client):
-            result = await read_wiki_structure("nope")
-            assert "error" in result
+            result = await search_wikis("nope")
+            assert result["count"] == 0
+            assert result["wikis"] == []
 
 
-class TestReadWikiContents:
+class TestGetWikiPage:
     @pytest.mark.asyncio
     async def test_returns_page_content(self):
         resp = _mock_response(json_data={"page_id": "p1", "content": "# Hello"})
@@ -87,7 +92,7 @@ class TestReadWikiContents:
         mock_client.get = AsyncMock(return_value=resp)
 
         with _patch_httpx(mock_client):
-            result = await read_wiki_contents("w1", "p1")
+            result = await get_wiki_page("w1", "p1")
             assert result["content"] == "# Hello"
 
     @pytest.mark.asyncio
@@ -97,11 +102,11 @@ class TestReadWikiContents:
         mock_client.get = AsyncMock(return_value=resp)
 
         with _patch_httpx(mock_client):
-            result = await read_wiki_contents("w1", "nope")
+            result = await get_wiki_page("w1", "nope")
             assert "error" in result
 
 
-class TestAskQuestion:
+class TestAskCodebase:
     @pytest.mark.asyncio
     async def test_returns_answer(self):
         resp = _mock_response(json_data={"answer": "Auth uses JWT.", "sources": []})
@@ -109,7 +114,7 @@ class TestAskQuestion:
         mock_client.post = AsyncMock(return_value=resp)
 
         with _patch_httpx(mock_client):
-            result = await ask_question("w1", "How does auth work?")
+            result = await ask_codebase("w1", "How does auth work?")
             assert result["answer"] == "Auth uses JWT."
 
     @pytest.mark.asyncio
@@ -119,5 +124,5 @@ class TestAskQuestion:
         mock_client.post = AsyncMock(return_value=resp)
 
         with _patch_httpx(mock_client):
-            result = await ask_question("nope", "question")
+            result = await ask_codebase("nope", "question")
             assert "error" in result

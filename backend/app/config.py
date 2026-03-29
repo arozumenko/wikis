@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     # Database (shared with web app's Prisma; empty = default SQLite)
     database_url: str = ""
 
+    # Q&A Cache
+    qa_cache_enabled: bool = True
+    qa_cache_similarity_threshold: float = 0.92
+    qa_cache_max_age_seconds: int = 86400  # 24 hours
+    qa_cache_max_wikis: int = 50  # LRU eviction threshold for in-memory FAISS indexes
+
     # App
     log_level: str = "INFO"
 

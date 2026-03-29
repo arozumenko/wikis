@@ -98,6 +98,7 @@ class AskResponse(BaseModel):
     answer: str
     sources: list[SourceReference] = Field(default_factory=list)
     tool_steps: int = 0  # Number of tool calls the agent made (0 = no tools used)
+    qa_id: str = ""  # Unique Q&A interaction ID (empty for backward compat)
 
 
 # ---------------------------------------------------------------------------

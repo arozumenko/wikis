@@ -367,6 +367,19 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                     }
                   : null,
               );
+            } else if (event.type === 'task_complete' && event.answer) {
+              const answer = event.answer;
+              const sources = event.sources ?? [];
+              setAskState((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      answer,
+                      sources: sources as typeof prev.sources,
+                      loading: false,
+                    }
+                  : null,
+              );
             } else if (event.type === 'ask_error') {
               setAskState((prev) =>
                 prev ? { ...prev, answer: `Error: ${event.error}`, loading: false } : null,

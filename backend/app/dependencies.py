@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import Request
 
 from app.services.ask_service import AskService
+from app.services.qa_service import QAService
 from app.services.research_service import ResearchService
 from app.services.wiki_management import WikiManagementService
 from app.services.wiki_service import WikiService
@@ -16,6 +17,10 @@ def get_wiki_service(request: Request) -> WikiService:
 
 def get_ask_service(request: Request) -> AskService:
     return request.app.state.ask_service
+
+
+def get_qa_service(request: Request) -> QAService:
+    return request.app.state.qa_service
 
 
 def get_research_service(request: Request) -> ResearchService:

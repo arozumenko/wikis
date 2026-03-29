@@ -44,8 +44,10 @@ class TestAuthProviders:
 
 class TestRegistration:
     def test_register_valid_user(self, auth_client):
+        uname = f"testuser_{id(self)}"
         resp = auth_client.post("/api/auth/register", json={
-            "username": f"testuser_{id(self)}",
+            "username": uname,
+            "email": f"{uname}@test.dev",
             "password": "ValidPass123!",
         })
         # 201 for new user, 409 if already exists
@@ -55,11 +57,13 @@ class TestRegistration:
         # Register first
         auth_client.post("/api/auth/register", json={
             "username": "duptest",
+            "email": "duptest@test.dev",
             "password": "ValidPass123!",
         })
         # Register again
         resp = auth_client.post("/api/auth/register", json={
             "username": "duptest",
+            "email": "duptest@test.dev",
             "password": "ValidPass123!",
         })
         assert resp.status_code == 409

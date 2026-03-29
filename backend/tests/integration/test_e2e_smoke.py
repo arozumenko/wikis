@@ -121,23 +121,18 @@ class TestE2ESmokeFlow:
         assert our_wiki["page_count"] == 3
 
         # === Step 4: Ask a question ===
-        mock_ask_response = {"answer": "The project uses microservices.", "sources": []}
+        from app.models.api import AskResponse
+        from app.models.qa_api import AskResult
+
         with patch.object(
             app.state.ask_service,
             "ask_sync",
             new_callable=AsyncMock,
-            return_value=MagicMock(
-                answer="The project uses microservices.",
-                sources=[],
-                model_dump=lambda: mock_ask_response,
+            return_value=AskResult(
+                response=AskResponse(answer="The project uses microservices.", sources=[]),
+                recording=None,
             ),
         ):
-            # Mock the response model properly
-            from app.models.api import AskResponse
-
-            app.state.ask_service.ask_sync = AsyncMock(
-                return_value=AskResponse(answer="The project uses microservices.", sources=[])
-            )
             resp = await c.post(
                 "/api/v1/ask",
                 json={
