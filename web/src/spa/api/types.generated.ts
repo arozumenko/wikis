@@ -414,10 +414,10 @@ export interface components {
              */
             research_type: string;
             /**
-             * Enable Subagents
-             * @default true
+             * Chat History
+             * @default []
              */
-            enable_subagents: boolean;
+            chat_history?: components["schemas"]["ChatMessage"][];
         };
         /**
          * ResearchResponse

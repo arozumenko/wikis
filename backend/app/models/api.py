@@ -112,6 +112,7 @@ class ResearchRequest(BaseModel):
     wiki_id: str
     question: str
     research_type: str = "general"
+    chat_history: list[ChatMessage] = Field(default_factory=list)
 
 
 class ResearchResponse(BaseModel):

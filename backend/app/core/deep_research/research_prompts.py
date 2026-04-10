@@ -292,7 +292,7 @@ RESEARCH_TYPE_PROMPTS = {
 }
 
 
-def get_research_prompt(research_type: str, topic: str, context: str = "") -> str:
+def get_research_prompt(research_type: str, topic: str, context: str = "", chat_history: str = "") -> str:
     """
     Generate a research task prompt for the question.
 
@@ -300,6 +300,7 @@ def get_research_prompt(research_type: str, topic: str, context: str = "") -> st
         research_type: Type of research (architecture, security, etc.)
         topic: The specific question or topic
         context: Additional context
+        chat_history: Optional formatted conversation history string
 
     Returns:
         Formatted task prompt
@@ -312,6 +313,12 @@ def get_research_prompt(research_type: str, topic: str, context: str = "") -> st
 
     if context:
         prompt_parts.append(f"## Repository Context\n\n{context}\n")
+
+    if chat_history:
+        prompt_parts.append(f"## Conversation History\n\n{chat_history}\n\n"
+                            "_Use the history above to resolve any references in the research "
+                            "question (e.g. 'it', 'that module', 'the same service'). Focus on "
+                            "what is new or different in the current question._\n")
 
     prompt_parts.append(f"## Research Focus\n\n{type_guidance}\n")
 

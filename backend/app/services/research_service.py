@@ -57,7 +57,8 @@ class ResearchService:
             repo_path=components.repo_path,
         )
 
-        async for event in engine.research(question=request.question):
+        chat_history = [{"role": m.role, "content": m.content} for m in request.chat_history] or None
+        async for event in engine.research(question=request.question, chat_history=chat_history):
             yield event
 
     async def research_sync(self, request: ResearchRequest) -> ResearchResponse:

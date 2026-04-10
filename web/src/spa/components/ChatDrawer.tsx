@@ -68,7 +68,7 @@ export function ChatDrawer({ wikiId }: ChatDrawerProps) {
           wiki_id: wikiId,
           question,
           research_type: 'general',
-          enable_subagents: true,
+          chat_history: chatHistory,
         });
         assistantMsg = {
           role: 'assistant',

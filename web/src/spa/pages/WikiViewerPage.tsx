@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Box, Typography, CircularProgress, Dialog, DialogTitle,
-  DialogContent, DialogActions, Button, TextField,
+  DialogContent, DialogActions, Button, TextField, Chip,
 } from '@mui/material';
+import ClearIcon from '@mui/icons-material/Clear';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { WikiSidebar } from '../components/WikiSidebar';
 import { WikiPageView } from '../components/WikiPageView';
@@ -21,6 +22,7 @@ import type { WikiDetail } from '../api/wiki';
 import type { components } from '../api/types.generated';
 
 type SourceReference = components['schemas']['SourceReference'];
+type ChatMessage = components['schemas']['ChatMessage'];
 
 interface WikiViewerPageProps {
   mode?: 'light' | 'dark';
@@ -71,8 +73,12 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
   const cancelResearchRef = useRef<(() => void) | null>(null);
   const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState('');
+  const [convHistory, setConvHistory] = useState<ChatMessage[]>([]);
 
-  // Track generating state from both URL params and API response
+  // Reset conversation history when switching wikis
+  useEffect(() => {
+    setConvHistory([]);
+  }, [wikiId]);
   const urlGenerating = searchParams.get('generating') === 'true';
   const urlInvocationId = searchParams.get('invocation');
   const [activeInvocationId, setActiveInvocationId] = useState<string | null>(urlInvocationId);
@@ -229,7 +235,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
       if (useDeepResearch) {
         const cancel = subscribeResearchSSE(
           '/api/v1/research',
-          { wiki_id: wikiId, question, research_type: 'general', enable_subagents: true },
+          { wiki_id: wikiId, question, research_type: 'general', chat_history: convHistory },
           (event) => {
             if (event.type === 'thinking_step') {
               const e = event;
@@ -275,9 +281,15 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                 prev ? { ...prev, answer: (prev.answer ?? '') + event.chunk } : null,
               );
             } else if (event.type === 'research_complete') {
+              const answer = event.report ?? '';
               setAskState((prev) =>
-                prev ? { ...prev, answer: event.report, loading: false } : null,
+                prev ? { ...prev, answer, loading: false } : null,
               );
+              setConvHistory((prev) => [
+                ...prev,
+                { role: 'user', content: question },
+                { role: 'assistant', content: answer },
+              ]);
             } else if (event.type === 'research_error') {
               setAskState((prev) =>
                 prev ? { ...prev, answer: `Error: ${event.error}`, loading: false } : null,
@@ -312,7 +324,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
       } else {
         const cancel = subscribeAskSSE(
           '/api/v1/ask',
-          { wiki_id: wikiId, question, chat_history: [], k: 15 },
+          { wiki_id: wikiId, question, chat_history: convHistory, k: 15 },
           (event) => {
             if (event.type === 'thinking_step') {
               const e = event;
@@ -357,16 +369,23 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                 prev ? { ...prev, answer: (prev.answer ?? '') + event.chunk } : null,
               );
             } else if (event.type === 'ask_complete') {
+              const answer = event.answer ?? '';
+              const sources = event.sources ?? [];
               setAskState((prev) =>
                 prev
                   ? {
                       ...prev,
-                      answer: event.answer,
-                      sources: event.sources as typeof prev.sources,
+                      answer,
+                      sources: sources as typeof prev.sources,
                       loading: false,
                     }
                   : null,
               );
+              setConvHistory((prev) => [
+                ...prev,
+                { role: 'user', content: question },
+                { role: 'assistant', content: answer },
+              ]);
             } else if (event.type === 'task_complete' && event.answer) {
               const answer = event.answer;
               const sources = event.sources ?? [];
@@ -380,6 +399,11 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                     }
                   : null,
               );
+              setConvHistory((prev) => [
+                ...prev,
+                { role: 'user', content: question },
+                { role: 'assistant', content: answer },
+              ]);
             } else if (event.type === 'ask_error') {
               setAskState((prev) =>
                 prev ? { ...prev, answer: `Error: ${event.error}`, loading: false } : null,
@@ -409,8 +433,9 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
         cancelResearchRef.current = cancel;
       }
     },
-    [wikiId],
+    [wikiId, convHistory],
   );
+
 
   // Cancel research stream on unmount
   useEffect(() => {
@@ -573,22 +598,38 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
       </Box>
 
       {!isGenerating && (
-        <AskBar
-          onSubmit={handleAsk}
-          disabled={askState?.loading}
-          repoLabel={
-            wiki?.repo_url
-              ? (() => {
-                  try {
-                    const p = new URL(wiki.repo_url).pathname.split('/').filter(Boolean);
-                    return p.length >= 2 ? `${p[0]}/${p[1]}` : undefined;
-                  } catch {
-                    return undefined;
-                  }
-                })()
-              : undefined
-          }
-        />
+        <>
+          {convHistory.length > 0 && (
+            <Box sx={{ display: 'flex', justifyContent: 'center', mb: 0.5 }}>
+              <Chip
+                size="small"
+                icon={<ClearIcon fontSize="small" />}
+                label={`Context active (${convHistory.length / 2} turn${convHistory.length / 2 !== 1 ? 's' : ''})`}
+                onClick={() => setConvHistory([])}
+                onDelete={() => setConvHistory([])}
+                color="primary"
+                variant="outlined"
+                sx={{ fontSize: '0.72rem', cursor: 'pointer' }}
+              />
+            </Box>
+          )}
+          <AskBar
+            onSubmit={handleAsk}
+            disabled={askState?.loading}
+            repoLabel={
+              wiki?.repo_url
+                ? (() => {
+                    try {
+                      const p = new URL(wiki.repo_url).pathname.split('/').filter(Boolean);
+                      return p.length >= 2 ? `${p[0]}/${p[1]}` : undefined;
+                    } catch {
+                      return undefined;
+                    }
+                  })()
+                : undefined
+            }
+          />
+        </>
       )}
 
       {/* Token dialog for retrying wikis that originally required auth */}

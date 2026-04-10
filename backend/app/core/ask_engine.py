@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Any
 
 import app.events as _events
+from app.core.chat_utils import format_chat_history
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -245,11 +246,7 @@ class AskEngine:
 
             # Build user prompt with repo context + history
             repo_context = self._get_repo_context()
-            history_str = ""
-            if chat_history:
-                history_str = "\n".join(
-                    f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:300]}" for m in chat_history[-4:]
-                )
+            history_str = format_chat_history(chat_history) if chat_history else ""
 
             user_prompt = get_ask_prompt(
                 question=question,

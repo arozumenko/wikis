@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any
 
 import app.events as _events
+from app.core.chat_utils import format_chat_history
 from deepagents import FilesystemMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware.summarization import SummarizationMiddleware
@@ -198,7 +199,12 @@ class DeepResearchEngine:
 
         return agent
 
-    async def research(self, question: str, session_id: str | None = None) -> AsyncGenerator[dict, None]:
+    async def research(
+        self,
+        question: str,
+        session_id: str | None = None,
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """
         Conduct deep research on a question.
 
@@ -210,6 +216,8 @@ class DeepResearchEngine:
         Args:
             question: The research question
             session_id: Optional session identifier
+            chat_history: Optional prior conversation as list of
+                ``{"role": "user"|"assistant", "content": "..."}`` dicts.
 
         Yields:
             Event dictionaries for UI updates
@@ -231,10 +239,14 @@ class DeepResearchEngine:
             # Create the agent
             agent = self._create_agent()
 
-            # Build research prompt with context
+            # Build research prompt with context (and optional conversation history)
             repo_context = self._get_repo_context()
+            history_str = format_chat_history(chat_history) if chat_history else ""
             research_prompt = get_research_prompt(
-                research_type=self.config.research_type, topic=question, context=repo_context
+                research_type=self.config.research_type,
+                topic=question,
+                context=repo_context,
+                chat_history=history_str,
             )
 
             # Prepare input message
@@ -356,13 +368,19 @@ class DeepResearchEngine:
 
         return "\n".join(parts) if parts else "No repository overview available."
 
-    def research_sync(self, question: str, on_event: Callable[[dict], None] | None = None) -> str:
+    def research_sync(
+        self,
+        question: str,
+        on_event: Callable[[dict], None] | None = None,
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> str:
         """
         Synchronous wrapper for deep research.
 
         Args:
             question: Research question
             on_event: Optional callback for events
+            chat_history: Optional prior conversation history
 
         Returns:
             Final research report
@@ -371,7 +389,7 @@ class DeepResearchEngine:
 
         async def _run():
             report = ""
-            async for event in self.research(question):
+            async for event in self.research(question, chat_history=chat_history):
                 if on_event:
                     on_event(event)
                 if event.get("event_type") == "research_complete":
