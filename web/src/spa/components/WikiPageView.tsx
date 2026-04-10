@@ -236,6 +236,10 @@ export function WikiPageView({ content, mode = 'dark', onNavigate, pages = [] }:
   };
 
   const components: Components = {
+    // Suppress the react-markdown <pre> wrapper — MermaidDiagram and CodeBlock own their card styling
+    pre({ children }) {
+      return <>{children}</>;
+    },
     blockquote({ children, node }) {
       const type = (node as any)?.properties?.['data-callout-type'] as string | undefined;
       const title = (node as any)?.properties?.['data-callout-title'] as string | undefined;
