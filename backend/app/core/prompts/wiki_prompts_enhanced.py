@@ -1406,6 +1406,19 @@ Some documents include relationship hints that help you understand how component
 
 ---
 
+**CALLOUT BLOCKS — use Obsidian-style callouts to surface key information:**
+Use the following callout types where appropriate (syntax: `> [!type] Optional Title` followed by indented content):
+- `> [!abstract]` — component or module overview at the start of a section
+- `> [!info]` — configuration options, environment variables, or setup notes
+- `> [!tip]` — usage patterns, best practices, recommended approaches
+- `> [!warning]` — gotchas, common mistakes, performance caveats, deprecation notices
+- `> [!example]` — key code patterns or illustrative usage snippets
+- `> [!danger]` — security considerations or breaking-change risks
+
+Use callouts sparingly (1–3 per page). Do not wrap entire sections in callouts.
+
+---
+
 **Generate comprehensive, well-structured, diagram-rich documentation that synthesizes all available information into clear, practical guidance for your target audience.**
 
 **STRICT GROUNDING / NO HALLUCINATIONS:**
@@ -3202,6 +3215,19 @@ Include performance considerations, optimization strategies, and scaling guidanc
 
 **WORKFLOW INTEGRATION:**
 Show how components fit into larger workflows and system operations.
+
+---
+
+**CALLOUT BLOCKS — use Obsidian-style callouts to surface key information:**
+Use the following callout types where appropriate (syntax: `> [!type] Optional Title` followed by indented content):
+- `> [!abstract]` — component or module overview at the start of a section
+- `> [!info]` — configuration options, environment variables, or setup notes
+- `> [!tip]` — usage patterns, best practices, recommended approaches
+- `> [!warning]` — gotchas, common mistakes, performance caveats, deprecation notices
+- `> [!example]` — key code patterns or illustrative usage snippets
+- `> [!danger]` — security considerations or breaking-change risks
+
+Use callouts sparingly (1–3 per page). Do not wrap entire sections in callouts.
 
 ---
 

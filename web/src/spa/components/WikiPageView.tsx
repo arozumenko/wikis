@@ -28,8 +28,84 @@ function extractText(node: React.ReactNode): string {
   return '';
 }
 
+function stripFrontmatter(raw: string): string {
+  if (!raw.startsWith('---')) return raw;
+  const end = raw.indexOf('\n---', 3);
+  if (end === -1) return raw;
+  return raw.slice(end + 4).replace(/^\r?\n/, '');
+}
+
 export function WikiPageView({ content, mode = 'dark', onNavigate }: WikiPageViewProps) {
+  // Callout type → color palette
+  const calloutColors: Record<string, { border: string; bg: string; label: string }> = {
+    abstract: { border: '#a78bfa', bg: 'rgba(167,139,250,0.08)', label: '📋' },
+    info:     { border: '#60a5fa', bg: 'rgba(96,165,250,0.08)',  label: 'ℹ️' },
+    tip:      { border: '#34d399', bg: 'rgba(52,211,153,0.08)',  label: '💡' },
+    warning:  { border: '#fbbf24', bg: 'rgba(251,191,36,0.08)', label: '⚠️' },
+    example:  { border: '#22d3ee', bg: 'rgba(34,211,238,0.08)', label: '📌' },
+    danger:   { border: '#f87171', bg: 'rgba(248,113,113,0.08)', label: '🔴' },
+    note:     { border: '#60a5fa', bg: 'rgba(96,165,250,0.08)',  label: '📝' },
+    success:  { border: '#34d399', bg: 'rgba(52,211,153,0.08)',  label: '✅' },
+    question: { border: '#fbbf24', bg: 'rgba(251,191,36,0.08)', label: '❓' },
+    bug:      { border: '#f87171', bg: 'rgba(248,113,113,0.08)', label: '🐛' },
+    quote:    { border: '#94a3b8', bg: 'rgba(148,163,184,0.08)', label: '💬' },
+  };
+
   const components: Components = {
+    blockquote({ children }) {
+      // Detect Obsidian callout: first text content starts with [!type]
+      const firstText = extractText(children);
+      const match = firstText.match(/^\[!(\w+)\][ \t]*(.*)/);
+      if (match) {
+        const type = match[1].toLowerCase();
+        const inlineTitle = match[2].trim();
+        const palette = calloutColors[type] ?? { border: '#94a3b8', bg: 'rgba(148,163,184,0.08)', label: '📄' };
+        // Strip the [!type] marker line from children so it's not rendered twice
+        const cleanedChildren = (() => {
+          const arr = Array.isArray(children) ? children : [children];
+          return arr.map((child, idx) => {
+            if (idx !== 0) return child;
+            if (typeof child === 'string') return child.replace(/^\[!\w+\][^\n]*\n?/, '');
+            if (child && typeof child === 'object' && 'props' in child) {
+              const inner = child.props.children;
+              const firstChild = Array.isArray(inner) ? inner[0] : inner;
+              if (typeof firstChild === 'string') {
+                const rest = firstChild.replace(/^\[!\w+\][^\n]*\n?/, '');
+                const newInner = Array.isArray(inner) ? [rest, ...inner.slice(1)] : rest;
+                return { ...child, props: { ...child.props, children: newInner } };
+              }
+            }
+            return child;
+          });
+        })();
+        return (
+          <Box
+            component="div"
+            sx={{
+              borderLeft: `4px solid ${palette.border}`,
+              background: palette.bg,
+              borderRadius: '0 6px 6px 0',
+              px: 2,
+              py: 1,
+              my: 2,
+            }}
+          >
+            <Box sx={{ fontWeight: 700, color: palette.border, mb: 0.5, fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              {palette.label} {type}{inlineTitle ? ` — ${inlineTitle}` : ''}
+            </Box>
+            <Box sx={{ '& p:last-child': { mb: 0 } }}>{cleanedChildren}</Box>
+          </Box>
+        );
+      }
+      return (
+        <Box
+          component="blockquote"
+          sx={{ borderLeft: '3px solid rgba(255,255,255,0.2)', pl: 2, my: 1, color: 'text.secondary', fontStyle: 'italic' }}
+        >
+          {children}
+        </Box>
+      );
+    },
     a({ href, children, ...props }) {
       // Intercept internal .md links
       if (href && href.endsWith('.md') && !href.startsWith('http') && onNavigate) {
@@ -148,15 +224,6 @@ export function WikiPageView({ content, mode = 'dark', onNavigate }: WikiPageVie
             bgcolor: mode === 'dark' ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.02)',
           },
         },
-        '& blockquote': {
-          borderLeft: '4px solid',
-          borderColor: 'primary.main',
-          pl: 2.5,
-          ml: 0,
-          my: 3,
-          color: 'text.secondary',
-          fontStyle: 'italic',
-        },
         '& pre': {
           borderRadius: '12px',
           overflow: 'auto',
@@ -195,7 +262,7 @@ export function WikiPageView({ content, mode = 'dark', onNavigate }: WikiPageVie
         rehypePlugins={[rehypeHighlight]}
         components={components}
       >
-        {content}
+        {stripFrontmatter(content)}
       </ReactMarkdown>
     </Box>
   );
