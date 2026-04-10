@@ -4,10 +4,56 @@ import { ShareButton } from './ShareButton';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeSlug from 'rehype-slug';
+import { visit } from 'unist-util-visit';
 import { MermaidDiagram } from './MermaidDiagram';
 import { CodeBlock } from './CodeBlock';
 import type { Components } from 'react-markdown';
 import React, { useState } from 'react';
+
+/** Remark plugin: transforms Obsidian callout blockquotes into annotated hast nodes.
+ *  Detects `> [!type] title` pattern, attaches data-callout-* hProperties to the
+ *  blockquote, and removes the marker line from the AST so children are body-only.
+ */
+function remarkCallout() {
+  return (tree: any) => {
+    visit(tree, 'blockquote', (node: any) => {
+      if (!node.children?.length) return;
+      const firstPara = node.children[0];
+      if (firstPara.type !== 'paragraph' || !firstPara.children?.length) return;
+      const firstNode = firstPara.children[0];
+      if (firstNode.type !== 'text') return;
+
+      const match = firstNode.value.match(/^\[!(\w+)\][ \t]*(.*)/);
+      if (!match) return;
+
+      // Attach type and title to blockquote hast properties
+      node.data = node.data ?? {};
+      node.data.hProperties = {
+        ...node.data.hProperties,
+        'data-callout-type': match[1].toLowerCase(),
+        'data-callout-title': match[2].trim(),
+      };
+
+      // Remove the marker line from the AST
+      const newlineIdx = firstNode.value.indexOf('\n');
+      if (newlineIdx >= 0) {
+        // Marker and body in same text node — keep only the part after the newline
+        firstNode.value = firstNode.value.slice(newlineIdx + 1);
+        if (!firstNode.value && firstPara.children.length === 1) node.children.shift();
+      } else {
+        // Check for a hard break node after the marker within the same paragraph
+        const breakIdx = firstPara.children.findIndex((n: any, i: number) => i > 0 && n.type === 'break');
+        if (breakIdx > 0) {
+          firstPara.children = firstPara.children.slice(breakIdx + 1);
+          if (!firstPara.children.length) node.children.shift();
+        } else {
+          // Whole first paragraph is just the marker — remove it
+          node.children.shift();
+        }
+      }
+    });
+  };
+}
 
 interface WikiPageViewProps {
   content: string;
@@ -190,32 +236,11 @@ export function WikiPageView({ content, mode = 'dark', onNavigate, pages = [] }:
   };
 
   const components: Components = {
-    blockquote({ children }) {
-      // Detect Obsidian callout: first text content starts with [!type]
-      const firstText = extractText(children);
-      const match = firstText.match(/^\[!(\w+)\][ \t]*(.*)/);
-      if (match) {
-        const type = match[1].toLowerCase();
-        const inlineTitle = match[2].trim();
+    blockquote({ children, node }) {
+      const type = (node as any)?.properties?.['data-callout-type'] as string | undefined;
+      const title = (node as any)?.properties?.['data-callout-title'] as string | undefined;
+      if (type) {
         const palette = calloutColors[type] ?? { border: '#94a3b8', bg: 'rgba(148,163,184,0.08)', label: '📄' };
-        // Strip the [!type] marker line from children so it's not rendered twice
-        const cleanedChildren = (() => {
-          const arr = Array.isArray(children) ? children : [children];
-          return arr.map((child, idx) => {
-            if (idx !== 0) return child;
-            if (typeof child === 'string') return child.replace(/^\[!\w+\][^\n]*\n?/, '');
-            if (child && typeof child === 'object' && 'props' in child) {
-              const inner = child.props.children;
-              const firstChild = Array.isArray(inner) ? inner[0] : inner;
-              if (typeof firstChild === 'string') {
-                const rest = firstChild.replace(/^\[!\w+\][^\n]*\n?/, '');
-                const newInner = Array.isArray(inner) ? [rest, ...inner.slice(1)] : rest;
-                return { ...child, props: { ...child.props, children: newInner } };
-              }
-            }
-            return child;
-          });
-        })();
         return (
           <Box
             component="div"
@@ -229,9 +254,9 @@ export function WikiPageView({ content, mode = 'dark', onNavigate, pages = [] }:
             }}
           >
             <Box sx={{ fontWeight: 700, color: palette.border, mb: 0.5, fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-              {palette.label} {type}{inlineTitle ? ` — ${inlineTitle}` : ''}
+              {palette.label} {type}{title ? ` — ${title}` : ''}
             </Box>
-            <Box sx={{ '& p:last-child': { mb: 0 } }}>{cleanedChildren}</Box>
+            <Box sx={{ '& p:last-child': { mb: 0 } }}>{children}</Box>
           </Box>
         );
       }
@@ -422,7 +447,7 @@ export function WikiPageView({ content, mode = 'dark', onNavigate, pages = [] }:
       </Box>
       <WikiProperties meta={meta} mode={mode} />
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkCallout]}
         rehypePlugins={[rehypeSlug, rehypeHighlight]}
         components={components}
         urlTransform={(url) => (url.startsWith('javascript:') ? '' : url)}
