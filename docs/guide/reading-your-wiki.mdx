@@ -28,15 +28,49 @@ The header shows:
 
 ## Sidebar navigation
 
-Pages are grouped into sections. Click a section header to collapse or expand it. The currently active page is highlighted.
+Pages are grouped into sections. Click a **section header** to navigate to the section's overview page (a table of contents listing every page in the section). Use the **chevron icon** to the right of the header to collapse or expand the section without navigating away. The currently active page is highlighted.
 
 <Tip>
   On mobile, the sidebar collapses into a drawer. Tap the menu icon in the top-left to open it.
 </Tip>
 
+<Note>
+  The sidebar is temporarily hidden while a Q&A conversation thread is active, to give more space to the conversation. It reappears when you clear the conversation or navigate away.
+</Note>
+
 ## Page content
 
 Wiki pages are rendered GitHub-flavoured Markdown with:
+
+### Callout blocks
+
+Wiki pages use Obsidian-style callout blocks for highlighted notes, warnings, tips, and examples:
+
+> [!tip] Performance tip
+> Use the cached JWKS endpoint rather than fetching the public key on every request.
+
+Six callout types are supported, each rendered with a colour-coded border and emoji label:
+
+| Type | Colour | Use |
+|------|--------|-----|
+| `[!abstract]` | Blue | Summaries, overviews |
+| `[!info]` | Cyan | Informational notes |
+| `[!tip]` | Green | Recommendations |
+| `[!warning]` | Orange | Cautions, edge cases |
+| `[!example]` | Purple | Code examples, walkthroughs |
+| `[!danger]` | Red | Breaking changes, destructive operations |
+
+### Properties panel
+
+Each wiki page begins with a YAML frontmatter block. This renders as a collapsible **Properties** panel at the top of the page, showing metadata the AI extracted from the code:
+
+- **Title** — the page title
+- **Tags** — architectural layer, domain, or feature area
+- **Type** — `module`, `architecture`, `api`, `guide`, or `overview`
+- **Source files** — repository paths of source files this page documents
+- **Symbols** — key functions, classes, or types covered on the page
+
+Click the panel header to collapse it and return to full reading width.
 
 ### Syntax-highlighted code blocks
 
@@ -60,9 +94,15 @@ graph LR
     D --> E[Browsable wiki]
 ```
 
-### Internal links
+### Internal links and wikilinks
 
-Links between wiki pages navigate within the viewer — no full page reload.
+Links between wiki pages navigate within the viewer — no full page reload. Pages link to each other using [Obsidian wikilink syntax](https://help.obsidian.md/Linking+notes+and+files/Internal+links):
+
+- `[[Page Title]]` — links to the page whose title matches
+- `[[Page Title|Display Text]]` — link with custom anchor text
+- `[[source/path/file.py|file.py]]` — links to source file stub pages
+
+Standard Markdown links (`[text](url)`) and anchor links (`#section-heading`) also work.
 
 ### Tables
 
@@ -84,3 +124,7 @@ Click the **share** icon (↗) in the top-right corner of any page to copy a dir
 | `Shift + Enter` | New line in Ask bar |
 | Clicking a sidebar item | Navigate to page |
 | Clicking a TOC item | Scroll to heading |
+
+## Obsidian compatibility
+
+Every wiki is structured as an Obsidian-compatible vault. See [Obsidian Integration](/guide/obsidian-integration) for a full guide on opening wikis in Obsidian, using graph view, and working with wikilinks and source file stubs.

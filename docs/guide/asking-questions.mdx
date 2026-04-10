@@ -1,15 +1,35 @@
 ---
 title: "Asking Questions"
-description: "Use the Ask bar to query your codebase with Fast Q&A or Deep Research."
+description: "Use the Ask bar to query your codebase with Fast Q&A or Deep Research — across a full multi-turn conversation."
 ---
 
 Every wiki has an **Ask bar** pinned to the bottom of the viewer. Type any question about the codebase and press **Enter**.
+
+## Conversation threads
+
+The Ask bar maintains a **persistent conversation thread** across questions. Each new question is added to the thread — prior questions and answers remain visible above, and the LLM receives the conversation history as context when generating the next answer.
 
 <img
   src="/images/ask-mode-selector.png"
   alt="Ask bar with Fast and Deep Research mode selector open"
   style={{ borderRadius: '0.5rem', border: '1px solid #e5e7eb' }}
 />
+
+### How threads work
+
+- The first question starts a new thread
+- Once a thread is active, the Ask bar placeholder changes to **"Ask a follow-up question…"**
+- A **Conversation (N turns)** chip appears above the Ask bar showing the number of completed turns
+- Both **Fast Q&A** and **Deep Research** carry the full conversation context, so follow-up questions can reference answers from earlier in the thread without repeating yourself
+- The sidebar hides while a conversation is active, giving more room to the thread
+
+### Clearing a conversation
+
+Click the **Clear** button on the Conversation chip to reset the thread and start fresh. The sidebar reappears. You can also navigate away from the wiki page and back to start a new thread automatically.
+
+<Tip>
+  Use the conversation thread to progressively drill into a topic — start with a broad question like *"How does authentication work?"*, then follow up with *"Walk me through the token validation flow specifically"* or *"What would break if the JWKS endpoint went down?"*
+</Tip>
 
 ## Two modes
 
@@ -73,15 +93,11 @@ Click a source citation to see the exact code the answer was grounded in.
 ## Tips for better answers
 
 <Tip>
-  **Be specific.** Instead of *"How does auth work?"*, try *"How is the JWT token validated on incoming API requests?"*
+  **Use the conversation thread.** Start broad — *"How does authentication work?"* — then follow up with *"Which file handles token refresh?"* The LLM remembers your earlier questions and builds on them.
 </Tip>
 
 <Tip>
   **Use Deep Research for architecture questions.** Questions like *"What is the data flow for wiki generation?"* benefit from the multi-step agent that can follow the code across many files.
-</Tip>
-
-<Tip>
-  **Ask follow-up questions.** Each question is independent — but you can reference terms from the previous answer to narrow down.
 </Tip>
 
 ## Example questions
