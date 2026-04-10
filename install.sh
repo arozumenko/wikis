@@ -55,6 +55,16 @@ if ! docker compose version &>/dev/null; then
   exit 1
 fi
 
+if ! docker info &>/dev/null; then
+  err "Docker daemon is not running."
+  case "$(uname -s)" in
+    Darwin) err "Start Docker Desktop: open -a Docker" ;;
+    Linux)  err "Start the daemon: sudo systemctl start docker" ;;
+    *)      err "Please start the Docker daemon before running this installer." ;;
+  esac
+  exit 1
+fi
+
 ok "All prerequisites found"
 
 # ── Create install directory ──────────────────────────────────────
@@ -313,9 +323,16 @@ ok "Configuration written to .env"
 header "🚀 Starting Wikis..."
 
 if ! docker compose pull; then
-  warn "Failed to pull images. Will try to start with cached images..."
+  warn "Failed to pull one or more images. This may fail if no cached images exist."
+  prompt "   Continue with cached images? [y/N] " pull_continue
+  if [[ ! "$pull_continue" =~ ^[Yy]$ ]]; then
+    echo "Aborted. Check your internet connection and try again."; exit 1
+  fi
 fi
-docker compose up -d
+if ! docker compose up -d; then
+  err "Failed to start services. Run 'docker compose up' in $INSTALL_DIR for details."
+  exit 1
+fi
 
 info "Waiting for services to be healthy..."
 attempt=0
