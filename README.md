@@ -110,6 +110,68 @@ Connect your AI IDE to Wikis for codebase-aware answers directly in your editor:
 
 Works with Claude Code, Cursor, Windsurf, and any MCP-compatible client.
 
+## Agent Skill
+
+The `wikis` skill lets any AI agent browse wikis, ask codebase questions, run deep research, and generate new wikis — without opening a browser. It ships with this repo and works in three ways.
+
+### 1. Claude Code plugin marketplace
+
+```
+/plugin marketplace add arozumenko/wikis
+/plugin install wikis@wikis
+```
+
+Claude Code auto-discovers the `skills/wikis/` directory and wires everything up.
+
+### 2. npx — any IDE (Claude Code, Cursor, Windsurf, GitHub Copilot)
+
+Copies the skill directly into the IDE skill directories of your current project:
+
+```bash
+# Install to all detected IDEs
+npx github:arozumenko/wikis init
+
+# Install to Claude Code only
+npx github:arozumenko/wikis init --target claude
+
+# Overwrite an existing install
+npx github:arozumenko/wikis init --update
+```
+
+| Target | Directory | Installed path |
+|--------|-----------|----------------|
+| Claude Code | `.claude/` | `.claude/skills/wikis/` |
+| Cursor | `.cursor/` | `.cursor/skills/wikis/` |
+| Windsurf | `.windsurf/` | `.windsurf/skills/wikis/` |
+| GitHub Copilot | `.github/` | `.github/skills/wikis/` |
+
+After install, set the `WIKIS_URL` env var before starting your IDE:
+
+```bash
+export WIKIS_URL=http://localhost:3000
+export WIKIS_TOKEN=<jwt-token>   # only if auth is enabled
+```
+
+### 3. agentskills.io / Vercel skills CLI
+
+```bash
+npx skills add https://github.com/arozumenko/wikis
+```
+
+The skill at `skills/wikis/SKILL.md` follows the [agentskills.io](https://agentskills.io) spec and is compatible with any tool that reads it.
+
+### What the skill can do
+
+| Operation | Script | API |
+|-----------|--------|-----|
+| List all wikis | `list-wikis.mjs` | `GET /api/v1/wikis` |
+| Read wiki / page | `get-wiki.mjs <id> [page]` | `GET /api/v1/wikis/{id}` |
+| Ask a question | `ask-wiki.mjs <id> "<question>"` | `POST /api/v1/ask` |
+| Deep research | `research-wiki.mjs <id> "<question>"` | `POST /api/v1/research` |
+| Generate wiki | `generate-wiki.mjs <repo_url> [branch]` | `POST /api/v1/generate` |
+
+Scripts live in `skills/wikis/scripts/` and require Node.js 18+.
+
 ## Screenshots
 
 <table>
