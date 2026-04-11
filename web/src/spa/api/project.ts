@@ -114,14 +114,14 @@ export const researchProject = (
  */
 export const mapProject = (
   projectId: string,
-  entryPoints: string[],
+  question: string,
   onEvent: (event: ResearchSSEEvent) => void,
   onDone: () => void,
   onError: (e: unknown) => void,
 ): (() => void) => {
   return subscribeResearchSSE(
     `/api/v1/projects/${encodeURIComponent(projectId)}/map`,
-    { entry_points: entryPoints },
+    { question },
     onEvent,
     onDone,
     onError,

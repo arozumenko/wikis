@@ -52,18 +52,12 @@ import type { ToolCallRecord, TodoItem } from '../api/sse';
 type WikiSummary = components['schemas']['WikiSummary'];
 type SourceReference = components['schemas']['SourceReference'];
 
-/** Extended source reference that may include cross-repo attribution. */
-interface CrossRepoSource extends SourceReference {
-  wiki_id?: string | null;
-  wiki_title?: string | null;
-}
-
 type QAMode = 'fast' | 'deep';
 
 interface QATurn {
   question: string;
   answer: string | null;
-  sources: CrossRepoSource[];
+  sources: SourceReference[];
   toolCalls: ToolCallRecord[];
   todos: TodoItem[];
   loading: boolean;
@@ -122,6 +116,9 @@ export function ProjectPage() {
   const [qaMode, setQaMode] = useState<QAMode>('fast');
   const [qaTurns, setQaTurns] = useState<QATurn[]>([]);
   const cancelQaRef = useRef<(() => void) | null>(null);
+
+  // Cancel any in-flight SSE stream on unmount to prevent memory leaks.
+  useEffect(() => () => { cancelQaRef.current?.(); }, []);
 
   const showSnack = useCallback((msg: string, severity: 'success' | 'error' = 'error') => {
     setSnackMessage(msg);
@@ -370,7 +367,7 @@ export function ProjectPage() {
             updateLastQaTurn((prev) => ({
               ...prev,
               answer: event.answer ?? '',
-              sources: (event.sources ?? []) as CrossRepoSource[],
+              sources: (event.sources ?? []) as SourceReference[],
               loading: false,
               error: false,
             }));
@@ -378,7 +375,7 @@ export function ProjectPage() {
             updateLastQaTurn((prev) => ({
               ...prev,
               answer: event.answer ?? '',
-              sources: (event.sources ?? []) as CrossRepoSource[],
+              sources: (event.sources ?? []) as SourceReference[],
               loading: false,
               error: false,
             }));

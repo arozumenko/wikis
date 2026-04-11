@@ -28,18 +28,12 @@ type ChatMessage = components['schemas']['ChatMessage'];
 type SourceReference = components['schemas']['SourceReference'];
 type CodeMapData = components['schemas']['CodeMapData'];
 
-/** Extended source reference with optional cross-repo attribution fields. */
-interface CrossRepoSource extends SourceReference {
-  wiki_id?: string | null;
-  wiki_title?: string | null;
-}
-
 type ChatMode = 'fast' | 'deep' | 'codemap';
 
 interface Message {
   role: 'user' | 'assistant';
   content: string;
-  sources?: CrossRepoSource[];
+  sources?: SourceReference[];
   thinkingSteps?: string[];
   codeMap?: CodeMapData | null;
   mode?: ChatMode;
