@@ -82,15 +82,24 @@ class SourceReference(BaseModel):
     symbol: str | None = None
     symbol_type: str | None = None
     relevance_score: float | None = None
+    wiki_id: str | None = None    # None for single-wiki answers
+    wiki_title: str | None = None  # Human-readable wiki title for cross-repo answers
 
 
 class AskRequest(BaseModel):
     """Request to ask a question about a wiki."""
 
-    wiki_id: str
+    wiki_id: str | None = None      # Optional when project_id is provided
+    project_id: str | None = None   # Query across all wikis in a project
     question: str
     chat_history: list[ChatMessage] = Field(default_factory=list)
     k: int = 15  # Retrieval doc count
+
+    @model_validator(mode="after")
+    def _require_target(self) -> "AskRequest":
+        if not self.wiki_id and not self.project_id:
+            raise ValueError("Either wiki_id or project_id is required")
+        return self
 
 
 class AskResponse(BaseModel):
@@ -223,6 +232,51 @@ class RefreshWikiRequest(BaseModel):
     """Request body for wiki refresh — allows passing an access token for private repos."""
 
     access_token: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Projects
+# ---------------------------------------------------------------------------
+
+
+class ProjectCreateRequest(BaseModel):
+    """Request to create a new project."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str | None = None
+    visibility: str = "personal"  # "personal" | "shared"
+
+
+class ProjectUpdateRequest(BaseModel):
+    """Request to update an existing project."""
+
+    name: str | None = Field(None, min_length=1, max_length=100)
+    description: str | None = None
+    visibility: str | None = None
+
+
+class ProjectResponse(BaseModel):
+    """Response for a single project."""
+
+    id: str
+    name: str
+    description: str | None
+    visibility: str
+    owner_id: str
+    created_at: datetime
+    wiki_count: int = 0
+
+
+class ProjectListResponse(BaseModel):
+    """Response listing all projects."""
+
+    projects: list[ProjectResponse]
+
+
+class ProjectAddWikiRequest(BaseModel):
+    """Request to add a wiki to a project."""
+
+    wiki_id: str
 
 
 # ---------------------------------------------------------------------------

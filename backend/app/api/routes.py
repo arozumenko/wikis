@@ -13,6 +13,7 @@ from sse_starlette import EventSourceResponse, ServerSentEvent
 from app.auth import CurrentUser, get_current_user
 from app.dependencies import (
     get_ask_service,
+    get_project_service,
     get_qa_service,
     get_research_service,
     get_wiki_management,
@@ -33,6 +34,14 @@ from app.models import (
     WikiListResponse,
     WikiSummary,
 )
+from app.models.api import (
+    ProjectAddWikiRequest,
+    ProjectCreateRequest,
+    ProjectListResponse,
+    ProjectResponse,
+    ProjectUpdateRequest,
+)
+from app.services.project_service import ProjectService
 from app.models.invocation import Invocation
 from app.models.qa_api import QAListResponse, QARecordResponse, QAStatsResponse, QAStatus
 from app.services.ask_service import AskService
@@ -143,23 +152,26 @@ async def ask(
     qa_service: QAService = Depends(get_qa_service),
     accept: str = "application/json",
 ) -> AskResponse | StreamingResponse:
+    user_id = user.id if user else None
     try:
         if "text/event-stream" in accept:
             # SSE: generator handles its own recording via try/finally
             async def stream():
-                async for event in service.ask_stream(request):
+                async for event in service.ask_stream(request, user_id=user_id):
                     event_type = event.get("event_type", "message")
                     yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         # Sync: BackgroundTask for recording
-        result = await service.ask_sync(request)
+        result = await service.ask_sync(request, user_id=user_id)
         if result.recording:
             background_tasks.add_task(qa_service.record_interaction, **asdict(result.recording))
         return result.response
     except FileNotFoundError as e:
-        raise HTTPException(404, f"Wiki not found: {request.wiki_id}") from e
+        raise HTTPException(404, f"Wiki not found: {request.wiki_id or request.project_id}") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     except RuntimeError as e:
         raise HTTPException(501, str(e)) from e
 
@@ -677,6 +689,160 @@ async def update_wiki_visibility(
             raise HTTPException(404, f"Wiki not found: {wiki_id}")
         raise HTTPException(403, "Only the wiki owner can change visibility")
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Projects
+# ---------------------------------------------------------------------------
+
+
+def _project_response(project, wiki_count: int = 0) -> ProjectResponse:
+    from datetime import datetime
+
+    return ProjectResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        visibility=project.visibility or "personal",
+        owner_id=project.owner_id,
+        created_at=project.created_at or datetime.now(),
+        wiki_count=wiki_count,
+    )
+
+
+@router.post("/projects", response_model=ProjectResponse, status_code=201)
+async def create_project(
+    body: ProjectCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> ProjectResponse:
+    project = await svc.create_project(
+        owner_id=user.id,
+        name=body.name,
+        description=body.description,
+        visibility=body.visibility,
+    )
+    return _project_response(project)
+
+
+@router.get("/projects", response_model=ProjectListResponse)
+async def list_projects(
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> ProjectListResponse:
+    projects = await svc.list_projects(user_id=user.id)
+    items = []
+    for p in projects:
+        count = await svc.get_wiki_count(p.id)
+        items.append(_project_response(p, count))
+    return ProjectListResponse(projects=items)
+
+
+@router.get("/projects/{project_id}", response_model=ProjectResponse)
+async def get_project(
+    project_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> ProjectResponse:
+    project = await svc.get_project(project_id, user_id=user.id)
+    if project is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    count = await svc.get_wiki_count(project_id)
+    return _project_response(project, count)
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectResponse)
+async def update_project(
+    project_id: str,
+    body: ProjectUpdateRequest,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> ProjectResponse:
+    # First verify project exists and is accessible (to distinguish 404 vs 403)
+    existing = await svc.get_project(project_id, user_id=user.id)
+    if existing is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+
+    fields = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    updated = await svc.update_project(project_id, owner_id=user.id, **fields)
+    if updated is None:
+        raise HTTPException(403, "Only the project owner can modify this project")
+    count = await svc.get_wiki_count(project_id)
+    return _project_response(updated, count)
+
+
+@router.delete("/projects/{project_id}", status_code=200)
+async def delete_project(
+    project_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> JSONResponse:
+    # Check existence first
+    existing = await svc.get_project(project_id, user_id=user.id)
+    if existing is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    deleted = await svc.delete_project(project_id, owner_id=user.id)
+    if not deleted:
+        raise HTTPException(403, "Only the project owner can delete this project")
+    return JSONResponse({"deleted": True, "project_id": project_id})
+
+
+@router.post("/projects/{project_id}/wikis", response_model=ProjectResponse, status_code=201)
+async def add_wiki_to_project(
+    project_id: str,
+    body: ProjectAddWikiRequest,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> ProjectResponse:
+    existing = await svc.get_project(project_id, user_id=user.id)
+    if existing is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    if existing.owner_id != user.id:
+        raise HTTPException(403, "Only the project owner can add wikis")
+    result = await svc.add_wiki(
+        project_id=project_id,
+        wiki_id=body.wiki_id,
+        owner_id=user.id,
+        added_by=user.id,
+    )
+    if result is None and existing.owner_id == user.id:
+        # Wiki already in project — idempotent, return current state
+        pass
+    count = await svc.get_wiki_count(project_id)
+    return _project_response(existing, count)
+
+
+@router.delete("/projects/{project_id}/wikis/{wiki_id}", status_code=200)
+async def remove_wiki_from_project(
+    project_id: str,
+    wiki_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> JSONResponse:
+    existing = await svc.get_project(project_id, user_id=user.id)
+    if existing is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    removed = await svc.remove_wiki(project_id, wiki_id=wiki_id, owner_id=user.id)
+    if not removed:
+        raise HTTPException(403, "Only the project owner can remove wikis")
+    return JSONResponse({"removed": True, "project_id": project_id, "wiki_id": wiki_id})
+
+
+@router.get("/projects/{project_id}/wikis", response_model=WikiListResponse)
+async def list_project_wikis(
+    project_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+    management: WikiManagementService = Depends(get_wiki_management),
+) -> WikiListResponse:
+    wikis = await svc.list_project_wikis(project_id, user_id=user.id)
+    if wikis is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    summaries = [
+        WikiManagementService._record_to_summary(w, user.id)
+        for w in wikis
+    ]
+    return WikiListResponse(wikis=summaries)
 
 
 # ---------------------------------------------------------------------------

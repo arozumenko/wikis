@@ -29,6 +29,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.settings = settings
     app.state.storage = storage
+    app.state.session_factory = get_session_factory()
     wiki_management = WikiManagementService(storage, get_session_factory())
     app.state.wiki_management = wiki_management
     app.state.wiki_service = WikiService(settings, storage, wiki_management=wiki_management)

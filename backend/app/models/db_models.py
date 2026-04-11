@@ -61,3 +61,35 @@ class QARecord(Base):
         Index("ix_qa_wiki_status", "wiki_id", "status"),
         Index("ix_qa_wiki_cache", "wiki_id", "is_cache_hit"),
     )
+
+
+class ProjectRecord(Base):
+    """Persistent record of a project grouping wikis together."""
+
+    __tablename__ = "project"
+
+    id = Column(String, primary_key=True)  # UUID4
+    owner_id = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    visibility = Column(String, default="personal")  # "personal" | "shared"
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (Index("ix_project_owner_visibility", "owner_id", "visibility"),)
+
+
+class ProjectWikiRecord(Base):
+    """Association between a project and a wiki."""
+
+    __tablename__ = "project_wiki"
+
+    project_id = Column(String, nullable=False, primary_key=True)
+    wiki_id = Column(String, nullable=False, primary_key=True)
+    added_at = Column(DateTime, server_default=func.now())
+    added_by = Column(String, nullable=True)
+
+    __table_args__ = (
+        Index("ix_project_wiki_project", "project_id"),
+        Index("ix_project_wiki_wiki", "wiki_id"),
+    )
