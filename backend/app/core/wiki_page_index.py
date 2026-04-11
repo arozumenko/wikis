@@ -108,6 +108,14 @@ class WikiPageIndex:
                 title = filename[: -len(".md")] if filename.endswith(".md") else filename
 
             normalized = title.strip()
+            if normalized in self.pages:
+                existing_path = self.pages[normalized].file_path
+                logger.warning(
+                    "WikiPageIndex: title collision for '%s' — '%s' overwritten by '%s'",
+                    normalized,
+                    existing_path,
+                    artifact_key,
+                )
             self.pages[normalized] = PageMeta(
                 title=normalized,
                 description=description,
@@ -146,6 +154,9 @@ class WikiPageIndex:
             List of PageMeta for reachable pages, excluding the seed page.
             At most 50 results are returned regardless of graph size.
         """
+        if hop_depth < 1:
+            return []
+
         normalized = title.strip()
         if normalized not in self.pages:
             return []
@@ -216,9 +227,12 @@ def _parse_frontmatter(content: str) -> tuple[str, str]:
     if not content.startswith("---"):
         return "", ""
 
-    end = content.find("\n---", 3)
-    if end == -1:
+    # Use "\n---\n" to avoid matching "---" embedded in body text; also accept
+    # "\n---" at end-of-file (no trailing newline) via the regex fallback.
+    match = re.search(r"\n---(?:\n|$)", content[3:])
+    if not match:
         return "", ""
+    end = 3 + match.start()
 
     frontmatter_block = content[3:end]
 
@@ -239,6 +253,9 @@ def _strip_yaml_value(raw: str) -> str:
     if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
         value = value[1:-1].replace('\\"', '"')
     elif len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+        # Note: YAML single-quoted scalars use '' to escape a literal single
+        # quote.  That escaping is NOT implemented here — callers should be
+        # aware that embedded '' sequences will be preserved as-is.
         value = value[1:-1]
     return value
 

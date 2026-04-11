@@ -320,3 +320,39 @@ async def test_get_description_returns_empty_for_unknown():
     }
     index = await WikiPageIndex.build(wiki_id, _make_storage(pages, wiki_id))
     assert index.get_description("Non Existent Page") == ""
+
+
+@pytest.mark.asyncio
+async def test_neighbors_zero_hop_depth_returns_empty():
+    """hop_depth=0 means no hops — should return an empty list, not depth-1 neighbors."""
+    wiki_id = "wiki1"
+    pages = {
+        _artifact_key(wiki_id, "a"): _FRONTMATTER_TEMPLATE.format(title="A", description="", body="Links to [[B]]."),
+        _artifact_key(wiki_id, "b"): _FRONTMATTER_TEMPLATE.format(title="B", description="", body="No links."),
+    }
+    index = await WikiPageIndex.build(wiki_id, _make_storage(pages, wiki_id))
+    assert index.neighbors("A", hop_depth=0) == []
+
+
+@pytest.mark.asyncio
+async def test_load_logs_warning_on_title_collision(caplog):
+    """When two files resolve to the same title, a warning must be logged."""
+    import logging
+
+    wiki_id = "wiki1"
+    # Both files have the same frontmatter title → collision.
+    pages = {
+        _artifact_key(wiki_id, "page_a"): _FRONTMATTER_TEMPLATE.format(
+            title="Shared Title", description="First", body=""
+        ),
+        _artifact_key(wiki_id, "page_b"): _FRONTMATTER_TEMPLATE.format(
+            title="Shared Title", description="Second", body=""
+        ),
+    }
+    with caplog.at_level(logging.WARNING, logger="app.core.wiki_page_index"):
+        index = await WikiPageIndex.build(wiki_id, _make_storage(pages, wiki_id))
+
+    assert "Shared Title" in index.pages, "colliding title should still be present"
+    assert any("collision" in record.message.lower() for record in caplog.records), (
+        "expected a collision warning in logs"
+    )
