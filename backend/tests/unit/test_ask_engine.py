@@ -5,16 +5,12 @@ All LLM and agent calls are mocked — no real network/LLM activity.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-from langchain_core.documents import Document
-
 from app.core.ask_engine import AskConfig, AskEngine, create_ask_engine
 from app.core.ask_tool import AskResponse, AskSource, AskTool
-
+from langchain_core.documents import Document
 
 # ============================================================================
 # AskEngine tests
@@ -99,6 +95,60 @@ class TestAskEngineGetRepoContext:
         ctx = engine._get_repo_context()
         assert "No repository overview available" in ctx
 
+    def test_description_prepended_before_other_fields(self):
+        """description key appears first in the context output."""
+        engine = AskEngine(
+            retriever_stack=MagicMock(),
+            graph_manager=MagicMock(),
+            code_graph=MagicMock(),
+            repo_analysis={
+                "description": "A payments API",
+                "summary": "handles billing",
+                "languages": "Python",
+            },
+        )
+        ctx = engine._get_repo_context()
+        assert ctx.startswith("Project Description: A payments API")
+        assert "Repository Summary: handles billing" in ctx
+        assert "Languages: Python" in ctx
+
+    def test_description_only(self):
+        """Only description key → output starts with the description."""
+        engine = AskEngine(
+            retriever_stack=MagicMock(),
+            graph_manager=MagicMock(),
+            code_graph=MagicMock(),
+            repo_analysis={"description": "A payments API"},
+        )
+        ctx = engine._get_repo_context()
+        assert ctx.startswith("Project Description: A payments API")
+
+    def test_no_description_existing_keys_unchanged(self):
+        """Without description, summary/key_components/languages still appear."""
+        engine = AskEngine(
+            retriever_stack=MagicMock(),
+            graph_manager=MagicMock(),
+            code_graph=MagicMock(),
+            repo_analysis={"summary": "Test repo", "key_components": "auth", "languages": "Go"},
+        )
+        ctx = engine._get_repo_context()
+        assert "Project Description" not in ctx
+        assert "Repository Summary: Test repo" in ctx
+        assert "Key Components: auth" in ctx
+        assert "Languages: Go" in ctx
+
+    def test_none_repo_analysis_returns_fallback(self):
+        """repo_analysis=None (edge-case, bypassing __init__ default) returns fallback."""
+        engine = AskEngine(
+            retriever_stack=MagicMock(),
+            graph_manager=MagicMock(),
+            code_graph=MagicMock(),
+        )
+        # Force None to simulate callers passing None directly
+        engine.repo_analysis = None
+        ctx = engine._get_repo_context()
+        assert ctx == "No repository overview available."
+
 
 class TestAskEngineAsk:
     """Tests for AskEngine.ask() async generator."""
@@ -149,6 +199,7 @@ class TestAskEngineAsk:
 
         async def _astream(*args, **kwargs):
             from langchain_core.messages import AIMessage
+
             yield ("messages", (AIMessage(content="answer"), {}))
 
         mock_agent = MagicMock()
@@ -193,6 +244,7 @@ class TestAskEngineAsk:
         async def _astream(*args, **kwargs):
             yield "not-a-tuple"  # should be skipped
             from langchain_core.messages import AIMessage
+
             yield ("messages", (AIMessage(content="done"), {}))
 
         mock_agent.astream = _astream
@@ -213,6 +265,7 @@ class TestAskEngineAsk:
         async def _astream(*args, **kwargs):
             yield ("updates", {"agent_node": {"todos": ["do something"]}})
             from langchain_core.messages import AIMessage
+
             yield ("messages", (AIMessage(content="done"), {}))
 
         mock_agent.astream = _astream
@@ -233,6 +286,7 @@ class TestAskEngineAsk:
 
         async def _astream(*args, **kwargs):
             from langchain_core.messages import AIMessage
+
             yield ("messages", (AIMessage(content="done"), {}))
 
         mock_agent.astream = _astream
@@ -258,6 +312,7 @@ class TestAskEngineAsk:
         async def _astream(*args, **kwargs):
             yield ("messages", "not-a-tuple")  # should be skipped
             from langchain_core.messages import AIMessage
+
             yield ("messages", (AIMessage(content="done"), {}))
 
         mock_agent.astream = _astream
@@ -460,10 +515,7 @@ class TestAskToolBuildSourcesReference:
         assert "db.py" in ref
 
     def test_truncates_symbols_at_5(self):
-        sources = [
-            AskSource(index=i, source="big.py", symbol=f"sym{i}")
-            for i in range(8)
-        ]
+        sources = [AskSource(index=i, source="big.py", symbol=f"sym{i}") for i in range(8)]
         tool = _make_tool()
         ref = tool._build_sources_reference(sources)
         assert "+3 more" in ref
@@ -657,6 +709,7 @@ class TestAskEngineAskSync:
 
         async def _astream(*args, **kwargs):
             from langchain_core.messages import AIMessage
+
             yield ("messages", (AIMessage(content="sync answer"), {}))
 
         mock_agent.astream = _astream
@@ -676,6 +729,7 @@ class TestAskEngineAskSync:
 
         async def _astream(*args, **kwargs):
             from langchain_core.messages import AIMessage
+
             yield ("messages", (AIMessage(content="done"), {}))
 
         mock_agent.astream = _astream
@@ -710,10 +764,7 @@ class TestAskToolAskWithHistory:
         docs = [_make_doc()]
         tool = _make_tool(docs=docs)
 
-        history = [
-            {"role": "user", "content": f"question {i}"}
-            for i in range(10)
-        ]
+        history = [{"role": "user", "content": f"question {i}"} for i in range(10)]
         resp = tool.ask_with_history("final q", history)
         assert isinstance(resp, AskResponse)
         # No assertion on content — just verify no crash and response returned

@@ -18,14 +18,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-import app.events as _events
-from app.core.chat_utils import format_chat_history
 from deepagents import FilesystemMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware.summarization import SummarizationMiddleware
 from langchain.agents.middleware.todo import TodoListMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
+
+import app.events as _events
+from app.core.chat_utils import format_chat_history
 
 from .research_prompts import RESEARCH_INSTRUCTIONS, get_research_prompt
 from .research_tools import create_codebase_tools
@@ -355,7 +356,13 @@ class DeepResearchEngine:
 
     def _get_repo_context(self) -> str:
         """Get repository context string"""
+        if not self.repo_analysis:
+            return "No repository overview available."
+
         parts = []
+
+        if self.repo_analysis.get("description"):
+            parts.append(f"Project Description: {self.repo_analysis['description']}")
 
         if self.repo_analysis.get("summary"):
             parts.append(f"Repository Summary: {self.repo_analysis['summary']}")

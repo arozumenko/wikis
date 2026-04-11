@@ -381,6 +381,7 @@ async def get_wiki(
             "error": wiki_meta.error,
             "requires_token": wiki_meta.requires_token,
             "description": wiki_meta.description,
+            "is_owner": wiki_meta.is_owner,
         }
 
     if not wiki_meta:
@@ -418,6 +419,7 @@ async def get_wiki(
                     "error": active_invocation.error,
                     "requires_token": False,
                     "description": None,
+                    "is_owner": False,
                 }
         if not wiki_meta:
             raise HTTPException(404, f"Wiki not found: {wiki_id}")
@@ -493,6 +495,7 @@ async def get_wiki(
         "requires_token": wiki_meta.requires_token,
         "error": wiki_meta.error,
         "description": wiki_meta.description,
+        "is_owner": wiki_meta.is_owner,
     }
     if active_invocation:
         response["invocation_id"] = active_invocation.id
