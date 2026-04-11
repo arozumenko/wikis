@@ -70,13 +70,18 @@ class ExportService:
         if record is None:
             raise WikiNotFoundError(f"No wiki found for id={wiki_id!r}")
 
-        vault_title = record.title or wiki_id
+        # Sanitize vault_title to prevent path traversal entries in the ZIP.
+        vault_title = re.sub(r"[^\w\s\-]", "", record.title or wiki_id).strip() or "wiki"
         repo_url = record.repo_url or ""
         generated_at = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Collect only .md artifacts for this wiki.
+        # Collect only .md artifacts stored under the wiki_pages/ sub-path.
+        # Skip any README.md — the generated one at vault root is the authoritative copy.
         all_artifacts = await self.storage.list_artifacts("wiki_artifacts", prefix=wiki_id)
-        md_artifacts = [a for a in all_artifacts if a.endswith(".md")]
+        md_artifacts = [
+            a for a in all_artifacts
+            if a.endswith(".md") and "wiki_pages/" in a and not a.endswith("/README.md")
+        ]
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:

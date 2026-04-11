@@ -57,8 +57,8 @@ def mock_storage():
     storage = AsyncMock()
     storage.list_artifacts = AsyncMock(
         return_value=[
-            "abc123/overview.md",
-            "abc123/architecture.md",
+            "abc123/wiki_pages/overview.md",
+            "abc123/wiki_pages/architecture.md",
             # non-md artifact — should be skipped
             "abc123/index.faiss",
         ]
@@ -69,8 +69,16 @@ def mock_storage():
 
 async def _fake_download(bucket: str, name: str) -> bytes:
     pages = {
-        "abc123/overview.md": b"# Overview\n\nThis is the overview page.",
-        "abc123/architecture.md": b"# Architecture\n\nThis is the architecture page.",
+        "abc123/wiki_pages/overview.md": b"# Overview\n\nThis is the overview page.",
+        "abc123/wiki_pages/architecture.md": b"# Architecture\n\nThis is the architecture page.",
+    }
+    return pages.get(name, b"")
+
+
+async def _fake_download_with_readme(bucket: str, name: str) -> bytes:
+    pages = {
+        "abc123/wiki_pages/overview.md": b"# Overview\n\nThis is the overview page.",
+        "abc123/wiki_pages/README.md": b"# README\n\nThis should be filtered out.",
     }
     return pages.get(name, b"")
 
@@ -214,3 +222,39 @@ class TestBuildObsidianZip:
             readme_entries = [n for n in zf.namelist() if n.endswith("README.md")]
             content = zf.read(readme_entries[0]).decode("utf-8")
         assert "generated" in content.lower(), "README.md missing generated timestamp info"
+
+    @pytest.mark.asyncio
+    async def test_path_traversal_title_is_sanitized(self, mock_storage, mock_wiki_management):
+        """A vault_title with path-traversal chars must be stripped before use in ZIP paths."""
+        mock_wiki_management.get_wiki_record = AsyncMock(
+            return_value=_make_wiki_record(title="../../evil")
+        )
+        svc = ExportService(storage=mock_storage, wiki_management=mock_wiki_management)
+        data = await _collect_zip(svc.build_obsidian_zip("abc123"))
+        with _open_zip(data) as zf:
+            names = zf.namelist()
+        # No ZIP entry must start with '.' or contain '..'
+        for name in names:
+            assert not name.startswith("."), f"ZIP entry starts with '.': {name}"
+            assert ".." not in name, f"ZIP entry contains '..': {name}"
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_readme_when_artifact_storage_has_readme(self, mock_wiki_management):
+        """When artifact storage contains a README.md, the ZIP must not have two README entries."""
+        storage = AsyncMock()
+        storage.list_artifacts = AsyncMock(
+            return_value=[
+                "abc123/wiki_pages/overview.md",
+                "abc123/wiki_pages/README.md",   # collision candidate
+                "abc123/index.faiss",
+            ]
+        )
+        storage.download = AsyncMock(side_effect=_fake_download_with_readme)
+        svc = ExportService(storage=storage, wiki_management=mock_wiki_management)
+        data = await _collect_zip(svc.build_obsidian_zip("abc123"))
+        with _open_zip(data) as zf:
+            names = zf.namelist()
+        readme_entries = [n for n in names if n.endswith("README.md")]
+        assert len(readme_entries) == 1, (
+            f"Expected exactly one README.md, got {len(readme_entries)}: {readme_entries}"
+        )
