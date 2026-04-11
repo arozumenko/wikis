@@ -7,9 +7,11 @@ import logging
 import os
 from collections import defaultdict
 from collections.abc import AsyncGenerator
+from typing import Union
 
 from app.config import Settings
 from app.core.code_graph.graph_query_service import GraphQueryService
+from app.core.code_graph.multi_graph_query_service import MultiGraphQueryService
 from app.core.deep_research.research_engine import DeepResearchEngine, ResearchConfig
 from app.models.api import (
     CallStack,
@@ -61,7 +63,7 @@ _GENERIC_EXPANSION_NAMES = frozenset({
 
 def _build_call_tree_from_sources(
     sources: list[SourceReference],
-    gqs: GraphQueryService,
+    gqs: Union[GraphQueryService, MultiGraphQueryService],
 ) -> CodeMapData | None:
     """Build a call tree seeded from ask-engine source references.
 
@@ -407,31 +409,18 @@ class ResearchService:
             ),
         )
 
-    async def _get_multi_wiki_components(
-        self,
-        project_id: str,
-        user_id: str | None,
-    ) -> EngineComponents:
-        """Load and compose EngineComponents for all wikis in a project."""
-        from app.db import get_session_factory
-        from app.services.multi_wiki_components import build_multi_wiki_components
-
-        session_factory = get_session_factory()
-        return await build_multi_wiki_components(
-            project_id=project_id,
-            user_id=user_id,
-            get_components_fn=self._get_components,
-            session_factory=session_factory,
-        )
-
-    async def research_stream(
-        self,
-        request: ResearchRequest,
-        user_id: str | None = None,
-    ) -> AsyncGenerator[dict, None]:
+    async def research_stream(self, request: ResearchRequest) -> AsyncGenerator[dict, None]:
         """Stream research events (research_start, thinking_step, research_complete)."""
         if request.project_id:
-            components = await self._get_multi_wiki_components(request.project_id, user_id)
+            from app.services.multi_wiki_components import build_multi_wiki_components
+
+            components, _per_wiki = await build_multi_wiki_components(
+                project_id=request.project_id,
+                user_id="",
+                storage=self.storage,
+                settings=self.settings,
+                tier="high",
+            )
         else:
             components = await self._get_components(request.wiki_id)
         engine = DeepResearchEngine(
@@ -451,18 +440,14 @@ class ResearchService:
         async for event in engine.research(question=request.question, chat_history=chat_history):
             yield event
 
-    async def research_sync(
-        self,
-        request: ResearchRequest,
-        user_id: str | None = None,
-    ) -> ResearchResponse:
+    async def research_sync(self, request: ResearchRequest) -> ResearchResponse:
         """Non-streaming: collect final answer from event stream."""
         final_answer = ""
         sources: list[SourceReference] = []
         steps: list[str] = []
         tool_events: list[dict] = []
 
-        async for event in self.research_stream(request, user_id=user_id):
+        async for event in self.research_stream(request):
             event_type = event.get("event_type", "")
             if event_type == "thinking_step":
                 step_data = event.get("data", {})
@@ -499,11 +484,7 @@ class ResearchService:
             code_map=None,
         )
 
-    async def codemap_stream(
-        self,
-        request: ResearchRequest,
-        user_id: str | None = None,
-    ) -> AsyncGenerator[dict, None]:
+    async def codemap_stream(self, request: ResearchRequest) -> AsyncGenerator[dict, None]:
         """Stream code-map pipeline events (tool calls from ask, then final result).
 
         Pipeline:
@@ -519,8 +500,18 @@ class ResearchService:
         from app.core.ask_engine import AskConfig, AskEngine
         from app.services.llm_factory import create_llm
 
+        # Load components — single wiki or multi-wiki (project) path
+        per_wiki_components: dict[str, object] | None = None
         if request.project_id:
-            components = await self._get_multi_wiki_components(request.project_id, user_id)
+            from app.services.multi_wiki_components import build_multi_wiki_components
+
+            components, per_wiki_components = await build_multi_wiki_components(
+                project_id=request.project_id,
+                user_id="",  # no user_id on ResearchRequest; project access checked at route level
+                storage=self.storage,
+                settings=self.settings,
+                tier="high",
+            )
         else:
             components = await self._get_components(request.wiki_id)
 
@@ -627,8 +618,18 @@ class ResearchService:
         }}
 
         code_map: CodeMapData | None = None
-        fts_index = components.graph_manager.fts_index if components.graph_manager else None
-        gqs = GraphQueryService(components.code_graph, fts_index)
+        if per_wiki_components:
+            # Project path — build MultiGraphQueryService from all loaded wikis
+            fts_index = components.graph_manager.fts_index if components.graph_manager else None
+            individual_services = {
+                wiki_id: GraphQueryService(comp.code_graph, comp.graph_manager.fts_index if comp.graph_manager else fts_index)
+                for wiki_id, comp in per_wiki_components.items()
+            }
+            gqs: Union[GraphQueryService, MultiGraphQueryService] = MultiGraphQueryService(individual_services)
+        else:
+            # Single-wiki path
+            fts_index = components.graph_manager.fts_index if components.graph_manager else None
+            gqs = GraphQueryService(components.code_graph, fts_index)
 
         try:
             code_map = _build_call_tree_from_sources(ask_sources, gqs)
@@ -743,18 +744,14 @@ class ResearchService:
             },
         }
 
-    async def codemap_sync(
-        self,
-        request: ResearchRequest,
-        user_id: str | None = None,
-    ) -> ResearchResponse:
+    async def codemap_sync(self, request: ResearchRequest) -> ResearchResponse:
         """Non-streaming wrapper for codemap_stream."""
         final_answer = ""
         sources: list[SourceReference] = []
         steps: list[str] = []
         code_map: CodeMapData | None = None
 
-        async for event in self.codemap_stream(request, user_id=user_id):
+        async for event in self.codemap_stream(request):
             event_type = event.get("event_type", "")
             if event_type == "thinking_step":
                 tool = event.get("data", {}).get("tool", "")

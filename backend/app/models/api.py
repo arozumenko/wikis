@@ -117,10 +117,10 @@ class AskResponse(BaseModel):
 
 
 class ResearchRequest(BaseModel):
-    """Request to perform deep research on a wiki or project."""
+    """Request to perform deep research on a wiki."""
 
     wiki_id: str | None = None      # Optional when project_id is provided
-    project_id: str | None = None   # Query across all wikis in a project
+    project_id: str | None = None   # Research across all wikis in a project
     question: str
     research_type: str = "general"
     chat_history: list[ChatMessage] = Field(default_factory=list)
@@ -130,6 +130,15 @@ class ResearchRequest(BaseModel):
         if not self.wiki_id and not self.project_id:
             raise ValueError("Either wiki_id or project_id is required")
         return self
+
+
+class ProjectCodeMapRequest(BaseModel):
+    """Request to build a code map for a project (all wikis)."""
+
+    project_id: str
+    question: str
+    research_type: str = "codemap"
+    chat_history: list[ChatMessage] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +156,6 @@ class CodeMapSymbol(BaseModel):
     line_start: int | None = None
     description: str = ""   # LLM-generated 1-sentence explanation of this symbol's role
     relationships: list[str] = Field(default_factory=list)  # e.g. ["calls: validate_token"]
-    wiki_id: str = ""       # source wiki (populated for cross-project codemaps)
-    repo_name: str = ""     # human-readable repo name for cross-project display
 
 
 class CodeMapSection(BaseModel):
@@ -167,8 +174,6 @@ class CallStackStep(BaseModel):
     symbol: str        # e.g. "MCPAuthMiddleware.__call__"
     file_path: str = ""
     description: str = ""  # what happens at this step
-    wiki_id: str = ""      # source wiki (populated for cross-project codemaps)
-    repo_name: str = ""    # human-readable repo name for cross-project display
 
 class CallStack(BaseModel):
     """A named call-flow chain, e.g. 'Frontend Auth' or 'MCP Auth'."""

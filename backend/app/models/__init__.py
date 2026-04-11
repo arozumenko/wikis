@@ -12,6 +12,7 @@ from .api import (
     GenerateWikiRequest,
     GenerateWikiResponse,
     HealthResponse,
+    ProjectCodeMapRequest,
     RefreshWikiRequest,
     ResearchRequest,
     ResearchResponse,
@@ -51,6 +52,7 @@ __all__ = [
     "RefreshWikiRequest",
     "HealthResponse",
     "ErrorResponse",
+    "ProjectCodeMapRequest",
     # Invocation
     "Invocation",
     # SSE events
