@@ -120,4 +120,22 @@ async def build_multi_wiki_components(
         repo_path=primary.repo_path,
     )
 
+    # Override repo_analysis description with project-level description (project takes precedence)
+    async with session_factory() as session:
+        from sqlalchemy import select
+
+        from app.models.db_models import ProjectRecord
+
+        try:
+            proj_result = await session.execute(
+                select(ProjectRecord).where(ProjectRecord.id == project_id)
+            )
+            proj_record = proj_result.scalar_one_or_none()
+            if proj_record and proj_record.description:
+                if merged.repo_analysis is None:
+                    merged.repo_analysis = {}
+                merged.repo_analysis["description"] = proj_record.description
+        except Exception:
+            logger.warning("Could not load project description for %s", project_id)
+
     return merged, loaded
