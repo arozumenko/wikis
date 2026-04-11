@@ -224,17 +224,6 @@ class TestExportEndpoint:
         resp = await c.get(f"/api/v1/wikis/{wiki_id}/export?format=obsidian")
         assert resp.status_code == 409, resp.text
 
-    @pytest.mark.asyncio
-    async def test_export_wikis_format_on_generating_wiki_returns_409(self, client):
-        """GET /api/v1/wikis/{id}/export?format=wikis on a generating wiki → 409."""
-        c, app, sf = client
-        wiki_id = "export-wikis-incomplete-001"
-        await _seed_wiki(sf, wiki_id=wiki_id, status="generating")
-
-        resp = await c.get(f"/api/v1/wikis/{wiki_id}/export?format=wikis")
-        assert resp.status_code == 409, resp.text
-        assert "fully generated" in resp.json().get("detail", "")
-
 
 # ---------------------------------------------------------------------------
 # Import endpoint tests
@@ -509,3 +498,13 @@ class TestImportEndpoint:
         assert resp.status_code == 422, resp.text
         assert "Invalid bundle" in resp.json().get("detail", "")
 
+    @pytest.mark.asyncio
+    async def test_export_wikis_format_generating_wiki_returns_409(self, client):
+        """GET /api/v1/wikis/{id}/export?format=wikis on a generating wiki → 409."""
+        c, app, sf = client
+        wiki_id = "export-wikis-incomplete-001"
+        await _seed_wiki(sf, wiki_id=wiki_id, status="generating")
+
+        resp = await c.get(f"/api/v1/wikis/{wiki_id}/export?format=wikis")
+        assert resp.status_code == 409, resp.text
+        assert "fully generated" in resp.json().get("detail", "")
