@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   Alert,
   Box,
+  Button,
   Card,
   CardActionArea,
   Chip,
@@ -23,6 +24,7 @@ import {
 import SearchIcon from '@mui/icons-material/Search';
 import AddIcon from '@mui/icons-material/Add';
 import AddCircleOutlineIcon from '@mui/icons-material/AddCircleOutline';
+import CreateNewFolderOutlinedIcon from '@mui/icons-material/CreateNewFolderOutlined';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 import LockOutlinedIcon from '@mui/icons-material/LockOutlined';
@@ -32,12 +34,15 @@ import ShareIcon from '@mui/icons-material/Share';
 import { useNavigate } from 'react-router-dom';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { GenerateForm } from '../components/GenerateForm';
+import { ProjectCard } from '../components/ProjectCard';
+import { CreateProjectDialog } from '../components/CreateProjectDialog';
 import { listWikis, deleteWiki, generateWiki, updateWikiVisibility } from '../api/wiki';
+import { listProjects, type ProjectResponse } from '../api/project';
 import { ApiError } from '../api/client';
 import type { components } from '../api/types.generated';
 
 type WikiSummary = components['schemas']['WikiSummary'];
-type VisibilityFilter = 'all' | 'mine' | 'shared';
+type VisibilityFilter = 'all' | 'mine' | 'shared' | 'projects';
 
 const CARD_GRADIENTS = [
   'linear-gradient(135deg, #A855F7, #6366F1)', // violet → indigo
@@ -83,11 +88,14 @@ function extractOwnerRepo(url: string): string {
 export function DashboardPage() {
   const navigate = useNavigate();
   const [wikis, setWikis] = useState<WikiSummary[]>([]);
+  const [projects, setProjects] = useState<ProjectResponse[]>([]);
+  const [loadingProjects, setLoadingProjects] = useState(false);
   const [loading, setLoading] = useState(true);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [searchUrl, setSearchUrl] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [showGenerateModal, setShowGenerateModal] = useState(false);
+  const [showCreateProjectDialog, setShowCreateProjectDialog] = useState(false);
   const [visibilityFilter, setVisibilityFilter] = useState<VisibilityFilter>('all');
   const [togglingVisibility, setTogglingVisibility] = useState<string | null>(null);
   const [snackbarMessage, setSnackbarMessage] = useState<string | null>(null);
@@ -105,9 +113,23 @@ export function DashboardPage() {
       .finally(() => setLoading(false));
   }, []);
 
+  const fetchProjects = useCallback(() => {
+    setLoadingProjects(true);
+    listProjects()
+      .then((data) => setProjects(data.projects ?? []))
+      .catch(() => setProjects([]))
+      .finally(() => setLoadingProjects(false));
+  }, []);
+
   useEffect(() => {
     fetchWikis();
   }, [fetchWikis]);
+
+  useEffect(() => {
+    if (visibilityFilter === 'projects') {
+      fetchProjects();
+    }
+  }, [visibilityFilter, fetchProjects]);
 
   // Auto-refresh every 10s while any wiki is generating
   useEffect(() => {
@@ -316,7 +338,19 @@ export function DashboardPage() {
             <ToggleButton value="all">All</ToggleButton>
             <ToggleButton value="mine">My Wikis</ToggleButton>
             <ToggleButton value="shared">Shared</ToggleButton>
+            <ToggleButton value="projects">Projects</ToggleButton>
           </ToggleButtonGroup>
+          {visibilityFilter === 'projects' && (
+            <Button
+              variant="contained"
+              size="small"
+              startIcon={<CreateNewFolderOutlinedIcon />}
+              onClick={() => setShowCreateProjectDialog(true)}
+              sx={{ flexShrink: 0, whiteSpace: 'nowrap', borderRadius: 3 }}
+            >
+              New Project
+            </Button>
+          )}
         </Box>
       </Box>
 
@@ -357,7 +391,43 @@ export function DashboardPage() {
         </Box>
       )}
 
-      <Grid container spacing={2.5}>
+      {visibilityFilter === 'projects' ? (
+        <Grid container spacing={2.5}>
+          {loadingProjects ? (
+            <Grid item xs={12}>
+              <Box display="flex" justifyContent="center" py={4}>
+                <CircularProgress />
+              </Box>
+            </Grid>
+          ) : projects.length === 0 ? (
+            <Grid item xs={12}>
+              <Box sx={{ textAlign: 'center', py: 6 }}>
+                <Typography variant="body1" color="text.secondary" sx={{ mb: 2 }}>
+                  No projects yet. Create one to group your wikis.
+                </Typography>
+                <Button
+                  variant="outlined"
+                  startIcon={<CreateNewFolderOutlinedIcon />}
+                  onClick={() => setShowCreateProjectDialog(true)}
+                >
+                  Create your first project
+                </Button>
+              </Box>
+            </Grid>
+          ) : (
+            projects.map((project) => (
+              <Grid item xs={12} sm={6} md={4} key={project.id}>
+                <ProjectCard
+                  project={project}
+                  onDelete={() => setProjects((prev) => prev.filter((p) => p.id !== project.id))}
+                />
+              </Grid>
+            ))
+          )}
+        </Grid>
+      ) : null}
+
+      {visibilityFilter !== 'projects' && <Grid container spacing={2.5}>
         {!hasSearchWithNoResults && (
           <Grid item xs={12} sm={6} md={4}>
             <Card
@@ -619,7 +689,7 @@ export function DashboardPage() {
             </Grid>
           );
         })}
-      </Grid>
+      </Grid>}
 
       <Dialog
         open={showGenerateModal}
@@ -668,6 +738,16 @@ export function DashboardPage() {
         message="Are you sure? This cannot be undone."
         onConfirm={confirmDelete}
         onCancel={() => setDeleteTarget(null)}
+      />
+
+      <CreateProjectDialog
+        open={showCreateProjectDialog}
+        onClose={() => setShowCreateProjectDialog(false)}
+        availableWikis={wikis}
+        onCreated={(project) => {
+          setProjects((prev) => [project, ...prev]);
+          setShowCreateProjectDialog(false);
+        }}
       />
 
       <Snackbar
