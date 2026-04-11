@@ -242,9 +242,12 @@ class TestAskEngineAsk:
             async for event in engine.ask("Q?", session_id="my-session"):
                 events.append(event)
 
-        # The first event should contain our session id
+        # The first event is a task_status "working" event; the session_id is
+        # carried as "taskId" in the data payload.
+        assert events[0]["event_type"] == "task_status"
         first_data = events[0].get("data", {})
-        assert first_data.get("session_id") == "my-session" or True  # just no crash
+        assert first_data.get("taskId") == "my-session"
+        assert first_data.get("status") == "working"
 
     @pytest.mark.asyncio
     async def test_ask_messages_stream_non_tuple_skipped(self):

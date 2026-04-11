@@ -858,8 +858,17 @@ class TestBuildCallTreeRelationships:
         gqs = self._make_gqs_with_rels(nodes, [rel])
         sources = [SourceReference(file_path="svc.py", symbol="func_a")]
         result = _build_call_tree_from_sources(sources, gqs)
-        # No crash — may or may not return sections
-        assert result is not None or result is None
+        # The seed node func_a is resolved and added to file_symbols, so a
+        # CodeMapData is returned.  The "uses" relationship is filtered out
+        # (not a call-flow edge), so no additional nodes appear in the sections.
+        assert result is not None
+        assert len(result.sections) == 1
+        section = result.sections[0]
+        assert section.file_path == "svc.py"
+        symbol_names = [s.name for s in section.symbols]
+        assert "FuncA" in symbol_names
+        # No relationship strings should be recorded (uses is filtered)
+        assert section.symbols[0].relationships == []
 
     def test_generic_target_name_skipped(self):
         """Targets with short/generic names (e.g. 'get', 'set') are skipped."""
@@ -884,9 +893,18 @@ class TestBuildCallTreeRelationships:
 
         gqs = self._make_gqs_with_rels(nodes, [rel])
         sources = [SourceReference(file_path="svc.py", symbol="func_a")]
-        # Should not crash
         result = _build_call_tree_from_sources(sources, gqs)
-        assert result is not None or result is None
+        # The seed func_a is present, so a CodeMapData is returned.
+        # The generic target "get" (len < 4) is not expanded into its own node,
+        # but the relationship label is still recorded on the source symbol.
+        assert result is not None
+        assert len(result.sections) == 1
+        section = result.sections[0]
+        assert section.file_path == "svc.py"
+        symbol_names = [s.name for s in section.symbols]
+        assert "FuncA" in symbol_names
+        # "get" must not appear as a standalone symbol in the section
+        assert "get" not in symbol_names
 
 
 # ---------------------------------------------------------------------------
