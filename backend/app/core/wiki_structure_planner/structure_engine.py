@@ -11,6 +11,8 @@ It follows the same pattern as deep_research:
 Events are captured via LangGraph's stream for progress tracking.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import time
