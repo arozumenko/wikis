@@ -1,9 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } from 'react';
 import {
-  Box, Typography, CircularProgress, Dialog, DialogTitle,
-  DialogContent, DialogActions, Button, TextField, Chip, Divider,
+  Box,
+  Typography,
+  CircularProgress,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Button,
+  TextField,
+  Chip,
+  Divider,
+  IconButton,
+  Tooltip,
 } from '@mui/material';
 import ClearIcon from '@mui/icons-material/Clear';
+import CheckIcon from '@mui/icons-material/Check';
+import CloseIcon from '@mui/icons-material/Close';
+import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { WikiSidebar } from '../components/WikiSidebar';
 import { WikiPageView } from '../components/WikiPageView';
@@ -15,7 +29,7 @@ import { AnswerView } from '../components/AnswerView';
 import { AnswerHeader } from '../components/AnswerHeader';
 import { ToolCallPanel } from '../components/ToolCallPanel';
 import { GenerationProgress } from '../components/GenerationProgress';
-import { getWiki } from '../api/wiki';
+import { getWiki, updateWikiDescription } from '../api/wiki';
 import { subscribeSSE, subscribeResearchSSE, subscribeAskSSE } from '../api/sse';
 import type { SSEEventData, ToolCallRecord, TodoItem } from '../api/sse';
 import type { WikiPage } from '../components/WikiSidebar';
@@ -81,14 +95,20 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
   const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState('');
 
+  // Inline description edit state
+  const [editingDescription, setEditingDescription] = useState(false);
+  const [editDescription, setEditDescription] = useState('');
+  const [savingDescription, setSavingDescription] = useState(false);
+
   // Derive LLM context from successfully completed turns (no errors)
-  const convHistory = useMemo<ChatMessage[]>(() =>
-    chatTurns
-      .filter((t) => !t.loading && !t.error && t.answer !== null)
-      .flatMap((t) => [
-        { role: 'user' as const, content: t.question },
-        { role: 'assistant' as const, content: t.answer! },
-      ]),
+  const convHistory = useMemo<ChatMessage[]>(
+    () =>
+      chatTurns
+        .filter((t) => !t.loading && !t.error && t.answer !== null)
+        .flatMap((t) => [
+          { role: 'user' as const, content: t.question },
+          { role: 'assistant' as const, content: t.answer! },
+        ]),
     [chatTurns],
   );
 
@@ -152,12 +172,24 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
         if (data.status === 'generating' && data.invocation_id) {
           setIsGenerating(true);
           setActiveInvocationId(data.invocation_id);
-        } else if (data.status === 'failed' || data.status === 'partial' || data.status === 'cancelled') {
+        } else if (
+          data.status === 'failed' ||
+          data.status === 'partial' ||
+          data.status === 'cancelled'
+        ) {
           // Show error state with repo info and retry button
           setIsGenerating(true);
           setActiveInvocationId(null);
-          const errorMsg = (data as WikiDetail & { error?: string }).error ?? `Generation ${data.status}`;
-          setGenEvents([{ type: 'task_failed' as const, taskId: data.invocation_id, status: 'failed', error: errorMsg }]);
+          const errorMsg =
+            (data as WikiDetail & { error?: string }).error ?? `Generation ${data.status}`;
+          setGenEvents([
+            {
+              type: 'task_failed' as const,
+              taskId: data.invocation_id,
+              status: 'failed',
+              error: errorMsg,
+            },
+          ]);
         }
       })
       .catch(() => {
@@ -211,7 +243,11 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           }, 2000);
         }
         // Terminal failure/cancellation — stop generating but stay on page so user can see error + retry
-        if (event.type === 'error' || event.type === 'task_failed' || event.type === 'task_cancelled') {
+        if (
+          event.type === 'error' ||
+          event.type === 'task_failed' ||
+          event.type === 'task_cancelled'
+        ) {
           source.close();
           setActiveInvocationId(null);
           setSearchParams({}, { replace: true });
@@ -257,7 +293,16 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
       // Append a new turn to the thread
       setChatTurns((prev) => [
         ...prev,
-        { question, answer: null, sources: [], toolCalls: [], todos: [], loading: true, error: false, mode },
+        {
+          question,
+          answer: null,
+          sources: [],
+          toolCalls: [],
+          todos: [],
+          loading: true,
+          error: false,
+          mode,
+        },
       ]);
 
       if (mode === 'deep' || mode === 'codemap') {
@@ -306,7 +351,9 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
               updateLastTurn((prev) => ({ ...prev, answer: (prev.answer ?? '') + event.chunk }));
             } else if (event.type === 'code_map_ready') {
               // Code map arrives early (before refine_answer finishes)
-              const codeMap = (event as { type: string; code_map?: unknown }).code_map as AskState['codeMap'] | undefined;
+              const codeMap = (event as { type: string; code_map?: unknown }).code_map as
+                | AskState['codeMap']
+                | undefined;
               if (codeMap) {
                 updateLastTurn((prev) => ({ ...prev, codeMap }));
               }
@@ -321,9 +368,19 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                 ...(codeMap ? { codeMap } : {}),
               }));
             } else if (event.type === 'research_error') {
-              updateLastTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
+              updateLastTurn((prev) => ({
+                ...prev,
+                answer: `Error: ${event.error}`,
+                loading: false,
+                error: true,
+              }));
             } else if (event.type === 'task_failed') {
-              updateLastTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
+              updateLastTurn((prev) => ({
+                ...prev,
+                answer: `Error: ${event.error}`,
+                loading: false,
+                error: true,
+              }));
             } else if (event.type === 'todo_update') {
               const todos = (event.todos as TodoItem[]) ?? [];
               updateLastTurn((prev) => ({ ...prev, todos }));
@@ -388,15 +445,37 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
             } else if (event.type === 'ask_complete') {
               const answer = event.answer ?? '';
               const sources = (event.sources ?? []) as AskState['sources'];
-              updateLastTurn((prev) => ({ ...prev, answer, sources, loading: false, error: false }));
+              updateLastTurn((prev) => ({
+                ...prev,
+                answer,
+                sources,
+                loading: false,
+                error: false,
+              }));
             } else if (event.type === 'task_complete' && event.answer) {
               const answer = event.answer;
               const sources = (event.sources ?? []) as AskState['sources'];
-              updateLastTurn((prev) => ({ ...prev, answer, sources, loading: false, error: false }));
+              updateLastTurn((prev) => ({
+                ...prev,
+                answer,
+                sources,
+                loading: false,
+                error: false,
+              }));
             } else if (event.type === 'ask_error') {
-              updateLastTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
+              updateLastTurn((prev) => ({
+                ...prev,
+                answer: `Error: ${event.error}`,
+                loading: false,
+                error: true,
+              }));
             } else if (event.type === 'task_failed') {
-              updateLastTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
+              updateLastTurn((prev) => ({
+                ...prev,
+                answer: `Error: ${event.error}`,
+                loading: false,
+                error: true,
+              }));
             }
           },
           () => {
@@ -416,7 +495,6 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
     },
     [wikiId, convHistory, updateLastTurn],
   );
-
 
   // Cancel research stream on unmount
   useEffect(() => {
@@ -457,6 +535,29 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
     },
     [wikiId],
   );
+
+  const handleEditDescription = useCallback(() => {
+    setEditDescription(wiki?.description ?? '');
+    setEditingDescription(true);
+  }, [wiki]);
+
+  const handleCancelDescription = useCallback(() => {
+    setEditingDescription(false);
+  }, []);
+
+  const handleSaveDescription = useCallback(async () => {
+    if (!wikiId) return;
+    setSavingDescription(true);
+    try {
+      const updated = await updateWikiDescription(wikiId, editDescription.trim() || null);
+      setWiki((prev) => (prev ? { ...prev, description: updated.description } : prev));
+      setEditingDescription(false);
+    } catch (err) {
+      console.error('Failed to save description', err);
+    } finally {
+      setSavingDescription(false);
+    }
+  }, [wikiId, editDescription]);
 
   const activePage = pages.find((p) => p.id === activePageId);
   const content = activePage?.content ?? '';
@@ -574,7 +675,13 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                 >
                   {/* Code map first (primary content when available) */}
                   {chatTurns[chatTurns.length - 1].codeMap && (
-                    <Suspense fallback={<Box sx={{ p: 2, display: 'flex', justifyContent: 'center' }}><CircularProgress size={24} /></Box>}>
+                    <Suspense
+                      fallback={
+                        <Box sx={{ p: 2, display: 'flex', justifyContent: 'center' }}>
+                          <CircularProgress size={24} />
+                        </Box>
+                      }
+                    >
                       <CodeMapTree data={chatTurns[chatTurns.length - 1].codeMap!} />
                     </Suspense>
                   )}
@@ -591,15 +698,81 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
               <Typography color="text.secondary">No wiki pages found.</Typography>
             </Box>
           ) : (
-            <WikiPageView
-              content={content}
-              mode={mode}
-              onNavigate={handleSelectPage}
-              pages={pages.map(p => ({ id: p.id, title: p.title }))}
-              wikiId={wiki?.wiki_id}
-              wikiTitle={wiki?.title}
-              isWikiComplete={wiki?.status === 'complete'}
-            />
+            <>
+              {/* Inline description editor — shown above wiki page content */}
+              <Box sx={{ px: 3, pt: 2, pb: 0 }}>
+                {editingDescription ? (
+                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, maxWidth: 600 }}>
+                    <TextField
+                      value={editDescription}
+                      onChange={(e) => setEditDescription(e.target.value)}
+                      label="Description"
+                      size="small"
+                      fullWidth
+                      multiline
+                      minRows={2}
+                      disabled={savingDescription}
+                      autoFocus
+                    />
+                    <Box sx={{ display: 'flex', gap: 1 }}>
+                      <Button
+                        size="small"
+                        variant="contained"
+                        startIcon={
+                          savingDescription ? <CircularProgress size={14} /> : <CheckIcon />
+                        }
+                        onClick={handleSaveDescription}
+                        disabled={savingDescription}
+                      >
+                        Save
+                      </Button>
+                      <Button
+                        size="small"
+                        startIcon={<CloseIcon />}
+                        onClick={handleCancelDescription}
+                        disabled={savingDescription}
+                      >
+                        Cancel
+                      </Button>
+                    </Box>
+                  </Box>
+                ) : (
+                  <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.5 }}>
+                    {wiki?.description ? (
+                      <Typography variant="body2" color="text.secondary" sx={{ flex: 1 }}>
+                        {wiki.description}
+                      </Typography>
+                    ) : (
+                      <Typography
+                        variant="body2"
+                        color="text.disabled"
+                        sx={{ flex: 1, fontStyle: 'italic' }}
+                      >
+                        No description
+                      </Typography>
+                    )}
+                    <Tooltip title="Edit description">
+                      <IconButton
+                        size="small"
+                        onClick={handleEditDescription}
+                        sx={{ flexShrink: 0 }}
+                      >
+                        <EditOutlinedIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  </Box>
+                )}
+              </Box>
+              <WikiPageView
+                content={content}
+                mode={mode}
+                onNavigate={handleSelectPage}
+                pages={pages.map((p) => ({ id: p.id, title: p.title }))}
+                wikiId={wiki?.wiki_id}
+                wikiTitle={wiki?.title}
+                isWikiComplete={wiki?.status === 'complete'}
+              />
+            </>
           )}
         </Box>
 
@@ -613,7 +786,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
               <Chip
                 size="small"
                 icon={<ClearIcon fontSize="small" />}
-                label={`Context active (${chatTurns.filter(t => !t.loading && !t.error).length} turn${chatTurns.filter(t => !t.loading && !t.error).length !== 1 ? 's' : ''})`}
+                label={`Context active (${chatTurns.filter((t) => !t.loading && !t.error).length} turn${chatTurns.filter((t) => !t.loading && !t.error).length !== 1 ? 's' : ''})`}
                 onClick={() => setChatTurns([])}
                 onDelete={() => setChatTurns([])}
                 color="primary"
@@ -643,11 +816,17 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
       )}
 
       {/* Token dialog for retrying wikis that originally required auth */}
-      <Dialog open={tokenDialogOpen} onClose={() => setTokenDialogOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog
+        open={tokenDialogOpen}
+        onClose={() => setTokenDialogOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
         <DialogTitle>Access Token Required</DialogTitle>
         <DialogContent>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            This repository was originally generated with an access token. Please provide one to retry.
+            This repository was originally generated with an access token. Please provide one to
+            retry.
           </Typography>
           <TextField
             autoFocus
@@ -661,7 +840,11 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setTokenDialogOpen(false)}>Cancel</Button>
-          <Button variant="contained" onClick={() => doRetry(tokenInput || undefined)} disabled={!tokenInput}>
+          <Button
+            variant="contained"
+            onClick={() => doRetry(tokenInput || undefined)}
+            disabled={!tokenInput}
+          >
             Retry
           </Button>
         </DialogActions>
