@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.wiki_page_index import WikiPageIndexCache
 from app.services.ask_service import AskService
 from app.services.export_service import ExportService
 from app.services.import_service import ImportService
@@ -56,4 +57,8 @@ def get_export_service(request: Request) -> ExportService:
 
 def get_import_service(request: Request) -> ImportService:
     return request.app.state.import_service
+
+
+def get_wiki_index_cache(request: Request) -> WikiPageIndexCache:
+    return request.app.state.wiki_index_cache
 

@@ -5,9 +5,10 @@ This module is pure Python: no LLM, no FAISS, no NetworkX.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 
 from app.storage.base import ArtifactStorage
@@ -258,6 +259,72 @@ def _strip_yaml_value(raw: str) -> str:
         # aware that embedded '' sequences will be preserved as-is.
         value = value[1:-1]
     return value
+
+
+class WikiPageIndexCache:
+    """LRU in-memory cache of WikiPageIndex instances, keyed by wiki_id.
+
+    Indexes are built lazily on first access and evicted from memory when the
+    number of loaded wikis exceeds ``max_wikis``.  Evicted indexes are simply
+    rebuilt from artifact storage on the next access — there is no disk
+    persistence.
+
+    Per-wiki async locks prevent duplicate builds under concurrent requests.
+
+    Args:
+        storage: ArtifactStorage instance passed to WikiPageIndex.build().
+        max_wikis: Maximum number of indexes to keep in memory (LRU eviction).
+    """
+
+    def __init__(self, storage, max_wikis: int = 50) -> None:
+        self._storage = storage
+        self._max_wikis = max_wikis
+        self._indexes: OrderedDict[str, WikiPageIndex] = OrderedDict()
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, wiki_id: str) -> asyncio.Lock:
+        return self._locks.setdefault(wiki_id, asyncio.Lock())
+
+    async def get(self, wiki_id: str) -> WikiPageIndex:
+        """Return the WikiPageIndex for *wiki_id*, building it if necessary.
+
+        On cache hit the entry is moved to the most-recently-used position.
+        On cache miss a per-wiki lock is acquired before building to prevent
+        duplicate work from concurrent callers; a double-check after acquiring
+        the lock handles the case where another coroutine completed the build
+        while this one was waiting.
+
+        Args:
+            wiki_id: Wiki identifier.
+
+        Returns:
+            A fully populated WikiPageIndex.
+        """
+        # Fast path: already cached — mark as recently used and return.
+        if wiki_id in self._indexes:
+            self._indexes.move_to_end(wiki_id)
+            return self._indexes[wiki_id]
+
+        # Slow path: acquire per-wiki lock, then double-check.
+        async with self._get_lock(wiki_id):
+            if wiki_id in self._indexes:
+                self._indexes.move_to_end(wiki_id)
+                return self._indexes[wiki_id]
+
+            logger.debug("WikiPageIndexCache: building index for wiki %s", wiki_id)
+            index = await WikiPageIndex.build(wiki_id, self._storage)
+
+            # LRU eviction before inserting.
+            while len(self._indexes) >= self._max_wikis:
+                evicted_id, _ = self._indexes.popitem(last=False)
+                logger.info(
+                    "WikiPageIndexCache: evicted wiki %s (LRU, capacity %d)",
+                    evicted_id,
+                    self._max_wikis,
+                )
+
+            self._indexes[wiki_id] = index
+            return index
 
 
 def _extract_wikilink_targets(content: str) -> set[str]:

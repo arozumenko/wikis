@@ -53,6 +53,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     qa_service = QAService(get_session_factory(), qa_cache, settings)
     app.state.qa_service = qa_service
 
+    from app.core.wiki_page_index import WikiPageIndexCache
+
+    app.state.wiki_index_cache = WikiPageIndexCache(storage, max_wikis=settings.wiki_index_cache_max_wikis)
+
     app.state.ask_service = AskService(settings, storage, qa_service=qa_service)
     app.state.research_service = ResearchService(settings, storage)
     app.state.export_service = ExportService(storage, wiki_management, settings)

@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     # Database (shared with web app's Prisma; empty = default SQLite)
     database_url: str = ""
 
+    # Wiki page index cache
+    wiki_index_cache_max_wikis: int = 50
+
     # Q&A Cache
     qa_cache_enabled: bool = True
     qa_cache_similarity_threshold: float = 0.92
