@@ -1,4 +1,4 @@
-import { Box, Chip, Collapse, IconButton, Tooltip, Typography } from '@mui/material';
+import { Box, Chip, Collapse, Typography } from '@mui/material';
 import ReactMarkdown from 'react-markdown';
 import { ShareButton } from './ShareButton';
 import { ExportButton } from './ExportButton';

@@ -98,7 +98,7 @@ export async function importWiki(file: File): Promise<WikiSummary> {
     try {
       const json = JSON.parse(text);
       if (json.detail) message = json.detail;
-    } catch {}
+    } catch (_e) { /* ignore JSON parse errors — fall back to HTTP status message */ }
     throw new Error(message);
   }
   return res.json() as Promise<WikiSummary>;

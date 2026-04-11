@@ -190,7 +190,7 @@ function SymbolRow({ sym }: { sym: CodeMapSymbol }) {
 }
 
 /* ── SectionRow (file node) ─────────────────────────────────────── */
-function SectionRow({ section, sectionIdx, defaultExpanded }: {
+function _SectionRow({ section, sectionIdx, defaultExpanded }: {
   section: CodeMapSection;
   sectionIdx: number;
   defaultExpanded: boolean;

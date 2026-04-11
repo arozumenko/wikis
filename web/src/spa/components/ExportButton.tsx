@@ -22,7 +22,7 @@ interface ExportButtonProps {
 
 /** Strip characters that are unsafe in filenames (keep alphanumeric, spaces, hyphens, underscores, dots). */
 function sanitizeFilename(name: string): string {
-  return name.replace(/[^\w\s.\-]/g, '').trim() || 'export';
+  return name.replace(/[^\w\s.-]/g, '').trim() || 'export';
 }
 
 export function ExportButton({ wikiId, wikiTitle, isComplete }: ExportButtonProps) {
