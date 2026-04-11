@@ -254,6 +254,46 @@ class WikiManagementService:
         )
 
 
+def _derive_cache_key(cache_dir: str, repo_url: str, branch: str) -> str | None:
+    """Read cache_index.json and return the cache_key for this repo+branch, or None.
+
+    The cache key is the opaque string stored in cache_index.json that maps a
+    repo+branch identifier to its set of on-disk FAISS/BM25/graph cache files.
+
+    Args:
+        cache_dir: Directory that contains ``cache_index.json``.
+        repo_url: Full URL of the repository (``https://github.com/org/repo``).
+        branch: Branch name (e.g. ``"main"``).
+
+    Returns:
+        The cache key string, or ``None`` if not found.
+    """
+    import json
+    from pathlib import Path
+
+    url = repo_url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    parts = url.split("/")
+
+    owner_repo = f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else url
+    repo_identifier = f"{owner_repo}:{branch}"
+
+    index_file = Path(cache_dir) / "cache_index.json"
+    if not index_file.exists():
+        return None
+
+    try:
+        with open(index_file) as f:
+            index = json.load(f)
+    except Exception:
+        return None
+
+    resolved = index.get("refs", {}).get(repo_identifier, repo_identifier)
+    cache_key = index.get(resolved) or index.get(repo_identifier)
+    return cache_key or None
+
+
 def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
     """Remove FAISS vectors, code graphs, and cloned repos for a wiki."""
     import glob as glob_mod
