@@ -164,7 +164,12 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
         });
         if (data.pages.length > 0) {
           const urlPage = searchParams.get('page');
-          const matched = urlPage ? data.pages.find((p) => p.id === urlPage) : null;
+          const urlPageTitle = searchParams.get('page_title');
+          const matched = urlPage
+            ? data.pages.find((p) => p.id === urlPage)
+            : urlPageTitle
+              ? data.pages.find((p) => p.title === urlPageTitle)
+              : null;
           setActivePageId(matched ? matched.id : data.pages[0].id);
         }
 

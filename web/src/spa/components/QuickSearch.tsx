@@ -78,7 +78,9 @@ export function QuickSearch({ open, onClose, wikiId, projectId }: QuickSearchPro
 
   function handleSelect(result: SearchResultItem) {
     const targetWikiId = result.wiki_id;
-    navigate(`/wiki/${targetWikiId}/${encodeURIComponent(result.page_title)}`);
+    // WikiViewerPage matches by ?page_title= (title-based) or ?page= (id-based).
+    // Search results carry page_title but not the internal page id, so we use page_title.
+    navigate(`/wiki/${targetWikiId}?page_title=${encodeURIComponent(result.page_title)}`);
     onClose();
   }
 

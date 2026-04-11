@@ -306,7 +306,7 @@ describe('keyboard navigation', () => {
 
     await waitFor(() => {
       expect(mockNavigate).toHaveBeenCalledWith(
-        `/wiki/wiki-1/${encodeURIComponent('Architecture')}`,
+        `/wiki/wiki-1?page_title=${encodeURIComponent('Architecture')}`,
       );
     });
   });
