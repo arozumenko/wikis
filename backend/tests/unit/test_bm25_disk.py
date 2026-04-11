@@ -232,7 +232,7 @@ class TestBuildBm25Index:
 
         result = build_bm25_index(tmp_path, "rk", rebuild=True)
         assert result is not None
-        assert result.stat().st_mtime >= mtime_before
+        assert result.stat().st_mtime > mtime_before
 
 
 # ---------------------------------------------------------------------------

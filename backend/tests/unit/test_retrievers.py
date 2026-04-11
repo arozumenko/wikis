@@ -230,7 +230,7 @@ class TestBuildRepoRetriever:
 
 
 class TestSearchRepository:
-    def test_search_returns_empty_when_no_repo_retriever(self):
+    def test_search_raises_when_no_repo_retriever(self):
         mgr = MagicMock()
         mgr.get_vectorstore.return_value = None
         mgr.get_all_documents.return_value = []
@@ -239,7 +239,7 @@ class TestSearchRepository:
         assert stack.repo_retriever is None
         # Calling search_repository with no repo_retriever raises AttributeError
         # (repo_retriever.invoke raises); verify the guard check works
-        with pytest.raises((AttributeError, Exception)):
+        with pytest.raises(AttributeError):
             stack.search_repository("query", k=5)
 
     @patch("app.core.retrievers.EnsembleRetriever")
@@ -604,7 +604,7 @@ class TestSearchDocsSemanticCoverage:
 
         with patch("app.core.retrievers.USE_SEMANTIC_DOC_RETRIEVAL", False):
             stack = WikiRetrieverStack(vectorstore_manager=mgr)
-            # Break the retriever to trigger the outer except
+            # Set repo_retriever to None to hit the early guard return in search_docs_semantic
             stack.repo_retriever = None
 
         result = stack.search_docs_semantic("query", k=10)

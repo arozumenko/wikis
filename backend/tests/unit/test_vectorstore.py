@@ -833,7 +833,8 @@ class TestBuildAndSaveLargeBatch:
         vs, returned_docs = mgr._build_and_save(docs, cache_file, docs_file)
 
         # add_texts should have been called for subsequent batches
-        assert fake_vs.add_texts.called or mock_from_texts.call_count > 1
+        # 5 docs with batch_size=2: batch1→from_texts, batch2→add_texts, batch3→add_texts
+        assert fake_vs.add_texts.call_count == 2
         assert len(returned_docs) == 5
 
     @patch("app.core.vectorstore.FAISS.from_texts")
