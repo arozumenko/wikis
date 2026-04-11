@@ -53,6 +53,7 @@ export interface WikiDetail {
   status?: string;
   invocation_id?: string;
   requires_token?: boolean;
+  description?: string | null;
 }
 
 export const getWiki = (wikiId: string) =>
@@ -73,6 +74,12 @@ export const updateWikiVisibility = (wikiId: string, visibility: 'personal' | 's
   apiRequest<{ wiki_id: string; visibility: string }>(`/api/v1/wikis/${encodeURIComponent(wikiId)}/visibility`, {
     method: 'PATCH',
     body: JSON.stringify({ visibility }),
+  });
+
+export const updateWikiDescription = (wikiId: string, description: string | null) =>
+  apiRequest<WikiDetail>(`/api/v1/wikis/${encodeURIComponent(wikiId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ description }),
   });
 
 export const healthCheck = () => apiRequest<HealthResponse>('/api/v1/health');
