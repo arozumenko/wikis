@@ -1,6 +1,7 @@
 import { Box, Chip, Collapse, IconButton, Tooltip, Typography } from '@mui/material';
 import ReactMarkdown from 'react-markdown';
 import { ShareButton } from './ShareButton';
+import { ExportButton } from './ExportButton';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeSlug from 'rehype-slug';
@@ -60,6 +61,9 @@ interface WikiPageViewProps {
   mode?: 'light' | 'dark';
   onNavigate?: (pageId: string) => void;
   pages?: { id: string; title: string }[];
+  wikiId?: string;
+  wikiTitle?: string;
+  isWikiComplete?: boolean;
 }
 
 /**
@@ -217,7 +221,7 @@ function WikiProperties({ meta, mode }: { meta: FrontmatterMeta; mode: 'light' |
   );
 }
 
-export function WikiPageView({ content, mode = 'dark', onNavigate, pages = [] }: WikiPageViewProps) {
+export function WikiPageView({ content, mode = 'dark', onNavigate, pages = [], wikiId, wikiTitle, isWikiComplete }: WikiPageViewProps) {
   const { meta, content: body } = parseFrontmatter(content);
   const processedBody = processWikilinks(body);
   // Callout type → color palette
@@ -446,7 +450,14 @@ export function WikiPageView({ content, mode = 'dark', onNavigate, pages = [] }:
         '& hr': { border: 'none', borderTop: '1px solid', borderColor: 'divider', my: 4 },
       }}
     >
-      <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 1 }}>
+      <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 1, mb: 1 }}>
+        {wikiId && (
+          <ExportButton
+            wikiId={wikiId}
+            wikiTitle={wikiTitle ?? ''}
+            isComplete={isWikiComplete ?? false}
+          />
+        )}
         <ShareButton />
       </Box>
       <WikiProperties meta={meta} mode={mode} />

@@ -591,7 +591,15 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
               <Typography color="text.secondary">No wiki pages found.</Typography>
             </Box>
           ) : (
-            <WikiPageView content={content} mode={mode} onNavigate={handleSelectPage} pages={pages.map(p => ({ id: p.id, title: p.title }))} />
+            <WikiPageView
+              content={content}
+              mode={mode}
+              onNavigate={handleSelectPage}
+              pages={pages.map(p => ({ id: p.id, title: p.title }))}
+              wikiId={wiki?.wiki_id}
+              wikiTitle={wiki?.title}
+              isWikiComplete={wiki?.status === 'complete'}
+            />
           )}
         </Box>
 
