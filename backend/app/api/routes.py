@@ -20,6 +20,7 @@ from app.dependencies import (
     get_project_service,
     get_qa_service,
     get_research_service,
+    get_wiki_index_cache,
     get_wiki_management,
     get_wiki_service,
 )
@@ -48,6 +49,16 @@ from app.models.api import (
 )
 from app.models.invocation import Invocation
 from app.models.qa_api import QAListResponse, QARecordResponse, QAStatsResponse, QAStatus
+from app.models.search import (
+    PageListItem,
+    PageNeighbor,
+    PageNeighborsResponse,
+    SearchResultItem,
+    WikiPageListResponse,
+    WikiPageResponse,
+    WikiSearchResponse,
+    WikiSummaryItem as SearchWikiSummaryItem,
+)
 from app.services.ask_service import AskService
 from app.services.export_service import ExportService, WikiNotFoundError
 from app.services.import_service import BundleValidationError, BundleVersionError, ImportService
@@ -506,6 +517,174 @@ async def get_wiki(
         if active_invocation.status == "generating":
             response["status"] = active_invocation.status
     return response
+
+
+# ---------------------------------------------------------------------------
+# Wiki Search, Pages, and Neighbors
+# NOTE: these routes MUST appear before the legacy get_wiki_page route
+# below because FastAPI uses first-match-wins for path parameters.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/wikis/{wiki_id}/search", response_model=WikiSearchResponse)
+async def search_wiki(
+    wiki_id: str,
+    request: Request,
+    q: str = Query(...),
+    hop_depth: int = Query(default=1, ge=1, le=5),
+    top_k: int = Query(default=10, ge=1),
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+    index_cache=Depends(get_wiki_index_cache),
+) -> WikiSearchResponse:
+    """Full-text search over wiki pages with graph-expansion re-ranking."""
+    from app.core.unified_db import UnifiedWikiDB
+    from app.core.wiki_search_engine import WikiSearchEngine
+
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    page_index = await index_cache.get(wiki_id)
+
+    settings = request.app.state.settings
+    db_path = f"{settings.cache_dir}/{wiki_id}.wiki.db"
+    db = UnifiedWikiDB(db_path, readonly=True)
+    try:
+        wiki_name = getattr(wiki, "title", wiki_id) or wiki_id
+        engine = WikiSearchEngine(wiki_id, wiki_name, db, page_index)
+        result = await engine.search(q, hop_depth=hop_depth, top_k=top_k)
+    finally:
+        db.close()
+
+    return WikiSearchResponse(
+        query=result.query,
+        results=[
+            SearchResultItem(
+                wiki_id=item.wiki_id,
+                wiki_name=item.wiki_name,
+                page_title=item.page_title,
+                snippet=item.snippet,
+                score=item.score,
+                neighbors=[PageNeighbor(title=n.title, rel=n.rel) for n in item.neighbors],
+            )
+            for item in result.results
+        ],
+        wiki_summary=[
+            SearchWikiSummaryItem(
+                wiki_id=s.wiki_id,
+                wiki_name=s.wiki_name,
+                match_count=s.match_count,
+                relevance=s.relevance,
+            )
+            for s in result.wiki_summary
+        ],
+    )
+
+
+@router.get("/wikis/{wiki_id}/pages", response_model=WikiPageListResponse)
+async def list_wiki_pages(
+    wiki_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+    index_cache=Depends(get_wiki_index_cache),
+) -> WikiPageListResponse:
+    """List all pages in a wiki with their titles and descriptions."""
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    page_index = await index_cache.get(wiki_id)
+
+    pages = []
+    for title, meta in page_index.pages.items():
+        # Determine section: first path component before '/' if the path has a
+        # subdirectory component (i.e. more than one path segment).
+        section: str | None = None
+        if meta.file_path:
+            # file_path is like {wiki_id}/{repo}/wiki_pages/{section}/{page}.md
+            # Extract the part after wiki_pages/ if present.
+            if "wiki_pages/" in meta.file_path:
+                rel = meta.file_path.split("wiki_pages/", 1)[1]
+                if "/" in rel:
+                    section = rel.split("/", 1)[0]
+        pages.append(PageListItem(page_title=title, description=meta.description, section=section))
+
+    return WikiPageListResponse(wiki_id=wiki_id, pages=pages)
+
+
+@router.get("/wikis/{wiki_id}/pages/{page_title}/neighbors", response_model=PageNeighborsResponse)
+async def get_page_neighbors(
+    wiki_id: str,
+    page_title: str,
+    hop_depth: int = Query(default=1, ge=1, le=5),
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+    index_cache=Depends(get_wiki_index_cache),
+) -> PageNeighborsResponse:
+    """Return the wikilink graph neighborhood for a single wiki page."""
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    page_index = await index_cache.get(wiki_id)
+    if page_title not in page_index.pages:
+        raise HTTPException(404, f"Page not found: {page_title}")
+
+    forward_metas = page_index.neighbors(page_title, hop_depth=hop_depth)
+    links_to = [m.title for m in forward_metas]
+    linked_from = page_index.backlinks(page_title)
+
+    return PageNeighborsResponse(
+        wiki_id=wiki_id,
+        page_title=page_title,
+        links_to=links_to,
+        linked_from=linked_from,
+    )
+
+
+@router.get("/wikis/{wiki_id}/pages/{page_title}", response_model=WikiPageResponse)
+async def get_wiki_page_by_title(
+    wiki_id: str,
+    page_title: str,
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+    index_cache=Depends(get_wiki_index_cache),
+) -> WikiPageResponse:
+    """Return the full content of a single wiki page identified by its title."""
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    page_index = await index_cache.get(wiki_id)
+    if page_title not in page_index.pages:
+        raise HTTPException(404, f"Page not found: {page_title}")
+
+    meta = page_index.pages[page_title]
+    try:
+        raw = await management.storage.download("wiki_artifacts", meta.file_path)
+        content = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+    except Exception as exc:
+        raise HTTPException(404, f"Page content not found: {page_title}") from exc
+
+    # Extract section headings (# and ## lines)
+    sections = []
+    for line in content.splitlines():
+        if line.startswith("## "):
+            sections.append(line[3:].strip())
+        elif line.startswith("# "):
+            sections.append(line[2:].strip())
+
+    return WikiPageResponse(
+        wiki_id=wiki_id,
+        page_title=page_title,
+        content=content,
+        sections=sections,
+    )
 
 
 @router.get("/wikis/{wiki_id}/pages/{page_id:path}")
