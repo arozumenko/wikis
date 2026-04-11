@@ -77,7 +77,7 @@ export const updateWikiVisibility = (wikiId: string, visibility: 'personal' | 's
   });
 
 export const updateWikiDescription = (wikiId: string, description: string | null) =>
-  apiRequest<WikiDetail>(`/api/v1/wikis/${encodeURIComponent(wikiId)}`, {
+  apiRequest<WikiDetail>(`/api/v1/wikis/${encodeURIComponent(wikiId)}/description`, {
     method: 'PATCH',
     body: JSON.stringify({ description }),
   });
