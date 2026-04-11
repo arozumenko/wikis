@@ -6,6 +6,8 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.ask_service import AskService
+from app.services.export_service import ExportService
+from app.services.import_service import ImportService
 from app.services.project_service import ProjectService
 from app.services.qa_service import QAService
 from app.services.research_service import ResearchService
@@ -46,3 +48,11 @@ async def get_db_session(request: Request) -> AsyncSession:
 async def get_project_service(session: AsyncSession = Depends(get_db_session)) -> ProjectService:
     """Provide a ProjectService backed by the current request's DB session."""
     return ProjectService(session)
+
+
+def get_export_service(request: Request) -> ExportService:
+    return request.app.state.export_service
+
+
+def get_import_service(request: Request) -> ImportService:
+    return request.app.state.import_service
