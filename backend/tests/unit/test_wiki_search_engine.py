@@ -292,3 +292,28 @@ async def test_snippet_sourced_from_page_hit():
     )
     result = await engine.search("query")
     assert result.results[0].snippet == "Desc of DocPage"
+
+
+@pytest.mark.asyncio
+async def test_reranking_formula_full_arithmetic():
+    """Verify the complete re-ranking formula: base × (1 + centrality + density) × relevance.
+
+    Setup:
+      - 4 total pages: "Target", "Linker", "Neighbor", "Other"
+      - hits: [("Target", 0.5), ("Neighbor", 0.5)]  → hit_count=2, relevance=2/4=0.5
+      - "Target" has 1 backlink ("Linker") → centrality = 1/4 = 0.25
+      - "Target" has 1 forward neighbor ("Neighbor") which IS in hit_titles
+        → density = 1/1 = 1.0
+      - Expected score for "Target":
+          0.5 × (1 + 0.25 + 1.0) × 0.5 = 0.5 × 2.25 × 0.5 = 0.5625
+    """
+    engine = _make_engine(
+        titles=["Target", "Linker", "Neighbor", "Other"],
+        hits=[("Target", 0.5), ("Neighbor", 0.5)],
+        forward={"Target": ["Neighbor"]},
+        backward={"Target": ["Linker"]},
+    )
+    result = await engine.search("query")
+
+    target = next(r for r in result.results if r.page_title == "Target")
+    assert target.score == pytest.approx(0.5625, rel=1e-6)
