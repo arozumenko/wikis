@@ -41,18 +41,23 @@ export function App() {
         <BrowserRouter>
           <AuthGuard>
             <RepoContextProvider>
-              <ProjectProvider>
-                <Suspense fallback={<PageLoader />}>
-                  <Routes>
-                    <Route element={<AppShellWithRepo mode={mode} onToggleTheme={toggleMode} />}>
-                      <Route index element={<DashboardPage />} />
-                      <Route path="wiki/:wikiId" element={<WikiViewerPage mode={mode} />} />
-                      <Route path="settings" element={<SettingsPage />} />
-                      <Route path="project/:projectId" element={<ProjectPage />} />
-                    </Route>
-                  </Routes>
-                </Suspense>
-              </ProjectProvider>
+              <Suspense fallback={<PageLoader />}>
+                <Routes>
+                  <Route element={<AppShellWithRepo mode={mode} onToggleTheme={toggleMode} />}>
+                    <Route index element={<DashboardPage />} />
+                    <Route path="wiki/:wikiId" element={<WikiViewerPage mode={mode} />} />
+                    <Route path="settings" element={<SettingsPage />} />
+                    <Route
+                      path="project/:projectId"
+                      element={
+                        <ProjectProvider>
+                          <ProjectPage />
+                        </ProjectProvider>
+                      }
+                    />
+                  </Route>
+                </Routes>
+              </Suspense>
             </RepoContextProvider>
           </AuthGuard>
         </BrowserRouter>

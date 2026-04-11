@@ -1,9 +1,11 @@
 import { useCallback, useState } from 'react';
 import {
+  Alert,
   Box,
   Card,
   Chip,
   IconButton,
+  Snackbar,
   Tooltip,
   Typography,
 } from '@mui/material';
@@ -40,6 +42,7 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
   const navigate = useNavigate();
   const { user } = useAuth();
   const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const isOwner = user?.id === project.owner_id;
   const gradient = projectGradient(project.id);
@@ -53,7 +56,7 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
         await deleteProject(project.id);
         onDelete?.();
       } catch {
-        // Silently fail — parent can handle re-fetch
+        setDeleteError('Failed to delete project. Please try again.');
       } finally {
         setDeleting(false);
       }
@@ -62,6 +65,7 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
   );
 
   return (
+    <>
     <Box
       sx={{
         position: 'relative',
@@ -190,5 +194,16 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
         </Box>
       </Card>
     </Box>
+    <Snackbar
+      open={deleteError !== null}
+      autoHideDuration={4000}
+      onClose={() => setDeleteError(null)}
+      anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+    >
+      <Alert onClose={() => setDeleteError(null)} severity="error" sx={{ width: '100%' }}>
+        {deleteError}
+      </Alert>
+    </Snackbar>
+    </>
   );
 }

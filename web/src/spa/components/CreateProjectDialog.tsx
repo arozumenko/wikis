@@ -18,7 +18,7 @@ import {
 } from '@mui/material';
 import LockOutlinedIcon from '@mui/icons-material/LockOutlined';
 import PublicOutlinedIcon from '@mui/icons-material/PublicOutlined';
-import { createProject, addWikiToProject, type ProjectResponse } from '../api/project';
+import { createProject, addWikiToProject, getProject, type ProjectResponse } from '../api/project';
 import type { components } from '../api/types.generated';
 
 type WikiSummary = components['schemas']['WikiSummary'];
@@ -98,15 +98,13 @@ export function CreateProjectDialog({
         description: description.trim() || undefined,
         visibility,
       });
-      // Add selected wikis sequentially — failures are non-fatal
-      for (const wikiId of selectedWikiIds) {
-        try {
-          await addWikiToProject(project.id, wikiId);
-        } catch {
-          // continue — partial success is acceptable
-        }
-      }
-      onCreated(project);
+      // Add selected wikis in parallel — failures are non-fatal
+      await Promise.allSettled(
+        [...selectedWikiIds].map((wikiId) => addWikiToProject(project.id, wikiId)),
+      );
+      // Fetch refreshed project so wiki_count is accurate
+      const refreshed = await getProject(project.id);
+      onCreated(refreshed);
       setName('');
       setDescription('');
       setVisibility('personal');

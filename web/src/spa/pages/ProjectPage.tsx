@@ -94,20 +94,23 @@ export function ProjectPage() {
     setLoading(true);
     setError(null);
     try {
-      const [proj, wikiRes, allWikiRes] = await Promise.all([
+      const [proj, wikiRes] = await Promise.all([
         getProject(projectId),
         listProjectWikis(projectId),
-        listWikis(),
       ]);
       setProject(proj);
       setWikis(wikiRes.wikis ?? []);
-      setAllWikis(allWikiRes.wikis ?? []);
+      // Only fetch all wikis if the current user is the owner (needed for the "add wiki" panel)
+      if (user?.id === proj.owner_id) {
+        const allWikiRes = await listWikis();
+        setAllWikis(allWikiRes.wikis ?? []);
+      }
     } catch {
       setError('Failed to load project.');
     } finally {
       setLoading(false);
     }
-  }, [projectId]);
+  }, [projectId, user?.id]);
 
   useEffect(() => {
     load();

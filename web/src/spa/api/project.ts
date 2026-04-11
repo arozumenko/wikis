@@ -49,8 +49,8 @@ export const deleteProject = (id: string): Promise<void> =>
     method: 'DELETE',
   });
 
-export const addWikiToProject = (projectId: string, wikiId: string): Promise<void> =>
-  apiRequest<void>(`/api/v1/projects/${encodeURIComponent(projectId)}/wikis`, {
+export const addWikiToProject = (projectId: string, wikiId: string): Promise<ProjectResponse> =>
+  apiRequest<ProjectResponse>(`/api/v1/projects/${encodeURIComponent(projectId)}/wikis`, {
     method: 'POST',
     body: JSON.stringify({ wiki_id: wikiId }),
   });

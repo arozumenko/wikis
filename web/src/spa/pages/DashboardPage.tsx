@@ -427,7 +427,7 @@ export function DashboardPage() {
         </Grid>
       ) : null}
 
-      <Grid container spacing={2.5} sx={{ display: visibilityFilter === 'projects' ? 'none' : undefined }}>
+      {visibilityFilter !== 'projects' && <Grid container spacing={2.5}>
         {!hasSearchWithNoResults && (
           <Grid item xs={12} sm={6} md={4}>
             <Card
@@ -689,7 +689,7 @@ export function DashboardPage() {
             </Grid>
           );
         })}
-      </Grid>
+      </Grid>}
 
       <Dialog
         open={showGenerateModal}
