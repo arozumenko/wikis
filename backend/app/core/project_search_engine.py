@@ -90,17 +90,32 @@ class ProjectSearchEngine:
         # Build one engine per wiki via the injected factory.
         engines = [(wiki_id, wiki_name, self._factory(wiki_id, wiki_name)) for wiki_id, wiki_name in wikis]
 
-        # Fan out in parallel.
-        wiki_results = await asyncio.gather(
-            *[engine.search(query, hop_depth=hop_depth, top_k=top_k) for _, _, engine in engines]
+        # Fan out in parallel. return_exceptions=True ensures a single failing
+        # wiki does not abort results from all other wikis.
+        raw_results = await asyncio.gather(
+            *[engine.search(query, hop_depth=hop_depth, top_k=top_k) for _, _, engine in engines],
+            return_exceptions=True,
         )
 
         # Merge results and wiki_summary.
         merged_results: list[ResultItem] = []
         merged_summary: list[WikiSummaryItem] = []
 
-        for wiki_result in wiki_results:
-            # Include ALL wikis in summary (even zero-hit ones).
+        for (wiki_id, wiki_name, _), wiki_result in zip(engines, raw_results):
+            if isinstance(wiki_result, BaseException):
+                logger.warning(
+                    "ProjectSearchEngine: wiki %s (%s) failed during search: %s",
+                    wiki_id,
+                    wiki_name,
+                    wiki_result,
+                )
+                # Still add a zero-hit summary entry so callers know it was attempted.
+                merged_summary.append(
+                    WikiSummaryItem(wiki_id=wiki_id, wiki_name=wiki_name, match_count=0, relevance=0.0)
+                )
+                continue
+
+            # Include ALL successful wikis in summary (even zero-hit ones).
             merged_summary.extend(wiki_result.wiki_summary)
 
             # Only include wikis with at least one result in the merged list.
