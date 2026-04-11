@@ -222,6 +222,7 @@ class WikiSummary(BaseModel):
     visibility: str = "personal"  # "personal" or "shared"
     is_owner: bool = False
     requires_token: bool = False
+    description: str | None = None
 
 
 class WikiListResponse(BaseModel):
@@ -242,6 +243,12 @@ class UpdateWikiVisibilityRequest(BaseModel):
     """Request to update the visibility of a wiki."""
 
     visibility: str  # "personal" or "shared"
+
+
+class UpdateWikiDescriptionRequest(BaseModel):
+    """Request to update the description of a wiki."""
+
+    description: str | None = None
 
 
 class RefreshWikiRequest(BaseModel):
