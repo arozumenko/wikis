@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import {
   Button,
+  CircularProgress,
   Menu,
   MenuItem,
   Tooltip,
@@ -11,6 +12,7 @@ import {
 import FileDownloadIcon from '@mui/icons-material/FileDownload';
 import FolderZipIcon from '@mui/icons-material/FolderZip';
 import InventoryIcon from '@mui/icons-material/Inventory';
+import { getAuthToken } from '../api/client';
 
 interface ExportButtonProps {
   wikiId: string;
@@ -18,10 +20,16 @@ interface ExportButtonProps {
   isComplete: boolean;
 }
 
-export function ExportButton({ wikiId, isComplete }: ExportButtonProps) {
+/** Strip characters that are unsafe in filenames (keep alphanumeric, spaces, hyphens, underscores, dots). */
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^\w\s.\-]/g, '').trim() || 'export';
+}
+
+export function ExportButton({ wikiId, wikiTitle, isComplete }: ExportButtonProps) {
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
   const [snackbarOpen, setSnackbarOpen] = useState(false);
   const [snackbarMessage, setSnackbarMessage] = useState('');
+  const [loading, setLoading] = useState(false);
 
   const open = Boolean(anchorEl);
 
@@ -33,33 +41,54 @@ export function ExportButton({ wikiId, isComplete }: ExportButtonProps) {
     setAnchorEl(null);
   };
 
+  const setError = (msg: string) => {
+    setSnackbarMessage(msg);
+    setSnackbarOpen(true);
+  };
+
   const handleExport = async (format: 'obsidian' | 'wikis') => {
-    handleClose();
-
-    const url = `/api/v1/wikis/${encodeURIComponent(wikiId)}/export?format=${format}`;
-
-    // Quick auth check — a HEAD request lets us detect 401 before navigating
+    setAnchorEl(null);
+    setLoading(true);
     try {
-      const resp = await fetch(url, { method: 'HEAD' });
-      if (resp.status === 401 || resp.status === 403) {
-        setSnackbarMessage('Session expired — please sign in again to export.');
-        setSnackbarOpen(true);
+      const token = await getAuthToken();
+      const res = await fetch(`/api/v1/wikis/${encodeURIComponent(wikiId)}/export?format=${format}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) {
+        if (res.status === 401 || res.status === 403) {
+          setError('Session expired. Please log in again.');
+        } else {
+          setError(`Export failed (${res.status})`);
+        }
         return;
       }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const base = sanitizeFilename(wikiTitle);
+      const filename = format === 'wikis' ? `${base}.wikiexport` : `${base}.zip`;
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     } catch {
-      // Network error — let the browser handle it on navigation
+      setError('Export failed. Please try again.');
+    } finally {
+      setLoading(false);
     }
-
-    window.location.href = url;
   };
+
+  const isDisabled = !isComplete || loading;
 
   const button = (
     <Button
       size="small"
       variant="outlined"
-      startIcon={<FileDownloadIcon fontSize="small" />}
-      onClick={isComplete ? handleOpen : undefined}
-      disabled={!isComplete}
+      startIcon={loading ? <CircularProgress size={14} color="inherit" /> : <FileDownloadIcon fontSize="small" />}
+      onClick={isDisabled ? undefined : handleOpen}
+      disabled={isDisabled}
       aria-haspopup="true"
       aria-expanded={open}
       aria-controls={open ? 'export-menu' : undefined}
