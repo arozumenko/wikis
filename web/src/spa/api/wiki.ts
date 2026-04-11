@@ -1,4 +1,4 @@
-import { apiRequest, getAuthToken } from './client';
+import { apiRequest, clearTokenCache, getAuthToken } from './client';
 import type { components } from './types.generated';
 
 type GenerateWikiRequest = components['schemas']['GenerateWikiRequest'];
@@ -87,8 +87,19 @@ export async function importWiki(file: File): Promise<WikiSummary> {
     body: form,
   });
   if (!res.ok) {
+    if (res.status === 401) {
+      clearTokenCache();
+      const returnPath = window.location.pathname + window.location.search;
+      window.location.href = `/login?callbackUrl=${encodeURIComponent(returnPath)}`;
+      return new Promise<never>(() => {});
+    }
     const text = await res.text();
-    throw new Error(`${res.status}: ${text}`);
+    let message = `Import failed (${res.status})`;
+    try {
+      const json = JSON.parse(text);
+      if (json.detail) message = json.detail;
+    } catch {}
+    throw new Error(message);
   }
   return res.json() as Promise<WikiSummary>;
 }

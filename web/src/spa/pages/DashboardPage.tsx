@@ -752,6 +752,8 @@ export function DashboardPage() {
         onSuccess={(wiki) => {
           setWikis((prev) => [wiki, ...prev]);
           setShowImportDialog(false);
+          showSnackbar('Wiki imported successfully', 'success');
+          navigate(`/wiki/${wiki.wiki_id}`);
         }}
       />
 

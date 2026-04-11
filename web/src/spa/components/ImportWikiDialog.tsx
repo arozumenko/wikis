@@ -26,7 +26,7 @@ function formatBytes(bytes: number): string {
 }
 
 function isValidExtension(filename: string): boolean {
-  return filename.endsWith('.zip') || filename.endsWith('.wikiexport');
+  return filename.endsWith('.wikiexport');
 }
 
 export function ImportWikiDialog({ open, onClose, onSuccess }: ImportWikiDialogProps) {
@@ -120,7 +120,7 @@ export function ImportWikiDialog({ open, onClose, onSuccess }: ImportWikiDialogP
           <input
             ref={fileInputRef}
             type="file"
-            accept=".zip,.wikiexport"
+            accept=".wikiexport"
             style={{ display: 'none' }}
             onChange={handleFileChange}
             disabled={uploading}
@@ -137,7 +137,7 @@ export function ImportWikiDialog({ open, onClose, onSuccess }: ImportWikiDialogP
             </Box>
           ) : (
             <Typography variant="body2" color="text.secondary">
-              Click to browse — .wikiexport or .zip
+              Click to browse — .wikiexport
             </Typography>
           )}
         </Box>
