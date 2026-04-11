@@ -563,7 +563,10 @@ async def search_wiki(
             result_list = await _wiki_management.list_wikis(user_id=user_id)
             wiki = next((w for w in result_list.wikis if w.wiki_id == wiki_id), None)
 
-        wiki_name = getattr(wiki, "title", wiki_id) or wiki_id if wiki else wiki_id
+        if wiki is None:
+            return {"error": f"Wiki not found: {wiki_id}. Use search_wikis() to find available wiki IDs."}
+
+        wiki_name = getattr(wiki, "title", wiki_id) or wiki_id
 
         page_index = await _page_index_cache.get(wiki_id)
         cache_dir = getattr(_settings, "cache_dir", "./data/cache")

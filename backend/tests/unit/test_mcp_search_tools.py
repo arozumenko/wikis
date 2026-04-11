@@ -485,3 +485,42 @@ async def test_search_project_auth_direct_mode():
         srv._page_index_cache = old_cache
         srv._settings = old_settings
         srv._session_factory = old_factory
+
+
+@pytest.mark.asyncio
+async def test_search_wiki_blocks_inaccessible_wiki():
+    """search_wiki must return an error dict when the wiki is not in the user's list."""
+    import mcp_server.server as srv
+
+    wiki_list_result = MagicMock()
+    wiki_list_result.wikis = []  # user has no wikis
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.list_wikis = AsyncMock(return_value=wiki_list_result)
+
+    mock_cache = AsyncMock()
+    mock_settings = MagicMock()
+    mock_settings.cache_dir = "/tmp"
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt = srv._wiki_management
+    old_cache = srv._page_index_cache
+    old_settings = srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._page_index_cache = mock_cache
+        srv._settings = mock_settings
+
+        result = await srv.search_wiki(wiki_id="secret-wiki", query="anything")
+
+        assert "error" in result
+        assert "Wiki not found" in result["error"]
+        # Cache must NOT be touched for an inaccessible wiki.
+        mock_cache.get.assert_not_called()
+        # user_id must be passed through.
+        mock_mgmt.list_wikis.assert_called_once_with(user_id="test-user")
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._page_index_cache = old_cache
+        srv._settings = old_settings

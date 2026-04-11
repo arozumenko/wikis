@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_server.server import ask_codebase, get_page_neighbors, get_wiki_page, search_wikis
+from mcp_server.server import _current_user_id
 
 
 def _mock_response(status_code=200, json_data=None):
@@ -126,6 +127,7 @@ class TestGetWikiPageAccessControl:
 
         orig_mgmt = srv._wiki_management
         orig_storage = srv._storage
+        token = _current_user_id.set("test-user")
         try:
             srv._wiki_management = mgmt
             srv._storage = storage
@@ -134,7 +136,10 @@ class TestGetWikiPageAccessControl:
             assert "Wiki not found" in result["error"]
             # Storage must not be touched for an inaccessible wiki.
             storage.list_artifacts.assert_not_called()
+            # The user_id was passed through to the access check.
+            mgmt.list_wikis.assert_called_once_with(user_id="test-user")
         finally:
+            _current_user_id.reset(token)
             srv._wiki_management = orig_mgmt
             srv._storage = orig_storage
 
@@ -158,13 +163,16 @@ class TestGetWikiPageAccessControl:
 
         orig_mgmt = srv._wiki_management
         orig_storage = srv._storage
+        token = _current_user_id.set("test-user")
         try:
             srv._wiki_management = mgmt
             srv._storage = storage
             result = await get_wiki_page("w1", "some-page")
             assert "error" not in result
             assert result["content"] == "# Hello"
+            mgmt.list_wikis.assert_called_once_with(user_id="test-user")
         finally:
+            _current_user_id.reset(token)
             srv._wiki_management = orig_mgmt
             srv._storage = orig_storage
 
@@ -187,6 +195,7 @@ class TestGetPageNeighborsAccessControl:
 
         orig_mgmt = srv._wiki_management
         orig_cache = srv._page_index_cache
+        token = _current_user_id.set("test-user")
         try:
             srv._wiki_management = mgmt
             srv._page_index_cache = page_index_cache
@@ -195,7 +204,9 @@ class TestGetPageNeighborsAccessControl:
             assert "Wiki not found" in result["error"]
             # page_index_cache.get must not be called for an inaccessible wiki.
             page_index_cache.get.assert_not_called()
+            mgmt.list_wikis.assert_called_once_with(user_id="test-user")
         finally:
+            _current_user_id.reset(token)
             srv._wiki_management = orig_mgmt
             srv._page_index_cache = orig_cache
 
@@ -226,6 +237,7 @@ class TestGetPageNeighborsAccessControl:
 
         orig_mgmt = srv._wiki_management
         orig_cache = srv._page_index_cache
+        token = _current_user_id.set("test-user")
         try:
             srv._wiki_management = mgmt
             srv._page_index_cache = page_index_cache
@@ -233,7 +245,9 @@ class TestGetPageNeighborsAccessControl:
             assert "error" not in result
             assert result["wiki_id"] == "w1"
             assert result["page_title"] == "SomePage"
+            mgmt.list_wikis.assert_called_once_with(user_id="test-user")
         finally:
+            _current_user_id.reset(token)
             srv._wiki_management = orig_mgmt
             srv._page_index_cache = orig_cache
 
