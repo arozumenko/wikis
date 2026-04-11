@@ -211,6 +211,7 @@ export function IntegrationsTab() {
           { name: 'get_wiki_page', desc: 'Read a page\'s full markdown content. Supports offset/limit for paginating large pages.' },
           { name: 'ask_codebase', desc: 'Ask a natural language question and get an AI answer grounded in the wiki. Fast, single-shot.' },
           { name: 'research_codebase', desc: 'Run a deep multi-step research agent across the codebase. Slower but thorough — best for complex architectural questions.' },
+          { name: 'map_codebase', desc: 'Generate a hierarchical call-tree showing which files and functions are involved in a feature or flow. Best for tracing request paths and understanding how things are wired together.' },
         ].map((tool) => (
           <Paper
             key={tool.name}

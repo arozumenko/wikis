@@ -363,6 +363,35 @@ async def research_codebase(wiki_id: str, question: str, research_type: str = "c
     return await _http_research_codebase(wiki_id, question, research_type)
 
 
+@mcp.tool()
+async def map_codebase(wiki_id: str, question: str) -> dict[str, Any]:
+    """Generate a hierarchical call-tree (code map) showing which files and functions are involved in a feature or flow.
+
+    Returns symbol-level call stacks — each step names the function, its file, and what it does.
+    Best for tracing request flows, understanding how a feature is wired end-to-end,
+    or answering "what calls what?" questions.
+
+    Use this instead of research_codebase when you need a structured call-graph view
+    rather than a prose answer.
+
+    Args:
+        wiki_id: Wiki identifier from search_wikis().
+        question: The flow or feature to map — e.g. "how does authentication work?" or "trace a wiki generation request".
+    """
+    if _research_service:
+        try:
+            from app.models.api import ResearchRequest
+
+            request = ResearchRequest(wiki_id=wiki_id, question=question, research_type="codemap")
+            response = await _research_service.codemap_sync(request)
+            return response.model_dump()
+        except FileNotFoundError:
+            return {"error": f"Wiki not found: {wiki_id}. Use search_wikis() to find available wiki IDs."}
+        except Exception as e:
+            return {"error": str(e)}
+    return await _http_research_codebase(wiki_id, question, "codemap")
+
+
 # --- HTTP fallback for standalone mode ---
 
 
