@@ -371,3 +371,140 @@ class TestImportEndpoint:
             )
         assert resp.status_code == 413, resp.text
         app.state.import_service.restore_wiki.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_import_missing_manifest_returns_422(self, client):
+        """POST /api/v1/wikis/import with a zip that has no manifest.json → 422."""
+        c, app, sf = client
+
+        # Build a valid zip but omit manifest.json entirely
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w") as zf:
+            zf.writestr("pages/dummy/wiki_pages/intro.md", "# Intro\n")
+            zf.writestr("cache/cache_key.txt", "")
+            zf.writestr("cache/cache_index_fragment.json", "{}")
+        buf.seek(0)
+        no_manifest_bytes = buf.read()
+
+        app.state.import_service.restore_wiki = AsyncMock(
+            side_effect=BundleValidationError("Invalid bundle: missing manifest.json")
+        )
+
+        resp = await c.post(
+            "/api/v1/wikis/import",
+            files={"bundle": ("nomanifest.wikiexport", no_manifest_bytes, "application/zip")},
+        )
+        assert resp.status_code == 422, resp.text
+        assert "manifest" in resp.json().get("detail", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_import_docs_pkl_in_bundle_returns_422(self, client):
+        """POST /api/v1/wikis/import with a .docs.pkl entry in the bundle → 422."""
+        c, app, sf = client
+
+        # Build a bundle that contains a .docs.pkl file
+        manifest = {
+            "bundle_version": 1,
+            "title": "Pkl Test Wiki",
+            "repo_url": "https://github.com/test/repo",
+            "branch": "main",
+            "commit_hash": None,
+            "page_count": 1,
+            "exported_at": "2026-04-11T00:00:00Z",
+        }
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w") as zf:
+            zf.writestr("manifest.json", json.dumps(manifest))
+            zf.writestr("pages/abc/wiki_pages/page.md", "# Page\n")
+            zf.writestr("cache/cache_key.txt", "somekey")
+            zf.writestr("cache/cache_index_fragment.json", "{}")
+            zf.writestr("cache/somekey.docs.pkl", b"PICKLE_CONTENT")
+        buf.seek(0)
+        pkl_bundle = buf.read()
+
+        app.state.import_service.restore_wiki = AsyncMock(
+            side_effect=BundleValidationError("Invalid bundle: .docs.pkl files are not permitted")
+        )
+
+        resp = await c.post(
+            "/api/v1/wikis/import",
+            files={"bundle": ("pkl.wikiexport", pkl_bundle, "application/zip")},
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json().get("detail", "")
+        assert "pkl" in detail.lower() or "pickle" in detail.lower() or "invalid bundle" in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_import_same_bundle_twice_second_succeeds(self, client):
+        """POST /api/v1/wikis/import the same bundle twice → second import succeeds (overwrite)."""
+        c, app, sf = client
+        wiki_id = "import-overwrite-001"
+
+        # Seed the wiki record that restore_wiki will return
+        async with sf() as session:
+            async with session.begin():
+                session.add(WikiRecord(
+                    id=wiki_id,
+                    owner_id="dev-user",
+                    repo_url="https://github.com/test/repo",
+                    branch="main",
+                    title="Overwrite Wiki",
+                    page_count=1,
+                    status="complete",
+                ))
+
+        from sqlalchemy import select
+
+        async with sf() as session:
+            result = await session.execute(select(WikiRecord).where(WikiRecord.id == wiki_id))
+            record = result.scalar_one_or_none()
+
+        # Both imports return the same record (overwrite scenario handled by ImportService)
+        app.state.import_service.restore_wiki = AsyncMock(return_value=record)
+
+        bundle_bytes = _make_wikis_bundle_bytes(wiki_id)
+
+        # First import
+        resp1 = await c.post(
+            "/api/v1/wikis/import",
+            files={"bundle": ("bundle.wikiexport", bundle_bytes, "application/zip")},
+        )
+        assert resp1.status_code == 201, f"First import failed: {resp1.text}"
+        assert resp1.json()["wiki_id"] == wiki_id
+
+        # Second import — should also succeed (not 409 or 500)
+        resp2 = await c.post(
+            "/api/v1/wikis/import",
+            files={"bundle": ("bundle.wikiexport", bundle_bytes, "application/zip")},
+        )
+        assert resp2.status_code == 201, f"Second import failed: {resp2.text}"
+        data2 = resp2.json()
+        assert data2["wiki_id"] == wiki_id
+        assert data2["status"] == "complete"
+
+    @pytest.mark.asyncio
+    async def test_import_plain_text_file_returns_422(self, client):
+        """POST /api/v1/wikis/import with a plain text file → 422 (not a zip)."""
+        c, app, sf = client
+
+        app.state.import_service.restore_wiki = AsyncMock(
+            side_effect=BundleValidationError("Invalid bundle: not a zip file")
+        )
+
+        resp = await c.post(
+            "/api/v1/wikis/import",
+            files={"bundle": ("plain.wikiexport", b"this is just text, not a zip", "text/plain")},
+        )
+        assert resp.status_code == 422, resp.text
+        assert "Invalid bundle" in resp.json().get("detail", "")
+
+    @pytest.mark.asyncio
+    async def test_export_wikis_format_generating_wiki_returns_409(self, client):
+        """GET /api/v1/wikis/{id}/export?format=wikis on a generating wiki → 409."""
+        c, app, sf = client
+        wiki_id = "export-wikis-incomplete-001"
+        await _seed_wiki(sf, wiki_id=wiki_id, status="generating")
+
+        resp = await c.get(f"/api/v1/wikis/{wiki_id}/export?format=wikis")
+        assert resp.status_code == 409, resp.text
+        assert "fully generated" in resp.json().get("detail", "")
