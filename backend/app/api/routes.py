@@ -1202,14 +1202,21 @@ async def search_project(
     for wiki_id, _ in wiki_tuples:
         page_indexes[wiki_id] = await index_cache.get(wiki_id)
 
+    open_dbs: list[UnifiedWikiDB] = []
+
     def wiki_engine_factory(wiki_id: str, wiki_name: str) -> WikiSearchEngine:
         page_index = page_indexes[wiki_id]
         db_path = f"{settings.cache_dir}/{wiki_id}.wiki.db"
         db = UnifiedWikiDB(db_path, readonly=True)
+        open_dbs.append(db)
         return WikiSearchEngine(wiki_id, wiki_name, db, page_index)
 
     engine = ProjectSearchEngine(wiki_engine_factory)
-    result = await engine.search(q, wikis=wiki_tuples, hop_depth=hop_depth, top_k=top_k)
+    try:
+        result = await engine.search(q, wikis=wiki_tuples, hop_depth=hop_depth, top_k=top_k)
+    finally:
+        for db in open_dbs:
+            db.close()
 
     return ProjectSearchResponse(
         query=result.query,
