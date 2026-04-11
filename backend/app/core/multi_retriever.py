@@ -70,19 +70,35 @@ class MultiWikiRetrieverStack:
     # ------------------------------------------------------------------
 
     def search_repository(self, query: str, k: int = 15, apply_expansion: bool = True) -> list:
-        """Synchronous fan-out retrieval — delegates to aretrieve."""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
+        """Synchronous fan-out retrieval — raises if called from a running event loop.
 
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, self.aretrieve(query, k=k))
-                    return future.result()
-            return loop.run_until_complete(self.aretrieve(query, k=k))
+        Use aretrieve() directly in async contexts.
+        """
+        try:
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.aretrieve(query, k=k))
+            loop = None
+
+        if loop is not None and loop.is_running():
+            raise RuntimeError(
+                "MultiWikiRetrieverStack.search_repository() cannot be called from an async context. "
+                "Use await aretrieve() instead."
+            )
+        return asyncio.run(self.aretrieve(query, k=k))
 
     def retrieve(self, query: str, k: int = 15) -> list:
-        """Alias for search_repository (for generic compatibility)."""
-        return self.search_repository(query, k=k)
+        """Sync retrieve — raises if called from a running event loop.
+
+        Use aretrieve() directly in async contexts.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            raise RuntimeError(
+                "MultiWikiRetrieverStack.retrieve() cannot be called from an async context. "
+                "Use await aretrieve() instead."
+            )
+        return asyncio.run(self.aretrieve(query, k=k))
