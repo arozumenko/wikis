@@ -34,6 +34,7 @@ _qa_service = None
 _storage = None
 _settings = None
 _session_factory = None  # async_sessionmaker[AsyncSession] for project DB queries
+_page_index_cache = None  # WikiPageIndexCache for search tools
 
 # Per-request user context (populated by auth middleware)
 _current_user_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_user_id", default=None)
@@ -47,9 +48,10 @@ def set_services(
     research_service: Any = None,
     qa_service: Any = None,
     session_factory: Any = None,
+    page_index_cache: Any = None,
 ) -> None:
     """Inject service references for direct calls (no HTTP round-trip)."""
-    global _wiki_management, _ask_service, _research_service, _qa_service, _storage, _settings, _session_factory
+    global _wiki_management, _ask_service, _research_service, _qa_service, _storage, _settings, _session_factory, _page_index_cache
     _wiki_management = wiki_management
     _ask_service = ask_service
     _research_service = research_service
@@ -57,6 +59,7 @@ def set_services(
     _storage = storage
     _settings = settings
     _session_factory = session_factory
+    _page_index_cache = page_index_cache
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +523,199 @@ async def map_project(project_id: str, entry_points: list[str]) -> dict[str, Any
     return {"error": "Research service unavailable in standalone mode. Use map_codebase() per wiki instead."}
 
 
+@mcp.tool()
+async def search_wiki(
+    wiki_id: str,
+    query: str,
+    hop_depth: int = 1,
+    top_k: int = 10,
+) -> dict[str, Any]:
+    """Search a wiki using graph-aware FTS5 search with wikilink expansion.
+
+    Args:
+        wiki_id: Wiki identifier from search_wikis().
+        query: Search query string.
+        hop_depth: Graph expansion depth (1-5, default 1).
+        top_k: Maximum results to return (default 10).
+
+    Returns:
+        Dict with query, results (list of page matches with snippets and neighbors),
+        and wiki_summary (per-wiki statistics).
+    """
+    if not 1 <= hop_depth <= 5:
+        raise ValueError(f"hop_depth must be between 1 and 5, got {hop_depth}")
+
+    if _page_index_cache and _settings:
+        from app.core.unified_db import UnifiedWikiDB
+        from app.core.wiki_search_engine import WikiSearchEngine
+
+        user_id = _current_user_id.get()
+        wiki = None
+        if _wiki_management:
+            result_list = await _wiki_management.list_wikis(user_id=user_id)
+            wiki = next((w for w in result_list.wikis if w.wiki_id == wiki_id), None)
+
+        wiki_name = getattr(wiki, "title", wiki_id) or wiki_id if wiki else wiki_id
+
+        page_index = await _page_index_cache.get(wiki_id)
+        cache_dir = getattr(_settings, "cache_dir", "./data/cache")
+        db_path = f"{cache_dir}/{wiki_id}.wiki.db"
+        db = UnifiedWikiDB(db_path, readonly=True)
+        try:
+            engine = WikiSearchEngine(wiki_id, wiki_name, db, page_index)
+            result = await engine.search(query, hop_depth=hop_depth, top_k=top_k)
+        finally:
+            db.close()
+
+        return {
+            "query": result.query,
+            "results": [
+                {
+                    "wiki_id": item.wiki_id,
+                    "wiki_name": item.wiki_name,
+                    "page_title": item.page_title,
+                    "snippet": item.snippet,
+                    "score": item.score,
+                    "neighbors": [{"title": n.title, "rel": n.rel} for n in item.neighbors],
+                }
+                for item in result.results
+            ],
+            "wiki_summary": [
+                {
+                    "wiki_id": s.wiki_id,
+                    "wiki_name": s.wiki_name,
+                    "match_count": s.match_count,
+                    "relevance": s.relevance,
+                }
+                for s in result.wiki_summary
+            ],
+        }
+    return await _http_search_wiki(wiki_id, query, hop_depth, top_k)
+
+
+@mcp.tool()
+async def get_page_neighbors(
+    wiki_id: str,
+    page_title: str,
+    hop_depth: int = 1,
+) -> dict[str, Any]:
+    """Get the wikilink graph neighbors of a wiki page.
+
+    Args:
+        wiki_id: Wiki identifier from search_wikis().
+        page_title: Exact page title as returned by list_wiki_pages() or search_wiki().
+        hop_depth: Expansion depth (1-5, default 1).
+
+    Returns:
+        Dict with wiki_id, page_title, links_to (pages this page links to),
+        and linked_from (pages that link to this page).
+    """
+    if not 1 <= hop_depth <= 5:
+        raise ValueError(f"hop_depth must be between 1 and 5, got {hop_depth}")
+
+    if _page_index_cache:
+        page_index = await _page_index_cache.get(wiki_id)
+        if page_title not in page_index.pages:
+            raise ValueError(f"Page not found: {page_title}. Use search_wiki('{wiki_id}', ...) to find available pages.")
+
+        forward_metas = page_index.neighbors(page_title, hop_depth=hop_depth)
+        links_to = [m.title for m in forward_metas]
+        linked_from = page_index.backlinks(page_title)
+
+        return {
+            "wiki_id": wiki_id,
+            "page_title": page_title,
+            "links_to": links_to,
+            "linked_from": linked_from,
+        }
+    return await _http_get_page_neighbors(wiki_id, page_title, hop_depth)
+
+
+@mcp.tool()
+async def search_project(
+    project_id: str,
+    query: str,
+    hop_depth: int = 1,
+    top_k: int = 10,
+) -> dict[str, Any]:
+    """Search across all wikis in a project using graph-aware FTS5 with wikilink expansion.
+
+    Args:
+        project_id: Project identifier from list_projects().
+        query: Search query string.
+        hop_depth: Graph expansion depth (1-5, default 1).
+        top_k: Maximum results to return across all wikis (default 10).
+
+    Returns:
+        Dict with query, results (merged and ranked from all wikis), and wiki_summary.
+    """
+    if not 1 <= hop_depth <= 5:
+        raise ValueError(f"hop_depth must be between 1 and 5, got {hop_depth}")
+
+    if _page_index_cache and _settings and _session_factory:
+        from app.core.project_search_engine import ProjectSearchEngine
+        from app.core.unified_db import UnifiedWikiDB
+        from app.core.wiki_search_engine import WikiSearchEngine
+        from app.services.project_service import ProjectService
+
+        user_id = _current_user_id.get()
+        async with _session_factory() as session:
+            project_svc = ProjectService(session)
+            wikis = await project_svc.list_project_wikis(project_id, user_id=user_id)
+
+        if wikis is None:
+            return {"error": f"Project not found: {project_id}. Use list_projects() to find available project IDs."}
+
+        wiki_tuples = [(w.id, getattr(w, "title", w.id) or w.id) for w in wikis]
+
+        # Pre-load page indexes.
+        page_indexes: dict[str, Any] = {}
+        for wid, _ in wiki_tuples:
+            page_indexes[wid] = await _page_index_cache.get(wid)
+
+        cache_dir = getattr(_settings, "cache_dir", "./data/cache")
+        open_dbs: list[Any] = []
+
+        def _wiki_engine_factory(wid: str, wiki_name: str) -> WikiSearchEngine:
+            page_index = page_indexes[wid]
+            db_path = f"{cache_dir}/{wid}.wiki.db"
+            db = UnifiedWikiDB(db_path, readonly=True)
+            open_dbs.append(db)
+            return WikiSearchEngine(wid, wiki_name, db, page_index)
+
+        engine = ProjectSearchEngine(_wiki_engine_factory)
+        try:
+            result = await engine.search(query, wikis=wiki_tuples, hop_depth=hop_depth, top_k=top_k)
+        finally:
+            for db in open_dbs:
+                db.close()
+
+        return {
+            "query": result.query,
+            "results": [
+                {
+                    "wiki_id": item.wiki_id,
+                    "wiki_name": item.wiki_name,
+                    "page_title": item.page_title,
+                    "snippet": item.snippet,
+                    "score": item.score,
+                    "neighbors": [{"title": n.title, "rel": n.rel} for n in item.neighbors],
+                }
+                for item in result.results
+            ],
+            "wiki_summary": [
+                {
+                    "wiki_id": s.wiki_id,
+                    "wiki_name": s.wiki_name,
+                    "match_count": s.match_count,
+                    "relevance": s.relevance,
+                }
+                for s in result.wiki_summary
+            ],
+        }
+    return await _http_search_project(project_id, query, hop_depth, top_k)
+
+
 # --- HTTP fallback for standalone mode ---
 
 
@@ -605,6 +801,51 @@ async def _http_research_codebase(wiki_id: str, question: str, research_type: st
         )
         if resp.status_code == 404:
             return {"error": f"Wiki not found: {wiki_id}"}
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _http_search_wiki(wiki_id: str, query: str, hop_depth: int, top_k: int) -> dict[str, Any]:
+    import httpx
+
+    url = os.getenv("WIKIS_BACKEND_URL", "http://localhost:8000")
+    async with httpx.AsyncClient(base_url=url, timeout=60) as client:
+        resp = await client.get(
+            f"/api/v1/wikis/{wiki_id}/search",
+            params={"q": query, "hop_depth": hop_depth, "top_k": top_k},
+        )
+        if resp.status_code == 404:
+            return {"error": f"Wiki not found: {wiki_id}"}
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _http_get_page_neighbors(wiki_id: str, page_title: str, hop_depth: int) -> dict[str, Any]:
+    import httpx
+
+    url = os.getenv("WIKIS_BACKEND_URL", "http://localhost:8000")
+    async with httpx.AsyncClient(base_url=url, timeout=60) as client:
+        resp = await client.get(
+            f"/api/v1/wikis/{wiki_id}/pages/{page_title}/neighbors",
+            params={"hop_depth": hop_depth},
+        )
+        if resp.status_code == 404:
+            return {"error": f"Page or wiki not found: {wiki_id}/{page_title}"}
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _http_search_project(project_id: str, query: str, hop_depth: int, top_k: int) -> dict[str, Any]:
+    import httpx
+
+    url = os.getenv("WIKIS_BACKEND_URL", "http://localhost:8000")
+    async with httpx.AsyncClient(base_url=url, timeout=120) as client:
+        resp = await client.get(
+            f"/api/v1/projects/{project_id}/search",
+            params={"q": query, "hop_depth": hop_depth, "top_k": top_k},
+        )
+        if resp.status_code == 404:
+            return {"error": f"Project not found: {project_id}"}
         resp.raise_for_status()
         return resp.json()
 
