@@ -28,7 +28,7 @@ def parse(source: str, path: str = "module.js") -> ParseResult:
 class TestJSParserSmoke:
     def test_parser_initialises(self):
         p = JavaScriptVisitorParser()
-        assert p is not None
+        assert p.capabilities.language == "javascript"
 
     def test_parse_empty_returns_result(self):
         result = parse("")
@@ -311,7 +311,7 @@ class TestJSCapabilities:
     def test_extensions_include_js(self):
         p = JavaScriptVisitorParser()
         exts = p._get_supported_extensions()
-        assert ".js" in exts or ".jsx" in exts or len(exts) > 0
+        assert ".js" in exts or ".jsx" in exts
 
     def test_has_classes(self):
         p = JavaScriptVisitorParser()

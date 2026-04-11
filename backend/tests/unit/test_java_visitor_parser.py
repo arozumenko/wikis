@@ -23,7 +23,7 @@ def parse(source: str, path: str = "Main.java") -> ParseResult:
 class TestJavaParserSmoke:
     def test_parser_initialises(self):
         p = JavaVisitorParser()
-        assert p is not None
+        assert p.capabilities.language == "java"
 
     def test_parse_empty_returns_result(self):
         result = parse("")
@@ -831,7 +831,7 @@ class TestJavaFieldRelationships:
         result = parse(src)
         rel_types = {r.relationship_type for r in result.relationships}
         # Collection field → COMPOSITION
-        assert RelationshipType.COMPOSITION in rel_types or len(result.symbols) > 0
+        assert RelationshipType.COMPOSITION in rel_types
 
     def test_optional_field_creates_aggregation(self):
         src = (

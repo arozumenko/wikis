@@ -278,7 +278,7 @@ class TestRelationships:
         )
         result = parse(src)
         # Should produce composition or defines edges
-        assert len(result.relationships) >= 0  # parser may or may not produce these
+        assert result.relationships is not None
 
     def test_multiple_inheritance(self):
         src = (
@@ -447,7 +447,7 @@ class TestParseFilePaths:
     def test_parse_file_missing_file_returns_error(self):
         parser = PythonParser()
         result = parser.parse_file("/nonexistent/path/file.py")
-        assert result.errors or result.symbols == []
+        assert result.errors
 
     def test_parse_file_with_explicit_content_ignores_disk(self):
         parser = PythonParser()
@@ -633,7 +633,7 @@ class TestCallRelationships:
         )
         result = parse(src)
         rel_types = {r.relationship_type for r in result.relationships}
-        assert RelationshipType.CALLS in rel_types or RelationshipType.REFERENCES in rel_types
+        assert RelationshipType.CALLS in rel_types
 
 
 # ---------------------------------------------------------------------------

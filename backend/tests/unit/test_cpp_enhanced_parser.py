@@ -23,7 +23,7 @@ def parse(source: str, path: str = "main.cpp") -> ParseResult:
 class TestCppParserSmoke:
     def test_parser_initialises(self):
         p = CppEnhancedParser()
-        assert p is not None
+        assert p.capabilities.language == "cpp"
 
     def test_parse_empty_returns_result(self):
         result = parse("")
@@ -314,7 +314,7 @@ class TestCppIncludes:
         src = "#define MAX_SIZE 100\n#define SQUARE(x) ((x)*(x))\nint main() { return 0; }\n"
         result = parse(src)
         names = [s.name for s in result.symbols]
-        assert "MAX_SIZE" in names or "SQUARE" in names or "main" in names
+        assert "MAX_SIZE" in names or "SQUARE" in names
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +352,7 @@ class TestCppRelationships:
         result = parse(src)
         rel_types = {r.relationship_type for r in result.relationships}
         # Composition or defines should be produced
-        assert len(result.relationships) >= 0
+        assert result.relationships is not None
 
 
 # ---------------------------------------------------------------------------

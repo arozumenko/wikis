@@ -23,7 +23,7 @@ def parse(source: str, path: str = "main.rs") -> ParseResult:
 class TestRustParserSmoke:
     def test_parser_initialises(self):
         p = RustVisitorParser()
-        assert p is not None
+        assert p.capabilities.language == "rust"
 
     def test_parse_empty_returns_result(self):
         result = parse("")
@@ -325,7 +325,7 @@ class TestRustModules:
 # Use declarations
 # ---------------------------------------------------------------------------
 
-class TestRustUseDeclarations:
+class TestRustUseDeclarationsBasic:
     def test_use_creates_import_relationship(self):
         src = "use std::collections::HashMap;\nfn main() {}\n"
         result = parse(src)

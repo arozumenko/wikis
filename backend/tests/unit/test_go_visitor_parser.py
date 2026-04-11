@@ -24,7 +24,7 @@ def parse(source: str, path: str = "main.go") -> ParseResult:
 class TestGoParserSmoke:
     def test_parser_initialises(self):
         p = GoVisitorParser()
-        assert p is not None
+        assert p.capabilities.language == "go"
 
     def test_parse_empty_returns_result(self):
         result = parse("")
@@ -329,7 +329,7 @@ class TestGoRelationships:
         result = parse(src)
         rel_types = {r.relationship_type for r in result.relationships}
         # Should have DEFINES linking Dog to Bark
-        assert len(result.relationships) >= 0
+        assert result.relationships is not None
 
     def test_struct_embedding_composition(self):
         src = (
@@ -339,7 +339,7 @@ class TestGoRelationships:
         )
         result = parse(src)
         rel_types = {r.relationship_type for r in result.relationships}
-        assert RelationshipType.COMPOSITION in rel_types or len(result.relationships) >= 0
+        assert RelationshipType.COMPOSITION in rel_types
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +599,7 @@ class TestGoLinkMethods:
         assert "Sit" in names
         # Methods should be linked with DEFINES relationship
         rel_types = {r.relationship_type for r in result.relationships}
-        assert RelationshipType.DEFINES in rel_types or len(result.relationships) >= 0
+        assert RelationshipType.DEFINES in rel_types
 
 
 class TestGoTypeAliases:
