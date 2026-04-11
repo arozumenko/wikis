@@ -1,4 +1,4 @@
-import { apiRequest } from './client';
+import { apiRequest, clearTokenCache, getAuthToken } from './client';
 import type { components } from './types.generated';
 
 type GenerateWikiRequest = components['schemas']['GenerateWikiRequest'];
@@ -10,6 +10,7 @@ type ResearchResponse = components['schemas']['ResearchResponse'];
 type WikiListResponse = components['schemas']['WikiListResponse'];
 type DeleteWikiResponse = components['schemas']['DeleteWikiResponse'];
 type HealthResponse = components['schemas']['HealthResponse'];
+export type WikiSummary = components['schemas']['WikiSummary'];
 
 export const generateWiki = (req: GenerateWikiRequest) =>
   apiRequest<GenerateWikiResponse>('/api/v1/generate', {
@@ -75,3 +76,30 @@ export const updateWikiVisibility = (wikiId: string, visibility: 'personal' | 's
   });
 
 export const healthCheck = () => apiRequest<HealthResponse>('/api/v1/health');
+
+export async function importWiki(file: File): Promise<WikiSummary> {
+  const token = await getAuthToken();
+  const form = new FormData();
+  form.append('bundle', file);
+  const res = await fetch('/api/v1/wikis/import', {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: form,
+  });
+  if (!res.ok) {
+    if (res.status === 401) {
+      clearTokenCache();
+      const returnPath = window.location.pathname + window.location.search;
+      window.location.href = `/login?callbackUrl=${encodeURIComponent(returnPath)}`;
+      return new Promise<never>(() => {});
+    }
+    const text = await res.text();
+    let message = `Import failed (${res.status})`;
+    try {
+      const json = JSON.parse(text);
+      if (json.detail) message = json.detail;
+    } catch {}
+    throw new Error(message);
+  }
+  return res.json() as Promise<WikiSummary>;
+}
