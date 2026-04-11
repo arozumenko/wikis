@@ -1,4 +1,4 @@
-"""Tests for MCP server tools (HTTP fallback path)."""
+"""Tests for MCP server tools (HTTP fallback path and direct-mode access control)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_server.server import ask_codebase, get_wiki_page, search_wikis
+from mcp_server.server import ask_codebase, get_page_neighbors, get_wiki_page, search_wikis
 
 
 def _mock_response(status_code=200, json_data=None):
@@ -104,6 +104,138 @@ class TestGetWikiPage:
         with _patch_httpx(mock_client):
             result = await get_wiki_page("w1", "nope")
             assert "error" in result
+
+
+class TestGetWikiPageAccessControl:
+    """Direct-mode (non-HTTP) access control for get_wiki_page."""
+
+    @pytest.mark.asyncio
+    async def test_blocks_inaccessible_wiki(self):
+        """get_wiki_page must return an error dict (not content) when the wiki is not
+        in the current user's list_wikis result set."""
+        import mcp_server.server as srv
+
+        # Build a wiki management mock that returns an empty list (no wikis for this user).
+        wiki_list_result = MagicMock()
+        wiki_list_result.wikis = []
+
+        mgmt = AsyncMock()
+        mgmt.list_wikis = AsyncMock(return_value=wiki_list_result)
+
+        storage = AsyncMock()
+
+        orig_mgmt = srv._wiki_management
+        orig_storage = srv._storage
+        try:
+            srv._wiki_management = mgmt
+            srv._storage = storage
+            result = await get_wiki_page("w-other", "some-page")
+            assert "error" in result
+            assert "Wiki not found" in result["error"]
+            # Storage must not be touched for an inaccessible wiki.
+            storage.list_artifacts.assert_not_called()
+        finally:
+            srv._wiki_management = orig_mgmt
+            srv._storage = orig_storage
+
+    @pytest.mark.asyncio
+    async def test_allows_accessible_wiki(self):
+        """get_wiki_page proceeds to storage when the wiki is accessible to the user."""
+        import mcp_server.server as srv
+
+        wiki = MagicMock()
+        wiki.wiki_id = "w1"
+
+        wiki_list_result = MagicMock()
+        wiki_list_result.wikis = [wiki]
+
+        mgmt = AsyncMock()
+        mgmt.list_wikis = AsyncMock(return_value=wiki_list_result)
+
+        storage = AsyncMock()
+        storage.list_artifacts = AsyncMock(return_value=["w1/repo/wiki_pages/some-page.md"])
+        storage.download = AsyncMock(return_value=b"# Hello")
+
+        orig_mgmt = srv._wiki_management
+        orig_storage = srv._storage
+        try:
+            srv._wiki_management = mgmt
+            srv._storage = storage
+            result = await get_wiki_page("w1", "some-page")
+            assert "error" not in result
+            assert result["content"] == "# Hello"
+        finally:
+            srv._wiki_management = orig_mgmt
+            srv._storage = orig_storage
+
+
+class TestGetPageNeighborsAccessControl:
+    """Direct-mode (non-HTTP) access control for get_page_neighbors."""
+
+    @pytest.mark.asyncio
+    async def test_blocks_inaccessible_wiki(self):
+        """get_page_neighbors must return error dict when wiki is not accessible."""
+        import mcp_server.server as srv
+
+        wiki_list_result = MagicMock()
+        wiki_list_result.wikis = []
+
+        mgmt = AsyncMock()
+        mgmt.list_wikis = AsyncMock(return_value=wiki_list_result)
+
+        page_index_cache = AsyncMock()
+
+        orig_mgmt = srv._wiki_management
+        orig_cache = srv._page_index_cache
+        try:
+            srv._wiki_management = mgmt
+            srv._page_index_cache = page_index_cache
+            result = await get_page_neighbors("w-other", "SomePage")
+            assert "error" in result
+            assert "Wiki not found" in result["error"]
+            # page_index_cache.get must not be called for an inaccessible wiki.
+            page_index_cache.get.assert_not_called()
+        finally:
+            srv._wiki_management = orig_mgmt
+            srv._page_index_cache = orig_cache
+
+    @pytest.mark.asyncio
+    async def test_allows_accessible_wiki(self):
+        """get_page_neighbors proceeds when the wiki is accessible to the user."""
+        import mcp_server.server as srv
+
+        wiki = MagicMock()
+        wiki.wiki_id = "w1"
+
+        wiki_list_result = MagicMock()
+        wiki_list_result.wikis = [wiki]
+
+        mgmt = AsyncMock()
+        mgmt.list_wikis = AsyncMock(return_value=wiki_list_result)
+
+        page_meta = MagicMock()
+        page_meta.title = "SomePage"
+
+        page_index = MagicMock()
+        page_index.pages = {"SomePage": page_meta}
+        page_index.neighbors = MagicMock(return_value=[])
+        page_index.backlinks = MagicMock(return_value=[])
+
+        page_index_cache = AsyncMock()
+        page_index_cache.get = AsyncMock(return_value=page_index)
+
+        orig_mgmt = srv._wiki_management
+        orig_cache = srv._page_index_cache
+        try:
+            srv._wiki_management = mgmt
+            srv._page_index_cache = page_index_cache
+            result = await get_page_neighbors("w1", "SomePage")
+            assert "error" not in result
+            assert result["wiki_id"] == "w1"
+            assert result["page_title"] == "SomePage"
+        finally:
+            srv._wiki_management = orig_mgmt
+            srv._page_index_cache = orig_cache
 
 
 class TestAskCodebase:

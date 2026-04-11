@@ -286,6 +286,14 @@ async def get_wiki_page(wiki_id: str, page_id: str, offset: int = 0, limit: int 
         limit: Maximum lines to return. Default 200. Increase or paginate if has_more is true.
     """
     if _storage:
+        # Access control — verify the caller owns or can see this wiki.
+        user_id = _current_user_id.get()
+        if _wiki_management:
+            result_list = await _wiki_management.list_wikis(user_id=user_id)
+            wiki_obj = next((w for w in result_list.wikis if w.wiki_id == wiki_id), None)
+            if wiki_obj is None:
+                return {"error": f"Wiki not found: {wiki_id}. Use search_wikis() to find available wiki IDs."}
+
         try:
             name = page_id if page_id.endswith(".md") else f"{page_id}.md"
             # Storage path has extra segments between wiki_id and wiki_pages/
@@ -614,6 +622,14 @@ async def get_page_neighbors(
         raise ValueError(f"hop_depth must be between 1 and 5, got {hop_depth}")
 
     if _page_index_cache:
+        # Access control — verify the caller owns or can see this wiki.
+        user_id = _current_user_id.get()
+        if _wiki_management:
+            result_list = await _wiki_management.list_wikis(user_id=user_id)
+            wiki = next((w for w in result_list.wikis if w.wiki_id == wiki_id), None)
+            if wiki is None:
+                return {"error": f"Wiki not found: {wiki_id}. Use search_wikis() to find available wiki IDs."}
+
         page_index = await _page_index_cache.get(wiki_id)
         if page_title not in page_index.pages:
             raise ValueError(f"Page not found: {page_title}. Use search_wiki('{wiki_id}', ...) to find available pages.")

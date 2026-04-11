@@ -177,10 +177,18 @@ async def test_get_page_neighbors_returns_links_to_and_linked_from():
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=page_index)
 
+    # Access-control mock: user can see "wiki-1".
+    wiki_list = MagicMock()
+    wiki_list.wikis = [_make_wiki_record("wiki-1")]
+    mock_mgmt = AsyncMock()
+    mock_mgmt.list_wikis = AsyncMock(return_value=wiki_list)
+
     token = srv._current_user_id.set("user-1")
     old_cache = srv._page_index_cache
+    old_mgmt = srv._wiki_management
     try:
         srv._page_index_cache = mock_cache
+        srv._wiki_management = mock_mgmt
         result = await srv.get_page_neighbors(wiki_id="wiki-1", page_title="Overview")
 
         assert result["wiki_id"] == "wiki-1"
@@ -192,6 +200,7 @@ async def test_get_page_neighbors_returns_links_to_and_linked_from():
     finally:
         srv._current_user_id.reset(token)
         srv._page_index_cache = old_cache
+        srv._wiki_management = old_mgmt
 
 
 @pytest.mark.asyncio
@@ -203,13 +212,22 @@ async def test_get_page_neighbors_raises_on_unknown_page():
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=page_index)
 
+    # Access-control mock: user can see "wiki-1" so we reach the page check.
+    wiki_list = MagicMock()
+    wiki_list.wikis = [_make_wiki_record("wiki-1")]
+    mock_mgmt = AsyncMock()
+    mock_mgmt.list_wikis = AsyncMock(return_value=wiki_list)
+
     old_cache = srv._page_index_cache
+    old_mgmt = srv._wiki_management
     try:
         srv._page_index_cache = mock_cache
+        srv._wiki_management = mock_mgmt
         with pytest.raises(ValueError, match="Page not found"):
             await srv.get_page_neighbors(wiki_id="wiki-1", page_title="NonExistent")
     finally:
         srv._page_index_cache = old_cache
+        srv._wiki_management = old_mgmt
 
 
 @pytest.mark.asyncio
@@ -398,10 +416,18 @@ async def test_get_page_neighbors_auth_direct_mode():
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=page_index)
 
+    # Access-control mock: "auth-user-99" can see "wiki-1".
+    wiki_list = MagicMock()
+    wiki_list.wikis = [_make_wiki_record("wiki-1")]
+    mock_mgmt = AsyncMock()
+    mock_mgmt.list_wikis = AsyncMock(return_value=wiki_list)
+
     token = srv._current_user_id.set("auth-user-99")
     old_cache = srv._page_index_cache
+    old_mgmt = srv._wiki_management
     try:
         srv._page_index_cache = mock_cache
+        srv._wiki_management = mock_mgmt
         result = await srv.get_page_neighbors(wiki_id="wiki-1", page_title="Overview")
         # Should succeed and return the right structure
         assert result["wiki_id"] == "wiki-1"
@@ -409,6 +435,7 @@ async def test_get_page_neighbors_auth_direct_mode():
     finally:
         srv._current_user_id.reset(token)
         srv._page_index_cache = old_cache
+        srv._wiki_management = old_mgmt
 
 
 @pytest.mark.asyncio
