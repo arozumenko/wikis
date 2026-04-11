@@ -102,6 +102,7 @@ async def _add_missing_columns(engine: AsyncEngine) -> None:
         ("wiki", "status", "VARCHAR", "'complete'"),
         ("wiki", "requires_token", "INTEGER", "0"),
         ("wiki", "error", "VARCHAR", None),
+        ("wiki", "description", "VARCHAR", None),
     ]
 
     # All identifiers are hardcoded constants — no user input in SQL.

@@ -29,6 +29,7 @@ class WikiRecord(Base):
     status = Column(String, default="generating")  # generating | complete | failed | partial | cancelled
     requires_token = Column(Integer, default=0)  # 1 if repo required an access token (Boolean as int for SQLite)
     error = Column(String, nullable=True)  # error message for failed generations
+    description = Column(String, nullable=True)
 
     __table_args__ = (Index("ix_wiki_owner_visibility", "owner_id", "visibility"),)
 

@@ -251,6 +251,7 @@ class WikiManagementService:
             status=record.status or "complete",
             requires_token=bool(record.requires_token),
             error=record.error,
+            description=record.description,
         )
 
 
