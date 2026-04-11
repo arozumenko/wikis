@@ -5,6 +5,7 @@ import { AppShellWithRepo } from './components/AppShellWithRepo';
 import { AuthGuard } from './components/AuthGuard';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { RepoContextProvider } from './context/RepoContext';
+import { ProjectProvider } from './context/ProjectContext';
 import { useThemeMode } from './hooks/useThemeMode';
 import { createAppTheme } from './theme';
 
@@ -16,6 +17,9 @@ const WikiViewerPage = lazy(() =>
 );
 const SettingsPage = lazy(() =>
   import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPage })),
+);
+const ProjectPage = lazy(() =>
+  import('./pages/ProjectPage').then((m) => ({ default: m.ProjectPage })),
 );
 
 function PageLoader() {
@@ -37,15 +41,18 @@ export function App() {
         <BrowserRouter>
           <AuthGuard>
             <RepoContextProvider>
-              <Suspense fallback={<PageLoader />}>
-                <Routes>
-                  <Route element={<AppShellWithRepo mode={mode} onToggleTheme={toggleMode} />}>
-                    <Route index element={<DashboardPage />} />
-                    <Route path="wiki/:wikiId" element={<WikiViewerPage mode={mode} />} />
-                    <Route path="settings" element={<SettingsPage />} />
-                  </Route>
-                </Routes>
-              </Suspense>
+              <ProjectProvider>
+                <Suspense fallback={<PageLoader />}>
+                  <Routes>
+                    <Route element={<AppShellWithRepo mode={mode} onToggleTheme={toggleMode} />}>
+                      <Route index element={<DashboardPage />} />
+                      <Route path="wiki/:wikiId" element={<WikiViewerPage mode={mode} />} />
+                      <Route path="settings" element={<SettingsPage />} />
+                      <Route path="project/:projectId" element={<ProjectPage />} />
+                    </Route>
+                  </Routes>
+                </Suspense>
+              </ProjectProvider>
             </RepoContextProvider>
           </AuthGuard>
         </BrowserRouter>
