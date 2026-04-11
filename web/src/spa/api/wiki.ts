@@ -54,6 +54,7 @@ export interface WikiDetail {
   invocation_id?: string;
   requires_token?: boolean;
   description?: string | null;
+  is_owner?: boolean;
 }
 
 export const getWiki = (wikiId: string) =>
@@ -71,10 +72,13 @@ export const deleteWiki = (id: string) =>
   });
 
 export const updateWikiVisibility = (wikiId: string, visibility: 'personal' | 'shared') =>
-  apiRequest<{ wiki_id: string; visibility: string }>(`/api/v1/wikis/${encodeURIComponent(wikiId)}/visibility`, {
-    method: 'PATCH',
-    body: JSON.stringify({ visibility }),
-  });
+  apiRequest<{ wiki_id: string; visibility: string }>(
+    `/api/v1/wikis/${encodeURIComponent(wikiId)}/visibility`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ visibility }),
+    },
+  );
 
 export const updateWikiDescription = (wikiId: string, description: string | null) =>
   apiRequest<WikiDetail>(`/api/v1/wikis/${encodeURIComponent(wikiId)}/description`, {
@@ -105,7 +109,9 @@ export async function importWiki(file: File): Promise<WikiSummary> {
     try {
       const json = JSON.parse(text);
       if (json.detail) message = json.detail;
-    } catch (_e) { /* ignore JSON parse errors — fall back to HTTP status message */ }
+    } catch (_e) {
+      /* ignore JSON parse errors — fall back to HTTP status message */
+    }
     throw new Error(message);
   }
   return res.json() as Promise<WikiSummary>;
