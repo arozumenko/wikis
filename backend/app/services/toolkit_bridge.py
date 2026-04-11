@@ -343,5 +343,19 @@ def _load_cached_artifacts(
         except Exception as e:
             logger.warning(f"Failed to load vectorstore {cache_key}: {e}")
 
+    # Load repository analysis
+    try:
+        from app.core.repository_analysis_store import RepositoryAnalysisStore
+
+        store = RepositoryAnalysisStore(cache_dir=cache_dir)
+        analysis = store.get_analysis_for_prompt(repo_identifier)
+        if analysis:
+            components.repo_analysis = {"summary": analysis}
+            logger.info(f"Loaded repository analysis for {repo_identifier}")
+        else:
+            logger.debug(f"No repository analysis found for {repo_identifier}")
+    except Exception as e:
+        logger.warning(f"Failed to load repository analysis for {repo_identifier}: {e}")
+
     if not cache_key and not graph_key:
         logger.warning(f"No cache entries found for {repo_identifier} — ask/research may fail")

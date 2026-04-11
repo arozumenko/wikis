@@ -8,7 +8,7 @@ import pytest
 from pydantic import SecretStr
 
 from app.config import Settings
-from app.services.toolkit_bridge import ComponentCache, EngineComponents, build_engine_components
+from app.services.toolkit_bridge import ComponentCache, EngineComponents, _load_cached_artifacts, build_engine_components
 from app.storage.local import LocalArtifactStorage
 
 
@@ -142,3 +142,44 @@ class TestComponentCache:
         )
         assert c1 is c2
         assert build_count == 1
+
+
+class TestLoadCachedArtifactsRepoAnalysis:
+    def test_populates_repo_analysis_when_analysis_exists(self, tmp_path):
+        """_load_cached_artifacts sets components.repo_analysis when analysis is stored."""
+        from app.core.repository_analysis_store import RepositoryAnalysisStore
+
+        repo_identifier = "owner/repo:main"
+        store = RepositoryAnalysisStore(cache_dir=str(tmp_path))
+        store.save_analysis(
+            repo_identifier=repo_identifier,
+            analysis="This repo does important things.",
+            commit_hash=None,
+        )
+
+        components = EngineComponents()
+        _load_cached_artifacts(components, str(tmp_path), "wiki-123", repo_identifier)
+
+        assert components.repo_analysis is not None
+        assert "summary" in components.repo_analysis
+        assert components.repo_analysis["summary"] == "This repo does important things."
+
+    def test_no_analysis_file_leaves_repo_analysis_none(self, tmp_path):
+        """_load_cached_artifacts does not raise and leaves repo_analysis None when no file exists."""
+        components = EngineComponents()
+        _load_cached_artifacts(components, str(tmp_path), "wiki-456", "owner/missing:main")
+
+        assert components.repo_analysis is None
+
+    def test_store_exception_does_not_propagate(self, tmp_path):
+        """If RepositoryAnalysisStore.get_analysis_for_prompt raises, _load_cached_artifacts swallows it."""
+        components = EngineComponents()
+
+        with patch(
+            "app.core.repository_analysis_store.RepositoryAnalysisStore.get_analysis_for_prompt",
+            side_effect=RuntimeError("disk failure"),
+        ):
+            # Must not raise
+            _load_cached_artifacts(components, str(tmp_path), "wiki-789", "owner/repo:main")
+
+        assert components.repo_analysis is None
