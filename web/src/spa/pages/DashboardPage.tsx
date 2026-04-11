@@ -25,6 +25,7 @@ import SearchIcon from '@mui/icons-material/Search';
 import AddIcon from '@mui/icons-material/Add';
 import AddCircleOutlineIcon from '@mui/icons-material/AddCircleOutline';
 import CreateNewFolderOutlinedIcon from '@mui/icons-material/CreateNewFolderOutlined';
+import FileUploadIcon from '@mui/icons-material/FileUpload';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 import LockOutlinedIcon from '@mui/icons-material/LockOutlined';
@@ -34,6 +35,7 @@ import ShareIcon from '@mui/icons-material/Share';
 import { useNavigate } from 'react-router-dom';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { GenerateForm } from '../components/GenerateForm';
+import { ImportWikiDialog } from '../components/ImportWikiDialog';
 import { ProjectCard } from '../components/ProjectCard';
 import { CreateProjectDialog } from '../components/CreateProjectDialog';
 import { listWikis, deleteWiki, generateWiki, updateWikiVisibility } from '../api/wiki';
@@ -95,6 +97,7 @@ export function DashboardPage() {
   const [searchUrl, setSearchUrl] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [showGenerateModal, setShowGenerateModal] = useState(false);
+  const [showImportDialog, setShowImportDialog] = useState(false);
   const [showCreateProjectDialog, setShowCreateProjectDialog] = useState(false);
   const [visibilityFilter, setVisibilityFilter] = useState<VisibilityFilter>('all');
   const [togglingVisibility, setTogglingVisibility] = useState<string | null>(null);
@@ -349,6 +352,17 @@ export function DashboardPage() {
               sx={{ flexShrink: 0, whiteSpace: 'nowrap', borderRadius: 3 }}
             >
               New Project
+            </Button>
+          )}
+          {visibilityFilter !== 'projects' && (
+            <Button
+              variant="outlined"
+              size="small"
+              startIcon={<FileUploadIcon />}
+              onClick={() => setShowImportDialog(true)}
+              sx={{ flexShrink: 0, whiteSpace: 'nowrap', borderRadius: 3 }}
+            >
+              Import Wiki
             </Button>
           )}
         </Box>
@@ -731,6 +745,15 @@ export function DashboardPage() {
           />
         </DialogContent>
       </Dialog>
+
+      <ImportWikiDialog
+        open={showImportDialog}
+        onClose={() => setShowImportDialog(false)}
+        onSuccess={(wiki) => {
+          setWikis((prev) => [wiki, ...prev]);
+          setShowImportDialog(false);
+        }}
+      />
 
       <ConfirmDialog
         open={deleteTarget !== null}
