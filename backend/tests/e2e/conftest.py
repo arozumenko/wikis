@@ -35,7 +35,8 @@ def _services_reachable() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _services_reachable(),
-    reason="E2E services not running (need web app on :3000 and backend on :8000)",
-)
+@pytest.fixture(autouse=True)
+def skip_if_services_unavailable():
+    """Skip all E2E tests when the web app / backend are not running."""
+    if not _services_reachable():
+        pytest.skip("E2E services not running (need web app on :3000 and backend on :8000)")

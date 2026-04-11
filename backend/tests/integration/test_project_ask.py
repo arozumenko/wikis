@@ -42,6 +42,9 @@ async def client(tmp_path, monkeypatch):
     """FastAPI test client with in-memory SQLite and AUTH_ENABLED=false."""
     monkeypatch.setenv("AUTH_ENABLED", "false")
     monkeypatch.setenv("LLM_API_KEY", "test-key")
+    # Disable QA cache so the test does not make real embedding API calls
+    # with the fake "test-key" credential before the wiki-not-found check fires.
+    monkeypatch.setenv("QA_CACHE_ENABLED", "false")
 
     engine, session_factory = await _make_session_factory()
     app = create_app()
