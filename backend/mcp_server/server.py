@@ -33,6 +33,7 @@ _research_service = None
 _qa_service = None
 _storage = None
 _settings = None
+_session_factory = None  # async_sessionmaker[AsyncSession] for project DB queries
 
 # Per-request user context (populated by auth middleware)
 _current_user_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_user_id", default=None)
@@ -45,15 +46,17 @@ def set_services(
     settings: Any = None,
     research_service: Any = None,
     qa_service: Any = None,
+    session_factory: Any = None,
 ) -> None:
     """Inject service references for direct calls (no HTTP round-trip)."""
-    global _wiki_management, _ask_service, _research_service, _qa_service, _storage, _settings
+    global _wiki_management, _ask_service, _research_service, _qa_service, _storage, _settings, _session_factory
     _wiki_management = wiki_management
     _ask_service = ask_service
     _research_service = research_service
     _qa_service = qa_service
     _storage = storage
     _settings = settings
+    _session_factory = session_factory
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +393,131 @@ async def map_codebase(wiki_id: str, question: str) -> dict[str, Any]:
         except Exception as e:
             return {"error": str(e)}
     return await _http_research_codebase(wiki_id, question, "codemap")
+
+
+@mcp.tool()
+async def list_projects(query: str = "") -> dict[str, Any]:
+    """List all projects the current user owns or has access to.
+
+    Returns: list of {project_id, name, description, visibility, wiki_count}
+    Filter by name with optional query string.
+
+    Args:
+        query: Optional case-insensitive prefix filter on project name. Empty = return all.
+    """
+    user_id = _current_user_id.get()
+    if not _session_factory:
+        return {"error": "Project service unavailable — session factory not configured."}
+    try:
+        from app.services.project_service import ProjectService
+
+        async with _session_factory() as session:
+            project_service = ProjectService(session)
+            projects = await project_service.list_projects(user_id=user_id)
+            if query:
+                q = query.lower()
+                projects = [p for p in projects if p.name.lower().startswith(q)]
+            project_ids = [p.id for p in projects]
+            wiki_counts = await project_service.batch_get_wiki_counts(project_ids)
+            result = [
+                {
+                    "project_id": p.id,
+                    "name": p.name,
+                    "description": p.description,
+                    "visibility": p.visibility,
+                    "wiki_count": wiki_counts.get(p.id, 0),
+                }
+                for p in projects
+            ]
+            return {"projects": result, "total": len(result)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def ask_project(project_id: str, question: str) -> dict[str, Any]:
+    """Ask a question across all wikis in a project.
+
+    Returns a cross-repo answer with source attribution per wiki.
+
+    Args:
+        project_id: Project identifier from list_projects().
+        question: Question about the codebase — architecture, implementation details, how-tos.
+    """
+    user_id = _current_user_id.get()
+    if _ask_service:
+        try:
+            from dataclasses import asdict
+
+            from app.models.api import AskRequest
+
+            request = AskRequest(project_id=project_id, question=question)
+            result = await _ask_service.ask_sync(request)
+            if result.recording and _qa_service:
+                try:
+                    await _qa_service.record_interaction(**asdict(result.recording))
+                except Exception:
+                    logger.error("MCP QA recording failed for ask_project", exc_info=True)
+            return result.response.model_dump()
+        except FileNotFoundError:
+            return {"error": f"Project not found: {project_id}. Use list_projects() to find available project IDs."}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"error": "Ask service unavailable in standalone mode. Use ask_codebase() per wiki instead."}
+
+
+@mcp.tool()
+async def research_project(project_id: str, question: str) -> dict[str, Any]:
+    """Run deep multi-step research across all wikis in a project.
+
+    Slower but more thorough than ask_project. Use for complex cross-repo questions
+    requiring multi-file analysis or architectural deep-dives.
+
+    Args:
+        project_id: Project identifier from list_projects().
+        question: The research question — supports complex, multi-part questions.
+    """
+    user_id = _current_user_id.get()
+    if _research_service:
+        try:
+            from app.models.api import ResearchRequest
+
+            request = ResearchRequest(project_id=project_id, question=question)
+            response = await _research_service.research_sync(request)
+            return response.model_dump()
+        except FileNotFoundError:
+            return {"error": f"Project not found: {project_id}. Use list_projects() to find available project IDs."}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"error": "Research service unavailable in standalone mode. Use research_codebase() per wiki instead."}
+
+
+@mcp.tool()
+async def map_project(project_id: str, entry_points: list[str]) -> dict[str, Any]:
+    """Build a cross-repo call graph / source map for the given entry points across all wikis in a project.
+
+    Returns symbol-level call stacks showing which files and functions are involved,
+    spanning multiple repos in the project.
+
+    Args:
+        project_id: Project identifier from list_projects().
+        entry_points: List of entry point descriptions or file paths to trace
+                      (e.g. ["main.py", "authenticate user flow"]).
+    """
+    user_id = _current_user_id.get()
+    if _research_service:
+        try:
+            from app.models.api import ResearchRequest
+
+            question = "; ".join(entry_points) if entry_points else "map all entry points"
+            request = ResearchRequest(project_id=project_id, question=question, research_type="codemap")
+            response = await _research_service.codemap_sync(request)
+            return response.model_dump()
+        except FileNotFoundError:
+            return {"error": f"Project not found: {project_id}. Use list_projects() to find available project IDs."}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"error": "Research service unavailable in standalone mode. Use map_codebase() per wiki instead."}
 
 
 # --- HTTP fallback for standalone mode ---

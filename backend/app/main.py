@@ -70,6 +70,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         storage=storage,
         settings=settings,
         qa_service=qa_service,
+        session_factory=get_session_factory(),
     )
     logger.info("MCP tools wired to services")
 
