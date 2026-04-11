@@ -699,8 +699,22 @@ class ResearchService:
                 tree_context = "\n\n---\n\n".join(context_parts)
                 tree_summary = code_map.summary or ""
 
+                _description = (
+                    (components.repo_analysis or {}).get("description")
+                    if components.repo_analysis
+                    else None
+                )
+                if _description:
+                    _description = _description[:500]
+                _desc_prefix = (
+                    f"## Project/Wiki Context\n\n{_description}\n\n"
+                    if _description
+                    else ""
+                )
+
                 prompt = (
-                    "You are a code analysis assistant. You have the initial answer from "
+                    _desc_prefix
+                    + "You are a code analysis assistant. You have the initial answer from "
                     "a code search agent and a detailed call-tree with per-node explanations.\n\n"
                     "Re-write the answer to accurately explain the call flow, referencing "
                     "specific files, functions, and their relationships. Be precise about "
