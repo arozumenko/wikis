@@ -54,6 +54,7 @@ export interface WikiDetail {
   invocation_id?: string;
   requires_token?: boolean;
   description?: string | null;
+  is_owner?: boolean;
 }
 
 export const getWiki = (wikiId: string) =>

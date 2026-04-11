@@ -751,15 +751,17 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                         No description
                       </Typography>
                     )}
-                    <Tooltip title="Edit description">
-                      <IconButton
-                        size="small"
-                        onClick={handleEditDescription}
-                        sx={{ flexShrink: 0 }}
-                      >
-                        <EditOutlinedIcon fontSize="small" />
-                      </IconButton>
-                    </Tooltip>
+                    {wiki?.is_owner && (
+                      <Tooltip title="Edit description">
+                        <IconButton
+                          size="small"
+                          onClick={handleEditDescription}
+                          sx={{ flexShrink: 0 }}
+                        >
+                          <EditOutlinedIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                    )}
                   </Box>
                 )}
               </Box>
