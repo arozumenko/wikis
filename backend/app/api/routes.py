@@ -53,6 +53,7 @@ from app.models.search import (
     PageListItem,
     PageNeighbor,
     PageNeighborsResponse,
+    ProjectSearchResponse,
     SearchResultItem,
     WikiPageListResponse,
     WikiPageResponse,
@@ -1170,6 +1171,69 @@ async def list_project_wikis(
         raise HTTPException(404, f"Project not found: {project_id}")
     summaries = [WikiManagementService._record_to_summary(w, user.id) for w in wikis]
     return WikiListResponse(wikis=summaries)
+
+
+@router.get("/projects/{project_id}/search", response_model=ProjectSearchResponse)
+async def search_project(
+    project_id: str,
+    request: Request,
+    q: str = Query(...),
+    hop_depth: int = Query(default=1, ge=1, le=5),
+    top_k: int = Query(default=10, ge=1),
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+    index_cache=Depends(get_wiki_index_cache),
+) -> ProjectSearchResponse:
+    """Full-text search over all wiki pages in a project with graph-expansion re-ranking."""
+    from app.core.project_search_engine import ProjectSearchEngine
+    from app.core.unified_db import UnifiedWikiDB
+    from app.core.wiki_search_engine import WikiSearchEngine
+
+    user_id = user.id if user else ""
+    wikis = await svc.list_project_wikis(project_id, user_id=user_id)
+    if wikis is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+
+    settings = request.app.state.settings
+
+    # Pre-load page indexes concurrently so the factory can be synchronous.
+    wiki_tuples = [(w.id, getattr(w, "title", w.id) or w.id) for w in wikis]
+    page_indexes = {}
+    for wiki_id, _ in wiki_tuples:
+        page_indexes[wiki_id] = await index_cache.get(wiki_id)
+
+    def wiki_engine_factory(wiki_id: str, wiki_name: str) -> WikiSearchEngine:
+        page_index = page_indexes[wiki_id]
+        db_path = f"{settings.cache_dir}/{wiki_id}.wiki.db"
+        db = UnifiedWikiDB(db_path, readonly=True)
+        return WikiSearchEngine(wiki_id, wiki_name, db, page_index)
+
+    engine = ProjectSearchEngine(wiki_engine_factory)
+    result = await engine.search(q, wikis=wiki_tuples, hop_depth=hop_depth, top_k=top_k)
+
+    return ProjectSearchResponse(
+        query=result.query,
+        results=[
+            SearchResultItem(
+                wiki_id=item.wiki_id,
+                wiki_name=item.wiki_name,
+                page_title=item.page_title,
+                snippet=item.snippet,
+                score=item.score,
+                neighbors=[PageNeighbor(title=n.title, rel=n.rel) for n in item.neighbors],
+            )
+            for item in result.results
+        ],
+        wiki_summary=[
+            SearchWikiSummaryItem(
+                wiki_id=s.wiki_id,
+                wiki_name=s.wiki_name,
+                match_count=s.match_count,
+                relevance=s.relevance,
+            )
+            for s in result.wiki_summary
+        ],
+    )
 
 
 class _ProjectCodeMapRequest(BaseModel):
