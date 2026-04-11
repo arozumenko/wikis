@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useRef, useState } from 'react';
 import {
   Box,
+  Chip,
   CircularProgress,
   Drawer,
   Fab,
@@ -27,12 +28,18 @@ type ChatMessage = components['schemas']['ChatMessage'];
 type SourceReference = components['schemas']['SourceReference'];
 type CodeMapData = components['schemas']['CodeMapData'];
 
+/** Extended source reference with optional cross-repo attribution fields. */
+interface CrossRepoSource extends SourceReference {
+  wiki_id?: string | null;
+  wiki_title?: string | null;
+}
+
 type ChatMode = 'fast' | 'deep' | 'codemap';
 
 interface Message {
   role: 'user' | 'assistant';
   content: string;
-  sources?: SourceReference[];
+  sources?: CrossRepoSource[];
   thinkingSteps?: string[];
   codeMap?: CodeMapData | null;
   mode?: ChatMode;
@@ -236,16 +243,29 @@ export function ChatDrawer({ wikiId }: ChatDrawerProps) {
                             Sources:
                           </Typography>
                           {msg.sources.map((src, j) => (
-                            <Typography
+                            <Box
                               key={j}
-                              variant="caption"
-                              component="div"
-                              sx={{ fontFamily: 'monospace', color: 'primary.main' }}
+                              sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.25, mt: 0.25 }}
                             >
-                              {src.file_path}
-                              {src.line_start ? `:${src.line_start}` : ''}
-                              {src.line_end ? `-${src.line_end}` : ''}
-                            </Typography>
+                              {src.wiki_id && (
+                                <Chip
+                                  size="small"
+                                  label={src.wiki_title ?? src.wiki_id}
+                                  variant="outlined"
+                                  color="primary"
+                                  sx={{ fontSize: '0.6rem', height: 16 }}
+                                />
+                              )}
+                              <Typography
+                                variant="caption"
+                                component="span"
+                                sx={{ fontFamily: 'monospace', color: 'primary.main' }}
+                              >
+                                {src.file_path}
+                                {src.line_start ? `:${src.line_start}` : ''}
+                                {src.line_end ? `-${src.line_end}` : ''}
+                              </Typography>
+                            </Box>
                           ))}
                         </Box>
                       )}

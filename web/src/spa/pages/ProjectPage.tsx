@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Autocomplete,
@@ -6,23 +6,33 @@ import {
   Button,
   Chip,
   CircularProgress,
+  Divider,
   Grid,
   IconButton,
+  InputAdornment,
   Snackbar,
   TextField,
+  ToggleButton,
+  ToggleButtonGroup,
   Tooltip,
   Typography,
 } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
+import BoltIcon from '@mui/icons-material/Bolt';
 import CheckIcon from '@mui/icons-material/Check';
 import CloseIcon from '@mui/icons-material/Close';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import LockOutlinedIcon from '@mui/icons-material/LockOutlined';
 import PublicOutlinedIcon from '@mui/icons-material/PublicOutlined';
+import QuestionAnswerOutlinedIcon from '@mui/icons-material/QuestionAnswerOutlined';
 import RemoveCircleOutlineIcon from '@mui/icons-material/RemoveCircleOutline';
+import SearchIcon from '@mui/icons-material/Search';
+import SendIcon from '@mui/icons-material/Send';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { AnswerView } from '../components/AnswerView';
+import { ToolCallPanel } from '../components/ToolCallPanel';
 import {
   getProject,
   updateProject,
@@ -30,13 +40,36 @@ import {
   addWikiToProject,
   removeWikiFromProject,
   listProjectWikis,
+  askProject,
+  researchProject,
   type ProjectResponse,
 } from '../api/project';
 import { listWikis } from '../api/wiki';
 import { useAuth } from '../hooks/useAuth';
 import type { components } from '../api/types.generated';
+import type { ToolCallRecord, TodoItem } from '../api/sse';
 
 type WikiSummary = components['schemas']['WikiSummary'];
+type SourceReference = components['schemas']['SourceReference'];
+
+/** Extended source reference that may include cross-repo attribution. */
+interface CrossRepoSource extends SourceReference {
+  wiki_id?: string | null;
+  wiki_title?: string | null;
+}
+
+type QAMode = 'fast' | 'deep';
+
+interface QATurn {
+  question: string;
+  answer: string | null;
+  sources: CrossRepoSource[];
+  toolCalls: ToolCallRecord[];
+  todos: TodoItem[];
+  loading: boolean;
+  error: boolean;
+  mode: QAMode;
+}
 
 function extractOwnerRepo(url: string): string {
   if (url.startsWith('/') || url.startsWith('file://')) {
@@ -83,6 +116,12 @@ export function ProjectPage() {
 
   const [snackMessage, setSnackMessage] = useState<string | null>(null);
   const [snackSeverity, setSnackSeverity] = useState<'success' | 'error'>('error');
+
+  // Q&A panel state
+  const [qaInput, setQaInput] = useState('');
+  const [qaMode, setQaMode] = useState<QAMode>('fast');
+  const [qaTurns, setQaTurns] = useState<QATurn[]>([]);
+  const cancelQaRef = useRef<(() => void) | null>(null);
 
   const showSnack = useCallback((msg: string, severity: 'success' | 'error' = 'error') => {
     setSnackMessage(msg);
@@ -196,6 +235,174 @@ export function ProjectPage() {
     },
     [project, showSnack],
   );
+
+  const updateLastQaTurn = useCallback((updater: (prev: QATurn) => QATurn) => {
+    setQaTurns((prev) => {
+      if (!prev.length) return prev;
+      return [...prev.slice(0, -1), updater(prev[prev.length - 1])];
+    });
+  }, []);
+
+  const handleQaSubmit = useCallback(() => {
+    const question = qaInput.trim();
+    if (!question || !projectId) return;
+
+    cancelQaRef.current?.();
+    cancelQaRef.current = null;
+
+    setQaTurns((prev) => [
+      ...prev,
+      { question, answer: null, sources: [], toolCalls: [], todos: [], loading: true, error: false, mode: qaMode },
+    ]);
+    setQaInput('');
+
+    if (qaMode === 'deep') {
+      const cancel = researchProject(
+        projectId,
+        question,
+        (event) => {
+          if (event.type === 'thinking_step') {
+            const e = event;
+            const stepKind = e.step_type ?? e.stepType;
+            updateLastQaTurn((prev) => {
+              if (stepKind === 'tool_call') {
+                const record: ToolCallRecord = {
+                  tool_name: e.tool,
+                  tool_input: e.input ?? '',
+                  tool_output: null,
+                  timestamp: e.timestamp,
+                  endTimestamp: null,
+                  done: false,
+                };
+                return { ...prev, toolCalls: [...prev.toolCalls, record] };
+              }
+              if (stepKind === 'tool_result') {
+                let updated = false;
+                const toolCalls = [...prev.toolCalls]
+                  .reverse()
+                  .map((tc) => {
+                    if (!updated && !tc.done && tc.tool_name === e.tool) {
+                      updated = true;
+                      return {
+                        ...tc,
+                        tool_output: e.output ?? e.output_preview ?? e.outputPreview ?? '',
+                        endTimestamp: e.timestamp,
+                        done: true,
+                      };
+                    }
+                    return tc;
+                  })
+                  .reverse();
+                return { ...prev, toolCalls };
+              }
+              return prev;
+            });
+          } else if (event.type === 'answer_chunk') {
+            updateLastQaTurn((prev) => ({ ...prev, answer: (prev.answer ?? '') + event.chunk }));
+          } else if (event.type === 'research_complete') {
+            updateLastQaTurn((prev) => ({ ...prev, answer: event.report ?? '', loading: false, error: false }));
+          } else if (event.type === 'research_error') {
+            updateLastQaTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
+          } else if (event.type === 'task_failed') {
+            updateLastQaTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
+          } else if (event.type === 'todo_update') {
+            const todos = (event.todos as TodoItem[]) ?? [];
+            updateLastQaTurn((prev) => ({ ...prev, todos }));
+          }
+        },
+        () => {
+          updateLastQaTurn((prev) => (prev.loading ? { ...prev, loading: false } : prev));
+        },
+        () => {
+          updateLastQaTurn((prev) => ({
+            ...prev,
+            answer: 'Sorry, something went wrong. Please try again.',
+            loading: false,
+            error: true,
+          }));
+        },
+      );
+      cancelQaRef.current = cancel;
+    } else {
+      const cancel = askProject(
+        projectId,
+        question,
+        (event) => {
+          if (event.type === 'thinking_step') {
+            const e = event;
+            const stepKind = e.step_type ?? e.stepType;
+            updateLastQaTurn((prev) => {
+              if (stepKind === 'tool_call') {
+                const record: ToolCallRecord = {
+                  tool_name: e.tool,
+                  tool_input: e.input ?? '',
+                  tool_output: null,
+                  timestamp: e.timestamp,
+                  endTimestamp: null,
+                  done: false,
+                };
+                return { ...prev, toolCalls: [...prev.toolCalls, record] };
+              }
+              if (stepKind === 'tool_result') {
+                let updated = false;
+                const toolCalls = [...prev.toolCalls]
+                  .reverse()
+                  .map((tc) => {
+                    if (!updated && !tc.done && tc.tool_name === e.tool) {
+                      updated = true;
+                      return {
+                        ...tc,
+                        tool_output: e.output ?? e.output_preview ?? e.outputPreview ?? '',
+                        endTimestamp: e.timestamp,
+                        done: true,
+                      };
+                    }
+                    return tc;
+                  })
+                  .reverse();
+                return { ...prev, toolCalls };
+              }
+              return prev;
+            });
+          } else if (event.type === 'answer_chunk') {
+            updateLastQaTurn((prev) => ({ ...prev, answer: (prev.answer ?? '') + event.chunk }));
+          } else if (event.type === 'ask_complete') {
+            updateLastQaTurn((prev) => ({
+              ...prev,
+              answer: event.answer ?? '',
+              sources: (event.sources ?? []) as CrossRepoSource[],
+              loading: false,
+              error: false,
+            }));
+          } else if (event.type === 'task_complete' && event.answer) {
+            updateLastQaTurn((prev) => ({
+              ...prev,
+              answer: event.answer ?? '',
+              sources: (event.sources ?? []) as CrossRepoSource[],
+              loading: false,
+              error: false,
+            }));
+          } else if (event.type === 'ask_error') {
+            updateLastQaTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
+          } else if (event.type === 'task_failed') {
+            updateLastQaTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
+          }
+        },
+        () => {
+          updateLastQaTurn((prev) => (prev.loading ? { ...prev, loading: false } : prev));
+        },
+        () => {
+          updateLastQaTurn((prev) => ({
+            ...prev,
+            answer: 'Sorry, something went wrong. Please try again.',
+            loading: false,
+            error: true,
+          }));
+        },
+      );
+      cancelQaRef.current = cancel;
+    }
+  }, [qaInput, qaMode, projectId, updateLastQaTurn]);
 
   if (loading) {
     return (
@@ -426,6 +633,146 @@ export function ProjectPage() {
             >
               Add
             </Button>
+          </Box>
+        </Box>
+      )}
+
+      {/* Ask This Project panel */}
+      {wikis.length > 0 && (
+        <Box sx={{ mt: 5 }}>
+          <Divider sx={{ mb: 3 }} />
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2 }}>
+            <QuestionAnswerOutlinedIcon color="action" fontSize="small" />
+            <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+              Ask This Project
+            </Typography>
+          </Box>
+
+          {/* Q&A conversation thread */}
+          {qaTurns.length > 0 && (
+            <Box sx={{ mb: 3 }}>
+              {qaTurns.map((turn, i) => (
+                <Box key={i} sx={{ mb: 3 }}>
+                  {i > 0 && <Divider sx={{ mb: 3 }} />}
+                  <Box sx={{ display: 'flex', gap: 2 }}>
+                    {/* Answer + sources */}
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      <AnswerView
+                        question={turn.question}
+                        answer={turn.answer}
+                        loading={turn.loading}
+                        mode="light"
+                      />
+                      {/* Attribution chips + sources for completed turns */}
+                      {!turn.loading && turn.sources.length > 0 && (
+                        <Box sx={{ px: { xs: 3, md: 5 }, pb: 2 }}>
+                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
+                            Sources:
+                          </Typography>
+                          {turn.sources.map((src, j) => (
+                            <Box
+                              key={j}
+                              sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.25, flexWrap: 'wrap' }}
+                            >
+                              {src.wiki_id && (
+                                <Chip
+                                  size="small"
+                                  label={src.wiki_title ?? src.wiki_id}
+                                  variant="outlined"
+                                  color="primary"
+                                  sx={{ fontSize: '0.65rem', height: 18 }}
+                                />
+                              )}
+                              <Typography
+                                variant="caption"
+                                sx={{ fontFamily: 'monospace', color: 'text.secondary' }}
+                              >
+                                {src.file_path}
+                                {src.line_start ? `:${src.line_start}` : ''}
+                                {src.line_end ? `-${src.line_end}` : ''}
+                              </Typography>
+                            </Box>
+                          ))}
+                        </Box>
+                      )}
+                    </Box>
+                    {/* Tool calls panel for the latest turn */}
+                    {i === qaTurns.length - 1 && turn.toolCalls.length > 0 && (
+                      <Box sx={{ width: 280, flexShrink: 0, display: { xs: 'none', md: 'block' } }}>
+                        <ToolCallPanel toolCalls={turn.toolCalls} todos={turn.todos} />
+                      </Box>
+                    )}
+                  </Box>
+                </Box>
+              ))}
+              <Button
+                size="small"
+                variant="text"
+                onClick={() => {
+                  cancelQaRef.current?.();
+                  cancelQaRef.current = null;
+                  setQaTurns([]);
+                }}
+                sx={{ mb: 2, color: 'text.secondary' }}
+              >
+                Clear conversation
+              </Button>
+            </Box>
+          )}
+
+          {/* Input row */}
+          <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+            <ToggleButtonGroup
+              value={qaMode}
+              exclusive
+              onChange={(_, v) => { if (v) setQaMode(v); }}
+              disabled={qaTurns[qaTurns.length - 1]?.loading}
+              size="small"
+              sx={{ flexShrink: 0 }}
+            >
+              <ToggleButton value="fast" sx={{ py: 0.5, px: 1.5, fontSize: 11, gap: 0.5 }}>
+                <BoltIcon sx={{ fontSize: 14 }} /> Fast
+              </ToggleButton>
+              <ToggleButton value="deep" sx={{ py: 0.5, px: 1.5, fontSize: 11, gap: 0.5 }}>
+                <SearchIcon sx={{ fontSize: 14 }} /> Deep
+              </ToggleButton>
+            </ToggleButtonGroup>
+            <TextField
+              value={qaInput}
+              onChange={(e) => setQaInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  handleQaSubmit();
+                }
+              }}
+              placeholder={
+                qaTurns.length > 0
+                  ? 'Ask a follow-up question…'
+                  : qaMode === 'deep'
+                  ? 'Ask a deep question across all project wikis…'
+                  : 'Ask a question across all project wikis…'
+              }
+              size="small"
+              fullWidth
+              multiline
+              maxRows={4}
+              disabled={qaTurns[qaTurns.length - 1]?.loading}
+              InputProps={{
+                endAdornment: (
+                  <InputAdornment position="end">
+                    <IconButton
+                      onClick={handleQaSubmit}
+                      disabled={!qaInput.trim() || qaTurns[qaTurns.length - 1]?.loading}
+                      size="small"
+                      color="primary"
+                    >
+                      <SendIcon fontSize="small" />
+                    </IconButton>
+                  </InputAdornment>
+                ),
+              }}
+            />
           </Box>
         </Box>
       )}
