@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from app.models.api import UpdateWikiDescriptionRequest, WikiSummary
 from app.models.db_models import WikiRecord
 
