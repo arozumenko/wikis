@@ -31,6 +31,17 @@ from .events import (
     WikiCompleteEvent,
 )
 from .invocation import Invocation
+from .search import (
+    PageListItem,
+    PageNeighbor,
+    PageNeighborsResponse,
+    ProjectSearchResponse,
+    SearchResultItem,
+    WikiPageListResponse,
+    WikiPageResponse,
+    WikiSearchResponse,
+    WikiSummaryItem,
+)
 
 __all__ = [
     # API models
@@ -55,6 +66,16 @@ __all__ = [
     "ProjectCodeMapRequest",
     # Invocation
     "Invocation",
+    # Search models
+    "PageNeighbor",
+    "SearchResultItem",
+    "WikiSummaryItem",
+    "WikiSearchResponse",
+    "ProjectSearchResponse",
+    "PageListItem",
+    "WikiPageListResponse",
+    "WikiPageResponse",
+    "PageNeighborsResponse",
     # SSE events
     "SSEEvent",
     "ProgressEvent",
