@@ -44,13 +44,14 @@ from app.models.api import (
     ProjectListResponse,
     ProjectResponse,
     ProjectUpdateRequest,
+    UpdateWikiDescriptionRequest,
 )
-from app.services.project_service import ProjectService
 from app.models.invocation import Invocation
 from app.models.qa_api import QAListResponse, QARecordResponse, QAStatsResponse, QAStatus
 from app.services.ask_service import AskService
 from app.services.export_service import ExportService, WikiNotFoundError
 from app.services.import_service import BundleValidationError, BundleVersionError, ImportService
+from app.services.project_service import ProjectService
 from app.services.qa_service import QAService
 from app.services.research_service import ResearchService
 from app.services.wiki_management import WikiManagementService
@@ -82,7 +83,7 @@ async def generate_wiki(
     try:
         invocation = await service.generate(request, owner_id=user.id if user else "")
     except WikiAlreadyExistsError as e:
-        raise HTTPException(
+        raise HTTPException(  # noqa: B904
             status_code=409,
             detail={"error": str(e), "wiki_id": e.wiki_id},
         )
@@ -193,10 +194,12 @@ async def research(
     try:
         if request.research_type == "codemap":
             if "text/event-stream" in accept:
+
                 async def codemap_sse():
                     async for event in service.codemap_stream(request, user_id=user_id):
                         event_type = event.get("event_type", "message")
                         yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
+
                 return StreamingResponse(codemap_sse(), media_type="text/event-stream")
             return await service.codemap_sync(request, user_id=user_id)
         if "text/event-stream" in accept:
@@ -289,7 +292,7 @@ async def list_wikis(
                         )
                     )
                     continue
-                except Exception:
+                except Exception:  # noqa: S110
                     pass  # fall through to append as invocation-only
             result.wikis.append(
                 WikiSummary(
@@ -377,6 +380,7 @@ async def get_wiki(
             "invocation_id": None,
             "error": wiki_meta.error,
             "requires_token": wiki_meta.requires_token,
+            "description": wiki_meta.description,
         }
 
     if not wiki_meta:
@@ -395,7 +399,7 @@ async def get_wiki(
                     )
                     wiki_record = await management.get_wiki(wiki_id, user_id=user_id)
                     wiki_meta = WikiManagementService._record_to_summary(wiki_record, user_id) if wiki_record else None
-                except Exception:
+                except Exception:  # noqa: S110
                     pass
             # Still generating or failed — return minimal info so the UI
             # can show repo details and offer a retry button (backward compat for pre-migration wikis).
@@ -413,6 +417,7 @@ async def get_wiki(
                     "invocation_id": active_invocation.id,
                     "error": active_invocation.error,
                     "requires_token": False,
+                    "description": None,
                 }
         if not wiki_meta:
             raise HTTPException(404, f"Wiki not found: {wiki_id}")
@@ -487,6 +492,7 @@ async def get_wiki(
         "status": wiki_meta.status or "complete",
         "requires_token": wiki_meta.requires_token,
         "error": wiki_meta.error,
+        "description": wiki_meta.description,
     }
     if active_invocation:
         response["invocation_id"] = active_invocation.id
@@ -698,6 +704,25 @@ async def update_wiki_visibility(
             raise HTTPException(404, f"Wiki not found: {wiki_id}")
         raise HTTPException(403, "Only the wiki owner can change visibility")
     return updated
+
+
+@router.patch("/wikis/{wiki_id}/description")
+async def update_wiki_description(
+    wiki_id: str,
+    body: UpdateWikiDescriptionRequest,
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+) -> dict:
+    """Update the user-provided description for a wiki."""
+    user_id = user.id if user else ""
+    record = await management.update_description(wiki_id, user_id=user_id, description=body.description)
+    if record is None:
+        # Either wiki not found or caller is not the owner
+        wiki_record = await management.get_wiki(wiki_id, user_id=user_id or None)
+        if wiki_record is None:
+            raise HTTPException(404, f"Wiki not found: {wiki_id}")
+        raise HTTPException(403, "Only the wiki owner can update the description")
+    return {"wiki_id": record.id, "description": record.description}
 
 
 # ---------------------------------------------------------------------------
@@ -961,10 +986,7 @@ async def list_project_wikis(
     wikis = await svc.list_project_wikis(project_id, user_id=user.id)
     if wikis is None:
         raise HTTPException(404, f"Project not found: {project_id}")
-    summaries = [
-        WikiManagementService._record_to_summary(w, user.id)
-        for w in wikis
-    ]
+    summaries = [WikiManagementService._record_to_summary(w, user.id) for w in wikis]
     return WikiListResponse(wikis=summaries)
 
 
@@ -1003,10 +1025,12 @@ async def project_codemap(
 
     try:
         if "text/event-stream" in accept:
+
             async def codemap_sse():
                 async for event in service.codemap_stream(request, user_id=user_id):
                     event_type = event.get("event_type", "message")
                     yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
+
             return StreamingResponse(codemap_sse(), media_type="text/event-stream")
         return await service.codemap_sync(request, user_id=user_id)
     except FileNotFoundError as e:

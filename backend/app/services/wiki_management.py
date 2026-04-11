@@ -98,6 +98,32 @@ class WikiManagementService:
 
         logger.info("Registered wiki: %s (owner=%s, status=%s)", wiki_id, owner_id, status)
 
+    async def update_description(
+        self,
+        wiki_id: str,
+        user_id: str,
+        description: str | None,
+    ) -> WikiRecord | None:
+        """Update the user-provided description for a wiki. Only the owner may do this.
+
+        Returns the updated WikiRecord, or None if not found / caller is not the owner.
+        """
+        async with self.session_factory() as session:
+            async with session.begin():
+                result = await session.execute(select(WikiRecord).where(WikiRecord.id == wiki_id))
+                record = result.scalar_one_or_none()
+                if record is None:
+                    return None
+                if record.owner_id and record.owner_id != user_id:
+                    return None
+                record.description = description
+                record.updated_at = datetime.now()
+                # Refresh so returned object has the new values detached from session
+                await session.flush()
+                await session.refresh(record)
+
+        return record
+
     async def update_visibility(
         self,
         wiki_id: str,
@@ -218,9 +244,7 @@ class WikiManagementService:
         if cache_dir and record.repo_url:
             import asyncio
 
-            await asyncio.to_thread(
-                _cleanup_cache_files, cache_dir, record.repo_url, record.branch or "main"
-            )
+            await asyncio.to_thread(_cleanup_cache_files, cache_dir, record.repo_url, record.branch or "main")
 
         # Remove the metadata record
         async with self.session_factory() as session:

@@ -21,13 +21,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
 from app.main import create_app
 from app.models.db_models import Base, WikiRecord
 from app.models.invocation import Invocation
-
+from app.services.wiki_management import WikiManagementService
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 # ---------------------------------------------------------------------------
 # Helper: seed a wiki record
@@ -128,42 +127,32 @@ class TestInvocationEndpoints:
         inv.status = "complete"
         inv.model_dump = MagicMock(return_value={"id": "inv-001", "wiki_id": "wiki-001", "status": "complete"})
 
-        with patch.object(
-            test_app.state.wiki_service, "get_invocation", new_callable=AsyncMock, return_value=inv
-        ):
+        with patch.object(test_app.state.wiki_service, "get_invocation", new_callable=AsyncMock, return_value=inv):
             resp = await client.get("/api/v1/invocations/inv-001")
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
     async def test_get_invocation_not_found(self, client, test_app):
-        with patch.object(
-            test_app.state.wiki_service, "get_invocation", new_callable=AsyncMock, return_value=None
-        ):
+        with patch.object(test_app.state.wiki_service, "get_invocation", new_callable=AsyncMock, return_value=None):
             resp = await client.get("/api/v1/invocations/nonexistent")
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
     async def test_cancel_invocation_success(self, client, test_app):
-        with patch.object(
-            test_app.state.wiki_service, "cancel_invocation", new_callable=AsyncMock, return_value=True
-        ):
+        with patch.object(test_app.state.wiki_service, "cancel_invocation", new_callable=AsyncMock, return_value=True):
             resp = await client.delete("/api/v1/invocations/inv-to-cancel")
         assert resp.status_code == 200
         assert resp.json()["cancelled"] is True
 
     @pytest.mark.asyncio
     async def test_cancel_invocation_not_found(self, client, test_app):
-        with patch.object(
-            test_app.state.wiki_service, "cancel_invocation", new_callable=AsyncMock, return_value=False
-        ):
+        with patch.object(test_app.state.wiki_service, "cancel_invocation", new_callable=AsyncMock, return_value=False):
             resp = await client.delete("/api/v1/invocations/nonexistent")
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
     async def test_stream_invocation_not_found(self, client, test_app):
-        with patch.object(
-            test_app.state.wiki_service, "get_invocation", new_callable=AsyncMock, return_value=None
-        ):
+        with patch.object(test_app.state.wiki_service, "get_invocation", new_callable=AsyncMock, return_value=None):
             resp = await client.get("/api/v1/invocations/ghost/stream")
         assert resp.status_code == 404
 
@@ -179,9 +168,7 @@ class TestInvocationEndpoints:
 
         inv.events = _events
 
-        with patch.object(
-            test_app.state.wiki_service, "get_invocation", new_callable=AsyncMock, return_value=inv
-        ):
+        with patch.object(test_app.state.wiki_service, "get_invocation", new_callable=AsyncMock, return_value=inv):
             resp = await client.get("/api/v1/invocations/inv-stream/stream")
         # SSE returns 200
         assert resp.status_code == 200
@@ -266,9 +253,7 @@ class TestAskEndpoint:
         mock_response = AskResponse(answer="JWT auth.", sources=[])
         mock_result = AskResult(response=mock_response, recording=None)
 
-        with patch.object(
-            test_app.state.ask_service, "ask_sync", new_callable=AsyncMock, return_value=mock_result
-        ):
+        with patch.object(test_app.state.ask_service, "ask_sync", new_callable=AsyncMock, return_value=mock_result):
             resp = await client.post("/api/v1/ask", json={"wiki_id": "w1", "question": "How does auth work?"})
         assert resp.status_code == 200
         assert resp.json()["answer"] == "JWT auth."
@@ -343,12 +328,8 @@ class TestAskEndpoint:
         mock_result = AskResult(response=mock_response, recording=payload)
 
         with (
-            patch.object(
-                test_app.state.ask_service, "ask_sync", new_callable=AsyncMock, return_value=mock_result
-            ),
-            patch.object(
-                test_app.state.qa_service, "record_interaction", new_callable=AsyncMock, return_value=None
-            ),
+            patch.object(test_app.state.ask_service, "ask_sync", new_callable=AsyncMock, return_value=mock_result),
+            patch.object(test_app.state.qa_service, "record_interaction", new_callable=AsyncMock, return_value=None),
         ):
             resp = await client.post("/api/v1/ask", json={"wiki_id": "w1", "question": "Q?"})
         assert resp.status_code == 200
@@ -460,16 +441,19 @@ class TestWikiVisibility:
 
     @pytest.mark.asyncio
     async def test_visibility_wiki_not_found(self, client, test_app):
-        with patch.object(
-            test_app.state.wiki_management,
-            "update_visibility",
-            new_callable=AsyncMock,
-            return_value=None,
-        ), patch.object(
-            test_app.state.wiki_management,
-            "get_wiki",
-            new_callable=AsyncMock,
-            return_value=None,
+        with (
+            patch.object(
+                test_app.state.wiki_management,
+                "update_visibility",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                test_app.state.wiki_management,
+                "get_wiki",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
         ):
             resp = await client.patch(
                 "/api/v1/wikis/missing/visibility",
@@ -482,16 +466,19 @@ class TestWikiVisibility:
         """update_visibility returns None when caller is not the owner → 403."""
         fake_record = MagicMock()
         fake_record.id = "some-wiki"
-        with patch.object(
-            test_app.state.wiki_management,
-            "update_visibility",
-            new_callable=AsyncMock,
-            return_value=None,
-        ), patch.object(
-            test_app.state.wiki_management,
-            "get_wiki",
-            new_callable=AsyncMock,
-            return_value=fake_record,
+        with (
+            patch.object(
+                test_app.state.wiki_management,
+                "update_visibility",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                test_app.state.wiki_management,
+                "get_wiki",
+                new_callable=AsyncMock,
+                return_value=fake_record,
+            ),
         ):
             resp = await client.patch(
                 "/api/v1/wikis/some-wiki/visibility",
@@ -521,9 +508,7 @@ class TestQAEndpoints:
     async def test_list_qa_success(self, client, test_app):
         fake_record = MagicMock()
         with (
-            patch.object(
-                test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record
-            ),
+            patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record),
             patch.object(
                 test_app.state.qa_service,
                 "list_qa",
@@ -557,12 +542,8 @@ class TestQAEndpoints:
             "hit_rate": 0.4,
         }
         with (
-            patch.object(
-                test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record
-            ),
-            patch.object(
-                test_app.state.qa_service, "get_stats", new_callable=AsyncMock, return_value=stats
-            ),
+            patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record),
+            patch.object(test_app.state.qa_service, "get_stats", new_callable=AsyncMock, return_value=stats),
         ):
             resp = await client.get("/api/v1/wikis/w1/qa/stats")
         assert resp.status_code == 200
@@ -580,9 +561,7 @@ class TestDeleteWiki:
         from app.models.api import DeleteWikiResponse as DeleteWikiResult
 
         result = DeleteWikiResult(deleted=True, wiki_id="del-wiki")
-        with patch.object(
-            test_app.state.wiki_management, "delete_wiki", new_callable=AsyncMock, return_value=result
-        ):
+        with patch.object(test_app.state.wiki_management, "delete_wiki", new_callable=AsyncMock, return_value=result):
             resp = await client.delete("/api/v1/wikis/del-wiki")
         assert resp.status_code == 200
         assert resp.json()["deleted"] is True
@@ -592,9 +571,7 @@ class TestDeleteWiki:
         from app.models.api import DeleteWikiResponse as DeleteWikiResult
 
         result = DeleteWikiResult(deleted=False, wiki_id="other-wiki", message="not the owner")
-        with patch.object(
-            test_app.state.wiki_management, "delete_wiki", new_callable=AsyncMock, return_value=result
-        ):
+        with patch.object(test_app.state.wiki_management, "delete_wiki", new_callable=AsyncMock, return_value=result):
             resp = await client.delete("/api/v1/wikis/other-wiki")
         assert resp.status_code == 403
 
@@ -608,12 +585,8 @@ class TestResumeWiki:
     @pytest.mark.asyncio
     async def test_resume_not_found(self, client, test_app):
         with (
-            patch.object(
-                test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None
-            ),
-            patch.object(
-                test_app.state.wiki_service, "resume", new_callable=AsyncMock, return_value=None
-            ),
+            patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None),
+            patch.object(test_app.state.wiki_service, "resume", new_callable=AsyncMock, return_value=None),
         ):
             resp = await client.post("/api/v1/wikis/missing/resume")
         assert resp.status_code == 404
@@ -623,9 +596,7 @@ class TestResumeWiki:
         fake_record = MagicMock()
         fake_record.owner_id = "other-user"
 
-        with patch.object(
-            test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record
-        ):
+        with patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record):
             resp = await client.post("/api/v1/wikis/owned-by-other/resume")
         assert resp.status_code == 403
 
@@ -642,9 +613,7 @@ class TestGenerateWiki:
 
         err = WikiAlreadyExistsError("existing-wiki")
 
-        with patch.object(
-            test_app.state.wiki_service, "generate", new_callable=AsyncMock, side_effect=err
-        ):
+        with patch.object(test_app.state.wiki_service, "generate", new_callable=AsyncMock, side_effect=err):
             resp = await client.post(
                 "/api/v1/generate",
                 json={"repo_url": "https://github.com/test/repo", "branch": "main"},
@@ -660,9 +629,7 @@ class TestGenerateWiki:
 class TestGetWikiPage:
     @pytest.mark.asyncio
     async def test_get_wiki_page_not_found_wiki(self, client, test_app):
-        with patch.object(
-            test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None
-        ):
+        with patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None):
             resp = await client.get("/api/v1/wikis/missing/pages/intro")
         assert resp.status_code == 404
 
@@ -670,9 +637,7 @@ class TestGetWikiPage:
     async def test_get_wiki_page_not_found_page(self, client, test_app):
         fake_record = MagicMock()
         with (
-            patch.object(
-                test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record
-            ),
+            patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record),
             patch.object(
                 test_app.state.wiki_management.storage,
                 "list_artifacts",
@@ -687,9 +652,7 @@ class TestGetWikiPage:
     async def test_get_wiki_page_success(self, client, test_app):
         fake_record = MagicMock()
         with (
-            patch.object(
-                test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record
-            ),
+            patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record),
             patch.object(
                 test_app.state.wiki_management.storage,
                 "list_artifacts",
@@ -722,12 +685,8 @@ class TestResumeWikiSuccess:
         fake_inv.status = "generating"
 
         with (
-            patch.object(
-                test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None
-            ),
-            patch.object(
-                test_app.state.wiki_service, "resume", new_callable=AsyncMock, return_value=fake_inv
-            ),
+            patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None),
+            patch.object(test_app.state.wiki_service, "resume", new_callable=AsyncMock, return_value=fake_inv),
         ):
             resp = await client.post("/api/v1/wikis/wiki-resume/resume")
         assert resp.status_code == 202
@@ -775,12 +734,8 @@ class TestRefreshWiki:
     @pytest.mark.asyncio
     async def test_refresh_wiki_not_found(self, client, test_app):
         with (
-            patch.object(
-                test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None
-            ),
-            patch.object(
-                test_app.state.wiki_service, "refresh", new_callable=AsyncMock, return_value=None
-            ),
+            patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None),
+            patch.object(test_app.state.wiki_service, "refresh", new_callable=AsyncMock, return_value=None),
         ):
             resp = await client.post("/api/v1/wikis/missing/refresh")
         assert resp.status_code == 404
@@ -790,9 +745,7 @@ class TestRefreshWiki:
         fake_record = MagicMock()
         fake_record.owner_id = "other-user"
 
-        with patch.object(
-            test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record
-        ):
+        with patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record):
             resp = await client.post("/api/v1/wikis/owned-by-other/refresh")
         assert resp.status_code == 403
 
@@ -804,12 +757,8 @@ class TestRefreshWiki:
         fake_inv.status = "generating"
 
         with (
-            patch.object(
-                test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None
-            ),
-            patch.object(
-                test_app.state.wiki_service, "refresh", new_callable=AsyncMock, return_value=fake_inv
-            ),
+            patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None),
+            patch.object(test_app.state.wiki_service, "refresh", new_callable=AsyncMock, return_value=fake_inv),
         ):
             resp = await client.post("/api/v1/wikis/w1/refresh")
         assert resp.status_code == 202
@@ -828,9 +777,7 @@ class TestExportEndpointExtended:
 
     @pytest.mark.asyncio
     async def test_export_wiki_not_found(self, client, test_app):
-        with patch.object(
-            test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None
-        ):
+        with patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=None):
             resp = await client.get("/api/v1/wikis/ghost/export?format=obsidian")
         assert resp.status_code == 404
 
@@ -851,7 +798,6 @@ class TestExportEndpointExtended:
 class TestImportEndpointExtended:
     @pytest.mark.asyncio
     async def test_import_not_implemented(self, client, test_app):
-        from app.services.import_service import BundleValidationError
 
         with patch.object(
             test_app.state.import_service,
@@ -907,6 +853,7 @@ def _fake_project(name: str = "My Project", owner_id: str = "dev-user") -> Magic
 def _override_project_svc(app, fake_svc):
     """Override the project service FastAPI DI dependency."""
     from app.dependencies import get_project_service
+
     app.dependency_overrides[get_project_service] = lambda: fake_svc
     return fake_svc
 
@@ -1047,6 +994,7 @@ class TestProjectsCRUD:
 class TestProjectWikiMembership:
     def _override(self, test_app, fake_svc):
         from app.dependencies import get_project_service
+
         test_app.dependency_overrides[get_project_service] = lambda: fake_svc
         return get_project_service
 
@@ -1155,6 +1103,7 @@ class TestProjectWikiMembership:
 class TestProjectCodemap:
     def _override(self, test_app, fake_svc):
         from app.dependencies import get_project_service
+
         test_app.dependency_overrides[get_project_service] = lambda: fake_svc
         return get_project_service
 
@@ -1187,3 +1136,158 @@ class TestProjectCodemap:
             test_app.dependency_overrides.pop(key, None)
         assert resp.status_code == 200
         assert resp.json()["answer"] == "Map answer."
+
+
+# ---------------------------------------------------------------------------
+# PATCH /wikis/{wiki_id}/description
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateWikiDescription:
+    @pytest.mark.asyncio
+    async def test_description_update_success(self, client, test_app):
+        """Happy path: owner updates description and gets back the new value."""
+        from app.models.db_models import WikiRecord
+
+        fake_record = MagicMock(spec=WikiRecord)
+        fake_record.id = "w1"
+        fake_record.description = "A concise description"
+
+        with patch.object(
+            test_app.state.wiki_management,
+            "update_description",
+            new_callable=AsyncMock,
+            return_value=fake_record,
+        ):
+            resp = await client.patch(
+                "/api/v1/wikis/w1/description",
+                json={"description": "A concise description"},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["wiki_id"] == "w1"
+        assert data["description"] == "A concise description"
+
+    @pytest.mark.asyncio
+    async def test_description_update_not_found(self, client, test_app):
+        """Returns 404 when wiki does not exist."""
+        with (
+            patch.object(
+                test_app.state.wiki_management,
+                "update_description",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                test_app.state.wiki_management,
+                "get_wiki",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            resp = await client.patch(
+                "/api/v1/wikis/missing/description",
+                json={"description": "Anything"},
+            )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_description_update_forbidden(self, client, test_app):
+        """Returns 403 when caller is not the owner."""
+        fake_record = MagicMock()
+        fake_record.owner_id = "other-user"
+
+        with (
+            patch.object(
+                test_app.state.wiki_management,
+                "update_description",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                test_app.state.wiki_management,
+                "get_wiki",
+                new_callable=AsyncMock,
+                return_value=fake_record,
+            ),
+        ):
+            resp = await client.patch(
+                "/api/v1/wikis/w1/description",
+                json={"description": "Hacked"},
+            )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_description_update_clear_with_none(self, client, test_app):
+        """Passing null description clears the field."""
+        from app.models.db_models import WikiRecord
+
+        fake_record = MagicMock(spec=WikiRecord)
+        fake_record.id = "w1"
+        fake_record.description = None
+
+        with patch.object(
+            test_app.state.wiki_management,
+            "update_description",
+            new_callable=AsyncMock,
+            return_value=fake_record,
+        ):
+            resp = await client.patch(
+                "/api/v1/wikis/w1/description",
+                json={"description": None},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["description"] is None
+
+
+# ---------------------------------------------------------------------------
+# GET /wikis/{wiki_id} includes description field
+# ---------------------------------------------------------------------------
+
+
+class TestGetWikiIncludesDescription:
+    @pytest.mark.asyncio
+    async def test_get_wiki_response_includes_description(self, client, test_app):
+        """The main GET endpoint must include description in its response."""
+        from datetime import datetime
+
+        from app.models.api import WikiSummary
+
+        fake_summary = MagicMock(spec=WikiSummary)
+        fake_summary.wiki_id = "w1"
+        fake_summary.repo_url = "https://github.com/test/repo"
+        fake_summary.branch = "main"
+        fake_summary.title = "Test Wiki"
+        fake_summary.page_count = 0
+        fake_summary.created_at = datetime(2026, 1, 1)
+        fake_summary.indexed_at = None
+        fake_summary.commit_hash = None
+        fake_summary.status = "complete"
+        fake_summary.requires_token = False
+        fake_summary.error = None
+        fake_summary.description = "My wiki description"
+
+        with (
+            patch.object(
+                test_app.state.wiki_management,
+                "get_wiki",
+                new_callable=AsyncMock,
+                return_value=MagicMock(id="w1"),
+            ),
+            patch.object(
+                WikiManagementService,
+                "_record_to_summary",
+                return_value=fake_summary,
+            ),
+            patch.object(
+                test_app.state.wiki_management.storage,
+                "list_artifacts",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            resp = await client.get("/api/v1/wikis/w1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "description" in data
+        assert data["description"] == "My wiki description"
