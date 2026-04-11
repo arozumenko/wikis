@@ -78,7 +78,7 @@ async def test_ask_sync_cache_miss(ask_service, mock_qa_service):
     mock_qa_service.lookup_cache.return_value = (None, np.ones(8))
     mock_qa_service.get_wiki_commit_hash = AsyncMock(return_value="abc123")
 
-    async def fake_stream(request):
+    async def fake_stream(request, **kwargs):
         yield {
             "event_type": "task_complete",
             "data": {"answer": "Agent answer", "sources": [], "steps": 3},
@@ -99,7 +99,7 @@ async def test_ask_sync_cache_miss(ask_service, mock_qa_service):
 async def test_ask_sync_no_qa_service(ask_service_no_qa):
     """Without QA service, returns AskResult with recording=None."""
 
-    async def fake_stream(request):
+    async def fake_stream(request, **kwargs):
         yield {
             "event_type": "task_complete",
             "data": {"answer": "answer", "sources": [], "steps": 0},
@@ -118,17 +118,18 @@ async def test_ask_sync_context_bypass(ask_service, mock_qa_service):
     """Non-empty chat_history passes history to lookup_cache."""
     mock_qa_service.lookup_cache.return_value = (None, None)
 
-    async def fake_stream(request):
-        yield {
-            "event_type": "task_complete",
-            "data": {"answer": "ans", "sources": [], "steps": 0},
-        }
-
     request = AskRequest(
         wiki_id="wiki-1",
         question="follow up",
         chat_history=[ChatMessage(role="user", content="hi")],
     )
+
+    async def fake_stream(request, **kwargs):
+        yield {
+            "event_type": "task_complete",
+            "data": {"answer": "ans", "sources": [], "steps": 0},
+        }
+
     with patch.object(ask_service, "_stream_from_agent", side_effect=fake_stream):
         result = await ask_service.ask_sync(request)
 
@@ -172,7 +173,7 @@ async def test_ask_sync_cache_miss_sources(ask_service, mock_qa_service):
     """Cache miss correctly parses sources from agent events."""
     mock_qa_service.lookup_cache.return_value = (None, None)
 
-    async def fake_stream(request):
+    async def fake_stream(request, **kwargs):
         yield {
             "event_type": "task_complete",
             "data": {
@@ -198,7 +199,7 @@ async def test_ask_sync_agent_error(ask_service, mock_qa_service):
     """Agent error raises RuntimeError."""
     mock_qa_service.lookup_cache.return_value = (None, None)
 
-    async def fake_stream(request):
+    async def fake_stream(request, **kwargs):
         yield {
             "event_type": "task_failed",
             "data": {"error": "Something broke"},
@@ -214,7 +215,7 @@ async def test_ask_sync_qa_id_present(ask_service, mock_qa_service):
     """AskResult response always contains a qa_id."""
     mock_qa_service.lookup_cache.return_value = (None, None)
 
-    async def fake_stream(request):
+    async def fake_stream(request, **kwargs):
         yield {
             "event_type": "task_complete",
             "data": {"answer": "ok", "sources": [], "steps": 0},
@@ -259,7 +260,7 @@ async def test_ask_stream_cache_miss_delegates(ask_service, mock_qa_service):
     mock_qa_service.lookup_cache.return_value = (None, None)
     mock_qa_service.get_wiki_commit_hash = AsyncMock(return_value="stream-commit")
 
-    async def fake_agent_stream(request):
+    async def fake_agent_stream(request, **kwargs):
         yield {"event_type": "answer_chunk", "data": {"chunk": "hello"}}
         yield {
             "event_type": "task_complete",
@@ -288,7 +289,7 @@ async def test_ask_stream_cache_miss_delegates(ask_service, mock_qa_service):
 async def test_ask_stream_no_qa_service(ask_service_no_qa):
     """Without QA service, ask_stream delegates directly to _stream_from_agent."""
 
-    async def fake_agent_stream(request):
+    async def fake_agent_stream(request, **kwargs):
         yield {"event_type": "answer_chunk", "data": {"chunk": "hi"}}
         yield {
             "event_type": "task_complete",

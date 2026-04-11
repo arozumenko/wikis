@@ -100,11 +100,63 @@ class AskService:
             ),
         )
 
-    async def _stream_from_agent(self, request: AskRequest) -> AsyncGenerator[dict, None]:
+    async def _get_multi_wiki_components(
+        self,
+        project_id: str,
+        user_id: str | None,
+    ) -> EngineComponents:
+        """Load and compose EngineComponents for all wikis in a project."""
+        from app.db import get_session_factory
+        from app.services.project_service import ProjectService
+
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            ps = ProjectService(session)
+            wikis = await ps.list_project_wikis(project_id, user_id or "")
+
+        if wikis is None:
+            raise ValueError(f"Project '{project_id}' not found or not accessible")
+
+        if not wikis:
+            raise ValueError(f"Project '{project_id}' has no accessible wikis")
+
+        # Load per-wiki components in parallel, tolerating individual failures
+        results = await asyncio.gather(
+            *[self._get_components(w.id) for w in wikis],
+            return_exceptions=True,
+        )
+
+        valid_pairs = [
+            (wiki, comp)
+            for wiki, comp in zip(wikis, results, strict=False)
+            if not isinstance(comp, Exception)
+        ]
+
+        if not valid_pairs:
+            raise ValueError(f"No wikis in project '{project_id}' could be loaded")
+
+        from app.core.multi_retriever import MultiWikiRetrieverStack
+
+        merged_retriever = MultiWikiRetrieverStack(
+            [(wiki.id, comp.retriever_stack) for wiki, comp in valid_pairs]
+        )
+
+        # Base on first valid wiki's components, swap in the merged retriever
+        base_comp = valid_pairs[0][1]
+        from dataclasses import replace
+
+        return replace(base_comp, retriever_stack=merged_retriever)
+
+    async def _stream_from_agent(
+        self, request: AskRequest, user_id: str | None = None
+    ) -> AsyncGenerator[dict, None]:
         """Stream raw events from AskEngine (no cache logic)."""
         from app.core.ask_engine import AskConfig, AskEngine
 
-        components = await self._get_components(request.wiki_id)
+        if request.project_id:
+            components = await self._get_multi_wiki_components(request.project_id, user_id)
+        else:
+            components = await self._get_components(request.wiki_id)
 
         engine = AskEngine(
             retriever_stack=components.retriever_stack,
@@ -121,14 +173,16 @@ class AskService:
         ):
             yield event
 
-    async def ask_stream(self, request: AskRequest) -> AsyncGenerator[dict, None]:
+    async def ask_stream(
+        self, request: AskRequest, user_id: str | None = None
+    ) -> AsyncGenerator[dict, None]:
         """Stream answer events, with cache lookup when QA service is available."""
         qa_id = str(uuid.uuid4())
         has_context = bool(request.chat_history)
         embedding = None
 
-        # Cache lookup
-        if self._qa_service:
+        # Cache lookup (only for single-wiki asks — project asks skip cache)
+        if self._qa_service and request.wiki_id and not request.project_id:
             cached_record, embedding = await self._qa_service.lookup_cache(
                 request.wiki_id, request.question, chat_history=_to_chat_dicts(request),
             )
@@ -160,7 +214,7 @@ class AskService:
         tool_steps = 0
 
         try:
-            async for event in self._stream_from_agent(request):
+            async for event in self._stream_from_agent(request, user_id=user_id):
                 event_type = event.get("event_type", "")
                 if event_type in ("task_complete", "ask_complete"):
                     data = event.get("data", {})
@@ -176,7 +230,7 @@ class AskService:
                     qa_id=qa_id, wiki_id=request.wiki_id,
                     question=request.question, answer=final_answer,
                     sources_json=sources_json, tool_steps=tool_steps,
-                    mode="fast", user_id=None,
+                    mode="fast", user_id=user_id,
                     is_cache_hit=False, source_qa_id=None,
                     embedding=embedding, has_context=has_context,
                     source_commit_hash=source_commit_hash,
@@ -185,15 +239,17 @@ class AskService:
             elif not completed:
                 logger.warning("Ask stream did not complete — recording skipped for %s", qa_id)
 
-    async def ask_sync(self, request: AskRequest) -> AskResult:
+    async def ask_sync(
+        self, request: AskRequest, user_id: str | None = None
+    ) -> AskResult:
         """Non-streaming: collect final answer from event stream."""
         qa_id = str(uuid.uuid4())
         has_context = bool(request.chat_history)
         cached_record = None
         embedding = None
 
-        # Cache lookup
-        if self._qa_service:
+        # Cache lookup (only for single-wiki asks — project asks skip cache)
+        if self._qa_service and request.wiki_id and not request.project_id:
             cached_record, embedding = await self._qa_service.lookup_cache(
                 request.wiki_id, request.question, chat_history=_to_chat_dicts(request),
             )
@@ -213,7 +269,7 @@ class AskService:
         sources: list[SourceReference] = []
         step_count = 0
 
-        async for event in self._stream_from_agent(request):
+        async for event in self._stream_from_agent(request, user_id=user_id):
             event_type = event.get("event_type", "")
             # Support both legacy (ask_complete/ask_error) and MCP (task_complete/task_failed) events
             if event_type in ("ask_complete", "task_complete"):
@@ -247,7 +303,7 @@ class AskService:
                 qa_id=qa_id, wiki_id=request.wiki_id,
                 question=request.question, answer=final_answer,
                 sources_json=sources_json, tool_steps=step_count,
-                mode="fast", user_id=None,
+                mode="fast", user_id=user_id,
                 is_cache_hit=False, source_qa_id=None,
                 embedding=embedding, has_context=has_context,
                 source_commit_hash=source_commit_hash,

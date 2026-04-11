@@ -58,7 +58,7 @@ class Settings(BaseSettings):
 
     # Ask engine
     ask_similarity_threshold: float = 0.75  # EmbeddingsFilter threshold for agentic tools (0.0 = disabled)
-    ask_cache_max_wikis: int = 5
+    ask_cache_max_wikis: int = 10
     ask_cache_ttl_seconds: int = 3600
 
     # Research engine
