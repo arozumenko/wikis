@@ -53,7 +53,7 @@ def _wiki_request():
 
 
 def _fake_agent_stream():
-    async def _gen(request):
+    async def _gen(request, user_id=None):
         yield {
             "event_type": "task_complete",
             "data": {"answer": "answer text", "sources": [], "steps": 1},

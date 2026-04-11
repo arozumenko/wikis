@@ -100,11 +100,31 @@ class AskService:
             ),
         )
 
-    async def _stream_from_agent(self, request: AskRequest) -> AsyncGenerator[dict, None]:
+    async def _get_multi_wiki_components(
+        self,
+        project_id: str,
+        user_id: str | None,
+    ) -> EngineComponents:
+        """Load and compose EngineComponents for all wikis in a project."""
+        from app.db import get_session_factory
+        from app.services.multi_wiki_components import build_multi_wiki_components
+
+        session_factory = get_session_factory()
+        return await build_multi_wiki_components(
+            project_id=project_id,
+            user_id=user_id,
+            get_components_fn=self._get_components,
+            session_factory=session_factory,
+        )
+
+    async def _stream_from_agent(self, request: AskRequest, user_id: str | None = None) -> AsyncGenerator[dict, None]:
         """Stream raw events from AskEngine (no cache logic)."""
         from app.core.ask_engine import AskConfig, AskEngine
 
-        components = await self._get_components(request.wiki_id)
+        if request.project_id:
+            components = await self._get_multi_wiki_components(request.project_id, user_id)
+        else:
+            components = await self._get_components(request.wiki_id)
 
         engine = AskEngine(
             retriever_stack=components.retriever_stack,
@@ -121,7 +141,7 @@ class AskService:
         ):
             yield event
 
-    async def ask_stream(self, request: AskRequest) -> AsyncGenerator[dict, None]:
+    async def ask_stream(self, request: AskRequest, user_id: str | None = None) -> AsyncGenerator[dict, None]:
         """Stream answer events, with cache lookup when QA service is available."""
         qa_id = str(uuid.uuid4())
         has_context = bool(request.chat_history)
@@ -160,7 +180,7 @@ class AskService:
         tool_steps = 0
 
         try:
-            async for event in self._stream_from_agent(request):
+            async for event in self._stream_from_agent(request, user_id=user_id):
                 event_type = event.get("event_type", "")
                 if event_type in ("task_complete", "ask_complete"):
                     data = event.get("data", {})
@@ -185,7 +205,7 @@ class AskService:
             elif not completed:
                 logger.warning("Ask stream did not complete — recording skipped for %s", qa_id)
 
-    async def ask_sync(self, request: AskRequest) -> AskResult:
+    async def ask_sync(self, request: AskRequest, user_id: str | None = None) -> AskResult:
         """Non-streaming: collect final answer from event stream."""
         qa_id = str(uuid.uuid4())
         has_context = bool(request.chat_history)
@@ -213,7 +233,7 @@ class AskService:
         sources: list[SourceReference] = []
         step_count = 0
 
-        async for event in self._stream_from_agent(request):
+        async for event in self._stream_from_agent(request, user_id=user_id):
             event_type = event.get("event_type", "")
             # Support both legacy (ask_complete/ask_error) and MCP (task_complete/task_failed) events
             if event_type in ("ask_complete", "task_complete"):

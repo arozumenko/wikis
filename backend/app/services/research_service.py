@@ -407,9 +407,33 @@ class ResearchService:
             ),
         )
 
-    async def research_stream(self, request: ResearchRequest) -> AsyncGenerator[dict, None]:
+    async def _get_multi_wiki_components(
+        self,
+        project_id: str,
+        user_id: str | None,
+    ) -> EngineComponents:
+        """Load and compose EngineComponents for all wikis in a project."""
+        from app.db import get_session_factory
+        from app.services.multi_wiki_components import build_multi_wiki_components
+
+        session_factory = get_session_factory()
+        return await build_multi_wiki_components(
+            project_id=project_id,
+            user_id=user_id,
+            get_components_fn=self._get_components,
+            session_factory=session_factory,
+        )
+
+    async def research_stream(
+        self,
+        request: ResearchRequest,
+        user_id: str | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Stream research events (research_start, thinking_step, research_complete)."""
-        components = await self._get_components(request.wiki_id)
+        if request.project_id:
+            components = await self._get_multi_wiki_components(request.project_id, user_id)
+        else:
+            components = await self._get_components(request.wiki_id)
         engine = DeepResearchEngine(
             retriever_stack=components.retriever_stack,
             graph_manager=components.graph_manager,
@@ -427,14 +451,18 @@ class ResearchService:
         async for event in engine.research(question=request.question, chat_history=chat_history):
             yield event
 
-    async def research_sync(self, request: ResearchRequest) -> ResearchResponse:
+    async def research_sync(
+        self,
+        request: ResearchRequest,
+        user_id: str | None = None,
+    ) -> ResearchResponse:
         """Non-streaming: collect final answer from event stream."""
         final_answer = ""
         sources: list[SourceReference] = []
         steps: list[str] = []
         tool_events: list[dict] = []
 
-        async for event in self.research_stream(request):
+        async for event in self.research_stream(request, user_id=user_id):
             event_type = event.get("event_type", "")
             if event_type == "thinking_step":
                 step_data = event.get("data", {})
@@ -471,7 +499,11 @@ class ResearchService:
             code_map=None,
         )
 
-    async def codemap_stream(self, request: ResearchRequest) -> AsyncGenerator[dict, None]:
+    async def codemap_stream(
+        self,
+        request: ResearchRequest,
+        user_id: str | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Stream code-map pipeline events (tool calls from ask, then final result).
 
         Pipeline:
@@ -487,7 +519,10 @@ class ResearchService:
         from app.core.ask_engine import AskConfig, AskEngine
         from app.services.llm_factory import create_llm
 
-        components = await self._get_components(request.wiki_id)
+        if request.project_id:
+            components = await self._get_multi_wiki_components(request.project_id, user_id)
+        else:
+            components = await self._get_components(request.wiki_id)
 
         # --- Step 1: Run ask engine, forwarding tool-call events to the UI ---
         ask_answer = ""
@@ -708,14 +743,18 @@ class ResearchService:
             },
         }
 
-    async def codemap_sync(self, request: ResearchRequest) -> ResearchResponse:
+    async def codemap_sync(
+        self,
+        request: ResearchRequest,
+        user_id: str | None = None,
+    ) -> ResearchResponse:
         """Non-streaming wrapper for codemap_stream."""
         final_answer = ""
         sources: list[SourceReference] = []
         steps: list[str] = []
         code_map: CodeMapData | None = None
 
-        async for event in self.codemap_stream(request):
+        async for event in self.codemap_stream(request, user_id=user_id):
             event_type = event.get("event_type", "")
             if event_type == "thinking_step":
                 tool = event.get("data", {}).get("tool", "")

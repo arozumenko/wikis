@@ -8,6 +8,7 @@ from dataclasses import asdict
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from app.auth import CurrentUser, get_current_user
@@ -183,26 +184,29 @@ async def research(
     service: ResearchService = Depends(get_research_service),
     accept: str = "application/json",
 ) -> ResearchResponse | StreamingResponse:
+    user_id = user.id if user else None
     try:
         if request.research_type == "codemap":
             if "text/event-stream" in accept:
                 async def codemap_sse():
-                    async for event in service.codemap_stream(request):
+                    async for event in service.codemap_stream(request, user_id=user_id):
                         event_type = event.get("event_type", "message")
                         yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
                 return StreamingResponse(codemap_sse(), media_type="text/event-stream")
-            return await service.codemap_sync(request)
+            return await service.codemap_sync(request, user_id=user_id)
         if "text/event-stream" in accept:
 
             async def stream():
-                async for event in service.research_stream(request):
+                async for event in service.research_stream(request, user_id=user_id):
                     event_type = event.get("event_type", "message")
                     yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
 
             return StreamingResponse(stream(), media_type="text/event-stream")
-        return await service.research_sync(request)
+        return await service.research_sync(request, user_id=user_id)
     except FileNotFoundError as e:
-        raise HTTPException(404, f"Wiki not found: {request.wiki_id}") from e
+        raise HTTPException(404, f"Wiki not found: {request.wiki_id or request.project_id}") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     except RuntimeError as e:
         raise HTTPException(501, str(e)) from e
 
@@ -839,6 +843,55 @@ async def list_project_wikis(
         for w in wikis
     ]
     return WikiListResponse(wikis=summaries)
+
+
+class _ProjectCodeMapRequest(BaseModel):
+    """Request body for the project code-map endpoint."""
+
+    question: str
+
+
+@router.post("/projects/{project_id}/map", response_model=ResearchResponse)
+async def project_codemap(
+    project_id: str,
+    body: _ProjectCodeMapRequest,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+    service: ResearchService = Depends(get_research_service),
+    accept: str = "application/json",
+) -> ResearchResponse | StreamingResponse:
+    """Build a code-map for all wikis in a project.
+
+    Proxies to the codemap pipeline with ``project_id`` set and
+    ``research_type=codemap``.
+    """
+    user_id = user.id if user else None
+
+    # Verify the project exists and is accessible
+    project = await svc.get_project(project_id, user_id=user_id or "")
+    if project is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+
+    request = ResearchRequest(
+        project_id=project_id,
+        question=body.question,
+        research_type="codemap",
+    )
+
+    try:
+        if "text/event-stream" in accept:
+            async def codemap_sse():
+                async for event in service.codemap_stream(request, user_id=user_id):
+                    event_type = event.get("event_type", "message")
+                    yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
+            return StreamingResponse(codemap_sse(), media_type="text/event-stream")
+        return await service.codemap_sync(request, user_id=user_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(501, str(e)) from e
 
 
 # ---------------------------------------------------------------------------
