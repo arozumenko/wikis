@@ -491,13 +491,19 @@ def test_merge_graph_adds_nodes():
 
 
 def test_merge_graph_merges_attrs():
+    """Source attributes win on conflict; non-conflicting attrs from both sides are preserved."""
     builder = _make_builder()
     target = nx.MultiDiGraph()
-    target.add_node("n1", existing_attr="old")
+    target.add_node("n1", color="red", target_only="kept")
     source = nx.MultiDiGraph()
-    source.add_node("n1", new_attr="new")
+    source.add_node("n1", color="blue", source_only="added")
     builder._merge_graph(target, source)
-    assert target.nodes["n1"].get("existing_attr") == "old" or target.nodes["n1"].get("new_attr") == "new"
+    # Source wins on conflict: color should be source's value
+    assert target.nodes["n1"]["color"] == "blue"
+    assert target.nodes["n1"]["color"] != "red"
+    # Non-conflicting attrs from both sides are preserved
+    assert target.nodes["n1"].get("target_only") == "kept"
+    assert target.nodes["n1"].get("source_only") == "added"
 
 
 def test_merge_graph_adds_edges():

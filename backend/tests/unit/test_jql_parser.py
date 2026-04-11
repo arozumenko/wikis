@@ -262,9 +262,10 @@ def test_tokenize_or_operator():
 
 def test_tokenize_case_insensitive_and():
     tokens = _tokenize("type:class and file:src/*")
-    # lowercase "and" won't be recognized as AND — only uppercase is per regex
-    # Depending on implementation, check no crash
-    assert isinstance(tokens, list)
+    # The tokenizer upper-cases the remaining string before checking for AND,
+    # so lowercase "and" is recognized as an AND operator token.
+    token_types = [t for t, _ in tokens]
+    assert "AND" in token_types
 
 
 def test_tokenize_empty_string():

@@ -792,8 +792,11 @@ def test_filter_related_finds_reachable_nodes():
     svc = GraphQueryService(g)
     all_results = svc._jql_full_scan(k=10)
     filtered = svc._filter_related(all_results, "AuthService")
-    # Results should be nodes reachable from AuthService
-    assert isinstance(filtered, list)
+    # BFS from AuthService (both directions): reaches BaseService (outgoing inheritance)
+    # and login (incoming calls). AuthService itself is also reachable via login -> AuthService.
+    filtered_ids = [r.node_id for r in filtered]
+    assert "n::base.py::BaseService" in filtered_ids
+    assert "n::auth.py::login" in filtered_ids
 
 
 def test_filter_related_with_direction_outgoing():
@@ -801,7 +804,10 @@ def test_filter_related_with_direction_outgoing():
     svc = GraphQueryService(g)
     all_results = svc._jql_full_scan(k=10)
     filtered = svc._filter_related(all_results, "AuthService", direction="outgoing")
-    assert isinstance(filtered, list)
+    # Outgoing from AuthService: AuthService -> BaseService (inheritance)
+    filtered_ids = [r.node_id for r in filtered]
+    assert "n::base.py::BaseService" in filtered_ids
+    assert "n::auth.py::login" not in filtered_ids
 
 
 def test_filter_related_with_direction_incoming():
@@ -809,7 +815,10 @@ def test_filter_related_with_direction_incoming():
     svc = GraphQueryService(g)
     all_results = svc._jql_full_scan(k=10)
     filtered = svc._filter_related(all_results, "AuthService", direction="incoming")
-    assert isinstance(filtered, list)
+    # Incoming to AuthService: login -> AuthService (calls)
+    filtered_ids = [r.node_id for r in filtered]
+    assert "n::auth.py::login" in filtered_ids
+    assert "n::base.py::BaseService" not in filtered_ids
 
 
 def test_filter_related_with_edge_types():
@@ -817,7 +826,10 @@ def test_filter_related_with_edge_types():
     svc = GraphQueryService(g)
     all_results = svc._jql_full_scan(k=10)
     filtered = svc._filter_related(all_results, "AuthService", edge_types=["inheritance"])
-    assert isinstance(filtered, list)
+    # Only inheritance edges: AuthService -> BaseService; login uses "calls" so excluded
+    filtered_ids = [r.node_id for r in filtered]
+    assert "n::base.py::BaseService" in filtered_ids
+    assert "n::auth.py::login" not in filtered_ids
 
 
 # ---------------------------------------------------------------------------
