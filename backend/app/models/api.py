@@ -244,7 +244,7 @@ class ProjectCreateRequest(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=100)
     description: str | None = None
-    visibility: str = "personal"  # "personal" | "shared"
+    visibility: Literal["personal", "shared"] = "personal"
 
 
 class ProjectUpdateRequest(BaseModel):
@@ -252,7 +252,7 @@ class ProjectUpdateRequest(BaseModel):
 
     name: str | None = Field(None, min_length=1, max_length=100)
     description: str | None = None
-    visibility: str | None = None
+    visibility: Literal["personal", "shared"] | None = None
 
 
 class ProjectResponse(BaseModel):

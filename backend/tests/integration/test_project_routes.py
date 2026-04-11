@@ -160,17 +160,31 @@ class TestGetProject:
 
     @pytest.mark.asyncio
     async def test_get_shared_project_accessible_to_all(self, client, monkeypatch):
-        """A shared project is readable by any user."""
-        c, _app, _sf = client
+        """A shared project is readable by any authenticated user, not just the owner."""
+        c, app, _sf = client
+        # Create the project as dev-user (the default mock identity)
         create_resp = await c.post(
             "/api/v1/projects",
             json={"name": "Shared", "visibility": "shared"},
         )
+        assert create_resp.status_code == 201
         project_id = create_resp.json()["id"]
 
-        # Verify the same client (simulating another user via AUTH_ENABLED=false returning dev-user)
-        resp = await c.get(f"/api/v1/projects/{project_id}")
-        assert resp.status_code == 200
+        # Switch to a completely different user and verify they can still GET the project
+        from app.auth import CurrentUser, get_current_user
+
+        async def other_user():
+            return CurrentUser(id="other-user", email="other@test.com", name="Other")
+
+        app.dependency_overrides[get_current_user] = other_user
+        try:
+            resp = await c.get(f"/api/v1/projects/{project_id}")
+            assert resp.status_code == 200, (
+                f"other-user should be able to access a shared project, got {resp.status_code}: {resp.text}"
+            )
+            assert resp.json()["id"] == project_id
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.db_models import ProjectRecord, ProjectWikiRecord, WikiRecord
@@ -88,9 +88,25 @@ class ProjectService:
     async def get_wiki_count(self, project_id: str) -> int:
         """Return the number of wikis in a project."""
         result = await self.session.execute(
-            select(ProjectWikiRecord).where(ProjectWikiRecord.project_id == project_id)
+            select(func.count()).where(ProjectWikiRecord.project_id == project_id).select_from(ProjectWikiRecord)
         )
-        return len(result.scalars().all())
+        return result.scalar_one()
+
+    async def batch_get_wiki_counts(self, project_ids: list[str]) -> dict[str, int]:
+        """Return a mapping of project_id -> wiki count for all given project IDs.
+
+        Uses a single GROUP BY query instead of one query per project.
+        """
+        if not project_ids:
+            return {}
+        result = await self.session.execute(
+            select(ProjectWikiRecord.project_id, func.count().label("cnt"))
+            .where(ProjectWikiRecord.project_id.in_(project_ids))
+            .group_by(ProjectWikiRecord.project_id)
+        )
+        counts = {row.project_id: row.cnt for row in result}
+        # Fill in zero for projects with no wikis
+        return {pid: counts.get(pid, 0) for pid in project_ids}
 
     # ------------------------------------------------------------------
     # Update
@@ -177,7 +193,7 @@ class ProjectService:
         )
         existing_record = existing.scalar_one_or_none()
         if existing_record is not None:
-            return None  # already present — treat as idempotent (caller should handle)
+            return existing_record  # already present — idempotent return
 
         membership = ProjectWikiRecord(
             project_id=project_id,

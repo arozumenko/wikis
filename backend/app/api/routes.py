@@ -697,15 +697,13 @@ async def update_wiki_visibility(
 
 
 def _project_response(project, wiki_count: int = 0) -> ProjectResponse:
-    from datetime import datetime
-
     return ProjectResponse(
         id=project.id,
         name=project.name,
         description=project.description,
-        visibility=project.visibility or "personal",
+        visibility=project.visibility,
         owner_id=project.owner_id,
-        created_at=project.created_at or datetime.now(),
+        created_at=project.created_at,
         wiki_count=wiki_count,
     )
 
@@ -731,10 +729,8 @@ async def list_projects(
     svc: ProjectService = Depends(get_project_service),
 ) -> ProjectListResponse:
     projects = await svc.list_projects(user_id=user.id)
-    items = []
-    for p in projects:
-        count = await svc.get_wiki_count(p.id)
-        items.append(_project_response(p, count))
+    counts = await svc.batch_get_wiki_counts([p.id for p in projects])
+    items = [_project_response(p, counts.get(p.id, 0)) for p in projects]
     return ProjectListResponse(projects=items)
 
 
