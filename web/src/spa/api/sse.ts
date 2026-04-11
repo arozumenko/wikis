@@ -1,6 +1,8 @@
 import type { components } from './types.generated';
 import { getAuthToken } from './client';
 
+type SourceReference = components['schemas']['SourceReference'];
+
 type ProgressEvent = components['schemas']['ProgressEvent'];
 type PageCompleteEvent = components['schemas']['PageCompleteEvent'];
 type WikiCompleteEvent = components['schemas']['WikiCompleteEvent'];
@@ -146,24 +148,14 @@ export type AskSSEEvent =
   | ({ type: 'answer_chunk' } & { chunk: string; timestamp: string })
   | ({ type: 'ask_complete' } & {
       answer: string;
-      sources: Array<{
-        file_path: string;
-        snippet?: string;
-        line_start?: number;
-        line_end?: number;
-      }>;
+      sources: SourceReference[];
       steps?: number;
     })
   | ({ type: 'task_complete' } & {
       taskId?: string;
       status: string;
       answer?: string;
-      sources?: Array<{
-        file_path: string;
-        snippet?: string;
-        line_start?: number;
-        line_end?: number;
-      }>;
+      sources?: SourceReference[];
       steps?: number;
     })
   | ({ type: 'task_failed' } & { taskId?: string; status: string; error: string; recoverable?: boolean })

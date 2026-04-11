@@ -455,6 +455,16 @@ export interface components {
              * @default null
              */
             snippet: string | null;
+            /**
+             * Wiki Id
+             * @default null
+             */
+            wiki_id: string | null;
+            /**
+             * Wiki Title
+             * @default null
+             */
+            wiki_title: string | null;
         };
         /** ValidationError */
         ValidationError: {

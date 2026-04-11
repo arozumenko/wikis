@@ -6,6 +6,10 @@ interface SourceFile {
   file_path: string;
   line_start?: number | null;
   line_end?: number | null;
+  /** Present on cross-repo (project-level) answers — identifies the source wiki. */
+  wiki_id?: string | null;
+  /** Human-readable wiki title for cross-repo attribution. */
+  wiki_title?: string | null;
 }
 
 interface SourceCitationsProps {
@@ -75,6 +79,16 @@ export function SourceCitations({
       <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
         {visibleSources.map((src, i) => {
           const label = `${src.file_path}${src.line_start ? `:${src.line_start}${src.line_end ? `-${src.line_end}` : ''}` : ''}`;
+          const attributionChip = src.wiki_id ? (
+            <Chip
+              key={`chip-${i}`}
+              size="small"
+              label={src.wiki_title ?? src.wiki_id}
+              variant="outlined"
+              color="primary"
+              sx={{ fontSize: '0.65rem', height: 18, mr: 0.5 }}
+            />
+          ) : null;
 
           if (repoUrl) {
             const url = buildSourceUrl(
@@ -86,26 +100,30 @@ export function SourceCitations({
               src.line_end,
             );
             return (
-              <Link
-                key={i}
-                href={url}
-                target="_blank"
-                rel="noopener"
-                underline="hover"
-                sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}
-              >
-                {label}
-              </Link>
+              <Box key={i} sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.25 }}>
+                {attributionChip}
+                <Link
+                  href={url}
+                  target="_blank"
+                  rel="noopener"
+                  underline="hover"
+                  sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}
+                >
+                  {label}
+                </Link>
+              </Box>
             );
           }
 
           return (
-            <Typography
-              key={i}
-              sx={{ fontFamily: 'monospace', fontSize: '0.8rem', color: 'text.secondary' }}
-            >
-              {label}
-            </Typography>
+            <Box key={i} sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.25 }}>
+              {attributionChip}
+              <Typography
+                sx={{ fontFamily: 'monospace', fontSize: '0.8rem', color: 'text.secondary' }}
+              >
+                {label}
+              </Typography>
+            </Box>
           );
         })}
       </Box>
