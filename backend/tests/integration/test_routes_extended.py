@@ -1266,6 +1266,7 @@ class TestGetWikiIncludesDescription:
         fake_summary.requires_token = False
         fake_summary.error = None
         fake_summary.description = "My wiki description"
+        fake_summary.is_owner = True
 
         with (
             patch.object(
