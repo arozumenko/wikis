@@ -416,7 +416,7 @@ class ResearchService:
 
             components, _per_wiki = await build_multi_wiki_components(
                 project_id=request.project_id,
-                user_id="",
+                user_id=user_id or "",
                 storage=self.storage,
                 settings=self.settings,
                 tier="high",
@@ -447,7 +447,7 @@ class ResearchService:
         steps: list[str] = []
         tool_events: list[dict] = []
 
-        async for event in self.research_stream(request):
+        async for event in self.research_stream(request, user_id=user_id):
             event_type = event.get("event_type", "")
             if event_type == "thinking_step":
                 step_data = event.get("data", {})
@@ -507,7 +507,7 @@ class ResearchService:
 
             components, per_wiki_components = await build_multi_wiki_components(
                 project_id=request.project_id,
-                user_id="",  # no user_id on ResearchRequest; project access checked at route level
+                user_id=user_id or "",
                 storage=self.storage,
                 settings=self.settings,
                 tier="high",
@@ -751,7 +751,7 @@ class ResearchService:
         steps: list[str] = []
         code_map: CodeMapData | None = None
 
-        async for event in self.codemap_stream(request):
+        async for event in self.codemap_stream(request, user_id=user_id):
             event_type = event.get("event_type", "")
             if event_type == "thinking_step":
                 tool = event.get("data", {}).get("tool", "")
