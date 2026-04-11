@@ -103,7 +103,12 @@ export function CreateProjectDialog({
         [...selectedWikiIds].map((wikiId) => addWikiToProject(project.id, wikiId)),
       );
       // Fetch refreshed project so wiki_count is accurate
-      const refreshed = await getProject(project.id);
+      let refreshed: ProjectResponse;
+      try {
+        refreshed = await getProject(project.id);
+      } catch {
+        refreshed = project; // wiki_count may be stale but project is in the list
+      }
       onCreated(refreshed);
       setName('');
       setDescription('');
