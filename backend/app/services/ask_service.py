@@ -142,7 +142,7 @@ class AskService:
         ):
             yield event
 
-    async def ask_stream(self, request: AskRequest) -> AsyncGenerator[dict, None]:
+    async def ask_stream(self, request: AskRequest, user_id: str | None = None) -> AsyncGenerator[dict, None]:
         """Stream answer events, with cache lookup when QA service is available."""
         qa_id = str(uuid.uuid4())
         has_context = bool(request.chat_history)
@@ -206,7 +206,7 @@ class AskService:
             elif not completed:
                 logger.warning("Ask stream did not complete — recording skipped for %s", qa_id)
 
-    async def ask_sync(self, request: AskRequest) -> AskResult:
+    async def ask_sync(self, request: AskRequest, user_id: str | None = None) -> AskResult:
         """Non-streaming: collect final answer from event stream."""
         qa_id = str(uuid.uuid4())
         has_context = bool(request.chat_history)

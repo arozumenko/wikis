@@ -409,7 +409,7 @@ class ResearchService:
             ),
         )
 
-    async def research_stream(self, request: ResearchRequest) -> AsyncGenerator[dict, None]:
+    async def research_stream(self, request: ResearchRequest, user_id: str | None = None) -> AsyncGenerator[dict, None]:
         """Stream research events (research_start, thinking_step, research_complete)."""
         if request.project_id:
             from app.services.multi_wiki_components import build_multi_wiki_components
@@ -440,7 +440,7 @@ class ResearchService:
         async for event in engine.research(question=request.question, chat_history=chat_history):
             yield event
 
-    async def research_sync(self, request: ResearchRequest) -> ResearchResponse:
+    async def research_sync(self, request: ResearchRequest, user_id: str | None = None) -> ResearchResponse:
         """Non-streaming: collect final answer from event stream."""
         final_answer = ""
         sources: list[SourceReference] = []
@@ -484,7 +484,7 @@ class ResearchService:
             code_map=None,
         )
 
-    async def codemap_stream(self, request: ResearchRequest) -> AsyncGenerator[dict, None]:
+    async def codemap_stream(self, request: ResearchRequest, user_id: str | None = None) -> AsyncGenerator[dict, None]:
         """Stream code-map pipeline events (tool calls from ask, then final result).
 
         Pipeline:
@@ -744,7 +744,7 @@ class ResearchService:
             },
         }
 
-    async def codemap_sync(self, request: ResearchRequest) -> ResearchResponse:
+    async def codemap_sync(self, request: ResearchRequest, user_id: str | None = None) -> ResearchResponse:
         """Non-streaming wrapper for codemap_stream."""
         final_answer = ""
         sources: list[SourceReference] = []

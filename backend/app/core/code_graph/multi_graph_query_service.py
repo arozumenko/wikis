@@ -171,6 +171,14 @@ class MultiGraphQueryService:
         return all_results
 
     # ------------------------------------------------------------------
+    # Wiki ID listing
+    # ------------------------------------------------------------------
+
+    def wiki_ids(self) -> list[str]:
+        """Return the list of wiki IDs this service spans."""
+        return list(self._services.keys())
+
+    # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
 

@@ -253,7 +253,7 @@ class TestResearchRouteValidation:
 
 
 class TestResearchServiceMultiWikiComponents:
-    """Unit tests for multi-wiki component loading in ResearchService."""
+    """Unit tests for multi-wiki component loading via build_multi_wiki_components."""
 
     def _make_mock_session_factory(self):
         mock_session = AsyncMock()
@@ -262,17 +262,15 @@ class TestResearchServiceMultiWikiComponents:
         return MagicMock(return_value=mock_session)
 
     @pytest.mark.asyncio
-    async def test_get_multi_wiki_components_empty_project_raises(self, tmp_path, monkeypatch):
+    async def test_empty_project_raises_value_error(self, tmp_path, monkeypatch):
         """A project with no wikis raises ValueError."""
         monkeypatch.setenv("LLM_API_KEY", "test-key")
         from app.config import Settings
-        from app.services.research_service import ResearchService
+        from app.services.multi_wiki_components import build_multi_wiki_components
         from app.storage.local import LocalArtifactStorage
 
         settings = Settings()
         storage = LocalArtifactStorage(str(tmp_path))
-        service = ResearchService(settings=settings, storage=storage)
-
         mock_factory = self._make_mock_session_factory()
 
         with patch("app.db.get_session_factory", return_value=mock_factory):
@@ -282,20 +280,23 @@ class TestResearchServiceMultiWikiComponents:
                 return_value=[],
             ):
                 with pytest.raises(ValueError, match="no accessible wikis"):
-                    await service._get_multi_wiki_components("project-1", "user-1")
+                    await build_multi_wiki_components(
+                        project_id="project-1",
+                        user_id="user-1",
+                        storage=storage,
+                        settings=settings,
+                    )
 
     @pytest.mark.asyncio
-    async def test_get_multi_wiki_components_inaccessible_project_raises(self, tmp_path, monkeypatch):
+    async def test_inaccessible_project_raises_value_error(self, tmp_path, monkeypatch):
         """A project not accessible to the user raises ValueError."""
         monkeypatch.setenv("LLM_API_KEY", "test-key")
         from app.config import Settings
-        from app.services.research_service import ResearchService
+        from app.services.multi_wiki_components import build_multi_wiki_components
         from app.storage.local import LocalArtifactStorage
 
         settings = Settings()
         storage = LocalArtifactStorage(str(tmp_path))
-        service = ResearchService(settings=settings, storage=storage)
-
         mock_factory = self._make_mock_session_factory()
 
         with patch("app.db.get_session_factory", return_value=mock_factory):
@@ -305,7 +306,12 @@ class TestResearchServiceMultiWikiComponents:
                 return_value=None,
             ):
                 with pytest.raises(ValueError, match="not found or not accessible"):
-                    await service._get_multi_wiki_components("project-1", "user-1")
+                    await build_multi_wiki_components(
+                        project_id="project-1",
+                        user_id="user-1",
+                        storage=storage,
+                        settings=settings,
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -328,10 +334,16 @@ class TestBuildMultiWikiComponents:
         return MagicMock(return_value=mock_session)
 
     @pytest.mark.asyncio
-    async def test_all_wikis_loaded_successfully(self):
+    async def test_all_wikis_loaded_successfully(self, tmp_path, monkeypatch):
         """All wikis load → MultiWikiRetrieverStack is populated."""
+        monkeypatch.setenv("LLM_API_KEY", "test-key")
+        from app.config import Settings
         from app.services.multi_wiki_components import build_multi_wiki_components
         from app.services.toolkit_bridge import EngineComponents
+        from app.storage.local import LocalArtifactStorage
+
+        settings = Settings()
+        storage = LocalArtifactStorage(str(tmp_path))
 
         mock_retriever = MagicMock()
         comp_a = EngineComponents(retriever_stack=mock_retriever, llm=MagicMock())
@@ -339,32 +351,43 @@ class TestBuildMultiWikiComponents:
 
         wiki_records = [self._make_wiki_record("w1"), self._make_wiki_record("w2")]
 
-        async def mock_get_components(wiki_id: str) -> EngineComponents:
-            return comp_a if wiki_id == "w1" else comp_b
-
         mock_factory = self._make_mock_session_factory()
 
-        with patch(
-            "app.services.project_service.ProjectService.list_project_wikis",
-            new_callable=AsyncMock,
-            return_value=wiki_records,
-        ):
-            result = await build_multi_wiki_components(
-                project_id="proj-1",
-                user_id="user-1",
-                get_components_fn=mock_get_components,
-                session_factory=mock_factory,
-            )
+        async def _side_effect(wiki_id, storage, settings, tier="high"):
+            return comp_a if wiki_id == "w1" else comp_b
+
+        with patch("app.db.get_session_factory", return_value=mock_factory):
+            with patch(
+                "app.services.project_service.ProjectService.list_project_wikis",
+                new_callable=AsyncMock,
+                return_value=wiki_records,
+            ):
+                with patch(
+                    "app.services.multi_wiki_components.build_engine_components",
+                    side_effect=_side_effect,
+                ):
+                    merged, _per_wiki = await build_multi_wiki_components(
+                        project_id="proj-1",
+                        user_id="user-1",
+                        storage=storage,
+                        settings=settings,
+                    )
 
         from app.core.multi_retriever import MultiWikiRetrieverStack
 
-        assert isinstance(result.retriever_stack, MultiWikiRetrieverStack)
+        assert isinstance(merged.retriever_stack, MultiWikiRetrieverStack)
 
     @pytest.mark.asyncio
-    async def test_partial_failure_does_not_block(self):
+    async def test_partial_failure_does_not_block(self, tmp_path, monkeypatch):
         """If one wiki fails to load, others still succeed."""
+        monkeypatch.setenv("LLM_API_KEY", "test-key")
+        from app.config import Settings
         from app.services.multi_wiki_components import build_multi_wiki_components
         from app.services.toolkit_bridge import EngineComponents
+        from app.storage.local import LocalArtifactStorage
+
+        settings = Settings()
+        storage = LocalArtifactStorage(str(tmp_path))
 
         mock_retriever = MagicMock()
         comp_ok = EngineComponents(retriever_stack=mock_retriever, llm=MagicMock())
@@ -374,52 +397,68 @@ class TestBuildMultiWikiComponents:
             self._make_wiki_record("wiki-bad"),
         ]
 
-        async def mock_get_components(wiki_id: str) -> EngineComponents:
+        async def _side_effect(wiki_id, storage, settings, tier="high"):
             if wiki_id == "wiki-bad":
                 raise FileNotFoundError("missing artifacts")
             return comp_ok
 
         mock_factory = self._make_mock_session_factory()
 
-        with patch(
-            "app.services.project_service.ProjectService.list_project_wikis",
-            new_callable=AsyncMock,
-            return_value=wiki_records,
-        ):
-            result = await build_multi_wiki_components(
-                project_id="proj-1",
-                user_id="user-1",
-                get_components_fn=mock_get_components,
-                session_factory=mock_factory,
-            )
+        with patch("app.db.get_session_factory", return_value=mock_factory):
+            with patch(
+                "app.services.project_service.ProjectService.list_project_wikis",
+                new_callable=AsyncMock,
+                return_value=wiki_records,
+            ):
+                with patch(
+                    "app.services.multi_wiki_components.build_engine_components",
+                    side_effect=_side_effect,
+                ):
+                    merged, _per_wiki = await build_multi_wiki_components(
+                        project_id="proj-1",
+                        user_id="user-1",
+                        storage=storage,
+                        settings=settings,
+                    )
 
         # Should succeed with one wiki
-        assert result.retriever_stack is not None
+        assert merged.retriever_stack is not None
 
     @pytest.mark.asyncio
-    async def test_all_wikis_fail_raises_value_error(self):
+    async def test_all_wikis_fail_raises_value_error(self, tmp_path, monkeypatch):
         """All wikis failing raises ValueError."""
+        monkeypatch.setenv("LLM_API_KEY", "test-key")
+        from app.config import Settings
         from app.services.multi_wiki_components import build_multi_wiki_components
+        from app.storage.local import LocalArtifactStorage
+
+        settings = Settings()
+        storage = LocalArtifactStorage(str(tmp_path))
 
         wiki_records = [self._make_wiki_record("w1")]
 
-        async def mock_get_components(wiki_id: str):
+        async def _side_effect(wiki_id, storage, settings, tier="high"):
             raise FileNotFoundError("missing")
 
         mock_factory = self._make_mock_session_factory()
 
-        with patch(
-            "app.services.project_service.ProjectService.list_project_wikis",
-            new_callable=AsyncMock,
-            return_value=wiki_records,
-        ):
-            with pytest.raises(ValueError, match="No usable components"):
-                await build_multi_wiki_components(
-                    project_id="proj-1",
-                    user_id="user-1",
-                    get_components_fn=mock_get_components,
-                    session_factory=mock_factory,
-                )
+        with patch("app.db.get_session_factory", return_value=mock_factory):
+            with patch(
+                "app.services.project_service.ProjectService.list_project_wikis",
+                new_callable=AsyncMock,
+                return_value=wiki_records,
+            ):
+                with patch(
+                    "app.services.multi_wiki_components.build_engine_components",
+                    side_effect=_side_effect,
+                ):
+                    with pytest.raises(ValueError, match="could be loaded"):
+                        await build_multi_wiki_components(
+                            project_id="proj-1",
+                            user_id="user-1",
+                            storage=storage,
+                            settings=settings,
+                        )
 
 
 # ---------------------------------------------------------------------------
@@ -455,18 +494,20 @@ class TestMultiGraphQueryService:
         result = svc.resolve_symbol("MyClass")
         assert result == "node-b-1"
 
-    def test_resolve_symbol_with_wiki_id_dispatches_to_correct_graph(self):
+    def test_resolve_symbol_first_match_wins(self):
+        """resolve_symbol fans out in insertion order; first non-None result wins."""
         from app.core.code_graph.multi_graph_query_service import MultiGraphQueryService
 
         gqs_a = self._make_gqs()
-        gqs_a.resolve_symbol.return_value = "node-a-1"
+        gqs_a.resolve_symbol.return_value = None  # wiki-a has no match
         gqs_b = self._make_gqs()
         gqs_b.resolve_symbol.return_value = "node-b-1"
 
         svc = MultiGraphQueryService({"wiki-a": gqs_a, "wiki-b": gqs_b})
-        result = svc.resolve_symbol("MyClass", wiki_id="wiki-b")
+        result = svc.resolve_symbol("MyClass")
         assert result == "node-b-1"
-        gqs_a.resolve_symbol.assert_not_called()
+        # wiki-b was reached because wiki-a returned None
+        gqs_b.resolve_symbol.assert_called_once()
 
     def test_get_relationships_finds_node_in_correct_graph(self):
         from app.core.code_graph.multi_graph_query_service import MultiGraphQueryService
@@ -515,24 +556,29 @@ class TestMultiGraphQueryService:
         # Higher score first
         assert results[0].node_id == "n-b"
 
-    def test_graph_property_returns_primary_graph(self):
+    def test_graph_property_returns_merged_view(self):
+        """svc.graph returns a _MergedGraphView proxy, not a raw nx.DiGraph."""
         import networkx as nx
 
-        from app.core.code_graph.multi_graph_query_service import MultiGraphQueryService
+        from app.core.code_graph.multi_graph_query_service import MultiGraphQueryService, _MergedGraphView
 
         gqs_a = self._make_gqs()
         graph = nx.DiGraph()
+        graph.add_node("node-a", symbol_name="FuncA")
         gqs_a.graph = graph
         svc = MultiGraphQueryService({"wiki-a": gqs_a})
-        assert svc.graph is graph
+        # .graph is a merged proxy — not the raw DiGraph
+        assert isinstance(svc.graph, _MergedGraphView)
+        # But node lookup still works through it
+        assert "node-a" in svc.graph
 
-    def test_empty_service_graph_property_returns_empty_digraph(self):
-        import networkx as nx
-
-        from app.core.code_graph.multi_graph_query_service import MultiGraphQueryService
+    def test_empty_service_graph_property_returns_merged_view(self):
+        """Even with no wikis, .graph is a _MergedGraphView (wrapping nothing)."""
+        from app.core.code_graph.multi_graph_query_service import MultiGraphQueryService, _MergedGraphView
 
         svc = MultiGraphQueryService({})
-        assert isinstance(svc.graph, nx.DiGraph)
+        assert isinstance(svc.graph, _MergedGraphView)
+        assert "any-node" not in svc.graph
 
     def test_wiki_ids_returns_keys(self):
         from app.core.code_graph.multi_graph_query_service import MultiGraphQueryService
