@@ -277,11 +277,29 @@ class TestExportImportRoundtrip:
                 f"Page content mismatch for {key}"
             )
 
-        # ── Step 6: Verify cache files written to disk ────────────────────
-        # At least the .faiss stub should be present
-        faiss_file = cache_dir / f"{_CACHE_KEY}.faiss"
-        assert faiss_file.exists(), f"{faiss_file} not found after import"
-        assert faiss_file.read_bytes() == b"faiss-stub"
+        # ── Step 6: Verify ALL expected cache files are present on disk ─────
+        expected_cache_files = [
+            (f"{_CACHE_KEY}.faiss", b"faiss-stub"),
+            (f"{_CACHE_KEY}.docstore.bin", b"docstore-stub"),
+            (f"{_CACHE_KEY}.doc_index.json", b'{"docs":[]}'),
+            (f"{_CACHE_KEY}.bm25.sqlite", b"bm25-stub"),
+            (f"{_CACHE_KEY}.fts5.db", b"fts5-stub"),
+            (f"{_CACHE_KEY}.code_graph.gz", b"graph-stub"),
+        ]
+        for filename, expected_bytes in expected_cache_files:
+            cache_file = cache_dir / filename
+            assert cache_file.exists(), (
+                f"{filename} not found after import — cache restore incomplete"
+            )
+            assert cache_file.read_bytes() == expected_bytes, (
+                f"Content mismatch for {filename} after import"
+            )
+
+        # .docs.pkl must never appear on disk after import (excluded by ExportService)
+        pkl_file = cache_dir / f"{_CACHE_KEY}.docs.pkl"
+        assert not pkl_file.exists(), (
+            f".docs.pkl found on disk after import — exclusion regressed: {pkl_file}"
+        )
 
         # ── Step 7: Verify cache_index.json updated correctly ─────────────
         cache_index_path = cache_dir / "cache_index.json"
@@ -335,6 +353,15 @@ class TestExportImportRoundtrip:
         )
         assert updated.get(existing_key) == existing_key, (
             f"Unrelated key mapping was removed: {updated}"
+        )
+
+        # The imported wiki's own cache entry must also be present (proves
+        # _patch_cache_index actually wrote the fragment, not just preserved others)
+        assert updated["refs"].get("roundtrip/repo:main") == _CACHE_KEY, (
+            f"Imported wiki refs entry missing from cache_index.json: {updated}"
+        )
+        assert updated.get(_CACHE_KEY) == _CACHE_KEY, (
+            f"Imported wiki key mapping missing from cache_index.json: {updated}"
         )
 
     @pytest.mark.asyncio
