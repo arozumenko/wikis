@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from pydantic import SecretStr
-
 from app.config import Settings
-from app.services.toolkit_bridge import ComponentCache, EngineComponents, _load_cached_artifacts, build_engine_components
+from app.services.toolkit_bridge import (
+    ComponentCache,
+    EngineComponents,
+    _load_cached_artifacts,
+    build_engine_components,
+)
 from app.storage.local import LocalArtifactStorage
+from pydantic import SecretStr
 
 
 def _settings():
@@ -183,3 +187,106 @@ class TestLoadCachedArtifactsRepoAnalysis:
             _load_cached_artifacts(components, str(tmp_path), "wiki-789", "owner/repo:main")
 
         assert components.repo_analysis is None
+
+
+def _make_db_session_mock(fake_record):
+    """Build a mock async session factory that returns fake_record on query.
+
+    The code under test does:
+        async with session_factory() as session:
+            result = await session.execute(...)
+            record = result.scalar_one_or_none()
+
+    ``session_factory()`` must return an async context manager whose ``__aenter__``
+    yields an object with an async ``execute`` method.
+    """
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = fake_record
+
+    # The object that will be bound to `session` inside `async with ... as session`
+    inner_session = AsyncMock()
+    inner_session.execute.return_value = mock_result
+
+    # The context manager returned by session_factory()
+    ctx_manager = AsyncMock()
+    ctx_manager.__aenter__.return_value = inner_session
+    ctx_manager.__aexit__.return_value = False
+
+    mock_session_factory = MagicMock()
+    mock_session_factory.return_value = ctx_manager
+    return mock_session_factory
+
+
+class TestBuildEngineComponentsDescription:
+    """Tests that wiki description is injected into repo_analysis by build_engine_components."""
+
+    @pytest.mark.asyncio
+    async def test_description_injected_when_set(self, tmp_path):
+        """When WikiRecord.description is set it appears in components.repo_analysis['description']."""
+        storage = LocalArtifactStorage(str(tmp_path))
+        await storage.upload("wiki_artifacts", "w-desc/dummy.txt", b"placeholder")
+
+        fake_record = MagicMock()
+        fake_record.repo_url = "https://github.com/owner/repo"
+        fake_record.branch = "main"
+        fake_record.commit_hash = None
+        fake_record.description = "A project that does something useful."
+
+        with (
+            patch("app.services.llm_factory.create_llm", return_value=MagicMock()),
+            patch("app.services.toolkit_bridge._load_cached_artifacts"),
+            patch("app.db.get_session_factory", return_value=_make_db_session_mock(fake_record)),
+        ):
+            components = await build_engine_components("w-desc", storage, _settings())
+
+        assert components.repo_analysis is not None
+        assert components.repo_analysis["description"] == "A project that does something useful."
+
+    @pytest.mark.asyncio
+    async def test_description_not_injected_when_none(self, tmp_path):
+        """When WikiRecord.description is None no 'description' key is added to repo_analysis."""
+        storage = LocalArtifactStorage(str(tmp_path))
+        await storage.upload("wiki_artifacts", "w-nodesc/dummy.txt", b"placeholder")
+
+        fake_record = MagicMock()
+        fake_record.repo_url = "https://github.com/owner/repo"
+        fake_record.branch = "main"
+        fake_record.commit_hash = None
+        fake_record.description = None
+
+        with (
+            patch("app.services.llm_factory.create_llm", return_value=MagicMock()),
+            patch("app.services.toolkit_bridge._load_cached_artifacts"),
+            patch("app.db.get_session_factory", return_value=_make_db_session_mock(fake_record)),
+        ):
+            components = await build_engine_components("w-nodesc", storage, _settings())
+
+        # No description key — repo_analysis may be None or a dict without 'description'
+        if components.repo_analysis is not None:
+            assert "description" not in components.repo_analysis
+
+    @pytest.mark.asyncio
+    async def test_description_does_not_overwrite_existing_keys(self, tmp_path):
+        """Injecting description must not remove pre-existing repo_analysis keys like 'summary'."""
+        storage = LocalArtifactStorage(str(tmp_path))
+        await storage.upload("wiki_artifacts", "w-both/dummy.txt", b"placeholder")
+
+        fake_record = MagicMock()
+        fake_record.repo_url = "https://github.com/owner/repo"
+        fake_record.branch = "main"
+        fake_record.commit_hash = None
+        fake_record.description = "User description."
+
+        def _load_with_summary(components, cache_dir, wiki_id, repo_identifier, settings=None):
+            components.repo_analysis = {"summary": "Auto-generated summary."}
+
+        with (
+            patch("app.services.llm_factory.create_llm", return_value=MagicMock()),
+            patch("app.services.toolkit_bridge._load_cached_artifacts", side_effect=_load_with_summary),
+            patch("app.db.get_session_factory", return_value=_make_db_session_mock(fake_record)),
+        ):
+            components = await build_engine_components("w-both", storage, _settings())
+
+        assert components.repo_analysis is not None
+        assert components.repo_analysis["summary"] == "Auto-generated summary."
+        assert components.repo_analysis["description"] == "User description."
