@@ -158,6 +158,7 @@ async def test_ask_project_delegates_to_ask_service():
         req = call_args[0][0]
         assert req.project_id == "proj-1"
         assert req.question == "How does auth work?"
+        assert call_args.kwargs.get("user_id") == "user-1"
     finally:
         srv._current_user_id.reset(token)
         srv._ask_service = old_ask
@@ -205,6 +206,7 @@ async def test_research_project_delegates_to_research_service():
         req = call_args[0][0]
         assert req.project_id == "proj-1"
         assert req.question == "deep question"
+        assert call_args.kwargs.get("user_id") == "user-1"
     finally:
         srv._current_user_id.reset(token)
         srv._research_service = old_research
@@ -251,6 +253,7 @@ async def test_map_project_delegates_to_codemap_sync():
         call_args = mock_research.codemap_sync.call_args
         req = call_args[0][0]
         assert req.project_id == "proj-1"
+        assert call_args.kwargs.get("user_id") == "user-1"
     finally:
         srv._current_user_id.reset(token)
         srv._research_service = old_research

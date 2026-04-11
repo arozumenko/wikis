@@ -452,7 +452,7 @@ async def ask_project(project_id: str, question: str) -> dict[str, Any]:
             from app.models.api import AskRequest
 
             request = AskRequest(project_id=project_id, question=question)
-            result = await _ask_service.ask_sync(request)
+            result = await _ask_service.ask_sync(request, user_id=user_id)
             if result.recording and _qa_service:
                 try:
                     await _qa_service.record_interaction(**asdict(result.recording))
@@ -483,7 +483,7 @@ async def research_project(project_id: str, question: str) -> dict[str, Any]:
             from app.models.api import ResearchRequest
 
             request = ResearchRequest(project_id=project_id, question=question)
-            response = await _research_service.research_sync(request)
+            response = await _research_service.research_sync(request, user_id=user_id)
             return response.model_dump()
         except FileNotFoundError:
             return {"error": f"Project not found: {project_id}. Use list_projects() to find available project IDs."}
@@ -511,7 +511,7 @@ async def map_project(project_id: str, entry_points: list[str]) -> dict[str, Any
 
             question = "; ".join(entry_points) if entry_points else "map all entry points"
             request = ResearchRequest(project_id=project_id, question=question, research_type="codemap")
-            response = await _research_service.codemap_sync(request)
+            response = await _research_service.codemap_sync(request, user_id=user_id)
             return response.model_dump()
         except FileNotFoundError:
             return {"error": f"Project not found: {project_id}. Use list_projects() to find available project IDs."}
