@@ -15,6 +15,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.config import get_settings
     from app.db import create_tables, dispose_engine, get_engine, get_session_factory, init_db
     from app.services.ask_service import AskService
+    from app.services.export_service import ExportService
+    from app.services.import_service import ImportService
     from app.services.research_service import ResearchService
     from app.services.wiki_management import WikiManagementService
     from app.services.wiki_service import WikiService
@@ -53,11 +55,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.ask_service = AskService(settings, storage, qa_service=qa_service)
     app.state.research_service = ResearchService(settings, storage)
+    app.state.export_service = ExportService(storage, wiki_management, settings)
+    app.state.import_service = ImportService(storage, wiki_management, settings)
 
     # Load persisted invocations from storage
     await app.state.wiki_service.load_persisted_invocations()
 
-    logger.info("Services initialized: wiki, ask, research, wiki_management, qa")
+    logger.info("Services initialized: wiki, ask, research, wiki_management, qa, export, import")
 
     # Wire MCP tools to services (direct calls, no HTTP)
     from mcp_server.server import mcp as mcp_server

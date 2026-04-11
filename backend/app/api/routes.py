@@ -5,8 +5,9 @@ from __future__ import annotations
 import json as _json
 import re
 from dataclasses import asdict
+from datetime import datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -14,6 +15,8 @@ from sse_starlette import EventSourceResponse, ServerSentEvent
 from app.auth import CurrentUser, get_current_user
 from app.dependencies import (
     get_ask_service,
+    get_export_service,
+    get_import_service,
     get_project_service,
     get_qa_service,
     get_research_service,
@@ -46,6 +49,8 @@ from app.services.project_service import ProjectService
 from app.models.invocation import Invocation
 from app.models.qa_api import QAListResponse, QARecordResponse, QAStatsResponse, QAStatus
 from app.services.ask_service import AskService
+from app.services.export_service import ExportService, WikiNotFoundError
+from app.services.import_service import BundleValidationError, BundleVersionError, ImportService
 from app.services.qa_service import QAService
 from app.services.research_service import ResearchService
 from app.services.wiki_management import WikiManagementService
@@ -693,6 +698,124 @@ async def update_wiki_visibility(
             raise HTTPException(404, f"Wiki not found: {wiki_id}")
         raise HTTPException(403, "Only the wiki owner can change visibility")
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Export / Import
+# ---------------------------------------------------------------------------
+
+_EXPORT_FORMAT_OBSIDIAN = "obsidian"
+_EXPORT_FORMAT_WIKIS = "wikis"
+_VALID_EXPORT_FORMATS = {_EXPORT_FORMAT_OBSIDIAN, _EXPORT_FORMAT_WIKIS}
+_MAX_IMPORT_BYTES = 500 * 1024 * 1024  # 500 MB
+
+
+@router.get(
+    "/wikis/{wiki_id}/export",
+    responses={
+        200: {"content": {"application/zip": {}}},
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        501: {"model": ErrorResponse},
+    },
+)
+async def export_wiki(
+    wiki_id: str,
+    format: str = Query(default="obsidian", description="Export format: 'obsidian' or 'wikis'"),
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+    export_service: ExportService = Depends(get_export_service),
+) -> StreamingResponse:
+    """Export a wiki as a downloadable ZIP archive.
+
+    Supports two formats:
+    - ``obsidian`` — Obsidian vault layout with YAML frontmatter
+    - ``wikis`` — Wikis-to-Wikis bundle for re-importing into another instance
+    """
+    if format not in _VALID_EXPORT_FORMATS:
+        raise HTTPException(
+            400, f"Invalid format '{format}'. Must be one of: {', '.join(sorted(_VALID_EXPORT_FORMATS))}"
+        )
+
+    user_id = user.id if user else None
+    wiki_record = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki_record is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    if wiki_record.status != "complete":
+        raise HTTPException(409, "Wiki must be fully generated before export")
+
+    safe_title = re.sub(r"[^\w\s\-]", "", wiki_record.title or wiki_id).strip() or "wiki"
+    if format == _EXPORT_FORMAT_WIKIS:
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        filename = f"{safe_title}_{timestamp}.wikiexport"
+    else:
+        filename = f"{safe_title}.zip"
+
+    if format == _EXPORT_FORMAT_OBSIDIAN:
+        raw_generator = export_service.build_obsidian_zip(wiki_id)
+    else:
+        raw_generator = export_service.build_wikis_bundle(wiki_id)
+
+    # Prime the generator so any early exceptions (raised before the first yield)
+    # propagate here where we can still return a proper HTTP error response.
+    try:
+        first_chunk = await raw_generator.__anext__()
+    except StopAsyncIteration:
+        first_chunk = b""
+    except WikiNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except NotImplementedError as exc:
+        raise HTTPException(501, str(exc)) from exc
+
+    async def _prepend(first: bytes, rest):
+        if first:
+            yield first
+        async for chunk in rest:
+            yield chunk
+
+    return StreamingResponse(
+        _prepend(first_chunk, raw_generator),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post(
+    "/wikis/import",
+    status_code=201,
+    response_model=WikiSummary,
+    responses={
+        422: {"model": ErrorResponse},
+        413: {"model": ErrorResponse},
+        501: {"model": ErrorResponse},
+    },
+)
+async def import_wiki(
+    bundle: UploadFile,
+    user: CurrentUser = Depends(get_current_user),
+    import_service: ImportService = Depends(get_import_service),
+) -> WikiSummary:
+    """Import a wiki from a ``.wikiexport`` bundle produced by the wikis export."""
+    user_id = user.id if user else None
+
+    # Size guard — reject overly large uploads before reading
+    if bundle.size is not None and bundle.size > _MAX_IMPORT_BYTES:
+        raise HTTPException(413, "Bundle exceeds 500 MB limit")
+
+    bundle_bytes = await bundle.read()
+    if len(bundle_bytes) > _MAX_IMPORT_BYTES:
+        raise HTTPException(413, "Bundle exceeds 500 MB limit")
+
+    try:
+        wiki_record = await import_service.restore_wiki(bundle_bytes, owner_id=user_id)
+    except (BundleValidationError, BundleVersionError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except NotImplementedError as exc:
+        raise HTTPException(501, str(exc)) from exc
+
+    return WikiManagementService._record_to_summary(wiki_record, user_id)
 
 
 # ---------------------------------------------------------------------------
