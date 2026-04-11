@@ -5,6 +5,7 @@ from __future__ import annotations
 import json as _json
 import re
 from dataclasses import asdict
+from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -746,7 +747,11 @@ async def export_wiki(
         raise HTTPException(409, "Wiki must be fully generated before export")
 
     safe_title = re.sub(r"[^\w\s\-]", "", wiki_record.title or wiki_id).strip() or "wiki"
-    filename = f"{safe_title}.zip"
+    if format == _EXPORT_FORMAT_WIKIS:
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        filename = f"{safe_title}_{timestamp}.wikiexport"
+    else:
+        filename = f"{safe_title}.zip"
 
     if format == _EXPORT_FORMAT_OBSIDIAN:
         raw_generator = export_service.build_obsidian_zip(wiki_id)
@@ -793,7 +798,7 @@ async def import_wiki(
     import_service: ImportService = Depends(get_import_service),
 ) -> WikiSummary:
     """Import a wiki from a ``.wikiexport`` bundle produced by the wikis export."""
-    user_id = user.id if user else ""
+    user_id = user.id if user else None
 
     # Size guard — reject overly large uploads before reading
     if bundle.size is not None and bundle.size > _MAX_IMPORT_BYTES:

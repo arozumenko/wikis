@@ -160,10 +160,8 @@ class TestExportEndpoint:
         )
 
         resp = await c.get(f"/api/v1/wikis/{wiki_id}/export?format=wikis")
-        # Local storage backend → 200; S3 backend → 501. Both are acceptable.
-        assert resp.status_code in (200, 501), resp.text
-        if resp.status_code == 200:
-            assert resp.headers["content-type"] == "application/zip"
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["content-type"] == "application/zip"
 
     @pytest.mark.asyncio
     async def test_export_nonexistent_wiki_returns_404(self, client):
@@ -319,3 +317,57 @@ class TestImportEndpoint:
             files={"bundle": ("bundle.wikiexport", bundle_bytes, "application/zip")},
         )
         assert resp.status_code == 501, resp.text
+
+    @pytest.mark.asyncio
+    async def test_import_bundle_under_size_limit_passes_to_service(self, client):
+        """POST /api/v1/wikis/import with bundle under _MAX_IMPORT_BYTES → reaches service."""
+        c, app, sf = client
+        wiki_id = "import-size-ok-001"
+
+        async with sf() as session:
+            async with session.begin():
+                session.add(WikiRecord(
+                    id=wiki_id,
+                    owner_id="dev-user",
+                    repo_url="https://github.com/test/repo",
+                    branch="main",
+                    title="Size Test Wiki",
+                    page_count=1,
+                    status="complete",
+                ))
+
+        from app.models.db_models import WikiRecord as WR
+        from sqlalchemy import select
+
+        async with sf() as session:
+            result = await session.execute(select(WR).where(WR.id == wiki_id))
+            record = result.scalar_one_or_none()
+
+        app.state.import_service.restore_wiki = AsyncMock(return_value=record)
+
+        bundle_bytes = _make_wikis_bundle_bytes(wiki_id)
+        # Bundle is well under the 500 MB limit — should reach the service
+        resp = await c.post(
+            "/api/v1/wikis/import",
+            files={"bundle": ("small.wikiexport", bundle_bytes, "application/zip")},
+        )
+        assert resp.status_code == 201, resp.text
+        app.state.import_service.restore_wiki.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_import_bundle_over_size_limit_returns_413(self, client):
+        """POST /api/v1/wikis/import with bundle over _MAX_IMPORT_BYTES → 413, service not called."""
+        from unittest.mock import patch as _patch
+        c, app, sf = client
+
+        app.state.import_service.restore_wiki = AsyncMock()
+
+        bundle_bytes = _make_wikis_bundle_bytes()
+        # Patch _MAX_IMPORT_BYTES to a tiny value so our real bundle exceeds it
+        with _patch("app.api.routes._MAX_IMPORT_BYTES", 10):
+            resp = await c.post(
+                "/api/v1/wikis/import",
+                files={"bundle": ("large.wikiexport", bundle_bytes, "application/zip")},
+            )
+        assert resp.status_code == 413, resp.text
+        app.state.import_service.restore_wiki.assert_not_called()
