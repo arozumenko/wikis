@@ -645,7 +645,7 @@ class ResearchService:
             # Project path — build per-wiki code maps, then merge sections so the
             # LLM can wire cross-repo call stacks in the explain step.
             all_sections: list[CodeMapSection] = []
-            for wiki_id, svc in components.query_service._services.items():
+            for wiki_id, svc in components.query_service.per_wiki_services().items():
                 try:
                     per_wiki_map = _build_call_tree_from_sources(ask_sources, svc)
                     if per_wiki_map and per_wiki_map.sections:
@@ -660,7 +660,7 @@ class ResearchService:
                         sym.id = f"s{sec_idx}_sym{sym_idx}"
                 code_map = CodeMapData(sections=all_sections)
                 logger.info("Codemap: merged %d sections from %d wikis",
-                            len(all_sections), len(components.query_service._services))
+                            len(all_sections), len(components.query_service.per_wiki_services()))
         else:
             # Single-wiki path
             fts_index = components.graph_manager.fts_index if components.graph_manager else None

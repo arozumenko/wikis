@@ -178,6 +178,10 @@ class MultiGraphQueryService:
         """Return the list of wiki IDs this service spans."""
         return list(self._services.keys())
 
+    def per_wiki_services(self) -> dict[str, GraphQueryService]:
+        """Return the mapping of wiki_id → GraphQueryService for per-wiki iteration."""
+        return dict(self._services)
+
     # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------

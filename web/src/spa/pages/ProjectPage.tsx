@@ -120,11 +120,6 @@ export function ProjectPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Inline edit state (name only)
-  const [editing, setEditing] = useState(false);
-  const [editName, setEditName] = useState('');
-  const [savingEdit, setSavingEdit] = useState(false);
-
   // Description modal state
   const [descModalOpen, setDescModalOpen] = useState(false);
   const [descDraft, setDescDraft] = useState('');
@@ -177,6 +172,7 @@ export function ProjectPage() {
     const handler = (e: BeforeUnloadEvent) => {
       if (descDraft !== descOriginal) {
         e.preventDefault();
+        e.returnValue = '';
       }
     };
     window.addEventListener('beforeunload', handler);
@@ -199,8 +195,11 @@ export function ProjectPage() {
       ]);
       setProject(proj);
       setWikis(wikiRes.wikis ?? []);
-      const allWikiRes = await listWikis();
-      setAllWikis(allWikiRes.wikis ?? []);
+      // Only fetch all wikis if current user is owner (needed for "add wiki" panel)
+      if (user?.id === proj.owner_id) {
+        const allWikiRes = await listWikis();
+        setAllWikis(allWikiRes.wikis ?? []);
+      }
     } catch {
       setError('Failed to load project.');
     } finally {
@@ -217,31 +216,6 @@ export function ProjectPage() {
   // Wikis not yet in this project
   const memberIds = new Set(wikis.map((w) => w.wiki_id));
   const availableToAdd = allWikis.filter((w) => !memberIds.has(w.wiki_id));
-
-  const handleStartEdit = useCallback(() => {
-    if (!project) return;
-    setEditName(project.name);
-    setEditing(true);
-  }, [project]);
-
-  const handleCancelEdit = useCallback(() => {
-    setEditing(false);
-  }, []);
-
-  const handleSaveEdit = useCallback(async () => {
-    if (!project || !editName.trim()) return;
-    setSavingEdit(true);
-    try {
-      const updated = await updateProject(project.id, { name: editName.trim() });
-      setProject(updated);
-      setEditing(false);
-      showSnack('Project updated', 'success');
-    } catch {
-      showSnack('Failed to save changes');
-    } finally {
-      setSavingEdit(false);
-    }
-  }, [project, editName, showSnack]);
 
   // Description modal handlers
   const handleOpenDescModal = useCallback(() => {
@@ -584,73 +558,45 @@ export function ProjectPage() {
 
       {/* Header */}
       <Box sx={{ mb: 2 }}>
-        {editing ? (
-          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, maxWidth: 600 }}>
-            <TextField
-              value={editName}
-              onChange={(e) => setEditName(e.target.value)}
-              label="Project Name"
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+            <Typography variant="h4" component="h1" sx={{ fontWeight: 700 }}>
+              {project.name}
+            </Typography>
+            <Chip
+              icon={
+                project.visibility === 'personal' ? (
+                  <LockOutlinedIcon sx={{ fontSize: '0.8rem !important' }} />
+                ) : (
+                  <PublicOutlinedIcon sx={{ fontSize: '0.8rem !important' }} />
+                )
+              }
+              label={project.visibility === 'personal' ? 'Personal' : 'Shared'}
               size="small"
-              fullWidth
-              inputProps={{ maxLength: 100 }}
-              disabled={savingEdit}
+              variant="outlined"
+              sx={{ fontSize: '0.7rem' }}
             />
-            <Box sx={{ display: 'flex', gap: 1 }}>
-              <Button
-                size="small"
-                variant="contained"
-                startIcon={savingEdit ? <CircularProgress size={14} /> : <CheckIcon />}
-                onClick={handleSaveEdit}
-                disabled={!editName.trim() || savingEdit}
-              >
-                Save
-              </Button>
-              <Button size="small" startIcon={<CloseIcon />} onClick={handleCancelEdit} disabled={savingEdit}>
-                Cancel
-              </Button>
-            </Box>
           </Box>
-        ) : (
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
-              <Typography variant="h4" component="h1" sx={{ fontWeight: 700 }}>
-                {project.name}
-              </Typography>
-              <Chip
-                icon={
-                  project.visibility === 'personal' ? (
-                    <LockOutlinedIcon sx={{ fontSize: '0.8rem !important' }} />
-                  ) : (
-                    <PublicOutlinedIcon sx={{ fontSize: '0.8rem !important' }} />
-                  )
-                }
-                label={project.visibility === 'personal' ? 'Personal' : 'Shared'}
-                size="small"
-                variant="outlined"
-                sx={{ fontSize: '0.7rem' }}
-              />
-            </Box>
+          {isOwner && (
             <Box sx={{ display: 'flex', gap: 0.5, flexShrink: 0 }}>
               <Tooltip title="Edit description">
                 <IconButton size="small" onClick={handleOpenDescModal}>
                   <EditOutlinedIcon fontSize="small" />
                 </IconButton>
               </Tooltip>
-              {isOwner && (
-                <Tooltip title="Delete project">
-                  <IconButton
-                    size="small"
-                    disabled={deleting}
-                    onClick={() => setConfirmDeleteOpen(true)}
-                    sx={{ '&:hover': { color: 'error.main' } }}
-                  >
-                    <DeleteOutlineIcon fontSize="small" />
-                  </IconButton>
-                </Tooltip>
-              )}
+              <Tooltip title="Delete project">
+                <IconButton
+                  size="small"
+                  disabled={deleting}
+                  onClick={() => setConfirmDeleteOpen(true)}
+                  sx={{ '&:hover': { color: 'error.main' } }}
+                >
+                  <DeleteOutlineIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
             </Box>
-          </Box>
-        )}
+          )}
+        </Box>
       </Box>
 
       {/* Description section */}

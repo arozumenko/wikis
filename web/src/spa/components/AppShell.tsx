@@ -78,7 +78,7 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
-  const isDashboard = !repoContext;
+  const isDashboard = !wikiId && !projectId;
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
