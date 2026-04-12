@@ -32,6 +32,7 @@ class EngineComponents:
     repo_analysis: dict | None = None
     llm: Any = None  # BaseChatModel
     repo_path: str | None = None  # Path to cloned repo (if still on disk)
+    query_service: Any = None  # GraphQueryService or MultiGraphQueryService (projects)
 
 
 class ComponentCache:

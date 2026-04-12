@@ -82,6 +82,7 @@ class AskEngine:
         backend: object | None = None,
         llm_settings: dict | None = None,
         config: AskConfig | None = None,
+        query_service: Any = None,  # Pre-built GraphQueryService or MultiGraphQueryService
     ):
         """
         Initialize the Ask engine.
@@ -95,6 +96,7 @@ class AskEngine:
             backend: DeepAgents backend factory or instance
             llm_settings: LLM config (used only if llm_client is None)
             config: Ask configuration
+            query_service: Pre-built query service (for multi-wiki projects)
         """
         self.retriever_stack = retriever_stack
         self.graph_manager = graph_manager
@@ -104,6 +106,7 @@ class AskEngine:
         self.backend = backend
         self.llm_settings = llm_settings or {}
         self.config = config or AskConfig()
+        self.query_service = query_service
 
         # Session state
         self.final_answer: str = ""
@@ -167,6 +170,7 @@ class AskEngine:
                 event_callback=None,  # Events come from LangGraph stream
                 graph_text_index=fts_index,
                 similarity_threshold=self.config.similarity_threshold,
+                query_service=self.query_service,
             )
         finally:
             # Restore original env

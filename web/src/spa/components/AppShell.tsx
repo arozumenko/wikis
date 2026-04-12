@@ -21,6 +21,7 @@ import LogoutIcon from '@mui/icons-material/Logout';
 import SettingsIcon from '@mui/icons-material/Settings';
 import GitHubIcon from '@mui/icons-material/GitHub';
 import RefreshIcon from '@mui/icons-material/Refresh';
+import FileUploadIcon from '@mui/icons-material/FileUpload';
 import SearchIcon from '@mui/icons-material/Search';
 import { Link, Outlet, useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
@@ -65,12 +66,19 @@ const isMac =
   typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('MAC');
 const shortcutHint = isMac ? '⌘K' : 'Ctrl+K';
 
+export interface AppShellOutletContext {
+  importDialogOpen: boolean;
+  setImportDialogOpen: (open: boolean) => void;
+}
+
 export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
   const { wikiId, projectId } = useParams<{ wikiId?: string; projectId?: string }>();
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const isDashboard = !repoContext;
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
@@ -253,6 +261,19 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
             </Tooltip>
           )}
 
+          {/* Import wiki button (dashboard only) */}
+          {isDashboard && (
+            <Tooltip title="Import wiki">
+              <IconButton
+                onClick={() => setImportDialogOpen(true)}
+                size="small"
+                sx={{ color: 'text.secondary', mr: 0.5, '&:hover': { color: 'primary.main' } }}
+              >
+                <FileUploadIcon sx={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          )}
+
           {/* Search button */}
           <Tooltip title={shortcutHint}>
             <IconButton
@@ -350,7 +371,7 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
           '& > *': { animation: 'fadeInUp 0.3s ease-out' },
         }}
       >
-        <Outlet />
+        <Outlet context={{ importDialogOpen, setImportDialogOpen } satisfies AppShellOutletContext} />
       </Box>
 
       <ConfirmDialog

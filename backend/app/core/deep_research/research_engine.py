@@ -84,6 +84,7 @@ class DeepResearchEngine:
         llm_settings: dict | None = None,
         config: ResearchConfig | None = None,
         repo_path: str | None = None,
+        query_service: Any = None,  # Pre-built GraphQueryService or MultiGraphQueryService
     ):
         """
         Initialize the research engine.
@@ -96,6 +97,7 @@ class DeepResearchEngine:
             llm_settings: LLM configuration dict
             config: Research configuration
             repo_path: Path to cloned repo for direct file access
+            query_service: Pre-built query service (for multi-wiki projects)
         """
         self.retriever_stack = retriever_stack
         self.graph_manager = graph_manager
@@ -106,6 +108,7 @@ class DeepResearchEngine:
         self.llm_settings = llm_settings or {}
         self.config = config or ResearchConfig()
         self.repo_path = repo_path
+        self.query_service = query_service
 
         # Session tracking (simplified - no redundant state)
         self.session_id: str | None = None
@@ -161,6 +164,7 @@ class DeepResearchEngine:
             graph_text_index=fts_index,
             similarity_threshold=self.config.similarity_threshold,
             repo_path=self.repo_path,
+            query_service=self.query_service,
         )
 
         _profile = getattr(model, "profile", None)

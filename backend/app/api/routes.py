@@ -1170,6 +1170,17 @@ async def list_project_wikis(
     if wikis is None:
         raise HTTPException(404, f"Project not found: {project_id}")
     summaries = [WikiManagementService._record_to_summary(w, user.id) for w in wikis]
+
+    # Enrich with actual page count (DB page_count may be stale)
+    for wiki in summaries:
+        try:
+            artifacts = await management.storage.list_artifacts("wiki_artifacts", prefix=wiki.wiki_id)
+            actual_pages = sum(1 for a in artifacts if a.endswith(".md") and "wiki_pages" in a)
+            if actual_pages > 0:
+                wiki.page_count = actual_pages
+        except Exception:  # noqa: S110
+            pass
+
     return WikiListResponse(wikis=summaries)
 
 
