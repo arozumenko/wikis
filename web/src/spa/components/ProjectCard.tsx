@@ -16,6 +16,7 @@ import PublicOutlinedIcon from '@mui/icons-material/PublicOutlined';
 import ShareIcon from '@mui/icons-material/Share';
 import { useNavigate } from 'react-router-dom';
 import { deleteProject, updateProject, type ProjectResponse } from '../api/project';
+import { useAuth } from '../hooks/useAuth';
 
 interface ProjectCardProps {
   project: ProjectResponse;
@@ -26,6 +27,8 @@ interface ProjectCardProps {
 
 export function ProjectCard({ project, gradient, onDelete, onUpdate }: ProjectCardProps) {
   const navigate = useNavigate();
+  const { user } = useAuth();
+  const isOwner = user?.id === project.owner_id;
   const [deleting, setDeleting] = useState(false);
   const [toggling, setToggling] = useState(false);
   const [snack, setSnack] = useState<{ message: string; severity: 'success' | 'error' } | null>(null);
@@ -158,38 +161,40 @@ export function ProjectCard({ project, gradient, onDelete, onUpdate }: ProjectCa
             <Typography variant="caption" color="text.secondary">
               {new Date(project.created_at).toLocaleDateString()}
             </Typography>
-            <Box onClick={(e) => e.stopPropagation()}>
-              <Tooltip title={visibility === 'personal' ? 'Share with all users' : 'Make private'}>
-                <span>
-                  <IconButton
-                    size="small"
-                    disabled={toggling}
-                    onClick={handleToggleVisibility}
-                    sx={{
-                      color: visibility === 'shared' ? 'primary.main' : 'text.secondary',
-                    }}
-                  >
-                    <ShareIcon fontSize="small" />
-                  </IconButton>
-                </span>
-              </Tooltip>
-              <Tooltip title="Delete project">
-                <span>
-                  <IconButton
-                    size="small"
-                    disabled={deleting}
-                    onClick={handleDelete}
-                    sx={{
-                      color: 'text.secondary',
-                      '&:hover': { color: 'error.main' },
-                      '&.Mui-disabled': { color: 'text.disabled' },
-                    }}
-                  >
-                    <DeleteIcon fontSize="small" />
-                  </IconButton>
-                </span>
-              </Tooltip>
-            </Box>
+            {isOwner && (
+              <Box onClick={(e) => e.stopPropagation()}>
+                <Tooltip title={visibility === 'personal' ? 'Share with all users' : 'Make private'}>
+                  <span>
+                    <IconButton
+                      size="small"
+                      disabled={toggling}
+                      onClick={handleToggleVisibility}
+                      sx={{
+                        color: visibility === 'shared' ? 'primary.main' : 'text.secondary',
+                      }}
+                    >
+                      <ShareIcon fontSize="small" />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+                <Tooltip title="Delete project">
+                  <span>
+                    <IconButton
+                      size="small"
+                      disabled={deleting}
+                      onClick={handleDelete}
+                      sx={{
+                        color: 'text.secondary',
+                        '&:hover': { color: 'error.main' },
+                        '&.Mui-disabled': { color: 'text.disabled' },
+                      }}
+                    >
+                      <DeleteIcon fontSize="small" />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              </Box>
+            )}
           </Box>
         </Box>
       </Card>
