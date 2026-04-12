@@ -295,7 +295,12 @@ class TestExportImportRoundtrip:
                 f"Content mismatch for {filename} after import"
             )
 
-        # .docs.pkl must never appear on disk after import (excluded by ExportService)
+        # .docs.pkl must never appear on disk after import.
+        # Note: the pre-import cleanup (above) deleted the original .docs.pkl from disk.
+        # ExportService excludes .docs.pkl from the bundle, so no importer write can
+        # recreate it.  This assert confirms the workspace is clean post-import and that
+        # the exclusion in ExportService has not regressed (if it had, the file would
+        # reappear here via the import's cache-file restore path).
         pkl_file = cache_dir / f"{_CACHE_KEY}.docs.pkl"
         assert not pkl_file.exists(), (
             f".docs.pkl found on disk after import — exclusion regressed: {pkl_file}"
@@ -365,8 +370,13 @@ class TestExportImportRoundtrip:
         )
 
     @pytest.mark.asyncio
-    async def test_roundtrip_page_content_integrity(self, rt_client):
-        """Every exported page byte-matches what was in storage pre-export."""
+    async def test_export_page_content_in_bundle(self, rt_client):
+        """Every exported page byte-matches what was in storage pre-export.
+
+        This is an export-only test: it verifies the bundle ZIP contains the
+        correct bytes for each page, but does not run the import leg.  Full
+        round-trip page integrity is covered by test_full_roundtrip (Step 5).
+        """
         c, app, sf, storage, cache_dir = rt_client
         await _seed_complete_wiki(sf, storage)
 

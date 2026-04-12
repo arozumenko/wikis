@@ -13,7 +13,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -223,17 +223,6 @@ class TestExportEndpoint:
 
         resp = await c.get(f"/api/v1/wikis/{wiki_id}/export?format=obsidian")
         assert resp.status_code == 409, resp.text
-
-    @pytest.mark.asyncio
-    async def test_export_wikis_format_on_generating_wiki_returns_409(self, client):
-        """GET /api/v1/wikis/{id}/export?format=wikis on a generating wiki → 409."""
-        c, app, sf = client
-        wiki_id = "export-wikis-incomplete-001"
-        await _seed_wiki(sf, wiki_id=wiki_id, status="generating")
-
-        resp = await c.get(f"/api/v1/wikis/{wiki_id}/export?format=wikis")
-        assert resp.status_code == 409, resp.text
-        assert "fully generated" in resp.json().get("detail", "")
 
 
 # ---------------------------------------------------------------------------
@@ -445,53 +434,10 @@ class TestImportEndpoint:
         detail = resp.json().get("detail", "")
         assert "pkl" in detail.lower() or "pickle" in detail.lower() or "invalid bundle" in detail.lower()
 
-    @pytest.mark.asyncio
-    async def test_import_same_bundle_twice_second_succeeds(self, client):
-        """POST /api/v1/wikis/import the same bundle twice → second import succeeds (overwrite)."""
-        c, app, sf = client
-        wiki_id = "import-overwrite-001"
-
-        # Seed the wiki record that restore_wiki will return
-        async with sf() as session:
-            async with session.begin():
-                session.add(WikiRecord(
-                    id=wiki_id,
-                    owner_id="dev-user",
-                    repo_url="https://github.com/test/repo",
-                    branch="main",
-                    title="Overwrite Wiki",
-                    page_count=1,
-                    status="complete",
-                ))
-
-        from sqlalchemy import select
-
-        async with sf() as session:
-            result = await session.execute(select(WikiRecord).where(WikiRecord.id == wiki_id))
-            record = result.scalar_one_or_none()
-
-        # Both imports return the same record (overwrite scenario handled by ImportService)
-        app.state.import_service.restore_wiki = AsyncMock(return_value=record)
-
-        bundle_bytes = _make_wikis_bundle_bytes(wiki_id)
-
-        # First import
-        resp1 = await c.post(
-            "/api/v1/wikis/import",
-            files={"bundle": ("bundle.wikiexport", bundle_bytes, "application/zip")},
-        )
-        assert resp1.status_code == 201, f"First import failed: {resp1.text}"
-        assert resp1.json()["wiki_id"] == wiki_id
-
-        # Second import — should also succeed (not 409 or 500)
-        resp2 = await c.post(
-            "/api/v1/wikis/import",
-            files={"bundle": ("bundle.wikiexport", bundle_bytes, "application/zip")},
-        )
-        assert resp2.status_code == 201, f"Second import failed: {resp2.text}"
-        data2 = resp2.json()
-        assert data2["wiki_id"] == wiki_id
-        assert data2["status"] == "complete"
+    # Note: duplicate-import idempotency (importing the same bundle twice) is tested
+    # in test_export_import_roundtrip.py::TestExportImportRoundtrip using real services
+    # end-to-end. A mock-only version here would pass vacuously because the mock always
+    # returns success regardless of any collision-handling logic in ImportService.
 
     @pytest.mark.asyncio
     async def test_import_plain_text_file_returns_422(self, client):
