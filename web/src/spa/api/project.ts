@@ -1,10 +1,7 @@
 import { apiRequest } from './client';
 import type { components } from './types.generated';
-import { subscribeAskSSE, subscribeResearchSSE } from './sse';
-import type { AskSSEEvent, ResearchSSEEvent } from './sse';
 
 type WikiSummary = components['schemas']['WikiSummary'];
-type ChatMessage = components['schemas']['ChatMessage'];
 
 export interface ProjectResponse {
   id: string;
@@ -69,63 +66,3 @@ export const listProjectWikis = (projectId: string): Promise<{ wikis: WikiSummar
     `/api/v1/projects/${encodeURIComponent(projectId)}/wikis`,
   );
 
-/**
- * Stream ask (fast Q&A) events scoped to a project.
- * Passes project_id instead of wiki_id so the backend queries all member wikis.
- */
-export const askProject = (
-  projectId: string,
-  question: string,
-  onEvent: (event: AskSSEEvent) => void,
-  onDone: () => void,
-  onError: (e: unknown) => void,
-  chatHistory?: ChatMessage[],
-): (() => void) => {
-  return subscribeAskSSE(
-    '/api/v1/ask',
-    { project_id: projectId, question, chat_history: chatHistory ?? [], stream: true },
-    onEvent,
-    onDone,
-    onError,
-  );
-};
-
-/**
- * Stream deep-research events scoped to a project.
- */
-export const researchProject = (
-  projectId: string,
-  question: string,
-  onEvent: (event: ResearchSSEEvent) => void,
-  onDone: () => void,
-  onError: (e: unknown) => void,
-): (() => void) => {
-  return subscribeResearchSSE(
-    '/api/v1/research',
-    { project_id: projectId, question, stream: true },
-    onEvent,
-    onDone,
-    onError,
-  );
-};
-
-/**
- * Stream code-map events for a project.
- */
-export const mapProject = (
-  projectId: string,
-  question: string,
-  onEvent: (event: ResearchSSEEvent) => void,
-  onDone: () => void,
-  onError: (e: unknown) => void,
-): (() => void) => {
-  return subscribeResearchSSE(
-    `/api/v1/projects/${encodeURIComponent(projectId)}/map`,
-    { question },
-    onEvent,
-    onDone,
-    onError,
-  );
-};
-
-export type { AskSSEEvent, ResearchSSEEvent };

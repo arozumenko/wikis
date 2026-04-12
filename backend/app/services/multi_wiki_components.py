@@ -110,7 +110,21 @@ async def build_multi_wiki_components(
     # Use the first wiki's llm / repo_analysis as the "primary" for generation
     primary = next(iter(loaded.values()))
 
-    # Build a combined code_graph (use primary's; multi-graph ops use per_wiki_components)
+    # Build a MultiGraphQueryService so all tools search across every wiki
+    from app.core.code_graph.graph_query_service import GraphQueryService
+    from app.core.code_graph.multi_graph_query_service import MultiGraphQueryService
+
+    individual_services = {}
+    for wid, comp in loaded.items():
+        if comp.code_graph is not None:
+            fts = comp.graph_manager.fts_index if comp.graph_manager else None
+            individual_services[wid] = GraphQueryService(comp.code_graph, fts_index=fts)
+
+    multi_gqs: MultiGraphQueryService | None = None
+    if individual_services:
+        multi_gqs = MultiGraphQueryService(individual_services)
+
+    # Build a combined code_graph (use primary's; multi-graph ops use query_service)
     merged = EngineComponents(
         retriever_stack=multi_stack,
         graph_manager=primary.graph_manager,
@@ -118,6 +132,7 @@ async def build_multi_wiki_components(
         repo_analysis=primary.repo_analysis,
         llm=primary.llm,
         repo_path=primary.repo_path,
+        query_service=multi_gqs,
     )
 
     # Override repo_analysis description with project-level description (project takes precedence)

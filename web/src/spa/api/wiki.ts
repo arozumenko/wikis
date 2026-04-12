@@ -80,12 +80,6 @@ export const updateWikiVisibility = (wikiId: string, visibility: 'personal' | 's
     },
   );
 
-export const updateWikiDescription = (wikiId: string, description: string | null) =>
-  apiRequest<WikiDetail>(`/api/v1/wikis/${encodeURIComponent(wikiId)}/description`, {
-    method: 'PATCH',
-    body: JSON.stringify({ description }),
-  });
-
 export const healthCheck = () => apiRequest<HealthResponse>('/api/v1/health');
 
 export async function importWiki(file: File): Promise<WikiSummary> {

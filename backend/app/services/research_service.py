@@ -127,6 +127,7 @@ def _build_call_tree_from_sources(
         name = data.get("symbol_name", "") or data.get("name", "")
         sym_type = (data.get("symbol_type") or "").lower()
         if sym_type in _EXCLUDE_SYMBOL_TYPES:
+            logger.debug("Codemap: skipping excluded type %s for %s", sym_type, name)
             continue
         fp = _rel_path(data)
         line = data.get("line_start")
@@ -272,12 +273,16 @@ async def _explain_tree_nodes(
     code_map: CodeMapData,
     question: str,
     llm: object,
+    answer_context: str = "",
 ) -> CodeMapData:
     """Annotate each symbol with a 1-sentence description using a low-tier LLM.
 
     Sends a single batch prompt listing all symbols; parses the JSON response
     back onto each ``CodeMapSymbol.description``.  Also sets
     ``CodeMapData.summary`` to a short call-flow overview.
+
+    When ``answer_context`` is provided (e.g. from the ask engine), it gives
+    the LLM additional context to build cross-repo call stacks.
     """
     from langchain_core.messages import HumanMessage
 
@@ -307,6 +312,14 @@ async def _explain_tree_nodes(
     for e in symbol_entries:
         id_to_info[e["id"]] = {"name": e["name"], "file": e["file"]}
 
+    answer_section = ""
+    if answer_context:
+        # Truncate to keep prompt manageable
+        truncated = answer_context[:2000]
+        answer_section = (
+            f"\nAnswer context (how these symbols relate):\n{truncated}\n"
+        )
+
     prompt = (
         "You are a code analysis assistant.  Given the user's question and a list of "
         "code symbols with their relationships, produce a JSON object with:\n\n"
@@ -319,9 +332,12 @@ async def _explain_tree_nodes(
         "   IMPORTANT: Use the actual symbol NAME (e.g. \"useAuth\", \"MCPAuthMiddleware\"), "
         "NOT the id (e.g. NOT \"s0_sym0\"). "
         "List steps in execution order (entry point first). "
-        "Create separate chains for independent flows.\n\n"
+        "Create separate chains for independent flows. "
+        "Symbols may come from different repositories — connect cross-repo flows "
+        "where one repo's code calls or depends on another's.\n\n"
         "Return ONLY valid JSON, no markdown fences.\n\n"
-        f"Question: {question}\n\n"
+        f"Question: {question}\n"
+        f"{answer_section}\n"
         f"Symbols:\n{symbols_text}\n\n"
         "JSON:"
     )
@@ -434,6 +450,7 @@ class ResearchService:
                 similarity_threshold=self.settings.research_similarity_threshold,
             ),
             repo_path=components.repo_path,
+            query_service=components.query_service,
         )
 
         chat_history = [{"role": m.role, "content": m.content} for m in request.chat_history] or None
@@ -501,11 +518,10 @@ class ResearchService:
         from app.services.llm_factory import create_llm
 
         # Load components — single wiki or multi-wiki (project) path
-        per_wiki_components: dict[str, object] | None = None
         if request.project_id:
             from app.services.multi_wiki_components import build_multi_wiki_components
 
-            components, per_wiki_components = await build_multi_wiki_components(
+            components, _per_wiki = await build_multi_wiki_components(
                 project_id=request.project_id,
                 user_id=user_id or "",
                 storage=self.storage,
@@ -520,7 +536,7 @@ class ResearchService:
         ask_sources: list[SourceReference] = []
         import re
         _SYM_LINE_RE = re.compile(
-            r"`(\w+)`\s+\((\w+)\)\s+(?:in|—)\s+([\w/.]+)"
+            r"(?:`|\*\*)(\w+)(?:`|\*\*)\s+\((\w+)(?:\s*\[[^\]]*\])?\)(?:\s*\[[^\]]*\])?\s*(?:in|—)\s*`?([\w/.]+)`?"
         )
 
         # Collect ALL symbols from tool results; we'll filter after we have the answer
@@ -537,6 +553,7 @@ class ResearchService:
                 config=AskConfig(
                     similarity_threshold=self.settings.ask_similarity_threshold,
                 ),
+                query_service=components.query_service,
             )
             chat_history = (
                 [{"role": m.role, "content": m.content} for m in request.chat_history]
@@ -569,9 +586,15 @@ class ResearchService:
                                         symbol_type=sym_type,
                                     ))
 
+                if event_type == "answer_chunk":
+                    chunk = event.get("data", {}).get("chunk", "")
+                    ask_answer += chunk
+
                 if event_type in ("ask_complete", "task_complete"):
                     data = event.get("data", {})
-                    ask_answer = data.get("answer", "")
+                    final = data.get("answer", "")
+                    if final:
+                        ask_answer = final
                 elif event_type in ("ask_error", "task_failed"):
                     logger.warning("Ask engine failed in codemap: %s", event)
         except Exception:
@@ -618,23 +641,34 @@ class ResearchService:
         }}
 
         code_map: CodeMapData | None = None
-        if per_wiki_components:
-            # Project path — build MultiGraphQueryService from all loaded wikis
-            fts_index = components.graph_manager.fts_index if components.graph_manager else None
-            individual_services = {
-                wiki_id: GraphQueryService(comp.code_graph, comp.graph_manager.fts_index if comp.graph_manager else fts_index)
-                for wiki_id, comp in per_wiki_components.items()
-            }
-            gqs: Union[GraphQueryService, MultiGraphQueryService] = MultiGraphQueryService(individual_services)
+        if components.query_service and isinstance(components.query_service, MultiGraphQueryService):
+            # Project path — build per-wiki code maps, then merge sections so the
+            # LLM can wire cross-repo call stacks in the explain step.
+            all_sections: list[CodeMapSection] = []
+            for wiki_id, svc in components.query_service.per_wiki_services().items():
+                try:
+                    per_wiki_map = _build_call_tree_from_sources(ask_sources, svc)
+                    if per_wiki_map and per_wiki_map.sections:
+                        all_sections.extend(per_wiki_map.sections)
+                except Exception:
+                    logger.warning("Failed to build call tree for wiki %s", wiki_id)
+            if all_sections:
+                # Re-number section/symbol IDs to avoid collisions
+                for sec_idx, sec in enumerate(all_sections):
+                    sec.id = f"section_{sec_idx}"
+                    for sym_idx, sym in enumerate(sec.symbols):
+                        sym.id = f"s{sec_idx}_sym{sym_idx}"
+                code_map = CodeMapData(sections=all_sections)
+                logger.info("Codemap: merged %d sections from %d wikis",
+                            len(all_sections), len(components.query_service.per_wiki_services()))
         else:
             # Single-wiki path
             fts_index = components.graph_manager.fts_index if components.graph_manager else None
-            gqs = GraphQueryService(components.code_graph, fts_index)
-
-        try:
-            code_map = _build_call_tree_from_sources(ask_sources, gqs)
-        except Exception:
-            logger.exception("Failed to build call tree from ask sources")
+            gqs: Union[GraphQueryService, MultiGraphQueryService] = GraphQueryService(components.code_graph, fts_index)
+            try:
+                code_map = _build_call_tree_from_sources(ask_sources, gqs)
+            except Exception:
+                logger.exception("Failed to build call tree from ask sources")
 
         node_count = sum(len(s.symbols) for s in code_map.sections) if code_map else 0
         yield {"event_type": "thinking_step", "data": {
@@ -655,6 +689,7 @@ class ResearchService:
                 explain_llm = create_llm(self.settings, tier="low", skip_retry=True)
                 code_map = await _explain_tree_nodes(
                     code_map, request.question, explain_llm,
+                    answer_context=ask_answer,
                 )
             except Exception:
                 logger.exception("Node explanation step failed")

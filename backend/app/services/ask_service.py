@@ -121,11 +121,16 @@ class AskService:
             tier="low",
         )
 
-    async def _stream_from_agent(self, request: AskRequest) -> AsyncGenerator[dict, None]:
+    async def _stream_from_agent(self, request: AskRequest, user_id: str | None = None) -> AsyncGenerator[dict, None]:
         """Stream raw events from AskEngine (no cache logic)."""
         from app.core.ask_engine import AskConfig, AskEngine
 
-        components = await self._get_components(request.wiki_id)
+        if request.project_id:
+            components, _per_wiki = await self._get_multi_wiki_components(
+                request.project_id, user_id or "",
+            )
+        else:
+            components = await self._get_components(request.wiki_id)
 
         engine = AskEngine(
             retriever_stack=components.retriever_stack,
@@ -134,6 +139,7 @@ class AskService:
             repo_analysis=components.repo_analysis,
             llm_client=components.llm,
             config=AskConfig(similarity_threshold=self.settings.ask_similarity_threshold),
+            query_service=components.query_service,
         )
 
         async for event in engine.ask(
@@ -181,7 +187,7 @@ class AskService:
         tool_steps = 0
 
         try:
-            async for event in self._stream_from_agent(request):
+            async for event in self._stream_from_agent(request, user_id=user_id):
                 event_type = event.get("event_type", "")
                 if event_type in ("task_complete", "ask_complete"):
                     data = event.get("data", {})
@@ -234,7 +240,7 @@ class AskService:
         sources: list[SourceReference] = []
         step_count = 0
 
-        async for event in self._stream_from_agent(request):
+        async for event in self._stream_from_agent(request, user_id=user_id):
             event_type = event.get("event_type", "")
             # Support both legacy (ask_complete/ask_error) and MCP (task_complete/task_failed) events
             if event_type in ("ask_complete", "task_complete"):

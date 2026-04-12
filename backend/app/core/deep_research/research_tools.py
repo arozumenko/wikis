@@ -394,6 +394,7 @@ def create_codebase_tools(
     graph_text_index: Any = None,  # GraphTextIndex (FTS5)
     unified_db_path: str | None = None,  # Path to .wiki.db (Phase 6)
     repo_path: str | None = None,  # Path to cloned repo for direct file access
+    query_service: Any = None,  # Pre-built GraphQueryService or MultiGraphQueryService (projects)
 ) -> list:
     """
     Create custom tools for deep research.
@@ -423,7 +424,9 @@ def create_codebase_tools(
     emit = event_callback or (lambda x: None)
 
     # Build unified query service (SPEC-1: replaces scattered O(N) scans)
-    query_service = GraphQueryService(code_graph, fts_index=graph_text_index) if code_graph else None
+    # Use pre-built query_service when provided (e.g. MultiGraphQueryService for projects)
+    if query_service is None:
+        query_service = GraphQueryService(code_graph, fts_index=graph_text_index) if code_graph else None
 
     # Resolve unified_db_path: auto-detect when flag is on but path not provided
     _udb_path = unified_db_path

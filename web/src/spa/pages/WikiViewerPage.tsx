@@ -15,9 +15,6 @@ import {
   Tooltip,
 } from '@mui/material';
 import ClearIcon from '@mui/icons-material/Clear';
-import CheckIcon from '@mui/icons-material/Check';
-import CloseIcon from '@mui/icons-material/Close';
-import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { WikiSidebar } from '../components/WikiSidebar';
 import { WikiPageView } from '../components/WikiPageView';
@@ -29,7 +26,7 @@ import { AnswerView } from '../components/AnswerView';
 import { AnswerHeader } from '../components/AnswerHeader';
 import { ToolCallPanel } from '../components/ToolCallPanel';
 import { GenerationProgress } from '../components/GenerationProgress';
-import { getWiki, updateWikiDescription } from '../api/wiki';
+import { getWiki } from '../api/wiki';
 import { subscribeSSE, subscribeResearchSSE, subscribeAskSSE } from '../api/sse';
 import type { SSEEventData, ToolCallRecord, TodoItem } from '../api/sse';
 import type { WikiPage } from '../components/WikiSidebar';
@@ -94,11 +91,6 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
   const cancelResearchRef = useRef<(() => void) | null>(null);
   const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState('');
-
-  // Inline description edit state
-  const [editingDescription, setEditingDescription] = useState(false);
-  const [editDescription, setEditDescription] = useState('');
-  const [savingDescription, setSavingDescription] = useState(false);
 
   // Derive LLM context from successfully completed turns (no errors)
   const convHistory = useMemo<ChatMessage[]>(
@@ -541,29 +533,6 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
     [wikiId],
   );
 
-  const handleEditDescription = useCallback(() => {
-    setEditDescription(wiki?.description ?? '');
-    setEditingDescription(true);
-  }, [wiki]);
-
-  const handleCancelDescription = useCallback(() => {
-    setEditingDescription(false);
-  }, []);
-
-  const handleSaveDescription = useCallback(async () => {
-    if (!wikiId) return;
-    setSavingDescription(true);
-    try {
-      const updated = await updateWikiDescription(wikiId, editDescription.trim() || null);
-      setWiki((prev) => (prev ? { ...prev, description: updated.description } : prev));
-      setEditingDescription(false);
-    } catch (err) {
-      console.error('Failed to save description', err);
-    } finally {
-      setSavingDescription(false);
-    }
-  }, [wikiId, editDescription]);
-
   const activePage = pages.find((p) => p.id === activePageId);
   const content = activePage?.content ?? '';
   const sidebarPages: WikiPage[] = pages.map((p) => ({
@@ -704,72 +673,6 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
             </Box>
           ) : (
             <>
-              {/* Inline description editor — shown above wiki page content */}
-              <Box sx={{ px: 3, pt: 2, pb: 0 }}>
-                {editingDescription ? (
-                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, maxWidth: 600 }}>
-                    <TextField
-                      value={editDescription}
-                      onChange={(e) => setEditDescription(e.target.value)}
-                      label="Description"
-                      size="small"
-                      fullWidth
-                      multiline
-                      minRows={2}
-                      disabled={savingDescription}
-                      autoFocus
-                    />
-                    <Box sx={{ display: 'flex', gap: 1 }}>
-                      <Button
-                        size="small"
-                        variant="contained"
-                        startIcon={
-                          savingDescription ? <CircularProgress size={14} /> : <CheckIcon />
-                        }
-                        onClick={handleSaveDescription}
-                        disabled={savingDescription}
-                      >
-                        Save
-                      </Button>
-                      <Button
-                        size="small"
-                        startIcon={<CloseIcon />}
-                        onClick={handleCancelDescription}
-                        disabled={savingDescription}
-                      >
-                        Cancel
-                      </Button>
-                    </Box>
-                  </Box>
-                ) : (
-                  <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.5 }}>
-                    {wiki?.description ? (
-                      <Typography variant="body2" color="text.secondary" sx={{ flex: 1 }}>
-                        {wiki.description}
-                      </Typography>
-                    ) : (
-                      <Typography
-                        variant="body2"
-                        color="text.disabled"
-                        sx={{ flex: 1, fontStyle: 'italic' }}
-                      >
-                        No description
-                      </Typography>
-                    )}
-                    {wiki?.is_owner && (
-                      <Tooltip title="Edit description">
-                        <IconButton
-                          size="small"
-                          onClick={handleEditDescription}
-                          sx={{ flexShrink: 0 }}
-                        >
-                          <EditOutlinedIcon fontSize="small" />
-                        </IconButton>
-                      </Tooltip>
-                    )}
-                  </Box>
-                )}
-              </Box>
               <WikiPageView
                 content={content}
                 mode={mode}
