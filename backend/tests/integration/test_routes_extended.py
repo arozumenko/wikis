@@ -650,15 +650,24 @@ class TestGetWikiPage:
 
     @pytest.mark.asyncio
     async def test_get_wiki_page_success(self, client, test_app):
+        """GET /wikis/{wiki_id}/pages/{page_title} returns WikiPageResponse.
+
+        The new route (added in the graph-aware search epic) resolves pages by
+        title via WikiPageIndexCache rather than scanning artifact paths.  The
+        response uses ``page_title`` (not the legacy ``title`` key).
+        """
         fake_record = MagicMock()
         with (
             patch.object(test_app.state.wiki_management, "get_wiki", new_callable=AsyncMock, return_value=fake_record),
+            # list_artifacts is used by WikiPageIndex.build() to discover .md files.
             patch.object(
                 test_app.state.wiki_management.storage,
                 "list_artifacts",
                 new_callable=AsyncMock,
                 return_value=["w1/repo/wiki_pages/intro.md"],
             ),
+            # download is called twice: once by WikiPageIndex.build() to parse
+            # the frontmatter/wikilinks, and once by the route to return content.
             patch.object(
                 test_app.state.wiki_management.storage,
                 "download",
@@ -668,7 +677,9 @@ class TestGetWikiPage:
         ):
             resp = await client.get("/api/v1/wikis/w1/pages/intro")
         assert resp.status_code == 200
-        assert "Intro" in resp.json()["title"] or resp.json()["content"]
+        # The new route returns WikiPageResponse which uses 'page_title', not 'title'.
+        assert resp.json()["page_title"] == "intro"
+        assert "Intro" in resp.json()["content"]
 
 
 # ---------------------------------------------------------------------------
