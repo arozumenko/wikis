@@ -239,6 +239,9 @@ case "${provider_choice:-7}" in
     LLM_API_KEY="not-needed"
     info "Make sure Ollama is running: ollama pull <model>"
     prompt_models "llama3.2" "llama3.2" "nomic-embed-text"
+    echo ""
+    prompt "Max parallel LLM requests [2]: " LLM_MAX_CONCURRENCY
+    LLM_MAX_CONCURRENCY="${LLM_MAX_CONCURRENCY:-2}"
     ;;
   7|"")
     info "Skipping LLM config — edit .env before generating wikis."
@@ -291,6 +294,10 @@ EMBEDDING_MODEL=${EMBEDDING_MODEL}
 ENVFILE
 
 # Conditional provider-specific vars
+if [ -n "$LLM_MAX_CONCURRENCY" ]; then
+  echo "LLM_MAX_CONCURRENCY=${LLM_MAX_CONCURRENCY}" >> .env
+fi
+
 if [ -n "$LLM_API_BASE" ]; then
   echo "LLM_API_BASE=${LLM_API_BASE}" >> .env
 fi

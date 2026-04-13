@@ -51,6 +51,7 @@ class HybridWikiToolkitWrapper:
         embeddings: Any = None,
         indexing_method: str = "filesystem",  # deprecated (filesystem only)
         cleanup_repos_on_exit: bool = True,
+        max_concurrent_pages: int = 4,
         **kwargs,
     ):
         """Initialize the wrapper with configurable multi-provider support"""
@@ -101,6 +102,7 @@ class HybridWikiToolkitWrapper:
         self.force_rebuild_index = force_rebuild_index
         self.indexing_method = "filesystem"  # Only filesystem is supported
         self.cleanup_repos_on_exit = cleanup_repos_on_exit
+        self.max_concurrent_pages = max_concurrent_pages
 
         # Core components
         self.llm = llm
@@ -226,6 +228,7 @@ class HybridWikiToolkitWrapper:
                 llm_low=self.llm_low,
                 enable_quality_enhancement=True,
                 progress_callback=self.progress_callback,
+                max_concurrent_pages=self.max_concurrent_pages,
                 graph_text_index=getattr(
                     getattr(self.indexer, "graph_manager", None),
                     "fts_index",

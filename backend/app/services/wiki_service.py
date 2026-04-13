@@ -205,6 +205,7 @@ class WikiService:
                 force_rebuild_index=request.force_rebuild_index,
                 llm_low=llm_low,
                 progress_callback=progress_callback,
+                max_concurrent_pages=self.settings.llm_max_concurrency,
             )
 
             # Token pre-estimation after toolkit init

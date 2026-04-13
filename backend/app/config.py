@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     storage_path: str = "./data/artifacts"
     cache_dir: str = "./data/cache"
 
+    # Concurrency
+    llm_max_concurrency: int = 4  # max parallel LLM calls during wiki generation (lower for Ollama)
+
     # Provider-specific
     ollama_base_url: str = "http://localhost:11434"
     ollama_num_ctx: int = 32768  # context window for Ollama models
