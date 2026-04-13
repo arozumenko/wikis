@@ -239,9 +239,6 @@ case "${provider_choice:-7}" in
     LLM_API_KEY="not-needed"
     info "Make sure Ollama is running: ollama pull <model>"
     prompt_models "llama3.2" "llama3.2" "nomic-embed-text"
-    echo ""
-    prompt "Max parallel LLM requests [2]: " LLM_MAX_CONCURRENCY
-    LLM_MAX_CONCURRENCY="${LLM_MAX_CONCURRENCY:-2}"
     ;;
   7|"")
     info "Skipping LLM config — edit .env before generating wikis."
@@ -250,6 +247,18 @@ case "${provider_choice:-7}" in
     warn "Invalid choice, skipping LLM config — edit .env later."
     ;;
 esac
+
+# ── LLM Concurrency ──────────────────────────────────────────────
+if [ -n "$LLM_PROVIDER" ]; then
+  if [ "$LLM_PROVIDER" = "ollama" ]; then
+    DEFAULT_CONCURRENCY=2
+  else
+    DEFAULT_CONCURRENCY=4
+  fi
+  echo ""
+  prompt "Max parallel LLM requests [${DEFAULT_CONCURRENCY}]: " LLM_MAX_CONCURRENCY
+  LLM_MAX_CONCURRENCY="${LLM_MAX_CONCURRENCY:-$DEFAULT_CONCURRENCY}"
+fi
 
 # ── Generate JWT keys ──────────────────────────────────────────────
 header "🔐 Generating authentication keys..."
