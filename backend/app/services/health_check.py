@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
+
+HEALTH_CHECK_TTL_SECONDS = 60
 
 
 @dataclass
@@ -16,11 +19,16 @@ class ProviderHealth:
 
     llm: str = "unchecked"  # ok | unreachable: {reason} | unchecked
     embeddings: str = "unchecked"
+    checked_at: float = field(default_factory=time.monotonic)
 
     @property
     def healthy(self) -> bool:
         """False only when a component explicitly reports an error."""
         return not (self.llm.startswith("unreachable:") or self.embeddings.startswith("unreachable:"))
+
+    @property
+    def stale(self) -> bool:
+        return time.monotonic() - self.checked_at > HEALTH_CHECK_TTL_SECONDS
 
 
 def validate_credentials(settings: Settings) -> str | None:

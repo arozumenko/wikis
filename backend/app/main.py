@@ -129,7 +129,13 @@ def create_app() -> FastAPI:
     async def health(request: Request) -> dict[str, object]:
         from fastapi.responses import JSONResponse
 
+        from app.services.health_check import check_providers
+
         provider_health = getattr(request.app.state, "provider_health", None)
+        if provider_health is not None and provider_health.stale:
+            provider_health = await check_providers(settings)
+            request.app.state.provider_health = provider_health
+
         if provider_health is not None and not provider_health.healthy:
             return JSONResponse(
                 status_code=503,

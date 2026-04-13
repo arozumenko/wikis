@@ -60,5 +60,9 @@ export const auth = betterAuth({
     // BETTER_AUTH_URL must be set (e.g. http://localhost:3000 or https://app.example.com).
     useSecureCookies: (process.env.BETTER_AUTH_URL ?? '').startsWith('https://'),
   },
-  trustedOrigins: ['http://localhost:3000', process.env.FRONTEND_URL ?? ''].filter(Boolean),
+  trustedOrigins: [
+    'http://localhost:3000',
+    process.env.BETTER_AUTH_URL ?? '',
+    process.env.FRONTEND_URL ?? '',
+  ].filter(Boolean),
 });
