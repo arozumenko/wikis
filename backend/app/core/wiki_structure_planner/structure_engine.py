@@ -274,7 +274,7 @@ class WikiStructurePlannerEngine:
                         collector.register_discovered_dirs(dirs)
                         logger.debug(f"[STRUCTURE_PLANNER][COVERAGE] Registered dirs from ls: {dirs[:10]}")
 
-    def plan_structure(self, repo_name: str = "", stream_callback: callable | None = None) -> dict[str, Any]:
+    def plan_structure(self, repo_name: str = "", stream_callback: "callable | None" = None) -> dict[str, Any]:
         """
         Generate a wiki structure plan for the repository.
 
@@ -770,7 +770,7 @@ class WikiStructurePlannerEngine:
         self,
         repo_name: str = "",
         repository_files: list[str] | None = None,
-        stream_callback: callable | None = None,
+        stream_callback: "callable | None" = None,
     ) -> dict[str, Any]:
         """Generate a wiki structure using the graph-first deterministic approach.
 

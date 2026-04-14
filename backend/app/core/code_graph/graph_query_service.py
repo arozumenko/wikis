@@ -109,8 +109,7 @@ class GraphQueryService:
     ) -> str | None:
         """Resolve a symbol name to its graph ``node_id``.
 
-        Uses the 6-strategy cascade from ``content_expander._find_graph_node``,
-        adapted as a standalone method:
+        Uses a 6-strategy cascade to resolve symbols:
 
         1. Exact key ``(name, file, lang)`` → ``_node_index``
         2. Simple name ``(simple, file, lang)`` → ``_simple_name_index``

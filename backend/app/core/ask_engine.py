@@ -150,8 +150,14 @@ class AskEngine:
 
         model = self.llm_client or self._build_model()
 
-        # Get FTS5 index from graph_manager if available
+        # Prefer a unified DB-backed FTS adapter when available.
         fts_index = getattr(self.graph_manager, "fts_index", None) if self.graph_manager else None
+        if fts_index is None:
+            db_path = getattr(getattr(self.retriever_stack, "db", None), "db_path", None)
+            if db_path:
+                from .code_graph.unified_graph_text_index import UnifiedGraphTextIndex
+
+                fts_index = UnifiedGraphTextIndex(db_path)
 
         # Force progressive tools for the agentic Ask
         _orig = os.environ.get("WIKIS_PROGRESSIVE_TOOLS", "")

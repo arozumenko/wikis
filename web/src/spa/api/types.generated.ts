@@ -315,6 +315,18 @@ export interface components {
              * @default personal
              */
             visibility?: 'personal' | 'shared';
+            /**
+             * Planner Type
+             * @description Structure planner override (agent or cluster). Null falls back to server config.
+             * @default null
+             */
+            planner_type?: 'agent' | 'cluster' | null;
+            /**
+             * Exclude Tests
+             * @description When true, soft-skip test nodes during clustering. Null falls back to server config.
+             * @default null
+             */
+            exclude_tests?: boolean | null;
         };
         /**
          * GenerateWikiResponse

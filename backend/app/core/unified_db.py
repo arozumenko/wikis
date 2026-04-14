@@ -9,7 +9,7 @@ Consolidates 6–8 per-repo artifact files into a single .wiki.db:
 - clusters:   pre-computed macro/micro cluster assignments (Phase 3)
 - wiki_meta:  build metadata, stats, feature flags
 
-Feature-flagged via WIKIS_UNIFIED_DB=1 (default 0).
+Always enabled — no feature flag.
 
 Phase 1 scope:
 - Schema creation with all tables/indexes
@@ -52,9 +52,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Feature flag — module-level so the indexer can check cheaply
+# Always enabled (no feature flag)
 # ---------------------------------------------------------------------------
-UNIFIED_DB_ENABLED = os.getenv("WIKIS_UNIFIED_DB", "0") == "1"
+UNIFIED_DB_ENABLED = True  # Kept for backward compat; always True
 
 # ---------------------------------------------------------------------------
 # sqlite-vec availability (graceful degradation)
@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS repo_nodes (
     -- Classification
     is_architectural INTEGER DEFAULT 0,
     is_doc           INTEGER DEFAULT 0,
+    is_test          INTEGER DEFAULT 0,
     chunk_type       TEXT DEFAULT NULL,
 
     -- Clustering (Phase 3 — pre-populated as NULL)
@@ -142,6 +143,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_macro      ON repo_nodes(macro_cluster);
 CREATE INDEX IF NOT EXISTS idx_nodes_micro      ON repo_nodes(macro_cluster, micro_cluster);
 CREATE INDEX IF NOT EXISTS idx_nodes_arch       ON repo_nodes(is_architectural) WHERE is_architectural = 1;
 CREATE INDEX IF NOT EXISTS idx_nodes_hub        ON repo_nodes(is_hub) WHERE is_hub = 1;
+CREATE INDEX IF NOT EXISTS idx_nodes_test       ON repo_nodes(is_test) WHERE is_test = 1;
 """
 
 _SCHEMA_EDGES = """
@@ -232,6 +234,12 @@ except ImportError:
     }
     DOC_SYMBOL_TYPES = {"module_doc", "file_doc"}
 
+try:
+    from .cluster_constants import is_test_path as _is_test_path
+except ImportError:
+    def _is_test_path(rel_path: str) -> bool:  # type: ignore[misc]
+        return False
+
 # Legacy symbol types used by graph_builder (pre-constants.py centralization)
 # These coexist with the *_document types in DOC_SYMBOL_TYPES from constants.py
 _LEGACY_DOC_TYPES = {"module_doc", "file_doc"}
@@ -308,6 +316,7 @@ class UnifiedWikiDB:
 
         self._load_extensions()
         if not readonly:
+            self._migrate_schema()
             self._create_schema()
 
         logger.info(
@@ -355,6 +364,43 @@ class UnifiedWikiDB:
 
         self.conn.commit()
 
+    def _migrate_schema(self) -> None:
+        """Add columns/indexes that may be missing in pre-existing DBs.
+
+        Called before ``_create_schema`` so that new indexes referencing
+        new columns don't fail on legacy databases.
+        """
+        cur = self.conn.cursor()
+        # Check whether repo_nodes table exists at all (fresh DB → skip)
+        tables = {
+            row[0]
+            for row in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "repo_nodes" not in tables:
+            return  # fresh DB — _create_schema will create everything
+
+        cols = {row[1] for row in cur.execute("PRAGMA table_info(repo_nodes)")}
+        if "is_test" not in cols:
+            logger.info("Migrating schema: adding is_test column to repo_nodes")
+            cur.execute("ALTER TABLE repo_nodes ADD COLUMN is_test INTEGER DEFAULT 0")
+            self.conn.commit()
+            self._backfill_is_test()
+
+    def _backfill_is_test(self) -> None:
+        """Set is_test=1 for existing rows whose rel_path matches test patterns."""
+        rows = self.conn.execute(
+            "SELECT node_id, rel_path FROM repo_nodes WHERE is_test = 0 AND rel_path != ''"
+        ).fetchall()
+        updates = [(nid,) for nid, path in rows if _is_test_path(path)]
+        if updates:
+            self.conn.executemany(
+                "UPDATE repo_nodes SET is_test = 1 WHERE node_id = ?", updates
+            )
+            self.conn.commit()
+            logger.info("Backfilled is_test=1 for %d nodes", len(updates))
+
     # ------------------------------------------------------------------
     # Context manager / cleanup
     # ------------------------------------------------------------------
@@ -398,14 +444,14 @@ class UnifiedWikiDB:
             start_line, end_line,
             symbol_name, symbol_type, parent_symbol, analysis_level,
             source_text, docstring, signature, parameters, return_type,
-            is_architectural, is_doc, chunk_type,
+            is_architectural, is_doc, is_test, chunk_type,
             macro_cluster, micro_cluster, is_hub, hub_assignment
         ) VALUES (
             :node_id, :rel_path, :file_name, :language,
             :start_line, :end_line,
             :symbol_name, :symbol_type, :parent_symbol, :analysis_level,
             :source_text, :docstring, :signature, :parameters, :return_type,
-            :is_architectural, :is_doc, :chunk_type,
+            :is_architectural, :is_doc, :is_test, :chunk_type,
             :macro_cluster, :micro_cluster, :is_hub, :hub_assignment
         )
         """
@@ -429,6 +475,10 @@ class UnifiedWikiDB:
             )
             is_doc = 1 if _is_doc_symbol(symbol_type) else 0
 
+            # Detect test nodes by path
+            rel_path = n.get("rel_path", "")
+            is_test = 1 if _is_test_path(rel_path) else 0
+
             # parameters can be a list — serialize to JSON
             params = n.get("parameters", "")
             if isinstance(params, (list, tuple)):
@@ -437,7 +487,7 @@ class UnifiedWikiDB:
             rows.append(
                 {
                     "node_id": n["node_id"],
-                    "rel_path": n.get("rel_path", ""),
+                    "rel_path": rel_path,
                     "file_name": n.get("file_name", ""),
                     "language": n.get("language", ""),
                     "start_line": n.get("start_line", 0),
@@ -453,6 +503,7 @@ class UnifiedWikiDB:
                     "return_type": n.get("return_type", ""),
                     "is_architectural": is_arch,
                     "is_doc": is_doc,
+                    "is_test": is_test,
                     "chunk_type": n.get("chunk_type"),
                     "macro_cluster": n.get("macro_cluster"),
                     "micro_cluster": n.get("micro_cluster"),
@@ -1014,6 +1065,27 @@ class UnifiedWikiDB:
         self._populate_fts5()
         t_fts = time.time() - t2
         logger.info("FTS5 index rebuilt in %.1fs", t_fts)
+
+        # --- Stale-node cleanup ---
+        imported_ids = {str(n) for n in G.nodes()}
+        existing_ids = {
+            row[0]
+            for row in self.conn.execute("SELECT node_id FROM repo_nodes").fetchall()
+        }
+        stale_ids = existing_ids - imported_ids
+        if stale_ids:
+            placeholders = ",".join("?" * len(stale_ids))
+            stale_list = list(stale_ids)
+            self.conn.execute(
+                f"DELETE FROM repo_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",  # noqa: S608
+                stale_list + stale_list,
+            )
+            self.conn.execute(
+                f"DELETE FROM repo_nodes WHERE node_id IN ({placeholders})",  # noqa: S608
+                stale_list,
+            )
+            self.conn.commit()
+            logger.info("Removed %d stale nodes and their edges", len(stale_ids))
 
         total = time.time() - t0
         logger.info(

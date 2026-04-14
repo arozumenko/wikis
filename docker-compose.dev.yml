@@ -1,0 +1,15 @@
+# Local development override — builds images from source.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: wikis-backend:dev
+
+  app:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    image: wikis-web:dev

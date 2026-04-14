@@ -19,7 +19,6 @@ from .graph_manager import GraphManager
 from .local_repository_manager import LocalRepositoryManager
 from .repo_providers import GitCloneConfig
 from .utils.resource_monitor import resource_monitor
-from .vectorstore import VectorStoreManager
 
 logger = logging.getLogger(__name__)
 
@@ -96,24 +95,26 @@ class FilesystemRepositoryIndexer:
             raise ImportError("Enhanced Unified Graph Builder is required for filesystem indexing")
         self.graph_builder = EnhancedUnifiedGraphBuilder(max_workers=max_workers)
 
-        # Initialize vector store and graph managers
-        self.vectorstore_manager = VectorStoreManager(
-            cache_dir=cache_dir,
-            embeddings=embeddings,
-        )
+        # Initialize graph manager (for analysis stats only; persistent storage is via unified DB)
         self.graph_manager = GraphManager(cache_dir=cache_dir)
+
+        # Embeddings instance for unified DB population
+        self.embeddings = embeddings
 
         # State containers
         self.text_documents = []
         self.code_documents = []
         self.all_documents = []
         self.relationship_graph = None
-        self.vectorstore = None
         self.last_index_stats = None
         self._doc_type_counts = {
             "text": 0,
             "code": 0,
         }
+
+        # Unified DB state
+        self._unified_db_path = None  # Path to {cache_key}.wiki.db
+        self._unified_db_cache_key = None  # Cache key for lookup
 
         # Current repository info
         self.current_repo_path = None
@@ -217,47 +218,86 @@ class FilesystemRepositoryIndexer:
             raise
 
     def _try_load_from_cache(self, repo_identifier: str, repo_path: str) -> dict[str, Any] | None:
-        """Try to load complete index from cache (graph + vectorstore + docs)."""
+        """Try to load complete index from unified DB cache."""
         try:
             commit_hash = self._last_commit_hash
+            cache_dir = self.graph_manager.cache_dir or "/tmp/wiki_builder/cached_graphs"  # noqa: S108
 
-            # 1. Graph cache (using commit hash for stable lookup)
-            if not self.graph_manager.graph_exists(repo_path, commit_hash=commit_hash):
-                logger.debug(
-                    f"[cache-miss] graph not found for {repo_path} @ {commit_hash[:8] if commit_hash else 'unknown'}"
-                )
-                return None
-            self.relationship_graph = self.graph_manager.load_graph(repo_path, commit_hash=commit_hash)
-            if not self.relationship_graph:
-                logger.debug(f"[cache-miss] failed to load graph object for {repo_path}")
-                return None
+            # Generate cache key matching what _write_unified_db uses
+            import hashlib
 
-            # 2. Vector store + documents cache (using commit hash)
-            self.vectorstore, self.all_documents = self.vectorstore_manager.load_or_build(
-                [], repo_path, force_rebuild=False, commit_hash=commit_hash
-            )
-            if not self.vectorstore or not self.all_documents:
-                logger.debug(f"[cache-miss] vector store or documents missing for {repo_path}")
+            hash_input = f"{repo_path}:{commit_hash or ''}"
+            cache_key = hashlib.md5(hash_input.encode()).hexdigest()  # noqa: S324 — cache key, not security
+            db_path = os.path.join(str(cache_dir), f"{cache_key}.wiki.db")
+
+            if not os.path.isfile(db_path):
+                logger.debug("[cache-miss] unified DB not found: %s", db_path)
                 return None
 
-            # 3. Separate docs
+            from .unified_db import UnifiedWikiDB
+
+            db = UnifiedWikiDB(db_path, readonly=True)
+            stats = db.stats()
+            if stats["node_count"] < 1:
+                logger.debug("[cache-miss] unified DB empty: %s", db_path)
+                db.close()
+                return None
+
+            # Reconstruct NX graph from DB
+            self.relationship_graph = db.to_networkx()
+
+            # Reconstruct all_documents from DB nodes
+            self.all_documents = self._reconstruct_documents_from_db(db)
+
+            # Separate docs
             text_docs = [doc for doc in self.all_documents if doc.metadata.get("chunk_type") == "text"]
             code_docs = [doc for doc in self.all_documents if doc.metadata.get("chunk_type") in ["symbol", "code"]]
             self._set_document_splits(text_docs, code_docs)
 
-            # 4. Register caches for Ask tool lookup with commit-aware identifier
-            cache_key = self.vectorstore_manager._generate_repo_hash(repo_path, [], commit_hash)
-            self.vectorstore_manager.register_cache(repo_identifier, cache_key)
-            self.graph_manager.register_graph_cache(
-                repo_identifier, self.graph_manager._generate_cache_key(repo_path, "combined", commit_hash)
-            )
+            # Store unified DB state for downstream use
+            self._unified_db_path = db_path
+            self._unified_db_cache_key = cache_key
 
-            logger.info(f"[cache-hit] Loaded graph + vectorstore for {repo_identifier} from {repo_path}")
+            db.close()
+            logger.info(
+                "[cache-hit] Loaded unified DB for %s: %d nodes, %d edges, %d docs — %s",
+                repo_identifier,
+                stats["node_count"],
+                stats["edge_count"],
+                len(self.all_documents),
+                db_path,
+            )
             self._emit_progress(0.20, "Index loaded from cache")
             return self._generate_index_stats(repo_identifier, from_cache=True)
         except Exception as e:
-            logger.debug(f"[cache-error] {e}")
+            logger.debug("[cache-error] %s", e)
             return None
+
+    @staticmethod
+    def _reconstruct_documents_from_db(db) -> list[Document]:
+        """Reconstruct LangChain Documents from unified DB nodes."""
+        rows = db.conn.execute("SELECT * FROM repo_nodes").fetchall()
+        documents = []
+        for row in rows:
+            d = dict(row)
+            page_content = d.get("source_text") or ""
+            metadata = {
+                "node_id": d.get("node_id", ""),
+                "symbol_name": d.get("symbol_name", ""),
+                "symbol_type": d.get("symbol_type", ""),
+                "source": d.get("rel_path", ""),
+                "rel_path": d.get("rel_path", ""),
+                "file_name": d.get("file_name", ""),
+                "file_path": d.get("rel_path", ""),
+                "language": d.get("language", ""),
+                "start_line": d.get("start_line", 0),
+                "end_line": d.get("end_line", 0),
+                "chunk_type": d.get("chunk_type", d.get("symbol_type", "")),
+                "docstring": d.get("docstring", ""),
+                "signature": d.get("signature", ""),
+            }
+            documents.append(Document(page_content=page_content, metadata=metadata))
+        return documents
 
     def _build_filesystem_index(
         self, repo_identifier: str, repo_path: str, max_files: int | None, force_rebuild: bool = False
@@ -350,105 +390,38 @@ class FilesystemRepositoryIndexer:
                 "all files may be filtered out, or the branch may not exist."
             )
 
-        # Step 3: Build or load vector store (allow cache reuse)
-        self._emit_progress(0.20, "Building vector embeddings for semantic search...")
-        logger.info("Building / loading vector store (cache enabled)...")
+        # Step 3: Write unified DB (replaces FAISS + graph pickle + BM25)
+        self._emit_progress(0.20, "Building unified wiki database...")
+        logger.info("Writing unified wiki DB (graph + embeddings + clusters)...")
         if this and getattr(this, "module", None):
             this.module.invocation_thinking(
-                "I am on phase indexing\nBuilding / loading vector store...\nReasoning: Create dense embeddings for retrieval-driven page generation.\n>Next: Cache graph; compute index stats."
+                "I am on phase indexing\nBuilding unified wiki DB...\nReasoning: Single DB file consolidates graph, embeddings, FTS5, and clusters.\nNext: Compute index stats."
             )
 
+        # If streaming, we need to materialise documents first
+        if documents_iter and not self.all_documents:
+            self.all_documents = list(documents_iter)
+            self._add_repository_metadata()
+            text_docs = [doc for doc in self.all_documents if doc.metadata.get("chunk_type") == "text"]
+            code_docs = [doc for doc in self.all_documents if doc.metadata.get("chunk_type") in ["symbol", "code"]]
+            self._set_document_splits(text_docs, code_docs)
+            documents_iter = None  # consumed
+
         try:
-            with resource_monitor("index.vectorstore_build", logger):
-                if documents_iter:
-                    self.vectorstore, self.all_documents = self.vectorstore_manager.load_or_build_from_iterable(
-                        documents_iter, repo_path, force_rebuild=force_rebuild, commit_hash=self._last_commit_hash
-                    )
+            with resource_monitor("index.unified_db_write", logger):
+                self._write_unified_db(repo_path, repo_identifier)
 
-                    # Ensure repository metadata and source paths are set after streaming build
-                    self._add_repository_metadata()
-
-                    # Rebuild document splits from streamed metadata
-                    text_docs = [doc for doc in self.all_documents if doc.metadata.get("chunk_type") == "text"]
-                    code_docs = [
-                        doc for doc in self.all_documents if doc.metadata.get("chunk_type") in ["symbol", "code"]
-                    ]
-                    self._set_document_splits(text_docs, code_docs)
-                else:
-                    self.vectorstore, self.all_documents = self.vectorstore_manager.load_or_build(
-                        self.all_documents, repo_path, force_rebuild=force_rebuild, commit_hash=self._last_commit_hash
-                    )
-
-                    # Ensure repository metadata and source paths are set after build
-                    self._add_repository_metadata()
-
-                self._emit_progress(0.25, f"Indexed {len(self.all_documents)} documents ({self._get_text_count()} text, {self._get_code_count()} code)")
+            self._emit_progress(0.25, f"Indexed {len(self.all_documents)} documents ({self._get_text_count()} text, {self._get_code_count()} code)")
         except Exception as e:
-            logger.error(f"Failed to build vector store: {e}")
+            logger.error(f"Failed to write unified DB: {e}")
             import traceback
 
             logger.error(f"Full traceback: {traceback.format_exc()}")
-
-            # Don't fail entire indexing - return results with graph but no vectorstore
+            # Non-fatal — in-memory graph + docs still available for generation
             logger.warning(
-                "Vector store building failed. Graph and documents are available, "
-                "but semantic search will not be functional. This may be due to empty "
-                "documents or embedding model issues."
+                "Unified DB write failed. In-memory graph and documents are available, "
+                "but Ask path will not be functional until re-indexed."
             )
-
-            # Save graph even if vectorstore failed (with commit hash)
-            if self.relationship_graph:
-                logger.info("Saving relationship graph to cache...")
-                self.graph_manager.save_graph(
-                    self.relationship_graph,
-                    repo_path,
-                    commit_hash=self._last_commit_hash,
-                    repo_identifier=repo_identifier,
-                )
-
-            # Return partial results
-            index_stats = self._generate_index_stats(repo_identifier, from_cache=False)
-            index_stats["vectorstore_error"] = str(e)
-            index_stats["warning"] = "Vectorstore building failed - graph available but semantic search disabled"
-            if self._last_commit_hash and "repository_info" in index_stats:
-                index_stats["repository_info"]["commit_hash"] = self._last_commit_hash
-            return index_stats
-
-        # Vectorstore health check
-        if self.vectorstore:
-            try:
-                doc_count = self.vectorstore.index.ntotal if hasattr(self.vectorstore, "index") else 0
-                if doc_count == 0:
-                    logger.error(
-                        "VECTORSTORE EMPTY after build — embeddings may have failed. "
-                        "Semantic search will not work. Check embedding model/credentials."
-                    )
-                    self._emit_progress(0.25, "WARNING: Vectorstore empty — embeddings may have failed")
-                else:
-                    logger.info(f"Vectorstore health check: {doc_count} vectors indexed")
-            except Exception as e:
-                logger.warning(f"Vectorstore health check failed: {e}")
-        else:
-            logger.error("Vectorstore is None after build — generation will produce generic content")
-            self._emit_progress(0.25, "WARNING: No vectorstore — content quality will be degraded")
-
-        # Step 4: Save relationship graph to cache (with commit hash for stability)
-        self._emit_progress(0.27, "Saving code graph and caches...")
-        if self.relationship_graph:
-            logger.info("Saving relationship graph to cache...")
-            with resource_monitor("index.graph_cache_save", logger):
-                self.graph_manager.save_graph(
-                    self.relationship_graph,
-                    repo_path,
-                    commit_hash=self._last_commit_hash,
-                    repo_identifier=repo_identifier,
-                )
-
-        # Step 5: Register vectorstore cache for Ask tool lookup
-        # Generate the same cache key that was used to store the vectorstore
-        cache_key = self.vectorstore_manager._generate_repo_hash(repo_path, [], self._last_commit_hash)
-        self.vectorstore_manager.register_cache(repo_identifier, cache_key)
-        self.vectorstore_manager.register_docstore_cache(repo_identifier, cache_key)
 
         self._emit_progress(0.30, "Indexing complete")
         logger.info("Filesystem index building complete")
@@ -462,6 +435,168 @@ class FilesystemRepositoryIndexer:
         if self._last_commit_hash and "repository_info" in index_stats:
             index_stats["repository_info"]["commit_hash"] = self._last_commit_hash
         return index_stats
+
+    def _write_unified_db(self, repo_path: str, repo_identifier: str) -> None:
+        """Write unified SQLite DB from current graph + metadata.
+
+        Produces a ``{cache_key}.wiki.db`` file in the cache directory that
+        consolidates the code graph, FTS5 full-text index, sqlite-vec
+        embeddings, Phase 2 topology enrichment, and Phase 3 clustering
+        into a single file.  This replaces the legacy FAISS + BM25 +
+        graph pickle + docstore stack.
+
+        The same cache_key is registered in ``cache_index.json`` under the
+        ``"unified_db"`` namespace so that ``toolkit_bridge.py`` (Ask path)
+        can locate the correct DB for a given wiki.
+        """
+        import hashlib
+        import json
+
+        cache_dir = str(self.graph_manager.cache_dir or "/tmp/wiki_builder/cached_graphs")  # noqa: S108
+        cache_key = hashlib.md5(  # noqa: S324 — cache key, not security
+            f"{repo_path}:{self._last_commit_hash or ''}".encode()
+        ).hexdigest()
+        db_filename = f"{cache_key}.wiki.db"
+        db_path = os.path.join(cache_dir, db_filename)
+
+        os.makedirs(cache_dir, exist_ok=True)
+
+        logger.info(
+            "Writing unified DB: %s (%d nodes, %d edges)",
+            db_path,
+            self.relationship_graph.number_of_nodes(),
+            self.relationship_graph.number_of_edges(),
+        )
+
+        from .unified_db import UnifiedWikiDB
+
+        _emb_obj = self.embeddings
+        _embed_query_fn = getattr(_emb_obj, "embed_query", None) if _emb_obj else None
+        _embed_batch_fn = getattr(_emb_obj, "embed_documents", None) if _emb_obj else None
+
+        with UnifiedWikiDB(db_path) as udb:
+            # Phase 1a — Populate graph (nodes + edges)
+            udb.from_networkx(self.relationship_graph)
+
+            # Phase 1b — Populate vector embeddings (repo_vec table)
+            if _embed_batch_fn:
+                try:
+                    n_embedded = udb.populate_embeddings(
+                        embedding_fn=_embed_batch_fn,
+                        batch_size=int(os.getenv("WIKI_EMBED_BATCH_SIZE", "64")),
+                    )
+                    logger.info("Unified DB: %d node embeddings stored", n_embedded)
+                except Exception as exc:
+                    logger.warning("Embedding population failed (non-fatal): %s", exc)
+            else:
+                logger.info("No embeddings model available — repo_vec will be empty")
+
+            # Phase 2 — Edge weighting, hub detection, orphan resolution
+            try:
+                from .graph_topology import run_phase2
+
+                phase2_stats = run_phase2(
+                    db=udb,
+                    G=self.relationship_graph,
+                    embedding_fn=_embed_query_fn,
+                )
+                logger.info(
+                    "Phase 2 complete: %d edges weighted, %d hubs",
+                    phase2_stats.get("weighting", {}).get("edges_weighted", 0),
+                    phase2_stats.get("hubs", {}).get("count", 0),
+                )
+            except Exception as exc:
+                logger.warning("Phase 2 graph topology failed (non-fatal): %s", exc)
+                phase2_stats = None
+
+            # Phase 3 — Hierarchical Leiden clustering
+            try:
+                from .graph_clustering import run_clustering
+
+                phase2_hubs = set()
+                if phase2_stats:
+                    phase2_hubs = set(phase2_stats.get("hubs", {}).get("node_ids", []))
+                clustering = run_clustering(
+                    G=self.relationship_graph,
+                    exclude_tests=False,  # Exclude-tests is applied at planner level
+                )
+
+                # Persist cluster assignments to DB
+                assignments = []
+                for nid, macro_id in clustering.macro_clusters.items():
+                    micro_id = None
+                    micro_map = clustering.micro_clusters.get(macro_id, {})
+                    if isinstance(micro_map, dict):
+                        micro_id = micro_map.get(nid)
+                    assignments.append((nid, macro_id, micro_id))
+                if assignments:
+                    udb.set_clusters_batch(assignments)
+                    udb.conn.commit()
+
+                logger.info(
+                    "Phase 3 complete: %d sections, %d pages, %d hubs",
+                    clustering.section_count,
+                    clustering.page_count,
+                    len(clustering.hub_assignments),
+                )
+            except Exception as exc:
+                logger.warning("Phase 3 clustering failed (non-fatal): %s", exc)
+
+            # Store build metadata
+            udb.set_meta("repo_identifier", repo_identifier)
+            udb.set_meta("commit_hash", self._last_commit_hash)
+            udb.set_meta("repo_path", repo_path)
+            udb.set_meta("node_count", self.relationship_graph.number_of_nodes())
+            udb.set_meta("edge_count", self.relationship_graph.number_of_edges())
+            udb.set_meta("doc_count", len(self.all_documents) if self.all_documents else 0)
+
+            stats = udb.stats()
+            logger.info(
+                "Unified DB written: %d nodes, %d edges, %.1f MB — %s",
+                stats["node_count"],
+                stats["edge_count"],
+                stats["db_size_mb"],
+                db_path,
+            )
+
+        # Store state for downstream use
+        self._unified_db_path = db_path
+        self._unified_db_cache_key = cache_key
+
+        # Register in cache_index.json so toolkit_bridge can find it
+        self._register_unified_db_cache(repo_identifier, cache_key, cache_dir)
+
+    def _register_unified_db_cache(self, repo_identifier: str, cache_key: str, cache_dir: str) -> None:
+        """Register the unified DB in cache_index.json for Ask-path lookup."""
+        import json
+        from pathlib import Path
+
+        index_file = Path(cache_dir) / "cache_index.json"
+        try:
+            if index_file.exists():
+                with open(index_file) as f:
+                    index = json.load(f)
+            else:
+                index = {}
+
+            # Store under "unified_db" namespace
+            udb_section = index.setdefault("unified_db", {})
+            udb_section[repo_identifier] = cache_key
+
+            # Also store a ref for branch-only lookups (owner/repo:branch → cache_key)
+            refs = index.setdefault("refs", {})
+            # Extract owner/repo:branch from full identifier (may include commit)
+            parts = repo_identifier.split(":")
+            if len(parts) >= 2:
+                short_ref = f"{parts[0]}:{parts[1]}"
+                refs[short_ref] = repo_identifier
+
+            with open(index_file, "w") as f:
+                json.dump(index, f, indent=2)
+
+            logger.info("Registered unified DB in cache_index.json: %s → %s", repo_identifier, cache_key)
+        except Exception as e:
+            logger.warning("Failed to register unified DB in cache_index.json: %s", e)
 
     def _discover_files(self, repo_path: str) -> list[str]:
         """Discover files in repository using filter manager"""
@@ -595,11 +730,9 @@ class FilesystemRepositoryIndexer:
                 "edges": self.relationship_graph.number_of_edges() if self.relationship_graph else 0,
                 **graph_analysis,
             },
-            "vector_store": {
-                "has_vectorstore": self.vectorstore is not None,
-                "embedding_dimensions": getattr(self.vectorstore, "embedding_dimension", None)
-                if self.vectorstore
-                else None,
+            "unified_db": {
+                "has_unified_db": self._unified_db_path is not None,
+                "unified_db_path": self._unified_db_path,
             },
             "repository_info": self.current_repo_info or {},
             "filter_stats": self.filter_manager.get_filter_summary(),
@@ -618,7 +751,7 @@ class FilesystemRepositoryIndexer:
             "documents": {"total": 0, "text_documents": 0, "code_documents": 0, "file_types": {}},
             "code_analysis": {"languages": [], "symbols_by_type": {}, "files_with_symbols": 0, "total_symbols": 0},
             "relationship_graph": {"nodes": 0, "edges": 0},
-            "vector_store": {"has_vectorstore": False, "embedding_dimensions": None},
+            "unified_db": {"has_unified_db": False, "unified_db_path": None},
             "repository_info": self.current_repo_info or {},
             "filter_stats": self.filter_manager.get_filter_summary(),
         }
@@ -664,13 +797,12 @@ class FilesystemRepositoryIndexer:
             "files": file_summary,
             "languages": list(languages),
             "relationship_graph": graph_summary,
-            "has_vectorstore": self.vectorstore is not None,
+            "has_unified_db": self._unified_db_path is not None,
             "repository_info": self.current_repo_info,
         }
 
     def clear_cache(self):
         """Clear all caches"""
-        self.vectorstore_manager.clear_cache()
         self.graph_manager.clear_cache()
         logger.info("Cleared all index caches")
 
@@ -713,29 +845,6 @@ class FilesystemRepositoryIndexer:
     def get_relationship_graph(self) -> nx.DiGraph | None:
         """Return the relationship graph if available."""
         return self.relationship_graph
-
-    def get_vectorstore(self):
-        """Return underlying vectorstore instance (FAISS or similar)."""
-        return self.vectorstore
-
-    def search_documents(self, query: str, k: int = 20, include_scores: bool = False):
-        """Search documents using similarity (delegates to VectorStoreManager)."""
-        if not self.vectorstore:
-            logger.warning("search_documents called before vectorstore is ready")
-            return []
-        if include_scores:
-            return self.vectorstore_manager.search_with_score(query, k=k)
-        return self.vectorstore_manager.search_combined(query, k=k)
-
-    def search_by_type(self, query: str, doc_type: str = "all", k: int = 20):
-        """Search subset of documents by type (text, code, or all)."""
-        if not self.vectorstore:
-            return []
-        if doc_type == "text":
-            return self.vectorstore_manager.search_text(query, k=k)
-        if doc_type == "code":
-            return self.vectorstore_manager.search_code(query, k=k)
-        return self.vectorstore_manager.search_combined(query, k=k)
 
     def find_related_symbols(self, symbol_name: str, hops: int = 2) -> list[str]:
         """Find symbols related to a given symbol via graph traversal (duck-typed)."""

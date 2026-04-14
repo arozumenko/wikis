@@ -9,7 +9,6 @@ from typing import Any
 
 from .agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
 from .filesystem_indexer import FilesystemRepositoryIndexer
-from .retrievers import WikiRetrieverStack
 
 logger = logging.getLogger(__name__)
 
@@ -98,12 +97,24 @@ class OptimizedWikiToolkitWrapper:
             #     }
             # )
             #
-            # Initialize retriever stack
-            self.retriever_stack = WikiRetrieverStack(
-                vectorstore_manager=self.indexer.vectorstore_manager,
-                relationship_graph=self.indexer.relationship_graph,
-                llm_client=self.llm,
-            )
+            # Initialize retriever from unified DB
+            db_path = getattr(self.indexer, "_unified_db_path", None)
+            if db_path:
+                from .unified_db import UnifiedWikiDB
+                from .unified_retriever import UnifiedRetriever
+
+                db = UnifiedWikiDB(db_path, readonly=True)
+                embedding_fn = None
+                embeddings = getattr(self.indexer, "embeddings", None)
+                if embeddings and hasattr(embeddings, "embed_query"):
+                    embedding_fn = embeddings.embed_query
+                self.retriever_stack = UnifiedRetriever(
+                    db=db,
+                    embedding_fn=embedding_fn,
+                    embeddings=embeddings,
+                )
+            else:
+                logger.warning("No unified DB path — retriever will be limited")
 
     def generate_wiki(
         self,

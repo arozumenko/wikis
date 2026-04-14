@@ -32,9 +32,6 @@ from .hybrid_fusion import (
 
 logger = logging.getLogger(__name__)
 
-# Feature flag: use UnifiedWikiDB for deep-research graph search
-UNIFIED_RETRIEVER_ENABLED = os.environ.get("WIKIS_UNIFIED_RETRIEVER", "0") == "1"
-
 # Container types that can own child methods/functions via 'defines' edges.
 # Used by orphan FTS fallback to discover string-based references.
 CONTAINER_SYMBOL_TYPES = frozenset({"class", "interface", "struct", "enum", "trait"})
@@ -146,8 +143,8 @@ def _search_graph_by_text(code_graph: Any, query: str, k: int = 10) -> list[Docu
 
 
 # ---------------------------------------------------------------------------
-# Unified-DB-backed helpers (used when WIKIS_UNIFIED_RETRIEVER=1 and
-# there is no in-memory NX code_graph or FTS5 index).
+# Unified-DB-backed helpers (used as fallback when there is no in-memory
+# NX code_graph or FTS5 index).
 # ---------------------------------------------------------------------------
 
 
@@ -385,14 +382,14 @@ def _extract_rel_type(edge_data: Any) -> str:
 
 
 def create_codebase_tools(
-    retriever_stack: Any,  # WikiRetrieverStack
+    retriever_stack: Any,  # UnifiedRetriever
     graph_manager: Any,  # GraphManager
     code_graph: Any,  # NetworkX graph
     repo_analysis: dict | None = None,
     event_callback: Callable | None = None,
     similarity_threshold: float = 0.75,
     graph_text_index: Any = None,  # GraphTextIndex (FTS5)
-    unified_db_path: str | None = None,  # Path to .wiki.db (Phase 6)
+    unified_db_path: str | None = None,  # Path to .wiki.db
     repo_path: str | None = None,  # Path to cloned repo for direct file access
 ) -> list:
     """
@@ -403,13 +400,11 @@ def create_codebase_tools(
     - Bounded output (configurable k)
     - Threshold filtering (default 0.75)
 
-    When ``code_graph`` is None but ``unified_db_path`` is set (i.e. the
-    Unified Retriever is active), graph search branches fall back to FTS5
-    queries against the ``.wiki.db`` file.  Gated by
-    ``WIKIS_UNIFIED_RETRIEVER=1``.
+    When ``code_graph`` is None but ``unified_db_path`` is set, graph
+    search branches fall back to FTS5 queries against the ``.wiki.db``.
 
     Args:
-        retriever_stack: WikiRetrieverStack instance for codebase search
+        retriever_stack: UnifiedRetriever instance for codebase search
         graph_manager: GraphManager instance for graph operations
         code_graph: The loaded code graph (NetworkX)
         repo_analysis: Pre-loaded repository analysis (optional)
@@ -425,9 +420,9 @@ def create_codebase_tools(
     # Build unified query service (SPEC-1: replaces scattered O(N) scans)
     query_service = GraphQueryService(code_graph, fts_index=graph_text_index) if code_graph else None
 
-    # Resolve unified_db_path: auto-detect when flag is on but path not provided
+    # Resolve unified_db_path: auto-detect when path not provided
     _udb_path = unified_db_path
-    if _udb_path is None and UNIFIED_RETRIEVER_ENABLED and code_graph is None:
+    if _udb_path is None and code_graph is None:
         # Try to get path from retriever_stack (UnifiedRetriever stores it)
         _udb_path = getattr(getattr(retriever_stack, "db", None), "db_path", None)
         if _udb_path:
@@ -439,8 +434,10 @@ def create_codebase_tools(
 
     # Get embeddings from retriever_stack for reranking
     embeddings = None
-    if retriever_stack and hasattr(retriever_stack, "vectorstore_manager"):
-        embeddings = getattr(retriever_stack.vectorstore_manager, "embeddings", None)
+    if retriever_stack:
+        embeddings = getattr(retriever_stack, "embeddings", None)
+        if embeddings is None and hasattr(retriever_stack, "vectorstore_manager"):
+            embeddings = getattr(retriever_stack.vectorstore_manager, "embeddings", None)
 
     # Doc search cap: the vector store mostly holds documentation chunks,
     # so we cap its contribution to avoid drowning out code results from FTS5.
@@ -463,21 +460,19 @@ def create_codebase_tools(
         try:
             all_docs = []
 
-            # === Branch 1: Vector store search (semantic — doc-heavy, capped) ===
-            # The vector store primarily contains documentation chunks.
+            # === Branch 1: Semantic search (doc-heavy, capped) ===
+            # The retriever primarily surfaces documentation chunks.
             # We cap results to _MAX_DOC_RESULTS (default 3) so code results
             # from FTS5 aren't drowned out.
             k_doc = min(k, _MAX_DOC_RESULTS)
             if retriever_stack:
                 try:
-                    # Skip EmbeddingsFilter reranking — it can reject valid results
-                    # when the filter uses a different embedding model than the FAISS
-                    # index (e.g. text-embedding-3-large vs all-MiniLM-L6-v2).
-                    # FAISS similarity is already a good relevance signal.
+                    # Skip EmbeddingsFilter reranking — the unified DB's
+                    # RRF hybrid search already ranks results well.
                     vs_docs = retriever_stack.search_repository(query=query, k=k_doc, apply_expansion=False)
 
                     for doc in vs_docs:
-                        doc.metadata["search_source"] = "vectorstore"
+                        doc.metadata["search_source"] = "semantic"
                     all_docs.extend(vs_docs)
                     logger.info(f"[SEARCH_CODEBASE] VS returned {len(vs_docs)} docs (cap={k_doc}, query={query!r:.60})")
                 except Exception as e:
@@ -529,7 +524,7 @@ def create_codebase_tools(
                 # BOTH sources get boosted.
                 ranked_lists = {}
                 if all_docs:
-                    ranked_lists["vectorstore"] = all_docs
+                    ranked_lists["semantic"] = all_docs
                 if graph_docs:
                     ranked_lists["graph"] = graph_docs
                 all_docs = fuse_search_results(
@@ -1351,9 +1346,7 @@ def create_codebase_tools(
             docs = []
             if retriever_stack:
                 try:
-                    # Doc search uses FAISS similarity directly — skip EmbeddingsFilter
-                    # reranking because the filter may use a different embedding model
-                    # than the index, causing valid results to be rejected.
+                    # Unified DB hybrid search already ranks results well
                     vs_docs = retriever_stack.search_repository(query=query, k=k, apply_expansion=False)
                     docs.extend(vs_docs)
                 except Exception as e:

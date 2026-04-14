@@ -26,6 +26,10 @@ class GenerateWikiRequest(BaseModel):
     # LLM overrides (optional, falls back to server config)
     llm_model: str | None = None
     embedding_model: str | None = None
+    # Structure planner override (optional, falls back to server config)
+    planner_type: str | None = None  # agent | cluster
+    # Test exclusion (optional, falls back to server config)
+    exclude_tests: bool | None = None  # True = soft-skip test nodes during clustering
 
     @model_validator(mode="after")
     def _validate_local_path(self) -> GenerateWikiRequest:

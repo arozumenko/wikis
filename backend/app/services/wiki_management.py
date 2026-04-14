@@ -301,7 +301,7 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
     # Find and delete vectorstore files
     cache_key = index.get(resolved) or index.get(repo_identifier)
     if cache_key:
-        for ext in (".faiss", ".docs.pkl"):
+        for ext in (".faiss", ".docs.pkl", ".wiki.db", ".fts5.db", "_analysis.json"):
             f = cache_path / f"{cache_key}{ext}"
             if f.exists():
                 try:
@@ -309,6 +309,33 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
                     logger.info("Deleted cache file: %s", f)
                 except Exception as e:
                     logger.warning("Failed to delete %s: %s", f, e)
+        # SQLite WAL/SHM sidecar files for unified DB and FTS5 index
+        for sidecar in (
+            ".wiki.db-wal", ".wiki.db-shm",
+            ".fts5.db-wal", ".fts5.db-shm",
+        ):
+            f = cache_path / f"{cache_key}{sidecar}"
+            if f.exists():
+                try:
+                    f.unlink()
+                    logger.info("Deleted cache sidecar: %s", f)
+                except Exception as e:
+                    logger.warning("Failed to delete %s: %s", f, e)
+
+    # Find and delete unified DB files (+ WAL/SHM sidecars)
+    udb_section = index.get("unified_db", {})
+    for k, v in list(udb_section.items()):
+        if k.startswith(resolved) or k.startswith(repo_identifier):
+            for ext in (".wiki.db", ".wiki.db-wal", ".wiki.db-shm"):
+                db_file = cache_path / f"{v}{ext}"
+                if db_file.exists():
+                    try:
+                        db_file.unlink()
+                        logger.info("Deleted unified DB file: %s", db_file)
+                    except Exception as e:
+                        logger.warning("Failed to delete %s: %s", db_file, e)
+            del udb_section[k]
+            dirty = True
 
     # Find and delete graph files
     dirty = False

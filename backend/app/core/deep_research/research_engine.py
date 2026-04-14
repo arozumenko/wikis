@@ -7,7 +7,7 @@ with explicit middleware stack:
 - FilesystemMiddleware for context offloading (outputs >20K tokens → files)
 - SummarizationMiddleware for auto-summarising at context limit
 - AnthropicPromptCachingMiddleware for prompt caching on Anthropic models
-- Custom tools wrapping WikiRetrieverStack and GraphManager
+- Custom tools wrapping UnifiedRetriever and GraphManager
 
 Events are captured via LangGraph's native astream with stream_mode=["messages", "updates"].
 """
@@ -73,7 +73,7 @@ class DeepResearchEngine:
 
     def __init__(
         self,
-        retriever_stack: Any,  # WikiRetrieverStack
+        retriever_stack: Any,  # UnifiedRetriever
         graph_manager: Any,  # GraphManager
         code_graph: Any,  # NetworkX graph
         repo_analysis: dict | None = None,
@@ -87,7 +87,7 @@ class DeepResearchEngine:
         Initialize the research engine.
 
         Args:
-            retriever_stack: WikiRetrieverStack for codebase search
+            retriever_stack: UnifiedRetriever for codebase search
             graph_manager: GraphManager for relationship analysis
             code_graph: Loaded NetworkX code graph
             repo_analysis: Pre-loaded repository analysis
@@ -150,6 +150,12 @@ class DeepResearchEngine:
         model = self.llm_client or self._build_model()
 
         fts_index = getattr(self.graph_manager, "fts_index", None) if self.graph_manager else None
+        if fts_index is None:
+            db_path = getattr(getattr(self.retriever_stack, "db", None), "db_path", None)
+            if db_path:
+                from ..code_graph.unified_graph_text_index import UnifiedGraphTextIndex
+
+                fts_index = UnifiedGraphTextIndex(db_path)
         custom_tools = create_codebase_tools(
             retriever_stack=self.retriever_stack,
             graph_manager=self.graph_manager,
@@ -412,7 +418,7 @@ def create_deep_research_engine(
     This is the main entry point for creating research engines.
 
     Args:
-        retriever_stack: WikiRetrieverStack for codebase search
+        retriever_stack: UnifiedRetriever for codebase search
         graph_manager: GraphManager for relationship analysis
         code_graph: Loaded NetworkX code graph
         repo_analysis: Pre-loaded repository analysis

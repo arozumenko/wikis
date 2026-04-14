@@ -5,7 +5,7 @@ Phase 5 of the Unified Graph & Clustering plan: replaces the legacy
 WikiRetrieverStack (EnsembleRetriever + FAISS + BM25) with direct SQL
 queries against the .wiki.db.
 
-Feature-flagged via ``WIKIS_UNIFIED_RETRIEVER=1`` (default 0).
+Always enabled — the only retrieval path.
 
 Key advantages over the legacy stack:
 - Single file, single connection (no FAISS + BM25 + docstore coordination)
@@ -33,8 +33,8 @@ from .constants import (
 
 logger = logging.getLogger(__name__)
 
-# Feature flag
-UNIFIED_RETRIEVER_ENABLED = os.getenv("WIKIS_UNIFIED_RETRIEVER", "0") == "1"
+# Always enabled (no feature flag)
+UNIFIED_RETRIEVER_ENABLED = True  # Kept for backward compat; always True
 
 # ---------------------------------------------------------------------------
 # Constants

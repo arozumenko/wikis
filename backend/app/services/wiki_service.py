@@ -251,12 +251,18 @@ class WikiService:
 
             await self._emit_progress(invocation, "generating", 0.3, "Generating wiki content")
 
+            # Resolve generation options (request overrides → config defaults)
+            planner_type = request.planner_type if request.planner_type is not None else self.settings.planner_type
+            exclude_tests = request.exclude_tests if request.exclude_tests is not None else self.settings.cluster_exclude_tests
+
             # generate_wiki is sync/CPU-bound — run in thread
             result = await asyncio.to_thread(
                 toolkit.generate_wiki,
                 query=request.wiki_title or "Generate comprehensive wiki",
                 include_research=request.include_research,
                 include_diagrams=request.include_diagrams,
+                planner_type=planner_type,
+                exclude_tests=exclude_tests,
             )
 
             if result is None or not isinstance(result, dict) or not result.get("success"):
