@@ -16,7 +16,6 @@ from app.core.cluster_expansion import (
     _augment_go_rust,
     _collect_expansion_neighbors,
     _estimate_tokens,
-    _fts_fallback,
     _get_cluster_docs,
     _is_excluded_test_node,
     _node_to_document,
@@ -110,10 +109,118 @@ def _insert_edge(conn, source_id, target_id, rel_type="calls", weight=1.0):
 
 
 class MockDB:
-    """Minimal mock that exposes .conn like UnifiedWikiDB."""
+    """Minimal mock that exposes .conn and protocol methods like UnifiedWikiDB."""
 
     def __init__(self, conn):
         self.conn = conn
+
+    def find_nodes_by_name(self, name, macro_cluster=None, architectural_only=True, limit=5):
+        conditions = ["symbol_name = ?"]
+        params = [name]
+        if macro_cluster is not None:
+            conditions.append("macro_cluster = ?")
+            params.append(macro_cluster)
+        if architectural_only:
+            conditions.append("is_architectural = 1")
+        where = " AND ".join(conditions)
+        rows = self.conn.execute(
+            f"SELECT * FROM repo_nodes WHERE {where} "
+            f"ORDER BY end_line - start_line DESC LIMIT ?",
+            params + [limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_fts_by_symbol_name(self, name, macro_cluster=None, architectural_only=True, limit=3):
+        try:
+            safe_name = name.replace('"', '""')
+            conditions = []
+            params = [f'symbol_name:"{safe_name}"']
+            if macro_cluster is not None:
+                conditions.append("n.macro_cluster = ?")
+                params.append(macro_cluster)
+            if architectural_only:
+                conditions.append("n.is_architectural = 1")
+            where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
+            rows = self.conn.execute(
+                f"SELECT n.* FROM repo_fts f "
+                f"JOIN repo_nodes n ON f.node_id = n.node_id "
+                f"WHERE repo_fts MATCH ? {where_extra} "
+                f"ORDER BY rank LIMIT ?",
+                params + [limit],
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def get_edge_targets(self, source_id):
+        rows = self.conn.execute(
+            "SELECT target_id, rel_type, weight FROM repo_edges WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_edge_sources(self, target_id):
+        rows = self.conn.execute(
+            "SELECT source_id, rel_type, weight FROM repo_edges WHERE target_id = ?",
+            (target_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_nodes_by_ids(self, node_ids):
+        if not node_ids:
+            return []
+        placeholders = ",".join("?" * len(node_ids))
+        rows = self.conn.execute(
+            f"SELECT * FROM repo_nodes WHERE node_id IN ({placeholders})",
+            node_ids,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_doc_nodes_by_cluster(self, macro, micro=None):
+        if micro is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM repo_nodes "
+                "WHERE macro_cluster = ? AND micro_cluster = ? AND is_doc = 1 "
+                "ORDER BY rel_path",
+                (macro, micro),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM repo_nodes "
+                "WHERE macro_cluster = ? AND is_doc = 1 ORDER BY rel_path",
+                (macro,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_related_nodes(self, node_id, rel_types, direction="out",
+                           target_symbol_types=None, exclude_path=None, limit=15):
+        if direction == "out":
+            base = (
+                "SELECT n.* FROM repo_edges e "
+                "JOIN repo_nodes n ON e.target_id = n.node_id "
+                "WHERE e.source_id = ?"
+            )
+        else:
+            base = (
+                "SELECT n.* FROM repo_edges e "
+                "JOIN repo_nodes n ON e.source_id = n.node_id "
+                "WHERE e.target_id = ?"
+            )
+        params = [node_id]
+        placeholders = ",".join("?" * len(rel_types))
+        base += f" AND e.rel_type IN ({placeholders})"
+        params.extend(rel_types)
+        if target_symbol_types:
+            ph = ",".join("?" * len(target_symbol_types))
+            base += f" AND n.symbol_type IN ({ph})"
+            params.extend(target_symbol_types)
+        if exclude_path:
+            base += " AND n.rel_path != ?"
+            params.append(exclude_path)
+        base += " ORDER BY n.rel_path, n.start_line LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(base, params).fetchall()
+        return [dict(r) for r in rows]
 
 
 @pytest.fixture()
@@ -372,21 +479,6 @@ class TestResolveSymbols:
     def test_empty_names_skipped(self, populated_db):
         result = _resolve_symbols(populated_db, ["", None, "AuthService"], macro_id=1)
         assert len(result) == 1
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# _fts_fallback
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestFtsFallback:
-    def test_finds_by_fts(self, populated_db):
-        rows = _fts_fallback(populated_db, "AuthService", macro_id=1)
-        assert len(rows) >= 1
-
-    def test_not_found(self, populated_db):
-        rows = _fts_fallback(populated_db, "TotallyNonexistent", macro_id=1)
-        assert len(rows) == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════

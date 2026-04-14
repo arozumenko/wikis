@@ -1277,3 +1277,195 @@ class UnifiedWikiDB:
             "embedding_dim": self.embedding_dim,
             "db_size_mb": round(db_size_mb, 2),
         }
+
+    # ══════════════════════════════════════════════════════════════════
+    # Protocol-required methods (WikiStorageProtocol conformance)
+    # ══════════════════════════════════════════════════════════════════
+
+    # --- search_fts: protocol-standard name for search_fts5 ---
+
+    def search_fts(
+        self,
+        query: str,
+        path_prefix: str | None = None,
+        cluster_id: int | None = None,
+        symbol_types: list[str] | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Protocol-standard alias for ``search_fts5``."""
+        return self.search_fts5(
+            query,
+            path_prefix=path_prefix,
+            cluster_id=cluster_id,
+            symbol_types=symbol_types,
+            limit=limit,
+        )
+
+    # --- Batch / bulk node retrieval ---
+
+    def get_nodes_by_ids(self, node_ids: list[str]) -> list[dict[str, Any]]:
+        """Batch fetch nodes by IDs."""
+        if not node_ids:
+            return []
+        placeholders = ",".join("?" * len(node_ids))
+        rows = self.conn.execute(
+            f"SELECT * FROM repo_nodes WHERE node_id IN ({placeholders})",  # noqa: S608
+            node_ids,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_nodes(self) -> list[dict[str, Any]]:
+        """Get every node in the database (cache validation)."""
+        rows = self.conn.execute("SELECT * FROM repo_nodes").fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Cluster-expansion query methods ---
+
+    def find_nodes_by_name(
+        self,
+        name: str,
+        macro_cluster: int | None = None,
+        architectural_only: bool = True,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Find nodes by symbol_name, optionally bounded to a cluster."""
+        conditions = ["symbol_name = ?"]
+        params: list[Any] = [name]
+
+        if macro_cluster is not None:
+            conditions.append("macro_cluster = ?")
+            params.append(macro_cluster)
+
+        if architectural_only:
+            conditions.append("is_architectural = 1")
+
+        params.append(limit)
+        where = " AND ".join(conditions)
+
+        rows = self.conn.execute(
+            f"SELECT * FROM repo_nodes WHERE {where} "  # noqa: S608
+            "ORDER BY end_line - start_line DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_fts_by_symbol_name(
+        self,
+        name: str,
+        macro_cluster: int | None = None,
+        architectural_only: bool = True,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """FTS fallback for symbol name resolution."""
+        safe_name = name.replace('"', '""')
+
+        conditions = ["n.is_architectural = 1"] if architectural_only else []
+        params: list[Any] = [f'symbol_name:"{safe_name}"']
+
+        if macro_cluster is not None:
+            conditions.append("n.macro_cluster = ?")
+            params.append(macro_cluster)
+
+        where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
+        params.append(limit)
+
+        try:
+            rows = self.conn.execute(
+                "SELECT n.* FROM repo_fts f "  # noqa: S608
+                "JOIN repo_nodes n ON f.node_id = n.node_id "
+                f"WHERE repo_fts MATCH ?{where_extra} "
+                "ORDER BY rank LIMIT ?",
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.OperationalError as exc:
+            logger.debug("search_fts_by_symbol_name failed for '%s': %s", name, exc)
+            return []
+
+    def get_edge_targets(self, source_id: str) -> list[dict[str, Any]]:
+        """Lightweight outgoing edges: [{target_id, rel_type, weight}]."""
+        rows = self.conn.execute(
+            "SELECT target_id, rel_type, weight FROM repo_edges WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_edge_sources(self, target_id: str) -> list[dict[str, Any]]:
+        """Lightweight incoming edges: [{source_id, rel_type, weight}]."""
+        rows = self.conn.execute(
+            "SELECT source_id, rel_type, weight FROM repo_edges WHERE target_id = ?",
+            (target_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_related_nodes(
+        self,
+        node_id: str,
+        rel_types: list[str],
+        direction: str = "out",
+        target_symbol_types: list[str] | None = None,
+        exclude_path: str | None = None,
+        limit: int = 15,
+    ) -> list[dict[str, Any]]:
+        """Find nodes related via specific edge types (JOIN edges + nodes)."""
+        if not rel_types:
+            return []
+
+        type_placeholders = ",".join("?" * len(rel_types))
+        params: list[Any] = []
+
+        if direction == "out":
+            join_sql = (
+                "SELECT n.* FROM repo_edges e "
+                f"JOIN repo_nodes n ON e.target_id = n.node_id "
+                f"WHERE e.source_id = ? AND e.rel_type IN ({type_placeholders})"
+            )
+            params = [node_id] + rel_types
+        else:
+            join_sql = (
+                "SELECT n.* FROM repo_edges e "
+                f"JOIN repo_nodes n ON e.source_id = n.node_id "
+                f"WHERE e.target_id = ? AND e.rel_type IN ({type_placeholders})"
+            )
+            params = [node_id] + rel_types
+
+        if target_symbol_types:
+            sym_placeholders = ",".join("?" * len(target_symbol_types))
+            join_sql += f" AND n.symbol_type IN ({sym_placeholders})"
+            params.extend(target_symbol_types)
+
+        if exclude_path:
+            join_sql += " AND n.rel_path != ?"
+            params.append(exclude_path)
+
+        join_sql += " ORDER BY n.rel_path, n.start_line LIMIT ?"
+        params.append(limit)
+
+        rows = self.conn.execute(join_sql, params).fetchall()  # noqa: S608
+        return [dict(r) for r in rows]
+
+    def get_doc_nodes_by_cluster(
+        self,
+        macro: int,
+        micro: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get documentation nodes (is_doc=1) from a cluster."""
+        if micro is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM repo_nodes "
+                "WHERE macro_cluster = ? AND micro_cluster = ? AND is_doc = 1 "
+                "ORDER BY rel_path",
+                (macro, micro),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM repo_nodes "
+                "WHERE macro_cluster = ? AND is_doc = 1 "
+                "ORDER BY rel_path",
+                (macro,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def commit(self) -> None:
+        """Explicitly commit the current transaction."""
+        self.conn.commit()

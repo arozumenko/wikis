@@ -175,28 +175,20 @@ def _augment_cpp(db, doc: Document, node_id: str) -> None:
     For a class declared in a .h file, find the corresponding .cpp
     methods via ``defines_body`` edges.
     """
-    conn = db.conn
     rel_path = doc.metadata.get("source", "")
 
     # Check if this is a header file
     is_header = any(rel_path.endswith(ext) for ext in ('.h', '.hpp', '.hxx', '.hh'))
 
     if is_header:
-        # Find implementation bodies linked via defines_body
-        rows = conn.execute(
-            "SELECT n.source_text, n.rel_path, n.symbol_name, n.start_line "
-            "FROM repo_edges e "
-            "JOIN repo_nodes n ON e.source_id = n.node_id "
-            "WHERE e.target_id = ? AND e.rel_type = 'defines_body' "
-            "ORDER BY n.rel_path, n.start_line "
-            "LIMIT 10",
-            (node_id,),
-        ).fetchall()
+        # Find implementation bodies linked via defines_body (incoming)
+        rows = db.find_related_nodes(
+            node_id, ['defines_body'], direction='in', limit=10,
+        )
 
         if rows:
             impl_parts = []
-            for row in rows:
-                r = dict(row)
+            for r in rows:
                 impl_text = r.get("source_text", "")
                 impl_path = r.get("rel_path", "")
                 impl_name = r.get("symbol_name", "")
@@ -209,19 +201,12 @@ def _augment_cpp(db, doc: Document, node_id: str) -> None:
                 doc.page_content += "\n".join(impl_parts)
     else:
         # Implementation file: find class declaration in header
-        rows = conn.execute(
-            "SELECT n.source_text, n.rel_path, n.symbol_name "
-            "FROM repo_edges e "
-            "JOIN repo_nodes n ON e.target_id = n.node_id "
-            "WHERE e.source_id = ? AND e.rel_type = 'defines_body' "
-            "AND n.symbol_type IN ('class', 'struct') "
-            "ORDER BY n.rel_path "
-            "LIMIT 3",
-            (node_id,),
-        ).fetchall()
+        rows = db.find_related_nodes(
+            node_id, ['defines_body'], direction='out',
+            target_symbol_types=['class', 'struct'], limit=3,
+        )
 
-        for row in rows:
-            r = dict(row)
+        for r in rows:
             decl_text = r.get("source_text", "")
             decl_path = r.get("rel_path", "")
             if decl_text:
@@ -240,29 +225,20 @@ def _augment_go_rust(
     For a struct/interface, find methods defined in other files via
     ``defines_body`` or ``implementation`` edges.
     """
-    conn = db.conn
     stype = doc.metadata.get("symbol_type", "").lower()
 
     if stype not in ('struct', 'interface', 'trait', 'enum'):
         return
 
-    # Find associated methods/implementations
-    rows = conn.execute(
-        "SELECT n.source_text, n.rel_path, n.symbol_name, n.start_line "
-        "FROM repo_edges e "
-        "JOIN repo_nodes n ON e.target_id = n.node_id "
-        "WHERE e.source_id = ? "
-        "AND e.rel_type IN ('defines_body', 'implementation') "
-        "AND n.rel_path != ? "
-        "ORDER BY n.rel_path, n.start_line "
-        "LIMIT 15",
-        (node_id, doc.metadata.get("source", "")),
-    ).fetchall()
+    # Find associated methods/implementations in other files
+    rows = db.find_related_nodes(
+        node_id, ['defines_body', 'implementation'], direction='out',
+        exclude_path=doc.metadata.get("source", ""), limit=15,
+    )
 
     if rows:
         impl_parts = []
-        for row in rows:
-            r = dict(row)
+        for r in rows:
             text = r.get("source_text", "")
             path = r.get("rel_path", "")
             name = r.get("symbol_name", "")
@@ -463,77 +439,31 @@ def expand_for_page(
 def _resolve_symbols(
     db, symbol_names: List[str], macro_id: Optional[int] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """Resolve symbol *names* to node dicts via SQL, optionally scoped to cluster.
+    """Resolve symbol *names* to node dicts, optionally scoped to cluster.
 
     Returns ``{node_id: node_dict}`` preserving insertion order.
     """
     result: Dict[str, Dict[str, Any]] = {}
-    conn = db.conn
 
     for name in symbol_names:
         if not name:
             continue
 
-        if macro_id is not None:
-            rows = conn.execute(
-                "SELECT * FROM repo_nodes "
-                "WHERE symbol_name = ? AND macro_cluster = ? "
-                "AND is_architectural = 1 "
-                "ORDER BY end_line - start_line DESC "
-                "LIMIT 5",
-                (name, macro_id),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM repo_nodes "
-                "WHERE symbol_name = ? "
-                "AND is_architectural = 1 "
-                "ORDER BY end_line - start_line DESC "
-                "LIMIT 5",
-                (name,),
-            ).fetchall()
+        rows = db.find_nodes_by_name(
+            name, macro_cluster=macro_id, architectural_only=True, limit=5,
+        )
 
         if not rows:
-            rows = _fts_fallback(db, name, macro_id)
+            rows = db.search_fts_by_symbol_name(
+                name, macro_cluster=macro_id, architectural_only=True, limit=3,
+            )
 
-        for row in rows:
-            node = dict(row)
+        for node in rows:
             nid = node.get("node_id", "")
             if nid and nid not in result:
                 result[nid] = node
 
     return result
-
-
-def _fts_fallback(
-    db, name: str, macro_id: Optional[int] = None,
-) -> list:
-    """Use FTS5 to find a symbol by name when exact SQL match fails."""
-    try:
-        safe_name = name.replace('"', '""')
-        if macro_id is not None:
-            rows = db.conn.execute(
-                'SELECT n.* FROM repo_fts f '
-                'JOIN repo_nodes n ON f.node_id = n.node_id '
-                'WHERE repo_fts MATCH ? '
-                'AND n.macro_cluster = ? '
-                'AND n.is_architectural = 1 '
-                'ORDER BY rank LIMIT 3',
-                (f'symbol_name:"{safe_name}"', macro_id),
-            ).fetchall()
-        else:
-            rows = db.conn.execute(
-                'SELECT n.* FROM repo_fts f '
-                'JOIN repo_nodes n ON f.node_id = n.node_id '
-                'WHERE repo_fts MATCH ? '
-                'AND n.is_architectural = 1 '
-                'ORDER BY rank LIMIT 3',
-                (f'symbol_name:"{safe_name}"',),
-            ).fetchall()
-        return rows
-    except Exception as exc:
-        logger.debug("[CLUSTER_EXPANSION] FTS5 fallback failed for '%s': %s", name, exc)
-        return []
 
 
 # ---------------------------------------------------------------------------
@@ -554,33 +484,26 @@ def _collect_expansion_neighbors(
     edge weight descending.
     """
     candidates: List[Tuple[str, Dict[str, Any], str, float]] = []
-    conn = db.conn
 
     for seed_id in seed_ids:
-        out_edges = conn.execute(
-            "SELECT target_id, rel_type, weight FROM repo_edges WHERE source_id = ?",
-            (seed_id,),
-        ).fetchall()
-        in_edges = conn.execute(
-            "SELECT source_id, rel_type, weight FROM repo_edges WHERE target_id = ?",
-            (seed_id,),
-        ).fetchall()
+        out_edges = db.get_edge_targets(seed_id)
+        in_edges = db.get_edge_sources(seed_id)
 
         neighbor_ids: Set[str] = set()
         edge_info: List[Tuple[str, str, float]] = []
 
         for row in out_edges:
-            tid = row[0] if isinstance(row, (tuple, list)) else row["target_id"]
-            rtype = (row[1] if isinstance(row, (tuple, list)) else row["rel_type"]) or "unknown"
-            w = (row[2] if isinstance(row, (tuple, list)) else row["weight"]) or 1.0
+            tid = row.get("target_id", "")
+            rtype = row.get("rel_type", "") or "unknown"
+            w = row.get("weight", 1.0) or 1.0
             if tid not in seen_ids and tid not in neighbor_ids:
                 neighbor_ids.add(tid)
                 edge_info.append((tid, rtype, w))
 
         for row in in_edges:
-            sid = row[0] if isinstance(row, (tuple, list)) else row["source_id"]
-            rtype = (row[1] if isinstance(row, (tuple, list)) else row["rel_type"]) or "unknown"
-            w = (row[2] if isinstance(row, (tuple, list)) else row["weight"]) or 1.0
+            sid = row.get("source_id", "")
+            rtype = row.get("rel_type", "") or "unknown"
+            w = row.get("weight", 1.0) or 1.0
             if sid not in seen_ids and sid not in neighbor_ids:
                 neighbor_ids.add(sid)
                 edge_info.append((sid, rtype, w))
@@ -588,13 +511,8 @@ def _collect_expansion_neighbors(
         if not neighbor_ids:
             continue
 
-        id_list = list(neighbor_ids)
-        placeholders = ",".join("?" * len(id_list))
-        rows = conn.execute(
-            f"SELECT * FROM repo_nodes WHERE node_id IN ({placeholders})",
-            id_list,
-        ).fetchall()
-        node_map = {dict(r)["node_id"]: dict(r) for r in rows}
+        node_rows = db.get_nodes_by_ids(list(neighbor_ids))
+        node_map = {n["node_id"]: n for n in node_rows}
 
         for nid, rel_type, weight in edge_info:
             node = node_map.get(nid)
@@ -638,25 +556,10 @@ def _get_cluster_docs(
     exclude_tests: bool = False,
 ) -> List[Dict[str, Any]]:
     """Fetch documentation nodes from the same cluster not yet in ``seen_ids``."""
-    conn = db.conn
-    if micro_id is not None:
-        rows = conn.execute(
-            "SELECT * FROM repo_nodes "
-            "WHERE macro_cluster = ? AND micro_cluster = ? AND is_doc = 1 "
-            "ORDER BY rel_path",
-            (macro_id, micro_id),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM repo_nodes "
-            "WHERE macro_cluster = ? AND is_doc = 1 "
-            "ORDER BY rel_path",
-            (macro_id,),
-        ).fetchall()
+    rows = db.get_doc_nodes_by_cluster(macro_id, micro_id)
 
     result = []
-    for r in rows:
-        node = dict(r)
+    for node in rows:
         if node.get("node_id", "") not in seen_ids:
             if not _is_excluded_test_node(node, exclude_tests):
                 result.append(node)

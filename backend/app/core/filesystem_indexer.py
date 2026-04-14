@@ -276,10 +276,9 @@ class FilesystemRepositoryIndexer:
     @staticmethod
     def _reconstruct_documents_from_db(db) -> list[Document]:
         """Reconstruct LangChain Documents from unified DB nodes."""
-        rows = db.conn.execute("SELECT * FROM repo_nodes").fetchall()
+        rows = db.get_all_nodes()
         documents = []
-        for row in rows:
-            d = dict(row)
+        for d in rows:
             page_content = d.get("source_text") or ""
             metadata = {
                 "node_id": d.get("node_id", ""),

@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     # Database (shared with web app's Prisma; empty = default SQLite)
     database_url: str = ""
 
+    # Wiki storage backend (graph + FTS + vectors)
+    wiki_storage_backend: str = "sqlite"  # sqlite | postgres
+    wiki_storage_dsn: str = ""  # PostgreSQL DSN for wiki storage (when backend=postgres)
+
     # Q&A Cache
     qa_cache_enabled: bool = True
     qa_cache_similarity_threshold: float = 0.92
