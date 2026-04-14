@@ -49,6 +49,7 @@ SEPARATE_DOC_INDEX = os.getenv("WIKIS_DOC_SEPARATE_INDEX", "0") == "1"
 # Documentation symbol types — single source of truth in constants.py
 from ..constants import (
     ARCHITECTURAL_SYMBOLS,
+    DOC_SYMBOL_TYPES,
 )
 from ..constants import (
     DOCUMENTATION_EXTENSIONS as _DOC_EXTENSIONS_MAP,
@@ -1047,22 +1048,31 @@ class EnhancedUnifiedGraphBuilder:
         graph.graph["analysis_type"] = "multi_tier"
 
         # Filter out documentation results when SEPARATE_DOC_INDEX is enabled
-        # This keeps graph code-only, reducing RAM by ~3x
+        # This keeps graph code-only for vector store, reducing RAM by ~3x.
+        # However, doc nodes are ALWAYS added to the NX graph (third pass below)
+        # so they enter the unified DB for clustering and wiki structure.
         if SEPARATE_DOC_INDEX:
             code_results = {
                 path: result
                 for path, result in parse_results.items()
                 if not (hasattr(result, "parse_level") and result.parse_level == "documentation")
             }
-            doc_count = len(parse_results) - len(code_results)
+            # Keep doc results available for the graph third-pass (unified DB needs them)
+            doc_results_separated = {
+                path: result
+                for path, result in parse_results.items()
+                if hasattr(result, "parse_level") and result.parse_level == "documentation"
+            }
             logger.info(
-                f"[SEPARATE_DOC_INDEX] Excluding {doc_count} doc files from graph (routed to vector store only)"
+                f"[SEPARATE_DOC_INDEX] {len(doc_results_separated)} doc files excluded from "
+                f"vector store but will be added to graph for unified DB"
             )
             parse_results_for_graph = code_results
         else:
+            doc_results_separated = {}
             parse_results_for_graph = parse_results
 
-        # Separate rich and basic parse results
+        # Separate rich, basic, and documentation parse results
         rich_results = {
             path: result
             for path, result in parse_results_for_graph.items()
@@ -1073,8 +1083,15 @@ class EnhancedUnifiedGraphBuilder:
             for path, result in parse_results_for_graph.items()
             if hasattr(result, "parse_level") and result.parse_level == "basic"
         }
+        # Merge: docs from parse_results_for_graph (SEPARATE_DOC_INDEX=0) + separated docs
+        doc_results = {
+            path: result
+            for path, result in parse_results_for_graph.items()
+            if hasattr(result, "parse_level") and result.parse_level == "documentation"
+        }
+        doc_results.update(doc_results_separated)
 
-        logger.info(f"Building multi-tier code_graph: {len(rich_results)} rich, {len(basic_results)} basic")
+        logger.info(f"Building multi-tier code_graph: {len(rich_results)} rich, {len(basic_results)} basic, {len(doc_results)} doc")
 
         # Add rich language graphs (comprehensive relationships)
         # Group by language first to avoid processing the same language multiple times
@@ -1135,6 +1152,56 @@ class EnhancedUnifiedGraphBuilder:
                     this.module.invocation_thinking(
                         f"I am on phase parsing\nGraph build progress: {pct}% (completed {language})"
                     )
+
+        # Add documentation nodes to the graph (README, markdown, configs, etc.)
+        # Without this, doc files are parsed but never added to the graph,
+        # so they don't make it into the unified DB, clustering, or expansion.
+        if doc_results:
+            doc_node_count = 0
+            for file_path, result in doc_results.items():
+                file_name = Path(file_path).stem
+                doc_lang = result.language  # e.g. 'markdown', 'yaml', 'text'
+                for symbol in result.symbols:
+                    node_id = f"{doc_lang}::{file_name}::{symbol.name}"
+                    # Handle duplicates
+                    base_node_id = node_id
+                    counter = 1
+                    while node_id in graph.nodes:
+                        node_id = f"{base_node_id}#{counter}"
+                        counter += 1
+
+                    symbol_type_str = symbol.symbol_type
+                    if hasattr(symbol_type_str, "value"):
+                        symbol_type_str = symbol_type_str.value
+                    symbol_type_str = str(symbol_type_str).lower()
+
+                    rel_path = getattr(symbol, "rel_path", "") or file_path
+
+                    node_attrs = {
+                        "name": symbol.name,
+                        "type": symbol_type_str,
+                        "symbol_name": symbol.name,
+                        "symbol_type": symbol_type_str,
+                        "file_path": file_path,
+                        "rel_path": rel_path,
+                        "file_name": file_name,
+                        "language": doc_lang,
+                        "start_line": symbol.start_line,
+                        "end_line": symbol.end_line,
+                        "analysis_level": "documentation",
+                        "source_text": symbol.source_text or "",
+                        "docstring": symbol.docstring or "",
+                        "parameters": symbol.parameters if hasattr(symbol, "parameters") else [],
+                        "return_type": symbol.return_type or "" if hasattr(symbol, "return_type") else "",
+                    }
+                    graph.add_node(node_id, **node_attrs)
+                    doc_node_count += 1
+
+            logger.info(
+                "Added %d documentation nodes from %d files to graph",
+                doc_node_count,
+                len(doc_results),
+            )
 
         # Final completion message (force 100%)
         if this and getattr(this, "module", None):
