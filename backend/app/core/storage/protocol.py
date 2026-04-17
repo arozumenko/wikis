@@ -375,3 +375,15 @@ class WikiStorageProtocol(Protocol):
     def commit(self) -> None:
         """Explicitly commit the current transaction (no-op for auto-commit backends)."""
         ...
+
+    # ── Bulk operations ──────────────────────────────────────────────
+
+    def delete_all_edges(self) -> None:
+        """Delete every row in the edges table (full replace before re-persist)."""
+        ...
+
+    # ── Language detection ───────────────────────────────────────────
+
+    def detect_dominant_language(self, node_ids: list[str]) -> str | None:
+        """Return the most common ``language`` value among *node_ids*, or None."""
+        ...

@@ -1382,6 +1382,51 @@ class OptimizedWikiGenerationAgent:
         # ── Populate unified DB from code graph (for expansion & topology) ──
         self._ensure_unified_db(code_graph)
 
+        # ── Ensure code_graph has Phase 2 enrichment ──────────────────
+        # When the indexer pre-built the DB, Phase 2 (orphan resolution,
+        # doc edges, component bridging, edge weighting) was applied to
+        # the indexer's copy of the graph and persisted to the DB.
+        # However, the in-memory code_graph we hold here is the *raw*
+        # graph from the retriever stack — it has none of those
+        # enrichments.  Leiden clustering on the un-enriched graph
+        # produces fragmented/disconnected results because ~55% of
+        # symbol nodes are orphans and all edges have weight=1.0.
+        #
+        # Fix: reconstruct the graph from the DB (which has the full
+        # enriched edge set with calibrated weights) and use THAT for
+        # clustering.
+        clustering_graph = code_graph  # default: use as-is
+        if self._cluster_db is not None and not code_graph.graph.get("phase2_enriched"):
+            try:
+                phase2_done = self._cluster_db.get_meta("phase2_completed")
+                if phase2_done:
+                    enriched_g = self._cluster_db.to_networkx()
+                    if enriched_g.number_of_nodes() > 0:
+                        logger.info(
+                            "[CLUSTER] Using Phase 2-enriched graph from DB: "
+                            "%d nodes, %d edges (raw graph had %d edges)",
+                            enriched_g.number_of_nodes(),
+                            enriched_g.number_of_edges(),
+                            code_graph.number_of_edges(),
+                        )
+                        clustering_graph = enriched_g
+                    else:
+                        logger.warning(
+                            "[CLUSTER] DB to_networkx() returned empty graph — "
+                            "using raw code_graph"
+                        )
+                else:
+                    logger.debug(
+                        "[CLUSTER] Phase 2 not completed in DB — "
+                        "using raw code_graph for clustering"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[CLUSTER] Failed to load enriched graph from DB: %s — "
+                    "using raw code_graph",
+                    exc,
+                )
+
         if self.progress_callback:
             try:
                 self.progress_callback("planning", 0.29, "Running graph clustering...")
@@ -1389,13 +1434,35 @@ class OptimizedWikiGenerationAgent:
                 pass
 
         cluster_assignment = run_clustering(
-            code_graph,
+            clustering_graph,
             exclude_tests=exclude_tests,
         )
 
         if not cluster_assignment.sections:
             logger.warning("Cluster planner: clustering produced 0 sections — falling back")
             return None
+
+        # Persist cluster assignments to DB so cluster_expansion can
+        # resolve symbols scoped to macro/micro clusters.
+        if self._cluster_db is not None:
+            try:
+                assignments = []
+                for nid, macro_id in cluster_assignment.macro_clusters.items():
+                    micro_id = None
+                    micro_map = cluster_assignment.micro_clusters.get(macro_id, {})
+                    if isinstance(micro_map, dict):
+                        micro_id = micro_map.get(nid)
+                    assignments.append((nid, macro_id, micro_id))
+                if assignments:
+                    self._cluster_db.set_clusters_batch(assignments)
+                    logger.info(
+                        "[CLUSTER] Persisted %d cluster assignments to DB",
+                        len(assignments),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[CLUSTER] Failed to persist cluster assignments: %s", exc,
+                )
 
         if self.progress_callback:
             try:
@@ -1409,11 +1476,12 @@ class OptimizedWikiGenerationAgent:
                 pass
 
         planner = ClusterStructurePlanner(
-            graph=code_graph,
+            graph=clustering_graph,
             cluster_assignment=cluster_assignment,
             llm=self.llm_low,
             repo_name=self.repository_url.rstrip("/").rsplit("/", 1)[-1] if self.repository_url else None,
             exclude_tests=exclude_tests,
+            db=self._cluster_db,
         )
 
         response = planner.plan_structure()
@@ -1548,21 +1616,26 @@ class OptimizedWikiGenerationAgent:
         if self._cluster_db is not None:
             return
 
-        from ..code_graph.unified_graph_text_index import UnifiedGraphTextIndex
-        from ..unified_db import UnifiedWikiDB
+        from ..storage import open_storage, repo_id_from_path
 
         # Try to find the pre-built DB from the indexer
         db_path = self._find_unified_db()
         if db_path:
             try:
-                db = UnifiedWikiDB(db_path, readonly=True)
+                repo_id = repo_id_from_path(db_path) if db_path else None
+                db = open_storage(repo_id=repo_id, db_path=db_path, readonly=True)
                 self._cluster_db = db
                 self._cluster_db_path = db_path
-                self.graph_text_index = UnifiedGraphTextIndex(db_path)
+                from ..storage.text_index import StorageTextIndex
+
+                self.graph_text_index = StorageTextIndex(db)
+                stats = db.stats()
+                backend_name = type(db).__name__
                 logger.info(
-                    "[UNIFIED_DB] Opened pre-built DB: %s (%d nodes)",
-                    db_path,
-                    db.stats()["node_count"],
+                    "[UNIFIED_DB] Opened storage: %s (repo_id=%s, %d nodes)",
+                    backend_name,
+                    repo_id,
+                    stats["node_count"],
                 )
                 return
             except Exception as exc:
@@ -1584,11 +1657,14 @@ class OptimizedWikiGenerationAgent:
             db_path = os.path.join(tmp, "unified_wiki.db")
 
         try:
-            db = UnifiedWikiDB(db_path)
+            repo_id = repo_id_from_path(db_path)
+            db = open_storage(repo_id=repo_id, db_path=db_path)
             db.from_networkx(code_graph)
             self._cluster_db = db
             self._cluster_db_path = db_path
-            self.graph_text_index = UnifiedGraphTextIndex(db_path)
+            from ..storage.text_index import StorageTextIndex
+
+            self.graph_text_index = StorageTextIndex(db)
             logger.info(
                 "[UNIFIED_DB] Created from code graph: %d nodes, %d edges → %s",
                 code_graph.number_of_nodes(),
@@ -1631,9 +1707,10 @@ class OptimizedWikiGenerationAgent:
             return None
 
         try:
-            from ..unified_db import UnifiedWikiDB
+            from ..storage import open_storage, repo_id_from_path
 
-            self._cluster_db = UnifiedWikiDB(db_path, readonly=True)
+            repo_id = repo_id_from_path(db_path)
+            self._cluster_db = open_storage(repo_id=repo_id, db_path=db_path, readonly=True)
             self._cluster_db_path = db_path
             logger.info("[CLUSTER_EXPANSION] Opened unified DB: %s (readonly)", db_path)
             return self._cluster_db
@@ -1651,17 +1728,25 @@ class OptimizedWikiGenerationAgent:
             self._cluster_db = None
 
     def _find_unified_db(self) -> str | None:
-        """Locate the unified wiki DB file.
+        """Locate the unified wiki DB file (or cache key for postgres).
 
         Checks:
         1. Indexer's ``_unified_db_path`` attribute (set during indexing)
         2. ``{cache_dir}/*.wiki.db`` via cache_index.json
         3. Legacy ``{source_dir}/.wikis/unified_wiki.db`` location
+
+        For postgres backend, we still return a db_path-like string
+        so the caller can extract the repo_id/cache_key from it.
         """
+        from ..storage import is_postgres_backend
+
+        _pg = is_postgres_backend()
+
         # 1. Direct path from indexer
         indexer_db = getattr(self.indexer, "_unified_db_path", None)
-        if indexer_db and os.path.isfile(indexer_db):
-            return indexer_db
+        if indexer_db:
+            if _pg or os.path.isfile(indexer_db):
+                return indexer_db
 
         # 2. Look in cache directory via cache_index.json
         cache_dir = None
@@ -1686,28 +1771,30 @@ class OptimizedWikiGenerationAgent:
                     udb_section = index.get("unified_db", {})
                     for _repo_id, cache_key in udb_section.items():
                         db_path = os.path.join(cache_dir, f"{cache_key}.wiki.db")
-                        if os.path.isfile(db_path):
+                        if _pg or os.path.isfile(db_path):
                             return db_path
                 except Exception:
                     pass
 
-            # Glob fallback
-            import glob as _glob
-            wiki_dbs = _glob.glob(os.path.join(cache_dir, "*.wiki.db"))
-            if wiki_dbs:
-                wiki_dbs.sort(key=os.path.getmtime, reverse=True)
-                return wiki_dbs[0]
+            if not _pg:
+                # Glob fallback (SQLite only)
+                import glob as _glob
+                wiki_dbs = _glob.glob(os.path.join(cache_dir, "*.wiki.db"))
+                if wiki_dbs:
+                    wiki_dbs.sort(key=os.path.getmtime, reverse=True)
+                    return wiki_dbs[0]
 
-        # 3. Legacy location in source dir
-        source_dir = getattr(self.indexer, "source_dir", None) or getattr(self.indexer, "repo_path", None)
-        if source_dir:
-            candidates = [
-                os.path.join(source_dir, ".wikis", "unified_wiki.db"),
-                os.path.join(source_dir, "unified_wiki.db"),
-            ]
-            for path in candidates:
-                if os.path.isfile(path):
-                    return path
+        if not _pg:
+            # 3. Legacy location in source dir (SQLite only)
+            source_dir = getattr(self.indexer, "source_dir", None) or getattr(self.indexer, "repo_path", None)
+            if source_dir:
+                candidates = [
+                    os.path.join(source_dir, ".wikis", "unified_wiki.db"),
+                    os.path.join(source_dir, "unified_wiki.db"),
+                ]
+                for path in candidates:
+                    if os.path.isfile(path):
+                        return path
 
         return None
 

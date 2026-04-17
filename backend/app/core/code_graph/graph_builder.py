@@ -28,6 +28,7 @@ from langchain_text_splitters import MarkdownHeaderTextSplitter
 from ..code_splitter import GraphAwareCodeSplitter
 from ..parsers.base_parser import ParseResult
 from ..parsers.cpp_enhanced_parser import CppEnhancedParser
+from ..parsers.csharp_visitor_parser import CSharpVisitorParser
 from ..parsers.go_visitor_parser import GoVisitorParser
 from ..parsers.java_visitor_parser import JavaVisitorParser
 from ..parsers.javascript_visitor_parser import JavaScriptVisitorParser
@@ -247,6 +248,7 @@ class EnhancedUnifiedGraphBuilder:
         # Tier 1: Rich parsers for comprehensive analysis
         self.rich_parsers = {
             "cpp": CppEnhancedParser(),
+            "csharp": CSharpVisitorParser(),
             "go": GoVisitorParser(),
             "java": JavaVisitorParser(),
             "python": PythonParser(),

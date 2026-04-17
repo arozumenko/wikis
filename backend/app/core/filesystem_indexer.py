@@ -230,16 +230,35 @@ class FilesystemRepositoryIndexer:
             cache_key = hashlib.md5(hash_input.encode()).hexdigest()  # noqa: S324 — cache key, not security
             db_path = os.path.join(str(cache_dir), f"{cache_key}.wiki.db")
 
-            if not os.path.isfile(db_path):
-                logger.debug("[cache-miss] unified DB not found: %s", db_path)
-                return None
+            from .storage import is_postgres_backend, open_storage
 
-            from .unified_db import UnifiedWikiDB
+            if is_postgres_backend():
+                # PostgreSQL: check by opening storage and querying node count
+                try:
+                    db = open_storage(repo_id=cache_key, db_path=db_path, readonly=True)
+                except Exception:
+                    logger.debug("[cache-miss] PostgreSQL storage not available for %s", cache_key)
+                    return None
+            else:
+                if not os.path.isfile(db_path):
+                    logger.debug("[cache-miss] unified DB not found: %s", db_path)
+                    return None
+                db = open_storage(repo_id=cache_key, db_path=db_path, readonly=True)
 
-            db = UnifiedWikiDB(db_path, readonly=True)
             stats = db.stats()
             if stats["node_count"] < 1:
                 logger.debug("[cache-miss] unified DB empty: %s", db_path)
+                db.close()
+                return None
+
+            # Detect broken import: nodes present but zero edges almost
+            # certainly means a prior from_networkx() crashed midway.
+            if stats["node_count"] > 1 and stats["edge_count"] == 0:
+                logger.warning(
+                    "[cache-miss] unified DB has %d nodes but 0 edges — "
+                    "likely a failed import, forcing re-index: %s",
+                    stats["node_count"], db_path,
+                )
                 db.close()
                 return None
 
@@ -467,13 +486,14 @@ class FilesystemRepositoryIndexer:
             self.relationship_graph.number_of_edges(),
         )
 
-        from .unified_db import UnifiedWikiDB
+        from .storage import open_storage, is_postgres_backend
 
         _emb_obj = self.embeddings
         _embed_query_fn = getattr(_emb_obj, "embed_query", None) if _emb_obj else None
         _embed_batch_fn = getattr(_emb_obj, "embed_documents", None) if _emb_obj else None
 
-        with UnifiedWikiDB(db_path) as udb:
+        udb = open_storage(repo_id=cache_key, db_path=db_path)
+        try:
             # Phase 1a — Populate graph (nodes + edges)
             udb.from_networkx(self.relationship_graph)
 
@@ -498,6 +518,7 @@ class FilesystemRepositoryIndexer:
                     db=udb,
                     G=self.relationship_graph,
                     embedding_fn=_embed_query_fn,
+                    embed_batch_fn=_embed_batch_fn,
                 )
                 logger.info(
                     "Phase 2 complete: %d edges weighted, %d hubs",
@@ -530,7 +551,7 @@ class FilesystemRepositoryIndexer:
                     assignments.append((nid, macro_id, micro_id))
                 if assignments:
                     udb.set_clusters_batch(assignments)
-                    udb.conn.commit()
+                    udb.commit()
 
                 logger.info(
                     "Phase 3 complete: %d sections, %d pages, %d hubs",
@@ -557,6 +578,8 @@ class FilesystemRepositoryIndexer:
                 stats["db_size_mb"],
                 db_path,
             )
+        finally:
+            udb.close()
 
         # Store state for downstream use
         self._unified_db_path = db_path

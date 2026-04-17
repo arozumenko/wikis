@@ -100,10 +100,11 @@ class OptimizedWikiToolkitWrapper:
             # Initialize retriever from unified DB
             db_path = getattr(self.indexer, "_unified_db_path", None)
             if db_path:
-                from .unified_db import UnifiedWikiDB
+                from .storage import open_storage, repo_id_from_path
                 from .unified_retriever import UnifiedRetriever
 
-                db = UnifiedWikiDB(db_path, readonly=True)
+                _repo_id = repo_id_from_path(db_path)
+                db = open_storage(repo_id=_repo_id, db_path=db_path, readonly=True)
                 embedding_fn = None
                 embeddings = getattr(self.indexer, "embeddings", None)
                 if embeddings and hasattr(embeddings, "embed_query"):

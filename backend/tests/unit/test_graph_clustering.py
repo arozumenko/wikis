@@ -40,6 +40,9 @@ from app.core.graph_clustering import (
     _dir_histogram,
     _dir_of_node,
     _dir_similarity,
+    _enforce_page_sizes,
+    _expand_sections,
+    _file_aware_split,
     _find_architectural_parent,
     _hierarchical_leiden,
     _nx_to_igraph,
@@ -959,3 +962,251 @@ class TestRunClustering:
         assert r1.section_count == r2.section_count
         assert r1.page_count == r2.page_count
         assert r1.macro_clusters == r2.macro_clusters
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Section Expansion Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestExpandSections:
+    """Test _expand_sections — splits large sections to reach target count."""
+
+    def _make_leiden_result(self, sections, macro, micro):
+        return {
+            "sections": sections,
+            "macro_assignments": macro,
+            "micro_assignments": micro,
+            "algorithm_metadata": {"file_nodes": 0, "sections": 0, "pages": 0},
+        }
+
+    def test_noop_when_already_at_target(self):
+        """When section count >= target, return unchanged."""
+        G = _build_multi_file_graph(n_files=4, nodes_per_file=2)
+        nodes = list(G.nodes())
+        # 4 sections for 4 files — target_section_count(4) = 5
+        # but we mock n_files=2 so target=5, but with 4 sections >= 5? No.
+        # target_section_count(2) = max(5, ...) = 5, so 4 < 5.
+        # Let's just test that >= target is a noop:
+        sections = {
+            i: {"pages": {0: [nodes[i * 2], nodes[i * 2 + 1]]}}
+            for i in range(4)
+        }
+        macro = {n: i // 2 for i, n in enumerate(nodes)}
+        micro = {i: {nodes[i * 2]: 0, nodes[i * 2 + 1]: 0} for i in range(4)}
+        lr = self._make_leiden_result(sections, macro, micro)
+        # Force n_files=1 so target=5, but we have 4 sections
+        # Actually target_section_count(1)=max(5,...)=5
+        # Set n_files high enough that target <= 4
+        # target_section_count(8) = max(5, min(20, ceil(1.2*3)))=5
+        # Hmm. Let's override n_files to get target <= current.
+        # We have 4 sections. n_files=4 → target=5. n_files=3 → target=5.
+        # Just patch target_section_count to return 3:
+        with patch("app.core.graph_clustering.target_section_count", return_value=3):
+            result = _expand_sections(lr, G, n_files=4)
+        assert len(result["sections"]) == 4  # unchanged
+
+    @requires_leiden
+    def test_splits_when_under_target(self):
+        """Build a graph that Leiden under-segments, verify expansion adds sections."""
+        # Build a large graph with many files in distinct directories
+        G = nx.MultiDiGraph()
+        n_files = 20
+        for f in range(n_files):
+            # Use different top-level dirs to enable directory-based splitting
+            dir_name = f"src/group{f % 5}/pkg{f}"
+            for n in range(4):
+                nid = f"py::{dir_name}/mod.py::Sym{n}"
+                stype = "class" if n == 0 else "function"
+                G.add_node(nid, **_make_node(stype, f"{dir_name}/mod.py", f"Sym{n}",
+                                             start_line=n * 20))
+            # Intra-file edges
+            for n in range(3):
+                G.add_edge(
+                    f"py::{dir_name}/mod.py::Sym{n}",
+                    f"py::{dir_name}/mod.py::Sym{n + 1}",
+                    weight=2.0,
+                )
+
+        # Cross-file edges (within same group)
+        for f in range(n_files - 1):
+            d1 = f"src/group{f % 5}/pkg{f}"
+            d2 = f"src/group{(f + 1) % 5}/pkg{f + 1}"
+            G.add_edge(
+                f"py::{d1}/mod.py::Sym0",
+                f"py::{d2}/mod.py::Sym0",
+                weight=1.0,
+            )
+
+        # Create leiden_result with only 2 sections containing all nodes
+        all_nodes = list(G.nodes())
+        half = len(all_nodes) // 2
+        sections = {
+            0: {"pages": {0: all_nodes[:half]}},
+            1: {"pages": {0: all_nodes[half:]}},
+        }
+        macro = {}
+        for nid in all_nodes[:half]:
+            macro[nid] = 0
+        for nid in all_nodes[half:]:
+            macro[nid] = 1
+        micro = {
+            0: {nid: 0 for nid in all_nodes[:half]},
+            1: {nid: 0 for nid in all_nodes[half:]},
+        }
+        lr = {
+            "sections": sections,
+            "macro_assignments": macro,
+            "micro_assignments": micro,
+            "algorithm_metadata": {"file_nodes": n_files, "sections": 2, "pages": 2},
+        }
+
+        # target_section_count(20) = max(5, min(20, ceil(1.2*log2(20))))
+        # = ceil(1.2*4.32) = ceil(5.18) = 6
+        result = _expand_sections(lr, G, n_files=n_files)
+        assert len(result["sections"]) > 2, "Should have expanded beyond 2 sections"
+
+        # All nodes should still be assigned
+        all_assigned = set()
+        for sec in result["sections"].values():
+            for pg_nids in sec["pages"].values():
+                all_assigned.update(pg_nids)
+        assert all_assigned == set(all_nodes)
+
+    def test_no_leiden_libs_noop(self):
+        """Without igraph/leidenalg, expansion is a noop."""
+        G = _build_multi_file_graph(n_files=4, nodes_per_file=2)
+        nodes = list(G.nodes())
+        lr = self._make_leiden_result(
+            {0: {"pages": {0: nodes}}},
+            {n: 0 for n in nodes},
+            {0: {n: 0 for n in nodes}},
+        )
+        with patch("app.core.graph_clustering._HAS_IGRAPH", False):
+            result = _expand_sections(lr, G, n_files=100)
+        assert len(result["sections"]) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Page Size Enforcement Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestEnforcePageSizes:
+    """Test _enforce_page_sizes — merge tiny, split oversized pages."""
+
+    def test_merges_tiny_pages(self):
+        """Pages smaller than MERGE_THRESHOLD get merged."""
+        G = nx.MultiDiGraph()
+        # All in the same directory for easy merging
+        for i in range(12):
+            G.add_node(f"n{i}", **_make_node("function", "src/a.py", f"fn{i}",
+                                              start_line=i * 10))
+
+        # 3 pages: [n0..n7] (8 nodes), [n8,n9] (2 nodes — tiny), [n10,n11] (2 — tiny)
+        sections = {
+            0: {
+                "pages": {
+                    0: [f"n{i}" for i in range(8)],
+                    1: ["n8", "n9"],
+                    2: ["n10", "n11"],
+                },
+            },
+        }
+        macro = {f"n{i}": 0 for i in range(12)}
+        micro = {0: {f"n{i}": (0 if i < 8 else 1 if i < 10 else 2) for i in range(12)}}
+        lr = {
+            "sections": sections,
+            "macro_assignments": macro,
+            "micro_assignments": micro,
+            "algorithm_metadata": {},
+        }
+
+        result = _enforce_page_sizes(lr, G)
+        # Tiny pages (size 2 < MERGE_THRESHOLD=4) should be merged
+        total_pages = sum(len(s["pages"]) for s in result["sections"].values())
+        assert total_pages < 3, f"Expected merging, got {total_pages} pages"
+        # All nodes still present
+        all_nids = set()
+        for s in result["sections"].values():
+            for pg in s["pages"].values():
+                all_nids.update(pg)
+        assert len(all_nids) == 12
+
+    def test_splits_oversized_pages(self):
+        """Pages larger than adaptive_max_page_size get split."""
+        G = nx.MultiDiGraph()
+        # Create 40 nodes in different files
+        for i in range(40):
+            G.add_node(
+                f"n{i}",
+                **_make_node("function", f"src/f{i // 5}.py", f"fn{i}",
+                             start_line=(i % 5) * 10),
+            )
+
+        sections = {0: {"pages": {0: [f"n{i}" for i in range(40)]}}}
+        macro = {f"n{i}": 0 for i in range(40)}
+        micro = {0: {f"n{i}": 0 for i in range(40)}}
+        lr = {
+            "sections": sections,
+            "macro_assignments": macro,
+            "micro_assignments": micro,
+            "algorithm_metadata": {},
+        }
+
+        # With 40 nodes total, adaptive_max_page_size(40) = 25
+        # So 40-node page should be split into 2 pages
+        result = _enforce_page_sizes(lr, G)
+        total_pages = sum(len(s["pages"]) for s in result["sections"].values())
+        assert total_pages >= 2, f"Expected split, got {total_pages} pages"
+
+    def test_single_page_section_untouched(self):
+        """Section with 1 page is not modified."""
+        G = nx.MultiDiGraph()
+        for i in range(6):
+            G.add_node(f"n{i}", **_make_node("class", "a.py", f"C{i}"))
+        lr = {
+            "sections": {0: {"pages": {0: [f"n{i}" for i in range(6)]}}},
+            "macro_assignments": {f"n{i}": 0 for i in range(6)},
+            "micro_assignments": {0: {f"n{i}": 0 for i in range(6)}},
+            "algorithm_metadata": {},
+        }
+        result = _enforce_page_sizes(lr, G)
+        assert len(result["sections"][0]["pages"]) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# File-Aware Split Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestFileAwareSplit:
+    """Test _file_aware_split — chunking nodes by file then by size cap."""
+
+    def test_keeps_same_file_together(self):
+        G = nx.MultiDiGraph()
+        for i in range(10):
+            G.add_node(f"n{i}", **_make_node("function", f"src/f{i // 5}.py", f"fn{i}",
+                                              start_line=(i % 5) * 10))
+        # max_size=6: file0 has 5 nodes, file1 has 5 nodes → 2 chunks
+        chunks = _file_aware_split([f"n{i}" for i in range(10)], G, max_size=6)
+        assert len(chunks) == 2
+        # Each chunk should have nodes from the same file
+        for chunk in chunks:
+            files = {G.nodes[n]["rel_path"] for n in chunk}
+            assert len(files) == 1
+
+    def test_splits_large_file(self):
+        G = nx.MultiDiGraph()
+        for i in range(30):
+            G.add_node(f"n{i}", **_make_node("function", "src/big.py", f"fn{i}",
+                                              start_line=i * 10))
+        chunks = _file_aware_split([f"n{i}" for i in range(30)], G, max_size=10)
+        assert len(chunks) == 3
+        total = sum(len(c) for c in chunks)
+        assert total == 30
+
+    def test_empty_returns_original(self):
+        G = nx.MultiDiGraph()
+        result = _file_aware_split([], G, max_size=10)
+        assert result == [[]]

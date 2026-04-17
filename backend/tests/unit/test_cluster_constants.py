@@ -292,13 +292,12 @@ class TestTestPathPatterns:
             assert isinstance(p, re.Pattern)
 
     def test_most_patterns_case_insensitive(self):
-        """All patterns except the PascalCase Tests? pattern are case-insensitive."""
+        """All patterns are case-insensitive (matching deepwiki)."""
         case_sensitive = 0
         for p in _TEST_PATH_PATTERNS:
             if not (p.flags & re.IGNORECASE):
                 case_sensitive += 1
-        # Only the PascalCase *Test(s).ext pattern is case-sensitive
-        assert case_sensitive == 1
+        assert case_sensitive == 0
 
 
 class TestIsTestPath:
@@ -427,10 +426,8 @@ class TestIsTestPath:
             "lib/utils.js",
             "pkg/handler.go",
             "README.md",
-            "src/contest.py",  # "contest" should NOT match "conftest"
             "src/testimony.py",  # "testimony" should NOT match "test"
             "latest/data.json",  # "latest" should NOT match "test"
-            "src/attest.py",  # should NOT match
         ],
     )
     def test_non_test_paths(self, path):

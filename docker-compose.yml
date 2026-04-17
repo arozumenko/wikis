@@ -42,7 +42,7 @@ services:
       start_period: 60s
 
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     profiles: ["postgres"]
     ports:
       - "5432:5432"
@@ -52,6 +52,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-wikis_auth}
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./scripts/init-wikis-store.sh:/docker-entrypoint-initdb.d/02-wikis-store.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wikis}"]
       interval: 10s

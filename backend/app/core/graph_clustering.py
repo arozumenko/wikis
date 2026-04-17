@@ -50,12 +50,16 @@ import networkx as nx
 from .cluster_constants import (
     CENTROID_ARCHITECTURAL_MIN_PRIORITY,
     DEFAULT_HUB_Z_THRESHOLD,
+    DEFAULT_MAX_PAGE_SIZE,
     DOC_DOMINANT_THRESHOLD,
     LEIDEN_FILE_SECTION_RESOLUTION,
     LEIDEN_PAGE_RESOLUTION,
     MAX_CENTROIDS,
+    MERGE_THRESHOLD,
     MIN_CENTROIDS,
+    MIN_PAGE_SIZE,
     SYMBOL_TYPE_PRIORITY,
+    adaptive_max_page_size,
     is_test_path,
     target_section_count,
     target_total_pages,
@@ -898,6 +902,341 @@ def _consolidate_pages(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 7b. Section Expansion (split under-count sections to reach target)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _expand_sections(
+    leiden_result: Dict[str, Any],
+    G: nx.MultiDiGraph,
+    n_files: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Split large sections using sub-Leiden until section count reaches target.
+
+    Consolidation only *merges* down (too many → target).  This function
+    handles the opposite case: when Leiden produces *fewer* sections than
+    the adaptive target, the largest sections are split via higher-resolution
+    Leiden on their file-contracted subgraph.
+
+    Mutates *leiden_result* in-place and returns it.
+    """
+    if not _HAS_IGRAPH or not _HAS_LEIDEN:
+        return leiden_result
+
+    sections = leiden_result["sections"]
+    macro_assign = leiden_result["macro_assignments"]
+    micro_assign = leiden_result["micro_assignments"]
+
+    scale = n_files if n_files is not None else len(macro_assign)
+    target = target_section_count(scale)
+
+    if len(sections) >= target:
+        return leiden_result
+
+    original_count = len(sections)
+    next_section_id = max(sections.keys(), default=-1) + 1
+
+    # Build per-section node sets (for quick size lookups)
+    sec_node_sets: Dict[int, Set[str]] = {}
+    for nid, sid in macro_assign.items():
+        sec_node_sets.setdefault(sid, set()).add(nid)
+
+    while len(sections) < target:
+        # Pick the largest section (by node count) that has enough nodes to split
+        splittable = [
+            (sid, len(nset))
+            for sid, nset in sec_node_sets.items()
+            if len(nset) >= 4  # need at least 4 nodes to produce 2 meaningful parts
+        ]
+        if not splittable:
+            break
+
+        splittable.sort(key=lambda x: -x[1])
+        split_sid, _ = splittable[0]
+        split_nodes = sec_node_sets[split_sid]
+
+        # Build file-contracted subgraph for this section
+        sub_G = G.subgraph(split_nodes).copy()
+        sub_file_graph, sub_file_to_nodes = _contract_to_file_graph(sub_G)
+
+        if sub_file_graph.number_of_edges() == 0:
+            # No cross-file edges — fall back to directory-based split
+            split_result = _directory_based_split(split_nodes, G)
+            if len(split_result) <= 1:
+                break  # Can't split further
+        else:
+            sub_undirected = sub_file_graph
+            ig_sub, file_list = _nx_to_igraph(sub_undirected)
+
+            # Use higher resolution (2.0) to encourage more communities
+            sub_partition = leidenalg.find_partition(
+                ig_sub,
+                leidenalg.RBConfigurationVertexPartition,
+                resolution_parameter=2.0,
+                weights="weight",
+                seed=42,
+            )
+
+            # Group files by community
+            file_communities: Dict[int, List[str]] = {}
+            for idx, comm_id in enumerate(sub_partition.membership):
+                file_communities.setdefault(comm_id, []).append(file_list[idx])
+
+            if len(file_communities) <= 1:
+                # Leiden couldn't split even at γ=2.0 — try directory split
+                split_result = _directory_based_split(split_nodes, G)
+                if len(split_result) <= 1:
+                    break
+            else:
+                # Expand file communities to node communities
+                split_result = []
+                for _comm_id, files in file_communities.items():
+                    nodes_in_comm: Set[str] = set()
+                    for f in files:
+                        nodes_in_comm.update(sub_file_to_nodes.get(f, []))
+                    # Filter to only nodes in our section
+                    nodes_in_comm &= split_nodes
+                    if nodes_in_comm:
+                        split_result.append(nodes_in_comm)
+
+                if len(split_result) <= 1:
+                    break
+
+        # Apply the split: keep the first part in split_sid, create new sections for rest
+        parts = sorted(split_result, key=lambda s: -len(s))  # Largest first
+        keep_nodes = parts[0]
+
+        # Update the original section to keep only the first part
+        new_pages_for_kept: Dict[int, List[str]] = {}
+        kept_micro: Dict[str, int] = {}
+        pg_id = 0
+        for old_pg_id, old_nids in sections[split_sid]["pages"].items():
+            kept = [nid for nid in old_nids if nid in keep_nodes]
+            if kept:
+                new_pages_for_kept[pg_id] = kept
+                for nid in kept:
+                    kept_micro[nid] = pg_id
+                pg_id += 1
+
+        sections[split_sid]["pages"] = new_pages_for_kept
+        if "centroids" in sections[split_sid]:
+            del sections[split_sid]["centroids"]
+        micro_assign[split_sid] = kept_micro
+        sec_node_sets[split_sid] = keep_nodes
+
+        # Create new sections from remaining parts
+        for part_nodes in parts[1:]:
+            new_sid = next_section_id
+            next_section_id += 1
+
+            # Group part_nodes by their original micro assignment
+            old_micro_groups: Dict[int, List[str]] = {}
+            for nid in part_nodes:
+                old_mid = None
+                old_sec_micro = micro_assign.get(split_sid)
+                if isinstance(old_sec_micro, dict):
+                    old_mid = old_sec_micro.get(nid)
+                if old_mid is None:
+                    old_mid = 0
+                old_micro_groups.setdefault(old_mid, []).append(nid)
+
+            new_pages: Dict[int, List[str]] = {}
+            new_micro: Dict[str, int] = {}
+            new_pg_id = 0
+            for _old_mid, nids in old_micro_groups.items():
+                new_pages[new_pg_id] = nids
+                for nid in nids:
+                    new_micro[nid] = new_pg_id
+                    macro_assign[nid] = new_sid
+                new_pg_id += 1
+
+            sections[new_sid] = {"pages": new_pages}
+            micro_assign[new_sid] = new_micro
+            sec_node_sets[new_sid] = part_nodes
+
+            if len(sections) >= target:
+                break
+
+    logger.info(
+        "Section expansion: %d → %d sections (target %d, scale %d %s)",
+        original_count,
+        len(sections),
+        target,
+        scale,
+        "files" if n_files is not None else "nodes",
+    )
+    return leiden_result
+
+
+def _directory_based_split(
+    nodes: Set[str],
+    G: nx.MultiDiGraph,
+) -> List[Set[str]]:
+    """Split a set of nodes into groups by top-level directory.
+
+    Fallback when Leiden cannot split the subgraph further.
+    Returns at least 2 groups if nodes span multiple directories.
+    """
+    dir_groups: Dict[str, Set[str]] = {}
+    for nid in nodes:
+        d = _dir_of_node(nid, G)
+        dir_groups.setdefault(d, set()).add(nid)
+
+    if len(dir_groups) <= 1:
+        return [nodes]
+
+    # Return the groups sorted by size (largest first)
+    return sorted(dir_groups.values(), key=lambda s: -len(s))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7c. Page Size Enforcement (merge small, split oversized pages)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _enforce_page_sizes(
+    leiden_result: Dict[str, Any],
+    G: nx.MultiDiGraph,
+) -> Dict[str, Any]:
+    """Merge tiny pages and split oversized pages within each section.
+
+    Uses adaptive_max_page_size() based on total node count.
+    Ported from deepwiki's legacy Louvain pipeline — adapted for the
+    Leiden result dict structure.
+
+    Mutates *leiden_result* in-place and returns it.
+    """
+    sections = leiden_result["sections"]
+    micro_assign = leiden_result["micro_assignments"]
+    n_nodes = len(leiden_result["macro_assignments"])
+
+    max_size = adaptive_max_page_size(n_nodes)
+    min_size = MIN_PAGE_SIZE
+    merge_thresh = MERGE_THRESHOLD
+
+    total_before = sum(len(s["pages"]) for s in sections.values())
+
+    for sec_id in list(sections.keys()):
+        pages = sections[sec_id]["pages"]
+        sec_micro = micro_assign.get(sec_id, {})
+
+        # ── Merge small pages (only when >1 page) ──
+        if len(pages) > 1:
+            changed = True
+            while changed:
+                changed = False
+                small_pids = [
+                    pid for pid, nids in pages.items()
+                    if len(nids) < merge_thresh and len(pages) > 1
+                ]
+                for small_pid in small_pids:
+                    if small_pid not in pages or len(pages) <= 1:
+                        break
+                    small_nids = pages[small_pid]
+                    small_dirs = _dir_histogram(small_nids, G)
+
+                    best_pid = None
+                    best_score = -1
+                    for other_pid, other_nids in pages.items():
+                        if other_pid == small_pid:
+                            continue
+                        score = _dir_similarity(small_dirs, _dir_histogram(other_nids, G))
+                        if score > best_score:
+                            best_score = score
+                            best_pid = other_pid
+
+                    if best_pid is not None:
+                        pages[best_pid].extend(pages.pop(small_pid))
+                        for nid in pages[best_pid]:
+                            sec_micro[nid] = best_pid
+                        changed = True
+
+        # ── Split oversized pages ──
+        new_pages: Dict[int, List[str]] = {}
+        next_pg = 0
+        for pid, nids in sorted(pages.items()):
+            if len(nids) <= max_size:
+                new_pages[next_pg] = nids
+                for nid in nids:
+                    sec_micro[nid] = next_pg
+                next_pg += 1
+            else:
+                # Split by file-aware chunking
+                chunks = _file_aware_split(nids, G, max_size)
+                for chunk in chunks:
+                    new_pages[next_pg] = chunk
+                    for nid in chunk:
+                        sec_micro[nid] = next_pg
+                    next_pg += 1
+
+        sections[sec_id]["pages"] = new_pages
+        if "centroids" in sections[sec_id]:
+            del sections[sec_id]["centroids"]
+        micro_assign[sec_id] = sec_micro
+
+    total_after = sum(len(s["pages"]) for s in sections.values())
+    logger.info(
+        "Page size enforcement: %d → %d pages (max_size=%d, min_merge=%d)",
+        total_before,
+        total_after,
+        max_size,
+        merge_thresh,
+    )
+    return leiden_result
+
+
+def _file_aware_split(
+    node_ids: List[str],
+    G: nx.MultiDiGraph,
+    max_size: int,
+) -> List[List[str]]:
+    """Split a list of nodes by file path, then chunk by declaration order.
+
+    Keeps nodes from the same file together. If a single file exceeds
+    max_size, splits by start_line order.
+    """
+    from collections import defaultdict
+
+    by_file: Dict[str, List[str]] = defaultdict(list)
+    for nid in node_ids:
+        data = G.nodes.get(nid, {})
+        fpath = data.get("rel_path") or data.get("file_path") or ""
+        by_file[fpath].append(nid)
+
+    # Sort each file's nodes by start_line
+    for fpath in by_file:
+        by_file[fpath].sort(
+            key=lambda n: G.nodes.get(n, {}).get("start_line", 0)
+        )
+
+    result: List[List[str]] = []
+    current_chunk: List[str] = []
+
+    for fpath in sorted(by_file):
+        file_nodes = by_file[fpath]
+        if len(file_nodes) > max_size:
+            # Flush current chunk
+            if current_chunk:
+                result.append(current_chunk)
+                current_chunk = []
+            # Split large file by line order
+            for i in range(0, len(file_nodes), max_size):
+                result.append(file_nodes[i:i + max_size])
+        elif len(current_chunk) + len(file_nodes) > max_size:
+            # Flush current chunk, start new one
+            if current_chunk:
+                result.append(current_chunk)
+            current_chunk = list(file_nodes)
+        else:
+            current_chunk.extend(file_nodes)
+
+    if current_chunk:
+        result.append(current_chunk)
+
+    return result if result else [node_ids]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 8. Hierarchical Leiden Clustering
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1160,14 +1499,22 @@ def run_clustering(
     DeepWiki plugin with a clean, DB-free interface.
 
     Steps:
-        1. Architectural projection (collapse methods → parent class)
-        2. Hub detection (Z-score on in-degree)
-        3. Optional test-node exclusion
-        4. Hierarchical Leiden clustering (file-contracted sections,
-           per-section pages)
-        5. Section consolidation (directory proximity, log₂ target)
-        6. Page consolidation (directory proximity, √ target)
-        7. Hub re-integration (plurality vote)
+        1. Hub detection (Z-score on in-degree, full graph)
+        2. Optional test-node exclusion
+        3. Hierarchical Leiden clustering (file-contracted sections,
+           per-section pages on ALL symbol types)
+        4. Section consolidation (directory proximity, log₂ target)
+        5. Page consolidation (directory proximity, √ target)
+        6. Hub re-integration (plurality vote)
+
+    Note:
+        Architectural projection is intentionally NOT applied before
+        hierarchical Leiden.  The file-contraction step in Leiden
+        already compresses methods/fields into file-level nodes for
+        section discovery, while per-section page-level Leiden benefits
+        from seeing ALL symbol types (tighter communities).  The
+        planner's ``_build_architectural_cluster_map`` filters to
+        architectural symbols afterward — matching deepwiki's behavior.
 
     Args:
         G: In-memory ``nx.MultiDiGraph`` with node attributes including
@@ -1189,41 +1536,41 @@ def run_clustering(
         }
     }
 
-    # Step 1: Architectural projection
-    P = architectural_projection(G)
-
-    stats["projection"] = {
-        "original_nodes": G.number_of_nodes(),
-        "projected_nodes": P.number_of_nodes(),
-    }
-
-    # Step 2: Hub detection
-    hubs = detect_hubs(P, z_threshold=hub_z_threshold)
+    # Step 1: Hub detection — on the FULL graph so in-degree Z-scores
+    # reflect the true connectivity (methods/fields contribute).
+    # This matches deepwiki's Phase 2 pipeline which detects hubs on
+    # the complete weighted graph *before* any architectural filtering.
+    hubs = detect_hubs(G, z_threshold=hub_z_threshold)
 
     stats["graph"]["hubs"] = len(hubs)
+    stats["projection"] = {
+        "original_nodes": G.number_of_nodes(),
+        "projected_nodes": G.number_of_nodes(),
+        "note": "no projection — hierarchical Leiden uses file-contraction",
+    }
 
     # Trivial fallback for very small graphs
-    non_hub_count = P.number_of_nodes() - len(hubs)
+    non_hub_count = G.number_of_nodes() - len(hubs)
     if non_hub_count < 3:
         logger.info(
             "Graph too small for clustering (%d non-hub nodes). "
             "Using trivial assignment.",
             non_hub_count,
         )
-        return _trivial_assignment(P)
+        return _trivial_assignment(G)
 
-    # Step 3: Optional test-node exclusion
+    # Step 2: Optional test-node exclusion
     excluded_test_nodes: Set[str] = set()
-    G_cluster = P
+    G_cluster = G
 
     if exclude_tests:
-        for nid, data in P.nodes(data=True):
+        for nid, data in G.nodes(data=True):
             rel_path = data.get("rel_path") or data.get("file_name") or ""
             if is_test_path(rel_path):
                 excluded_test_nodes.add(nid)
 
         if excluded_test_nodes:
-            non_test_nodes = set(P.nodes()) - excluded_test_nodes
+            non_test_nodes = set(G.nodes()) - excluded_test_nodes
             if not non_test_nodes:
                 # Every node is a test file — fall back to full graph
                 logger.warning(
@@ -1233,7 +1580,7 @@ def run_clustering(
                 )
                 excluded_test_nodes = set()
             else:
-                G_cluster = P.subgraph(non_test_nodes).copy()
+                G_cluster = G.subgraph(non_test_nodes).copy()
                 logger.info(
                     "Test exclusion: removed %d test nodes from clustering "
                     "(%d remaining)",
@@ -1248,7 +1595,7 @@ def run_clustering(
     if non_hub_in_cluster < 3:
         return _trivial_assignment(G_cluster)
 
-    # Step 4: Hierarchical Leiden
+    # Step 3: Hierarchical Leiden
     leiden_result = _hierarchical_leiden(
         G_cluster,
         hubs,
@@ -1256,10 +1603,13 @@ def run_clustering(
         page_resolution=page_resolution,
     )
 
-    # Step 5+6: Consolidation
+    # Step 4+5: Consolidation
+    # Use the ORIGINAL graph G (not G_cluster) for directory-proximity
+    # lookups during consolidation — this matches deepwiki's pipeline
+    # where _consolidate_sections/pages receive the full graph.
     n_files = leiden_result["algorithm_metadata"].get("file_nodes")
-    leiden_result = _consolidate_sections(leiden_result, G_cluster, n_files=n_files)
-    leiden_result = _consolidate_pages(leiden_result, G_cluster)
+    leiden_result = _consolidate_sections(leiden_result, G, n_files=n_files)
+    leiden_result = _consolidate_pages(leiden_result, G)
 
     macro_assignments = leiden_result["macro_assignments"]
     micro_assignments = leiden_result["micro_assignments"]
@@ -1277,16 +1627,39 @@ def run_clustering(
     }
     stats["algorithm_metadata"] = leiden_result["algorithm_metadata"]
 
-    # Step 7: Hub re-integration
+    # Step 6: Hub re-integration
+    # Use original G so hub edges to all nodes (including test nodes)
+    # participate in the plurality vote — matches deepwiki.
     hub_assignments = reintegrate_hubs(
-        G_cluster, hubs, macro_assignments, micro_assignments
+        G, hubs, macro_assignments, micro_assignments
     )
 
-    # Merge hubs into macro/micro so they appear in cluster queries
+    # Merge hubs into macro/micro AND sections so the planner sees them.
+    # In deepwiki, persist_clusters() writes ALL nodes (including hubs)
+    # to the DB, and the planner reads them via SQL.  Here we must
+    # insert hubs into the sections dict directly.
+    sections = leiden_result["sections"]
     for hub_id, (macro_id, micro_id) in hub_assignments.items():
         macro_assignments[hub_id] = macro_id
         if micro_id is not None:
             micro_assignments.setdefault(macro_id, {})[hub_id] = micro_id
+        # Insert into sections page-list so _build_architectural_cluster_map
+        # can see the hub when iterating sections → pages → node_ids.
+        if macro_id in sections:
+            pages = sections[macro_id].setdefault("pages", {})
+            if micro_id is not None and micro_id in pages:
+                if hub_id not in pages[micro_id]:
+                    pages[micro_id].append(hub_id)
+            elif micro_id is not None:
+                # micro_id doesn't exist yet — pick the largest page
+                if pages:
+                    largest_pg = max(pages, key=lambda p: len(pages[p]))
+                    pages[largest_pg].append(hub_id)
+            else:
+                # No micro assigned — add to the largest page
+                if pages:
+                    largest_pg = max(pages, key=lambda p: len(pages[p]))
+                    pages[largest_pg].append(hub_id)
 
     stats["hubs"] = {
         "total": len(hub_assignments),

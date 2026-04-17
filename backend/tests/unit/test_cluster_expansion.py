@@ -222,6 +222,25 @@ class MockDB:
         rows = self.conn.execute(base, params).fetchall()
         return [dict(r) for r in rows]
 
+    def get_node(self, node_id):
+        row = self.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def detect_dominant_language(self, node_ids):
+        if not node_ids:
+            return None
+        placeholders = ",".join("?" for _ in node_ids)
+        row = self.conn.execute(
+            f"SELECT language FROM repo_nodes "
+            f"WHERE node_id IN ({placeholders}) AND language IS NOT NULL "
+            f"GROUP BY language ORDER BY COUNT(*) DESC LIMIT 1",
+            node_ids,
+        ).fetchone()
+        return row[0] if row else None
+
 
 @pytest.fixture()
 def db():
@@ -404,21 +423,27 @@ class TestAugmentation:
         assert doc.page_content == "class Foo: pass"
 
     def test_augment_cpp_header(self, db):
+        # 2-hop: Class →defines→ Method ←defines_body← Impl
         _insert_node(db.conn, "CppClass", symbol_type="class", language="cpp",
                       rel_path="include/foo.h",
                       source_text="class Foo { void bar(); };")
+        _insert_node(db.conn, "CppMethod", symbol_type="method", language="cpp",
+                      rel_path="include/foo.h",
+                      source_text="void bar();")
         _insert_node(db.conn, "CppImpl", symbol_type="function", language="cpp",
                       rel_path="src/foo.cpp",
                       source_text="void Foo::bar() { /* impl */ }")
-        _insert_edge(db.conn, "CppImpl", "CppClass", "defines_body")
+        _insert_edge(db.conn, "CppClass", "CppMethod", "defines")
+        _insert_edge(db.conn, "CppImpl", "CppMethod", "defines_body")
         db.conn.commit()
 
         doc = Document(
             page_content="class Foo { void bar(); };",
-            metadata={"language": "cpp", "node_id": "CppClass", "source": "include/foo.h"},
+            metadata={"language": "cpp", "node_id": "CppClass",
+                       "source": "include/foo.h", "symbol_type": "class"},
         )
         cost = _augment_cpp(db, doc, "CppClass")
-        assert "Implementation" in doc.page_content
+        assert "Implementations from src/foo.cpp" in doc.page_content
         assert "Foo::bar()" in doc.page_content
 
     def test_augment_go_struct(self, db):
@@ -428,7 +453,7 @@ class TestAugmentation:
         _insert_node(db.conn, "GoMethod", symbol_type="function", language="go",
                       rel_path="pkg/user_methods.go",
                       source_text="func (u *User) Validate() error { return nil }")
-        _insert_edge(db.conn, "GoStruct", "GoMethod", "defines_body")
+        _insert_edge(db.conn, "GoStruct", "GoMethod", "defines")
         db.conn.commit()
 
         doc = Document(

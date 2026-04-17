@@ -7,7 +7,7 @@ from pathlib import Path
 import networkx as nx
 import pytest
 
-from app.core.code_graph.unified_graph_text_index import UnifiedGraphTextIndex
+from app.core.storage.text_index import StorageTextIndex
 from app.core.unified_db import UnifiedWikiDB
 
 
@@ -261,7 +261,7 @@ class TestStaleNodeCleanup:
         assert db.get_node("d") is not None
 
 
-class TestUnifiedGraphTextIndex:
+class TestStorageTextIndex:
     def test_search_by_name_uses_unified_db(self, db, db_path):
         graph = nx.MultiDiGraph()
         graph.add_node(
@@ -276,7 +276,7 @@ class TestUnifiedGraphTextIndex:
         )
         db.from_networkx(graph)
 
-        index = UnifiedGraphTextIndex(db_path)
+        index = StorageTextIndex(db)
         docs = index.search_by_name("AuthService", exact=True, k=5)
 
         assert len(docs) == 1
@@ -307,7 +307,7 @@ class TestUnifiedGraphTextIndex:
         )
         db.from_networkx(graph)
 
-        index = UnifiedGraphTextIndex(db_path)
+        index = StorageTextIndex(db)
         docs = index.search_symbols("authentication service", k=10, path_prefix="src")
 
         assert [doc.metadata["node_id"] for doc in docs] == ["auth-service"]
@@ -326,7 +326,7 @@ class TestUnifiedGraphTextIndex:
         )
         db.from_networkx(graph)
 
-        index = UnifiedGraphTextIndex(db_path)
+        index = StorageTextIndex(db)
         docs = index.search_by_layer("entry_point", k=5)
 
         assert len(docs) == 1

@@ -523,7 +523,7 @@ class UnifiedWikiDB:
         """Get nodes whose ``rel_path`` starts with *prefix* (B-tree GLOB)."""
         rows = self.conn.execute(
             "SELECT * FROM repo_nodes WHERE rel_path GLOB ? LIMIT ?",
-            (prefix + "*", limit),
+            (prefix.rstrip("/") + "/*", limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -726,12 +726,14 @@ class UnifiedWikiDB:
         params.append(limit)
         where = " AND ".join(conditions)
 
+        # BM25 weights: symbol_name=10, signature=4, docstring=2, source_text=1
+        # Aligned with Postgres tsvector weights (A=1.0, B=0.4, C=0.2, D=0.1)
         sql = (
-            "SELECT m.*, f.rank AS fts_rank "  # noqa: S608 — FTS search query, conditions built from validated field names
+            "SELECT m.*, bm25(repo_fts, 10.0, 4.0, 2.0, 1.0) AS fts_rank "  # noqa: S608
             "FROM repo_fts f "
             "JOIN repo_nodes m ON f.node_id = m.node_id "
             f"WHERE {where} "
-            "ORDER BY f.rank "
+            "ORDER BY fts_rank "
             "LIMIT ?"
         )
 
@@ -1469,3 +1471,24 @@ class UnifiedWikiDB:
     def commit(self) -> None:
         """Explicitly commit the current transaction."""
         self.conn.commit()
+
+    # ── Bulk operations ──────────────────────────────────────────────
+
+    def delete_all_edges(self) -> None:
+        """Delete every row in the edges table."""
+        self.conn.execute("DELETE FROM repo_edges")
+
+    # ── Language detection ───────────────────────────────────────────
+
+    def detect_dominant_language(self, node_ids: list[str]) -> str | None:
+        """Return the most common language among *node_ids*."""
+        if not node_ids:
+            return None
+        placeholders = ",".join("?" for _ in node_ids)
+        row = self.conn.execute(
+            f"SELECT language FROM repo_nodes "
+            f"WHERE node_id IN ({placeholders}) AND language IS NOT NULL "
+            f"GROUP BY language ORDER BY COUNT(*) DESC LIMIT 1",
+            node_ids,
+        ).fetchone()
+        return row[0] if row else None

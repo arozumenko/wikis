@@ -262,6 +262,8 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
     import shutil
     from pathlib import Path
 
+    from app.core.storage import drop_storage
+
     cache_path = Path(cache_dir)
 
     # Derive repo identifier (same logic as toolkit_bridge._extract_repo_identifier)
@@ -286,6 +288,13 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
     # 2. Remove FAISS + graph cache files using cache_index.json
     index_file = cache_path / "cache_index.json"
     if not index_file.exists():
+        # No local cache index; still try postgres cleanup via glob for .wiki.db files
+        for db_file in glob_mod.glob(os.path.join(cache_dir, f"{safe_name}*.wiki.db")):
+            from app.core.storage import repo_id_from_path
+            try:
+                drop_storage(repo_id_from_path(db_file))
+            except Exception as e:
+                logger.warning("Failed to drop postgres schema for %s: %s", db_file, e)
         return
 
     try:
@@ -300,7 +309,9 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
 
     # Find and delete vectorstore files
     cache_key = index.get(resolved) or index.get(repo_identifier)
+    pg_repo_ids: set[str] = set()  # collect repo_ids for postgres schema cleanup
     if cache_key:
+        pg_repo_ids.add(cache_key)
         for ext in (".faiss", ".docs.pkl", ".wiki.db", ".fts5.db", "_analysis.json"):
             f = cache_path / f"{cache_key}{ext}"
             if f.exists():
@@ -326,6 +337,7 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
     udb_section = index.get("unified_db", {})
     for k, v in list(udb_section.items()):
         if k.startswith(resolved) or k.startswith(repo_identifier):
+            pg_repo_ids.add(v)
             for ext in (".wiki.db", ".wiki.db-wal", ".wiki.db-shm"):
                 db_file = cache_path / f"{v}{ext}"
                 if db_file.exists():
@@ -370,3 +382,10 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
             logger.info("Updated cache_index.json after cleanup for %s", repo_identifier)
         except Exception as e:
             logger.warning("Failed to update cache_index.json: %s", e)
+
+    # Drop PostgreSQL schemas (no-op when backend is SQLite)
+    for rid in pg_repo_ids:
+        try:
+            drop_storage(rid)
+        except Exception as e:
+            logger.warning("Failed to drop postgres schema for repo_id %s: %s", rid, e)

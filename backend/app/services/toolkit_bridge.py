@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -305,7 +306,8 @@ def _load_cached_artifacts(
         if wiki_dbs:
             # Use the most recent one
             wiki_dbs.sort(key=os.path.getmtime, reverse=True)
-            cache_key = Path(wiki_dbs[0]).stem  # e.g. "abc123" from "abc123.wiki.db"
+            from app.core.storage import repo_id_from_path
+            cache_key = repo_id_from_path(wiki_dbs[0])
             logger.info("Found .wiki.db via glob fallback: %s", wiki_dbs[0])
 
     if not cache_key:
@@ -314,15 +316,19 @@ def _load_cached_artifacts(
 
     # Open unified DB and create retriever
     db_path = cache_path / f"{cache_key}.wiki.db"
-    if not db_path.exists():
-        logger.warning(f"Unified DB file not found: {db_path}")
-        return
 
     try:
-        from app.core.unified_db import UnifiedWikiDB
+        from app.core.storage import is_postgres_backend, open_storage
         from app.core.unified_retriever import UnifiedRetriever
 
-        db = UnifiedWikiDB(str(db_path), readonly=True)
+        if is_postgres_backend():
+            db = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
+        else:
+            if not db_path.exists():
+                logger.warning(f"Unified DB file not found: {db_path}")
+                return
+            db = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
+
         components.unified_db_path = str(db_path)
 
         # Create embedding function for hybrid search

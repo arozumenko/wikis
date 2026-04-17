@@ -128,7 +128,7 @@ class _ConnCompat:
 
     def execute(self, sql: str, params=None):
         adapted_sql, named_params = self._adapt(sql, params)
-        with self._engine.connect() as conn:
+        with self._engine.begin() as conn:
             conn.execute(text(f"SET search_path TO {self._schema}, public"))
             result = conn.execute(text(adapted_sql), named_params)
             keys = tuple(result.keys())
@@ -290,7 +290,9 @@ class PostgresWikiStorage:
         self._repo_id = repo_id
         self._embedding_dim = embedding_dim
         self._readonly = readonly
-        self._schema = f"wiki_{repo_id.replace('-', '_')}"
+        # Sanitise repo_id for use as a PG schema name: only alnum + underscore.
+        _safe = repo_id.replace("-", "_").replace(".", "_")
+        self._schema = f"wiki_{_safe}"
 
         self._engine: Engine = create_engine(
             dsn,
@@ -440,6 +442,17 @@ class PostgresWikiStorage:
             self._engine.dispose()
             self._engine = None  # type: ignore[assignment]
 
+    def drop_schema(self) -> None:
+        """Drop the entire ``wiki_{repo_id}`` schema and all its tables.
+
+        Used during wiki deletion to fully remove a repository's data.
+        """
+        if self._engine is None:
+            return
+        with self._engine.begin() as conn:
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {self._schema} CASCADE"))
+        logger.info("Dropped PostgreSQL schema: %s", self._schema)
+
     def __enter__(self):
         return self
 
@@ -450,6 +463,29 @@ class PostgresWikiStorage:
     # ==================================================================
     # Helpers
     # ==================================================================
+
+    @staticmethod
+    def _strip_nul(value):
+        """Sanitise text for PostgreSQL: strip NUL bytes and lone surrogates.
+
+        PostgreSQL text columns reject NUL (0x00).  Lone surrogates
+        (U+D800..U+DFFF) can appear when source code is read with
+        ``errors='surrogateescape'`` and cause encoding failures on
+        the wire protocol.  We replace both with the empty string.
+        """
+        if isinstance(value, str):
+            # Fast path: most strings are clean
+            if "\x00" not in value:
+                try:
+                    value.encode("utf-8")
+                    return value
+                except UnicodeEncodeError:
+                    pass
+            # Slow path: strip NUL + re-encode to drop surrogates
+            value = value.replace("\x00", "")
+            value = value.encode("utf-8", errors="replace").decode("utf-8")
+            return value
+        return value
 
     def _row_to_dict(self, row) -> dict[str, Any]:
         """Convert a SQLAlchemy Row to a plain dict."""
@@ -476,30 +512,31 @@ class PostgresWikiStorage:
         if isinstance(params, (list, tuple)):
             params = json.dumps(params)
 
+        _s = self._strip_nul
         return {
-            "node_id": n["node_id"],
-            "rel_path": rel_path,
-            "file_name": n.get("file_name", ""),
-            "language": n.get("language", ""),
+            "node_id": _s(n["node_id"]),
+            "rel_path": _s(rel_path),
+            "file_name": _s(n.get("file_name", "")),
+            "language": _s(n.get("language", "")),
             "start_line": n.get("start_line", 0),
             "end_line": n.get("end_line", 0),
-            "symbol_name": n.get("symbol_name", ""),
-            "symbol_type": symbol_type,
-            "parent_symbol": n.get("parent_symbol"),
-            "analysis_level": n.get("analysis_level", "comprehensive"),
-            "source_text": n.get("source_text", ""),
-            "docstring": n.get("docstring", ""),
-            "signature": n.get("signature", ""),
-            "parameters": params,
-            "return_type": n.get("return_type", ""),
+            "symbol_name": _s(n.get("symbol_name", "")),
+            "symbol_type": _s(symbol_type),
+            "parent_symbol": _s(n.get("parent_symbol")),
+            "analysis_level": _s(n.get("analysis_level", "comprehensive")),
+            "source_text": _s(n.get("source_text", "")),
+            "docstring": _s(n.get("docstring", "")),
+            "signature": _s(n.get("signature", "")),
+            "parameters": _s(params),
+            "return_type": _s(n.get("return_type", "")),
             "is_architectural": is_arch,
             "is_doc": is_doc,
             "is_test": is_test,
-            "chunk_type": n.get("chunk_type"),
+            "chunk_type": _s(n.get("chunk_type")),
             "macro_cluster": n.get("macro_cluster"),
             "micro_cluster": n.get("micro_cluster"),
             "is_hub": n.get("is_hub", 0),
-            "hub_assignment": n.get("hub_assignment"),
+            "hub_assignment": _s(n.get("hub_assignment")),
         }
 
     # ==================================================================
@@ -611,6 +648,7 @@ class PostgresWikiStorage:
         if not edges:
             return
 
+        _s = self._strip_nul
         schema = self._schema
         rows = []
         for e in edges:
@@ -618,18 +656,18 @@ class PostgresWikiStorage:
             if isinstance(annotations, dict):
                 annotations = json.dumps(annotations)
             rows.append({
-                "source_id": e["source_id"],
-                "target_id": e["target_id"],
-                "rel_type": e.get("rel_type", ""),
-                "edge_class": e.get("edge_class", "structural"),
-                "analysis_level": e.get("analysis_level", "comprehensive"),
+                "source_id": _s(e["source_id"]),
+                "target_id": _s(e["target_id"]),
+                "rel_type": _s(e.get("rel_type", "")),
+                "edge_class": _s(e.get("edge_class", "structural")),
+                "analysis_level": _s(e.get("analysis_level", "comprehensive")),
                 "weight": e.get("weight", 1.0),
                 "raw_similarity": e.get("raw_similarity"),
-                "source_file": e.get("source_file", ""),
-                "target_file": e.get("target_file", ""),
-                "language": e.get("language", ""),
-                "annotations": annotations,
-                "created_by": e.get("created_by", "ast"),
+                "source_file": _s(e.get("source_file", "")),
+                "target_file": _s(e.get("target_file", "")),
+                "language": _s(e.get("language", "")),
+                "annotations": _s(annotations),
+                "created_by": _s(e.get("created_by", "ast")),
             })
 
         cols = [c for c in rows[0].keys() if c != "id"]
@@ -810,18 +848,31 @@ class PostgresWikiStorage:
             return 0
 
         with self._engine.connect() as conn:
+            # Fetch all nodes; use source_text with fallback to
+            # docstring / symbol_name so that nodes with empty
+            # source_text still get an embedding vector.
             rows = conn.execute(
                 text(
-                    f"SELECT node_id, source_text FROM {self._schema}.repo_nodes "
-                    "WHERE source_text IS NOT NULL AND length(trim(source_text)) > 0"
+                    f"SELECT node_id, source_text, docstring, symbol_name "
+                    f"FROM {self._schema}.repo_nodes"
                 ),
             ).fetchall()
 
         total = 0
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i: i + batch_size]
-            texts = [r[1] for r in batch]
-            node_ids = [r[0] for r in batch]
+        embeddable: list[tuple[str, str]] = []
+        for r in rows:
+            txt = (r[1] or "").strip()
+            if not txt:
+                txt = (r[2] or "").strip()  # docstring
+            if not txt:
+                txt = (r[3] or "").strip()  # symbol_name
+            if txt:
+                embeddable.append((r[0], txt))
+
+        for i in range(0, len(embeddable), batch_size):
+            batch = embeddable[i: i + batch_size]
+            texts = [t for _, t in batch]
+            node_ids = [nid for nid, _ in batch]
 
             try:
                 vectors = embedding_fn(texts)
@@ -859,12 +910,14 @@ class PostgresWikiStorage:
 
         where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
 
+        # Note: use CAST(:emb AS vector) instead of :emb::vector to avoid
+        # SQLAlchemy text() misinterpreting the :: cast as a bind-param marker.
         sql = text(
-            f"SELECT v.node_id, v.embedding <-> :emb::vector AS vec_distance, m.* "
+            f"SELECT v.node_id, v.embedding <-> CAST(:emb AS vector) AS vec_distance, m.* "
             f"FROM {self._schema}.repo_vec v "
             f"JOIN {self._schema}.repo_nodes m ON v.node_id = m.node_id "
             f"WHERE 1=1 {where_extra} "
-            f"ORDER BY v.embedding <-> :emb::vector "
+            f"ORDER BY v.embedding <-> CAST(:emb AS vector) "
             f"LIMIT :k"
         )
 
@@ -1006,7 +1059,7 @@ class PostgresWikiStorage:
         )
 
         # Nodes
-        BATCH = 2000
+        BATCH = 5000
         node_batch: list[dict[str, Any]] = []
 
         for node_id, data in G.nodes(data=True):
@@ -1022,22 +1075,61 @@ class PostgresWikiStorage:
         t_nodes = time.time() - t0
         logger.info("Imported %d nodes in %.1fs", G.number_of_nodes(), t_nodes)
 
-        # Edges
+        # Edges — with per-batch recovery so a single bad edge cannot
+        # leave the DB in a "nodes-only" state.
         t1 = time.time()
         edge_batch: list[dict[str, Any]] = []
+        edges_ok = 0
+        edges_failed = 0
+
+        def _flush_edges(batch: list[dict[str, Any]]) -> tuple[int, int]:
+            """Insert a batch; on failure, fall back to row-by-row."""
+            ok = fail = 0
+            try:
+                self.upsert_edges_batch(batch)
+                ok = len(batch)
+            except Exception as batch_exc:
+                logger.warning(
+                    "Edge batch of %d failed (%s) — retrying row-by-row",
+                    len(batch), batch_exc,
+                )
+                for row in batch:
+                    try:
+                        self.upsert_edges_batch([row])
+                        ok += 1
+                    except Exception as row_exc:
+                        fail += 1
+                        if fail <= 3:
+                            logger.warning(
+                                "Skipping edge %s→%s: %s",
+                                row.get("source_id", "?")[:40],
+                                row.get("target_id", "?")[:40],
+                                row_exc,
+                            )
+            return ok, fail
 
         for u, v, key, data in G.edges(data=True, keys=True):
             edge_dict = self._nx_edge_to_dict(u, v, key, data)
             edge_batch.append(edge_dict)
             if len(edge_batch) >= BATCH:
-                self.upsert_edges_batch(edge_batch)
+                ok, fail = _flush_edges(edge_batch)
+                edges_ok += ok
+                edges_failed += fail
                 edge_batch.clear()
 
         if edge_batch:
-            self.upsert_edges_batch(edge_batch)
+            ok, fail = _flush_edges(edge_batch)
+            edges_ok += ok
+            edges_failed += fail
 
         t_edges = time.time() - t1
-        logger.info("Imported %d edges in %.1fs", G.number_of_edges(), t_edges)
+        if edges_failed:
+            logger.warning(
+                "Imported %d edges in %.1fs (%d failed)",
+                edges_ok, t_edges, edges_failed,
+            )
+        else:
+            logger.info("Imported %d edges in %.1fs", edges_ok, t_edges)
 
         # FTS is handled by PostgreSQL trigger (auto-update on INSERT/UPDATE)
         # No manual FTS rebuild needed
@@ -1121,19 +1213,20 @@ class PostgresWikiStorage:
         if isinstance(annotations, dict):
             annotations = json.dumps(annotations)
 
+        _s = self._strip_nul
         return {
-            "source_id": str(u),
-            "target_id": str(v),
-            "rel_type": data.get("relationship_type", ""),
-            "edge_class": data.get("edge_class", "structural"),
-            "analysis_level": data.get("analysis_level", "comprehensive"),
+            "source_id": _s(str(u)),
+            "target_id": _s(str(v)),
+            "rel_type": _s(data.get("relationship_type", "")),
+            "edge_class": _s(data.get("edge_class", "structural")),
+            "analysis_level": _s(data.get("analysis_level", "comprehensive")),
             "weight": data.get("weight", 1.0),
             "raw_similarity": data.get("raw_similarity"),
-            "source_file": data.get("source_file", ""),
-            "target_file": data.get("target_file", ""),
-            "language": data.get("language", ""),
-            "annotations": annotations,
-            "created_by": data.get("created_by", "ast"),
+            "source_file": _s(data.get("source_file", "")),
+            "target_file": _s(data.get("target_file", "")),
+            "language": _s(data.get("language", "")),
+            "annotations": _s(annotations),
+            "created_by": _s(data.get("created_by", "ast")),
         }
 
     def to_networkx(self) -> nx.MultiDiGraph:
@@ -1421,3 +1514,29 @@ class PostgresWikiStorage:
     def commit(self) -> None:
         """No-op — PostgreSQL uses auto-commit via SQLAlchemy engine.begin()."""
         pass
+
+    # ── Bulk operations ──────────────────────────────────────────────
+
+    def delete_all_edges(self) -> None:
+        """Delete every row in the edges table."""
+        with self._engine.begin() as conn:
+            conn.execute(text(f"DELETE FROM {self._edges}"))
+
+    # ── Language detection ───────────────────────────────────────────
+
+    def detect_dominant_language(self, node_ids: list[str]) -> str | None:
+        """Return the most common language among *node_ids*."""
+        if not node_ids:
+            return None
+        placeholders = ", ".join(f":p{i}" for i in range(len(node_ids)))
+        params = {f"p{i}": nid for i, nid in enumerate(node_ids)}
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    f"SELECT language FROM {self._nodes} "
+                    f"WHERE node_id IN ({placeholders}) AND language IS NOT NULL "
+                    f"GROUP BY language ORDER BY COUNT(*) DESC LIMIT 1"
+                ),
+                params,
+            ).fetchone()
+        return row[0] if row else None

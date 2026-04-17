@@ -113,6 +113,7 @@ class ClusterStructurePlanner:
         wiki_title: str | None = None,
         repo_name: str | None = None,
         exclude_tests: bool = True,
+        db=None,
     ):
         self.graph = graph
         self.cluster_assignment = cluster_assignment
@@ -120,6 +121,7 @@ class ClusterStructurePlanner:
         self.repo_name = repo_name or ""
         self.wiki_title = wiki_title or self._derive_wiki_title()
         self.exclude_tests = exclude_tests
+        self.db = db
         self._central_k: int | None = None
 
     # ── Node access helpers ──────────────────────────────────────────
@@ -241,6 +243,9 @@ class ClusterStructurePlanner:
                 "ClusterStructurePlanner: no clusters — returning fallback"
             )
             return self._fallback_spec()
+
+        # ── Phase 5/6: Optional candidate validation & coverage ──────
+        cluster_map = self._maybe_validate_candidates(cluster_map)
 
         logger.info(
             "ClusterStructurePlanner: %d macro-clusters to name",
@@ -690,6 +695,134 @@ class ClusterStructurePlanner:
             )
             return f"{name} — Technical Documentation"
         return "Repository Technical Documentation"
+
+    # ── Phase 5/6: Candidate validation & coverage ──────────────────
+
+    def _maybe_validate_candidates(
+        self,
+        cluster_map: dict[int, dict[int, list[str]]],
+    ) -> dict[int, dict[int, list[str]]]:
+        """Run candidate validation + coverage ledger when enabled.
+
+        Gated behind env vars:
+        - ``WIKIS_CANDIDATE_VALIDATION=1`` — Phase 5 (validate & reshape)
+        - ``WIKIS_COVERAGE_LEDGER=1``       — Phase 6 (coverage metrics)
+
+        Requires ``self.db`` to be set (protocol storage instance).
+        Returns the (possibly modified) cluster_map.
+        """
+        validate_enabled = os.environ.get("WIKIS_CANDIDATE_VALIDATION") == "1"
+        coverage_enabled = os.environ.get("WIKIS_COVERAGE_LEDGER") == "1"
+
+        if not (validate_enabled or coverage_enabled):
+            return cluster_map
+
+        if self.db is None:
+            logger.debug(
+                "ClusterStructurePlanner: validation/coverage requested "
+                "but no db provided — skipping"
+            )
+            return cluster_map
+
+        try:
+            from .candidate_builder import build_candidates
+            from .page_validator import (
+                DEMOTE,
+                MERGE_WITH,
+                PROMOTE_DOCS,
+                SPLIT_BY,
+                validate_all,
+            )
+
+            candidates = build_candidates(self.db, cluster_map)
+
+            if validate_enabled:
+                results = validate_all(candidates)
+
+                # Pass 1 — Remove DEMOTE candidates
+                for vr in results:
+                    if vr.shape_decision == DEMOTE:
+                        mid = vr.candidate.macro_id
+                        pid = vr.candidate.micro_id
+                        if mid in cluster_map and pid in cluster_map[mid]:
+                            del cluster_map[mid][pid]
+                            logger.info(
+                                "[VALIDATION] Demoting micro %d (macro %d)",
+                                pid, mid,
+                            )
+
+                # Pass 2 — Merge MERGE_WITH candidates into their
+                # largest surviving sibling (same macro-cluster).
+                merge_count = 0
+                for vr in results:
+                    if vr.shape_decision != MERGE_WITH:
+                        continue
+                    mid = vr.candidate.macro_id
+                    pid = vr.candidate.micro_id
+                    if mid not in cluster_map or pid not in cluster_map[mid]:
+                        continue
+                    # Find largest surviving sibling in this macro
+                    best_sibling = None
+                    best_size = 0
+                    for other_pid, other_nids in cluster_map[mid].items():
+                        if other_pid == pid:
+                            continue
+                        if len(other_nids) > best_size:
+                            best_size = len(other_nids)
+                            best_sibling = other_pid
+                    if best_sibling is not None:
+                        cluster_map[mid][best_sibling].extend(
+                            cluster_map[mid].pop(pid),
+                        )
+                        merge_count += 1
+
+                if merge_count:
+                    logger.info(
+                        "[VALIDATION] Merged %d MERGE_WITH candidates",
+                        merge_count,
+                    )
+
+                # Clean up empty macros
+                cluster_map = {
+                    m: micros for m, micros in cluster_map.items() if micros
+                }
+
+                total_surviving = sum(
+                    len(micros) for micros in cluster_map.values()
+                )
+                logger.info(
+                    "[VALIDATION] After validation — %d sections, "
+                    "%d pages surviving",
+                    len(cluster_map), total_surviving,
+                )
+
+            if coverage_enabled:
+                from .coverage_ledger import CoverageLedger
+
+                # Rebuild candidates from (possibly modified) cluster_map
+                candidates = build_candidates(self.db, cluster_map)
+                ledger = CoverageLedger(self.db, candidates)
+                report = ledger.report()
+                logger.info(
+                    "[COVERAGE] symbol=%.1f%% (%d/%d) doc=%.1f%% dir=%.1f%% "
+                    "high_value_uncovered=%d overlaps=%d",
+                    report.symbol_coverage * 100,
+                    report.covered_symbols,
+                    report.total_symbols,
+                    report.doc_coverage * 100,
+                    report.dir_coverage * 100,
+                    len(report.uncovered_high_value),
+                    len(report.page_overlap_pairs),
+                )
+
+        except Exception as exc:
+            logger.warning(
+                "[VALIDATION] Candidate validation failed — "
+                "continuing with original cluster_map: %s",
+                exc,
+            )
+
+        return cluster_map
 
     def _build_overview(self, sections: list[SectionSpec]) -> str:
         section_list = ", ".join(s.section_name for s in sections)

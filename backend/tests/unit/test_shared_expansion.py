@@ -98,10 +98,54 @@ def _insert_edge(conn, source_id, target_id, rel_type="calls", weight=1.0):
     )
 
 
+class _MockDB:
+    """Thin wrapper around raw sqlite3.Connection exposing protocol methods."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    # Delegate raw SQL calls for test setup helpers
+    def execute(self, *args, **kwargs):
+        return self.conn.execute(*args, **kwargs)
+
+    def commit(self):
+        return self.conn.commit()
+
+    def get_edge_targets(self, source_id):
+        rows = self.conn.execute(
+            "SELECT target_id, rel_type, weight FROM repo_edges WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_edge_sources(self, target_id):
+        rows = self.conn.execute(
+            "SELECT source_id, rel_type, weight FROM repo_edges WHERE target_id = ?",
+            (target_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_node(self, node_id):
+        row = self.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?", (node_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_nodes_by_ids(self, node_ids):
+        if not node_ids:
+            return []
+        placeholders = ",".join("?" * len(node_ids))
+        rows = self.conn.execute(
+            f"SELECT * FROM repo_nodes WHERE node_id IN ({placeholders})",
+            node_ids,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 @pytest.fixture()
 def conn():
     c = _make_db()
-    yield c
+    yield _MockDB(c)
     c.close()
 
 
@@ -128,7 +172,7 @@ def populated_conn():
     _insert_edge(c, "Base", "OutOfCluster", "references", 0.5)
 
     c.commit()
-    yield c
+    yield _MockDB(c)
     c.close()
 
 

@@ -1,4 +1,4 @@
-# Override file for PostgreSQL auth database.
+# Override file for PostgreSQL auth database + wiki storage.
 # Start with: docker compose --profile postgres -f docker-compose.yml -f docker-compose.postgres.yml up -d
 #
 # Set POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB in .env to override defaults.
@@ -6,6 +6,14 @@ services:
   app:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-wikis}:${POSTGRES_PASSWORD:-wikis}@postgres:5432/${POSTGRES_DB:-wikis_auth}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    environment:
+      WIKI_STORAGE_BACKEND: postgres
+      WIKI_STORAGE_DSN: postgresql://${POSTGRES_USER:-wikis}:${POSTGRES_PASSWORD:-wikis}@postgres:5432/wikis_store
     depends_on:
       postgres:
         condition: service_healthy

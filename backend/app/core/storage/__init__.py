@@ -18,10 +18,16 @@ Usage::
     db.close()
 """
 
-from .factory import create_storage
+from .factory import create_storage, drop_storage, is_postgres_backend, open_storage, repo_id_from_path
 from .protocol import WikiStorageProtocol
+from .text_index import StorageTextIndex
 
 __all__ = [
+    "StorageTextIndex",
     "WikiStorageProtocol",
     "create_storage",
+    "drop_storage",
+    "is_postgres_backend",
+    "open_storage",
+    "repo_id_from_path",
 ]

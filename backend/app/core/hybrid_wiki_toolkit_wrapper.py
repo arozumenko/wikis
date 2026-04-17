@@ -137,10 +137,11 @@ class HybridWikiToolkitWrapper:
             # Initialize retriever from unified DB
             db_path = getattr(self.indexer, "_unified_db_path", None)
             if db_path:
-                from .unified_db import UnifiedWikiDB
+                from .storage import open_storage, repo_id_from_path
                 from .unified_retriever import UnifiedRetriever
 
-                db = UnifiedWikiDB(db_path, readonly=True)
+                _repo_id = repo_id_from_path(db_path)
+                db = open_storage(repo_id=_repo_id, db_path=db_path, readonly=True)
                 embedding_fn = None
                 if self.embeddings and hasattr(self.embeddings, "embed_query"):
                     embedding_fn = self.embeddings.embed_query
@@ -306,10 +307,14 @@ class HybridWikiToolkitWrapper:
                     db_path = getattr(self.indexer, "_unified_db_path", None)
                     if db_path:
                         try:
-                            from .unified_db import UnifiedWikiDB
+                            from .storage import open_storage, repo_id_from_path
 
-                            with UnifiedWikiDB(db_path) as udb:
+                            _repo_id = repo_id_from_path(db_path)
+                            udb = open_storage(repo_id=_repo_id, db_path=db_path)
+                            try:
                                 udb.set_meta("repository_analysis", repo_context)
+                            finally:
+                                udb.close()
                             logger.info("Stored repository analysis in unified DB (%d chars)", len(repo_context))
                         except Exception as exc:
                             logger.warning("Failed to store analysis in unified DB: %s", exc)

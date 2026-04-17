@@ -32,7 +32,6 @@ from .code_graph.shared_expansion import (
 from .cluster_constants import is_test_path
 from .wiki_structure_planner.language_heuristics import (
     compute_augmentation_budget_fraction,
-    detect_dominant_language,
     get_language_hints,
     should_include_in_expansion,
 )
@@ -124,12 +123,20 @@ def _node_to_document(
 
     metadata = {
         "source": rel_path,
+        "rel_path": rel_path,
         "symbol_name": symbol_name,
         "symbol_type": symbol_type,
         "start_line": start_line,
         "end_line": end_line,
         "language": language,
         "node_id": node.get("node_id", ""),
+        "file_name": node.get("file_name", ""),
+        "chunk_type": node.get("chunk_type") or symbol_type,
+        "docstring": node.get("docstring", ""),
+        "signature": node.get("signature", ""),
+        "is_architectural": bool(node.get("is_architectural", 0)),
+        "is_doc": bool(node.get("is_doc", 0)),
+        "is_documentation": bool(node.get("is_doc", 0)),
         "is_initially_retrieved": is_initial,
         "expanded_from": expanded_from,
         "macro_cluster": node.get("macro_cluster"),
@@ -172,49 +179,63 @@ def _augment_document(db, doc: Document) -> int:
 def _augment_cpp(db, doc: Document, node_id: str) -> None:
     """C/C++: stitch header declarations with implementation bodies.
 
-    For a class declared in a .h file, find the corresponding .cpp
-    methods via ``defines_body`` edges.
+    Dispatches by symbol type:
+    - function/method/constructor: 1-hop, find incoming defines_body (impl→decl)
+    - class/struct: 2-hop, Class→defines→Method←defines_body←Impl
     """
-    rel_path = doc.metadata.get("source", "")
+    sym_type = doc.metadata.get("symbol_type", "").lower()
+    decl_file = doc.metadata.get("source", "")
 
-    # Check if this is a header file
-    is_header = any(rel_path.endswith(ext) for ext in ('.h', '.hpp', '.hxx', '.hh'))
-
-    if is_header:
-        # Find implementation bodies linked via defines_body (incoming)
+    if sym_type in ('function', 'method', 'constructor'):
+        # 1-hop: find implementation bodies that point at this declaration
         rows = db.find_related_nodes(
-            node_id, ['defines_body'], direction='in', limit=10,
+            node_id, ['defines_body'], direction='in',
+            exclude_path=decl_file, limit=10,
         )
-
-        if rows:
-            impl_parts = []
-            for r in rows:
-                impl_text = r.get("source_text", "")
-                impl_path = r.get("rel_path", "")
-                impl_name = r.get("symbol_name", "")
-                if impl_text:
-                    impl_parts.append(
-                        f"\n// --- Implementation: {impl_name} "
-                        f"(from {impl_path}) ---\n{impl_text}"
-                    )
-            if impl_parts:
-                doc.page_content += "\n".join(impl_parts)
-    else:
-        # Implementation file: find class declaration in header
-        rows = db.find_related_nodes(
-            node_id, ['defines_body'], direction='out',
-            target_symbol_types=['class', 'struct'], limit=3,
-        )
-
         for r in rows:
-            decl_text = r.get("source_text", "")
-            decl_path = r.get("rel_path", "")
-            if decl_text:
-                doc.page_content = (
-                    f"// --- Declaration (from {decl_path}) ---\n"
-                    f"{decl_text}\n\n"
-                    f"// --- Implementation ---\n{doc.page_content}"
+            impl_text = r.get("source_text", "")
+            impl_file = r.get("rel_path", "")
+            if impl_text and impl_text.strip():
+                doc.page_content += (
+                    f"\n/* Implementation from {impl_file} */\n{impl_text}"
                 )
+
+    elif sym_type in ('class', 'struct'):
+        # 2-hop: Class →defines→ Method ←defines_body← Impl
+        # Step 1: find methods defined by this class
+        method_edges = db.get_edge_targets(node_id)
+        method_ids = [
+            e["target_id"] for e in method_edges
+            if e.get("rel_type") == "defines"
+        ]
+
+        impl_by_file: Dict[str, List[str]] = {}
+        for method_id in method_ids:
+            # Verify the target is a method-like symbol
+            method_node = db.get_node(method_id)
+            if not method_node:
+                continue
+            m_type = (method_node.get("symbol_type") or "").lower()
+            if m_type not in ('method', 'constructor', 'function'):
+                continue
+
+            # Step 2: find defines_body predecessors for this method
+            impl_rows = db.find_related_nodes(
+                method_id, ['defines_body'], direction='in',
+                exclude_path=decl_file, limit=5,
+            )
+            for r in impl_rows:
+                impl_text = r.get("source_text", "")
+                impl_file = r.get("rel_path", "")
+                if impl_text and impl_text.strip():
+                    impl_by_file.setdefault(impl_file, []).append(impl_text)
+
+        for impl_file, impls in sorted(impl_by_file.items()):
+            header = (
+                f"/* Implementations from {impl_file} "
+                f"({len(impls)} method{'s' if len(impls) != 1 else ''}) */"
+            )
+            doc.page_content += f"\n{header}\n" + "\n\n".join(impls)
 
 
 def _augment_go_rust(
@@ -222,32 +243,36 @@ def _augment_go_rust(
 ) -> None:
     """Go/Rust: attach receiver methods or impl block members.
 
-    For a struct/interface, find methods defined in other files via
-    ``defines_body`` or ``implementation`` edges.
+    For a struct/class/interface/enum/trait, find methods defined in other
+    files via ``defines`` edges (the edge type Go/Rust parsers emit for
+    struct→receiver-method and type→impl-method relationships).
     """
     stype = doc.metadata.get("symbol_type", "").lower()
 
-    if stype not in ('struct', 'interface', 'trait', 'enum'):
+    if stype not in ('struct', 'class', 'interface', 'trait', 'enum'):
         return
 
     # Find associated methods/implementations in other files
     rows = db.find_related_nodes(
-        node_id, ['defines_body', 'implementation'], direction='out',
+        node_id, ['defines'], direction='out',
+        target_symbol_types=['method', 'function', 'constructor'],
         exclude_path=doc.metadata.get("source", ""), limit=15,
     )
 
     if rows:
-        impl_parts = []
+        methods_by_file: Dict[str, List[str]] = {}
         for r in rows:
             text = r.get("source_text", "")
             path = r.get("rel_path", "")
-            name = r.get("symbol_name", "")
-            if text:
-                impl_parts.append(
-                    f"\n// --- Method/Impl: {name} (from {path}) ---\n{text}"
-                )
-        if impl_parts:
-            doc.page_content += "\n".join(impl_parts)
+            if text and text.strip() and path:
+                methods_by_file.setdefault(path, []).append(text)
+
+        for mfile, mtexts in sorted(methods_by_file.items()):
+            header = (
+                f"// Methods from {mfile} "
+                f"({len(mtexts)} method{'s' if len(mtexts) != 1 else ''})"
+            )
+            doc.page_content += f"\n{header}\n" + "\n\n".join(mtexts)
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +357,7 @@ def expand_for_page(
     # ── Step 3: Smart expansion per seed ──────────────────────────
     # Detect dominant language for expansion hints
     seed_ids = list(matched_nodes.keys())
-    dominant_lang = detect_dominant_language(db.conn, seed_ids)
+    dominant_lang = db.detect_dominant_language(seed_ids)
     lang_hints = get_language_hints(dominant_lang or "unknown")
 
     use_smart_expansion = True  # Always use smart expansion in wikis
@@ -347,7 +372,7 @@ def expand_for_page(
             stype = (node.get("symbol_type") or "").lower()
 
             neighbors = expand_symbol_smart(
-                conn=db.conn,
+                db=db,
                 node_id=seed_id,
                 symbol_type=stype,
                 seen_ids=seen_ids,

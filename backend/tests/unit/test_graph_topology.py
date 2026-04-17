@@ -230,7 +230,7 @@ class TestSemanticResolution:
         db = _mock_db()
         db.vec_available = True
         db.search_fts5.return_value = []
-        db.search_vec.return_value = [{"node_id": "target", "distance": 0.10}]
+        db.search_vec.return_value = [{"node_id": "target", "vec_distance": 0.10}]
 
         embedding_fn = lambda text: [0.1, 0.2, 0.3]  # noqa: E731
         stats = resolve_orphans(db, G, embedding_fn=embedding_fn)
@@ -248,7 +248,7 @@ class TestSemanticResolution:
         db = _mock_db()
         db.vec_available = True
         db.search_fts5.return_value = []
-        db.search_vec.return_value = [{"node_id": "far", "distance": 0.20}]
+        db.search_vec.return_value = [{"node_id": "far", "vec_distance": 0.20}]
 
         embedding_fn = lambda text: [0.1]  # noqa: E731
         stats = resolve_orphans(
@@ -444,8 +444,10 @@ class TestDocProximityEdges:
         G.add_node("code", **_make_code_node("src/service.py", "Service"))
 
         stats = inject_doc_edges(None, G)
-        # src/ is NOT a doc prefix → no proximity
-        assert stats["proximity_edges"] == 0
+        # Even without a doc prefix to strip, a doc in src/ and code in
+        # src/ share the same directory — matches deepwiki which keys by
+        # directory equality (topic_dir == code_dir) after prefix strip.
+        assert stats["proximity_edges"] == 1
 
     def test_documentation_prefix(self):
         G = nx.MultiDiGraph()
@@ -619,7 +621,7 @@ class TestHubDetection:
         db = _mock_db()
         flag_hubs_in_db(db, {"hub1", "hub2"})
         assert db.set_hub.call_count == 2
-        db.conn.commit.assert_called_once()
+        db.commit.assert_called_once()
 
     def test_flag_hubs_none_db(self):
         """flag_hubs_in_db with None db doesn't crash."""
@@ -646,7 +648,7 @@ class TestEdgePersistence:
 
         count = persist_weights_to_db(db, G)
         assert count == 9
-        db.conn.execute.assert_called_once()  # DELETE
+        db.delete_all_edges.assert_called_once()
 
     def test_persist_none_db(self):
         G = nx.MultiDiGraph()

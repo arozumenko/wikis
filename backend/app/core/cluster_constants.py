@@ -213,7 +213,7 @@ _TEST_PATH_PATTERNS: List[Pattern[str]] = [
     re.compile(r"(^|/)[^/]+_test\.\w+$", re.IGNORECASE),
     re.compile(r"(^|/)[^/]+\.test\.\w+$", re.IGNORECASE),
     re.compile(r"(^|/)[^/]+\.spec\.\w+$", re.IGNORECASE),
-    re.compile(r"(^|/)[^/]+Tests?\.\w+$"),  # PascalCase only — no IGNORECASE
+    re.compile(r"(^|/)[^/]+Tests?\.\w+$", re.IGNORECASE),  # FooTest.java
     re.compile(r"(^|/)conftest\.py$", re.IGNORECASE),
     re.compile(r"(^|/)setup_tests?\.\w+$", re.IGNORECASE),
 ]

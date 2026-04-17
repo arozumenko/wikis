@@ -151,11 +151,11 @@ class DeepResearchEngine:
 
         fts_index = getattr(self.graph_manager, "fts_index", None) if self.graph_manager else None
         if fts_index is None:
-            db_path = getattr(getattr(self.retriever_stack, "db", None), "db_path", None)
-            if db_path:
-                from ..code_graph.unified_graph_text_index import UnifiedGraphTextIndex
+            db = getattr(self.retriever_stack, "db", None)
+            if db is not None:
+                from ..storage.text_index import StorageTextIndex
 
-                fts_index = UnifiedGraphTextIndex(db_path)
+                fts_index = StorageTextIndex(db)
         custom_tools = create_codebase_tools(
             retriever_stack=self.retriever_stack,
             graph_manager=self.graph_manager,

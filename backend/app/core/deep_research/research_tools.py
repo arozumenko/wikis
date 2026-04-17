@@ -151,9 +151,10 @@ def _search_graph_by_text(code_graph: Any, query: str, k: int = 10) -> list[Docu
 def _open_unified_db_readonly(db_path: str):
     """Open a UnifiedWikiDB in read-only mode, or return None on failure."""
     try:
-        from ..unified_db import UnifiedWikiDB
+        from ..storage import open_storage, repo_id_from_path
 
-        return UnifiedWikiDB(db_path, readonly=True)
+        repo_id = repo_id_from_path(db_path)
+        return open_storage(repo_id=repo_id, db_path=db_path, readonly=True)
     except Exception as exc:
         logger.warning("[RESEARCH_TOOLS] Failed to open unified DB %s: %s", db_path, exc)
         return None
@@ -163,7 +164,7 @@ def _search_unified_db_fts(db_path: str, query: str, k: int = 10) -> list[Docume
     """FTS5 full-text search against the unified .wiki.db.
 
     Equivalent of _search_graph_by_text / graph_text_index.search_smart but
-    backed by the SQLite FTS5 index in repo_fts.
+    backed by the FTS index in the storage backend.
 
     Returns up to *k* LangChain Documents.
     """
@@ -171,47 +172,39 @@ def _search_unified_db_fts(db_path: str, query: str, k: int = 10) -> list[Docume
     if db is None:
         return []
     try:
-        conn = db.conn
-        # Build FTS5 query: split on non-word chars, join with OR
+        # Build FTS query: split on non-word chars, join with OR
         keywords = [w for w in re.split(r"\W+", query) if len(w) >= 2]
         if not keywords:
             return []
         fts_query = " OR ".join(keywords)
 
-        sql = """
-            SELECT n.node_id, n.symbol_name, n.symbol_type,
-                   n.rel_path, n.start_line, n.end_line,
-                   n.content, n.docstring,
-                   rank
-            FROM repo_fts f
-            JOIN repo_nodes n ON n.node_id = f.node_id
-            WHERE repo_fts MATCH ?
-              AND n.symbol_type NOT IN ('module_doc', 'file_doc', 'readme')
-            ORDER BY rank
-            LIMIT ?
-        """
-        rows = conn.execute(sql, (fts_query, k)).fetchall()
+        _SKIP_TYPES = frozenset({"module_doc", "file_doc", "readme"})
+        rows = db.search_fts(fts_query, limit=k * 2)
 
         docs: list[Document] = []
         for row in rows:
-            (node_id, sym_name, sym_type, rel_path, start_line, end_line, content, docstring, _rank) = row
-            page_content = content or docstring or ""
+            sym_type = row.get("symbol_type", "")
+            if sym_type in _SKIP_TYPES:
+                continue
+            page_content = row.get("content") or row.get("source_text") or row.get("docstring") or ""
             if not page_content.strip():
                 continue
             docs.append(
                 Document(
                     page_content=page_content,
                     metadata={
-                        "source": rel_path or "unknown",
-                        "rel_path": rel_path or "",
-                        "symbol_name": sym_name or "",
+                        "source": row.get("rel_path") or "unknown",
+                        "rel_path": row.get("rel_path") or "",
+                        "symbol_name": row.get("symbol_name") or "",
                         "symbol_type": sym_type or "unknown",
-                        "start_line": start_line or "",
-                        "end_line": end_line or "",
+                        "start_line": row.get("start_line") or "",
+                        "end_line": row.get("end_line") or "",
                         "search_source": "unified_db_fts",
                     },
                 )
             )
+            if len(docs) >= k:
+                break
         return docs
     except Exception as exc:
         logger.warning("[RESEARCH_TOOLS] Unified DB FTS search failed: %s", exc)
@@ -232,63 +225,52 @@ def _get_unified_db_relationships(db_path: str, symbol_name: str, max_depth: int
     if db is None:
         return None
     try:
-        conn = db.conn
-
         # Resolve symbol to node_id (best match)
-        rows = conn.execute(
-            "SELECT node_id, symbol_name, symbol_type FROM repo_nodes WHERE LOWER(symbol_name) = LOWER(?) LIMIT 5",
-            (symbol_name,),
-        ).fetchall()
-        if not rows:
-            # Fallback: LIKE search
-            rows = conn.execute(
-                "SELECT node_id, symbol_name, symbol_type FROM repo_nodes WHERE LOWER(symbol_name) LIKE ? LIMIT 5",
-                (f"%{symbol_name.lower()}%",),
-            ).fetchall()
+        rows = db.find_nodes_by_name(symbol_name, limit=5)
         if not rows:
             return f"Symbol '{symbol_name}' not found in unified DB."
 
-        target_id = rows[0][0]
-        target_name = rows[0][1]
+        target_id = rows[0].get("node_id", "")
+        target_name = rows[0].get("symbol_name", symbol_name)
 
         # Outgoing edges
-        outgoing = conn.execute(
-            "SELECT e.target_id, e.relationship_type, n.symbol_name, n.symbol_type "
-            "FROM repo_edges e "
-            "JOIN repo_nodes n ON n.node_id = e.target_id "
-            "WHERE e.source_id = ? "
-            "LIMIT 50",
-            (target_id,),
-        ).fetchall()
+        out_edges = db.get_edge_targets(target_id)
+        out_node_ids = [e.get("target_id", "") for e in out_edges]
+        out_nodes = {n["node_id"]: n for n in db.get_nodes_by_ids(out_node_ids)} if out_node_ids else {}
 
         # Incoming edges
-        incoming = conn.execute(
-            "SELECT e.source_id, e.relationship_type, n.symbol_name, n.symbol_type "
-            "FROM repo_edges e "
-            "JOIN repo_nodes n ON n.node_id = e.source_id "
-            "WHERE e.target_id = ? "
-            "LIMIT 50",
-            (target_id,),
-        ).fetchall()
+        in_edges = db.get_edge_sources(target_id)
+        in_node_ids = [e.get("source_id", "") for e in in_edges]
+        in_nodes = {n["node_id"]: n for n in db.get_nodes_by_ids(in_node_ids)} if in_node_ids else {}
 
         lines = [
             f"# Relationships for `{target_name}`\n",
             f"**Matched Node:** `{target_id}`",
-            f"**Outgoing:** {len(outgoing)}, **Incoming:** {len(incoming)}\n",
+            f"**Outgoing:** {len(out_edges)}, **Incoming:** {len(in_edges)}\n",
         ]
 
         if len(rows) > 1:
-            others = ", ".join(f"`{r[1]}`" for r in rows[1:])
+            others = ", ".join(f"`{r.get('symbol_name', '')}`" for r in rows[1:])
             lines.append(f"**Other Matches:** {others}\n")
 
-        if outgoing:
+        if out_edges:
             lines.append("\n## Outgoing Relationships")
-            for _tid, rel_type, sym_name, sym_type in outgoing:
+            for edge in out_edges[:50]:
+                tid = edge.get("target_id", "")
+                rel_type = edge.get("rel_type", "")
+                node = out_nodes.get(tid, {})
+                sym_name = node.get("symbol_name", tid)
+                sym_type = node.get("symbol_type", "unknown")
                 lines.append(f"- `{target_name}` → `{sym_name}` ({sym_type}) [{rel_type}]")
 
-        if incoming:
+        if in_edges:
             lines.append("\n## Incoming Relationships")
-            for _sid, rel_type, sym_name, sym_type in incoming:
+            for edge in in_edges[:50]:
+                sid = edge.get("source_id", "")
+                rel_type = edge.get("rel_type", "")
+                node = in_nodes.get(sid, {})
+                sym_name = node.get("symbol_name", sid)
+                sym_type = node.get("symbol_type", "unknown")
                 lines.append(f"- `{sym_name}` ({sym_type}) → `{target_name}` [{rel_type}]")
 
         return "\n".join(lines)
