@@ -5,16 +5,16 @@ Transforms micro-clusters into ``CandidateRecord`` objects with
 classification and quality metrics, ready for validation by the
 page validator.
 
-Gated behind env var ``WIKIS_CANDIDATE_VALIDATION=1``.
+Gated behind ``FeatureFlags.capability_validation``.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
-from ..cluster_constants import (
+from ..constants import (
     DOC_CLUSTER_SYMBOLS,
     PAGE_IDENTITY_SYMBOLS,
     SUPPORTING_CODE_SYMBOLS,
@@ -32,7 +32,33 @@ CLASS_BRIDGE = "bridge"
 
 @dataclass
 class CandidateRecord:
-    """A micro-cluster candidate for becoming a wiki page."""
+    """A micro-cluster candidate for becoming a wiki page.
+
+    Attributes
+    ----------
+    macro_id : int
+        Parent section (macro-cluster) ID.
+    micro_id : int
+        Page (micro-cluster) ID.
+    node_ids : list[str]
+        All node IDs in this micro-cluster.
+    classification : str
+        One of: ``code``, ``mixed``, ``docs``, ``bridge``.
+    code_identity_score : float
+        Fraction of nodes that are page-identity symbols (0..1).
+    implementation_evidence : float
+        Fraction of code nodes with non-trivial source text (0..1).
+    docs_dominance : float
+        Fraction of nodes that are documentation nodes (0..1).
+    public_api_presence : float
+        Fraction of code nodes that appear to be public API (0..1).
+    utility_contamination : float
+        Fraction of code nodes with "util", "helper", "misc" in name (0..1).
+    file_spread : int
+        Number of distinct files spanned by this cluster.
+    node_details : list[dict]
+        Node metadata for quick reference.
+    """
 
     macro_id: int
     micro_id: int
@@ -66,12 +92,18 @@ def build_candidates(
 
     Parameters
     ----------
-    db : WikiStorageProtocol
-        Open storage instance.
+    db : UnifiedWikiDB
+        Open database connection.
     cluster_map : dict
         ``{macro_id: {micro_id: [node_ids]}}`` from the planner.
+
+    Returns
+    -------
+    list[CandidateRecord]
+        One record per micro-cluster, with metrics computed.
     """
     candidates: List[CandidateRecord] = []
+    conn = db.conn
 
     for macro_id in sorted(cluster_map.keys()):
         for micro_id in sorted(cluster_map[macro_id].keys()):
@@ -79,7 +111,9 @@ def build_candidates(
             if not node_ids:
                 continue
 
-            record = _build_one_candidate(db, macro_id, micro_id, node_ids)
+            record = _build_one_candidate(
+                conn, macro_id, micro_id, node_ids,
+            )
             candidates.append(record)
 
     logger.info(
@@ -95,13 +129,20 @@ def build_candidates(
 
 
 def _build_one_candidate(
-    db, macro_id: int, micro_id: int, node_ids: List[str],
+    conn, macro_id: int, micro_id: int, node_ids: List[str],
 ) -> CandidateRecord:
     """Compute metrics for a single micro-cluster."""
-    nodes = db.get_nodes_by_ids(node_ids)
+    # Fetch node metadata
+    placeholders = ",".join("?" * len(node_ids))
+    rows = conn.execute(
+        f"SELECT * FROM repo_nodes WHERE node_id IN ({placeholders})",
+        node_ids,
+    ).fetchall()
+    nodes = [dict(r) for r in rows]
 
-    total = len(nodes) or 1
+    total = len(nodes) or 1  # avoid division by zero
 
+    # Classify nodes by type
     identity_count = 0
     supporting_count = 0
     doc_count = 0
@@ -123,14 +164,17 @@ def _build_one_candidate(
         elif stype in DOC_CLUSTER_SYMBOLS:
             doc_count += 1
 
+        # Implementation evidence: has substantial source text
         if stype not in DOC_CLUSTER_SYMBOLS and len(source) >= _MIN_IMPL_LENGTH:
             impl_count += 1
 
+        # Public API heuristic: starts with uppercase or no leading underscore
         if stype not in DOC_CLUSTER_SYMBOLS:
             sym_name = node.get("symbol_name") or ""
             if sym_name and not sym_name.startswith("_"):
                 public_api_count += 1
 
+        # Utility contamination
         if any(pat in name for pat in _UTILITY_PATTERNS):
             utility_count += 1
 
@@ -145,6 +189,7 @@ def _build_one_candidate(
     utility_contamination = utility_count / total
     file_spread = len(files)
 
+    # Classification
     classification = _classify(
         code_identity_score=code_identity_score,
         docs_dominance=docs_dominance,
@@ -179,16 +224,22 @@ def _classify(
     total: int,
 ) -> str:
     """Classify a micro-cluster into one of four categories."""
+    # Docs-dominant: ≥70% documentation nodes
     if docs_dominance >= 0.7:
         return CLASS_DOCS
 
+    # Bridge: high file spread relative to node count (linking cluster)
+    # Heuristic: if files > nodes/2 and at least 3 files, likely a bridge
     if file_spread >= 3 and file_spread > total / 2:
         return CLASS_BRIDGE
 
+    # Pure code: no doc nodes at all
     if doc_count == 0 and code_count > 0:
         return CLASS_CODE
 
+    # Mixed: has both code and doc nodes
     if code_count > 0 and doc_count > 0:
         return CLASS_MIXED
 
+    # Fallback
     return CLASS_CODE

@@ -164,10 +164,10 @@ class WikiStructurePlannerEngine:
         # Get base model (either passed or built)
         base_model = self.llm_client or self._build_model()
 
-        # Bind max_tokens for speed - tool-based output needs less tokens
-        # parallel_tool_calls=True allows the model to call multiple tools at once
-        # (e.g. query_graph for 5 modules in one round-trip instead of 5 sequential calls)
-        model = base_model.bind(max_tokens=4096, parallel_tool_calls=True)
+        # NOTE: Do NOT call base_model.bind() here — RunnableBinding is not a
+        # BaseChatModel, so deepagents' resolve_model() cannot hash it.
+        # deepagents handles tool calling configuration internally.
+        model = base_model
 
         # Create a backend factory that returns FilesystemBackend with virtual_mode=True
         # This sandboxes all file operations to repo_root

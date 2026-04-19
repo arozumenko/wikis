@@ -1368,7 +1368,7 @@ class OptimizedWikiGenerationAgent:
         Returns the standard structure dict on success, or ``None`` to signal
         that the caller should fall back to the agent-based planner.
         """
-        from ..graph_clustering import run_clustering
+        from ..graph_clustering import run_phase3
         from ..wiki_structure_planner.cluster_planner import ClusterStructurePlanner
 
         code_graph = (
@@ -1381,6 +1381,10 @@ class OptimizedWikiGenerationAgent:
 
         # ── Populate unified DB from code graph (for expansion & topology) ──
         self._ensure_unified_db(code_graph)
+
+        if self._cluster_db is None:
+            logger.warning("Cluster planner: no unified DB available — falling back")
+            return None
 
         # ── Ensure code_graph has Phase 2 enrichment ──────────────────
         # When the indexer pre-built the DB, Phase 2 (orphan resolution,
@@ -1396,7 +1400,7 @@ class OptimizedWikiGenerationAgent:
         # enriched edge set with calibrated weights) and use THAT for
         # clustering.
         clustering_graph = code_graph  # default: use as-is
-        if self._cluster_db is not None and not code_graph.graph.get("phase2_enriched"):
+        if not code_graph.graph.get("phase2_enriched"):
             try:
                 phase2_done = self._cluster_db.get_meta("phase2_completed")
                 if phase2_done:
@@ -1433,41 +1437,40 @@ class OptimizedWikiGenerationAgent:
             except Exception:
                 pass
 
-        cluster_assignment = run_clustering(
-            clustering_graph,
-            exclude_tests=exclude_tests,
-        )
+        # ── Run Phase 3: clustering persists directly to DB ──
+        try:
+            from ..feature_flags import FeatureFlags
 
-        if not cluster_assignment.sections:
+            # planner_type="cluster" means all Leiden features are ON.
+            # exclude_tests comes from the UI toggle.
+            flags = FeatureFlags(
+                hierarchical_leiden=True,
+                capability_validation=True,
+                smart_expansion=True,
+                coverage_ledger=True,
+                language_hints=True,
+                exclude_tests=exclude_tests,
+            )
+            phase3_stats = run_phase3(
+                db=self._cluster_db,
+                G=clustering_graph,
+                feature_flags=flags,
+            )
+            logger.info("[CLUSTER] Phase 3 complete: %s", phase3_stats)
+        except Exception as exc:
+            logger.warning("Cluster planner: Phase 3 failed: %s — falling back", exc)
+            return None
+
+        # Verify clustering produced results
+        all_clusters = self._cluster_db.get_all_clusters()
+        if not all_clusters:
             logger.warning("Cluster planner: clustering produced 0 sections — falling back")
             return None
 
-        # Persist cluster assignments to DB so cluster_expansion can
-        # resolve symbols scoped to macro/micro clusters.
-        if self._cluster_db is not None:
-            try:
-                assignments = []
-                for nid, macro_id in cluster_assignment.macro_clusters.items():
-                    micro_id = None
-                    micro_map = cluster_assignment.micro_clusters.get(macro_id, {})
-                    if isinstance(micro_map, dict):
-                        micro_id = micro_map.get(nid)
-                    assignments.append((nid, macro_id, micro_id))
-                if assignments:
-                    self._cluster_db.set_clusters_batch(assignments)
-                    logger.info(
-                        "[CLUSTER] Persisted %d cluster assignments to DB",
-                        len(assignments),
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "[CLUSTER] Failed to persist cluster assignments: %s", exc,
-                )
-
         if self.progress_callback:
             try:
-                n_sections = len(cluster_assignment.sections)
-                n_pages = sum(len(s.pages) for s in cluster_assignment.sections)
+                n_sections = len(all_clusters)
+                n_pages = sum(len(micros) for micros in all_clusters.values())
                 self.progress_callback(
                     "planning", 0.32,
                     f"Detected {n_sections} sections, {n_pages} pages — naming with LLM...",
@@ -1476,12 +1479,9 @@ class OptimizedWikiGenerationAgent:
                 pass
 
         planner = ClusterStructurePlanner(
-            graph=clustering_graph,
-            cluster_assignment=cluster_assignment,
-            llm=self.llm_low,
-            repo_name=self.repository_url.rstrip("/").rsplit("/", 1)[-1] if self.repository_url else None,
-            exclude_tests=exclude_tests,
             db=self._cluster_db,
+            llm=self.llm_low,
+            wiki_title=None,  # Auto-derive from repo metadata
         )
 
         response = planner.plan_structure()
@@ -1564,7 +1564,6 @@ class OptimizedWikiGenerationAgent:
                 micro_id=micro_id,
                 cluster_node_ids=cluster_node_ids,
                 token_budget=CONTEXT_TOKEN_BUDGET,
-                exclude_tests=self.exclude_tests,
             )
         except Exception as exc:
             logger.warning(
@@ -1623,7 +1622,7 @@ class OptimizedWikiGenerationAgent:
         if db_path:
             try:
                 repo_id = repo_id_from_path(db_path) if db_path else None
-                db = open_storage(repo_id=repo_id, db_path=db_path, readonly=True)
+                db = open_storage(repo_id=repo_id, db_path=db_path)
                 self._cluster_db = db
                 self._cluster_db_path = db_path
                 from ..storage.text_index import StorageTextIndex
@@ -1710,9 +1709,9 @@ class OptimizedWikiGenerationAgent:
             from ..storage import open_storage, repo_id_from_path
 
             repo_id = repo_id_from_path(db_path)
-            self._cluster_db = open_storage(repo_id=repo_id, db_path=db_path, readonly=True)
+            self._cluster_db = open_storage(repo_id=repo_id, db_path=db_path)
             self._cluster_db_path = db_path
-            logger.info("[CLUSTER_EXPANSION] Opened unified DB: %s (readonly)", db_path)
+            logger.info("[CLUSTER_EXPANSION] Opened unified DB: %s", db_path)
             return self._cluster_db
         except Exception as exc:
             logger.warning("[CLUSTER_EXPANSION] Failed to open DB: %s", exc)

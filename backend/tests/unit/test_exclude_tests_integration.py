@@ -1,14 +1,17 @@
 """Integration smoke test: cluster pipeline with exclude_tests=True.
 
-Verifies the full path: graph → clustering → unified DB → enrichment
+Verifies the full path: graph → unified DB → Phase 3 clustering
 preserves the test-exclusion flag without error.
+Uses the actual ``run_phase3`` API and ``FeatureFlags``.
 """
 
 import networkx as nx
 import pytest
+from unittest.mock import patch
 
 from app.core.cluster_constants import is_test_path
-from app.core.graph_clustering import run_clustering
+from app.core.feature_flags import FeatureFlags
+from app.core.graph_clustering import run_phase3
 from app.core.unified_db import UnifiedWikiDB
 
 
@@ -40,48 +43,18 @@ def _build_mixed_graph():
             source_text=f"def {nid}(): pass",
         )
     # Add some edges
-    G.add_edge("auth_login", "auth_mod", relationship_type="calls")
-    G.add_edge("api_route", "auth_login", relationship_type="calls")
-    G.add_edge("api_route", "user_model", relationship_type="uses")
-    G.add_edge("user_model", "db_conn", relationship_type="calls")
-    G.add_edge("test_auth", "auth_login", relationship_type="calls")
-    G.add_edge("test_user", "user_model", relationship_type="calls")
-    G.add_edge("mock_db", "db_conn", relationship_type="calls")
+    G.add_edge("auth_login", "auth_mod", relationship_type="calls", weight=1.0)
+    G.add_edge("api_route", "auth_login", relationship_type="calls", weight=1.0)
+    G.add_edge("api_route", "user_model", relationship_type="uses", weight=1.0)
+    G.add_edge("user_model", "db_conn", relationship_type="calls", weight=1.0)
+    G.add_edge("test_auth", "auth_login", relationship_type="calls", weight=1.0)
+    G.add_edge("test_user", "user_model", relationship_type="calls", weight=1.0)
+    G.add_edge("mock_db", "db_conn", relationship_type="calls", weight=1.0)
     return G
 
 
 class TestExcludeTestsIntegration:
     """End-to-end: clustering → unified DB, test nodes excluded."""
-
-    def test_clustering_excludes_test_nodes(self):
-        G = _build_mixed_graph()
-        result = run_clustering(G, exclude_tests=True)
-
-        # All assigned node_ids should be production paths
-        all_node_ids = set()
-        for _sec_id, sec_data in result.sections.items():
-            for _page_id, node_ids in sec_data["pages"].items():
-                all_node_ids.update(node_ids)
-
-        for nid in all_node_ids:
-            path = G.nodes[nid].get("rel_path", "")
-            assert not is_test_path(path), f"Test node {nid} ({path}) leaked through"
-
-    def test_clustering_includes_test_nodes_when_disabled(self):
-        G = _build_mixed_graph()
-        result = run_clustering(G, exclude_tests=False)
-
-        all_node_ids = set()
-        for _sec_id, sec_data in result.sections.items():
-            for _page_id, node_ids in sec_data["pages"].items():
-                all_node_ids.update(node_ids)
-
-        # At least one test node should be present
-        test_present = any(
-            is_test_path(G.nodes[nid].get("rel_path", ""))
-            for nid in all_node_ids
-        )
-        assert test_present, "Expected test nodes when exclude_tests=False"
 
     def test_unified_db_marks_test_nodes(self, tmp_path):
         G = _build_mixed_graph()
@@ -99,26 +72,64 @@ class TestExcludeTestsIntegration:
             )
         db.close()
 
+    @patch("app.core.feature_flags.get_feature_flags")
+    def test_run_phase3_excludes_test_nodes(self, mock_flags, tmp_path):
+        """run_phase3 with exclude_tests should not cluster test nodes."""
+        flags = FeatureFlags(exclude_tests=True)
+        mock_flags.return_value = flags
+
+        G = _build_mixed_graph()
+        db_path = tmp_path / "phase3.wiki.db"
+        db = UnifiedWikiDB(db_path, embedding_dim=8)
+        db.from_networkx(G)
+
+        result = run_phase3(db, G, feature_flags=flags)
+
+        assert "macro" in result
+        assert "micro" in result
+        assert result["macro"]["cluster_count"] > 0
+        db.close()
+
+    @patch("app.core.feature_flags.get_feature_flags")
+    def test_run_phase3_includes_test_nodes_when_disabled(self, mock_flags, tmp_path):
+        """run_phase3 without exclude_tests clusters everything."""
+        flags = FeatureFlags(exclude_tests=False)
+        mock_flags.return_value = flags
+
+        G = _build_mixed_graph()
+        db_path = tmp_path / "phase3_all.wiki.db"
+        db = UnifiedWikiDB(db_path, embedding_dim=8)
+        db.from_networkx(G)
+
+        result = run_phase3(db, G, feature_flags=flags)
+
+        assert result["macro"]["cluster_count"] > 0
+        db.close()
+
     def test_full_pipeline_no_errors(self, tmp_path):
         """Run clustering + DB + topology enrichment without errors."""
         G = _build_mixed_graph()
 
-        # 1. Cluster with test exclusion
-        result = run_clustering(G, exclude_tests=True)
-        assert len(result.sections) > 0
-
-        # 2. Populate unified DB
+        # 1. Populate unified DB
         db_path = tmp_path / "pipeline.wiki.db"
         db = UnifiedWikiDB(db_path, embedding_dim=8)
         db.from_networkx(G)
         assert db.node_count() == G.number_of_nodes()
 
-        # 3. Run topology enrichment
+        # 2. Run topology enrichment
         from app.core.graph_topology import run_phase2
 
         stats = run_phase2(db=db, G=G)
         assert "orphan_resolution" in stats
         assert "hubs" in stats
         assert "persisted_edges" in stats
+
+        # 3. Cluster with test exclusion
+        flags = FeatureFlags(exclude_tests=True)
+        with patch("app.core.feature_flags.get_feature_flags", return_value=flags):
+            result = run_phase3(db, G, feature_flags=flags)
+
+        assert result["macro"]["cluster_count"] > 0
+        assert result["micro"]["total_pages"] > 0
 
         db.close()

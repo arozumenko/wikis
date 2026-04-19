@@ -2,6 +2,7 @@
 
 import sqlite3
 from typing import Optional
+from unittest.mock import patch
 
 import pytest
 
@@ -26,6 +27,7 @@ from app.core.code_graph.shared_expansion import (
     expand_symbol_smart,
     resolve_alias_chain_db,
 )
+from app.core.feature_flags import FeatureFlags
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -261,8 +263,17 @@ class TestIsValidExpansion:
 
     def test_exclude_tests_by_column(self, populated_conn):
         node = _fetch_node(populated_conn, "TestNode")
-        assert _is_valid_expansion(node, None, 1, exclude_tests=True) is False
-        assert _is_valid_expansion(node, None, 1, exclude_tests=False) is True
+        # exclude_tests is read internally via get_feature_flags()
+        with patch(
+            "app.core.feature_flags.get_feature_flags",
+            return_value=FeatureFlags(exclude_tests=True),
+        ):
+            assert _is_valid_expansion(node, None, 1) is False
+        with patch(
+            "app.core.feature_flags.get_feature_flags",
+            return_value=FeatureFlags(exclude_tests=False),
+        ):
+            assert _is_valid_expansion(node, None, 1) is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -389,11 +400,15 @@ class TestExpandSymbolSmart:
         assert "Decorated" in found_ids
 
     def test_exclude_tests(self, populated_conn):
-        results = expand_symbol_smart(
-            populated_conn, "Child", "class",
-            seen_ids=set(), macro_id=1,
-            exclude_tests=True,
-        )
+        # exclude_tests is read internally via get_feature_flags()
+        with patch(
+            "app.core.feature_flags.get_feature_flags",
+            return_value=FeatureFlags(exclude_tests=True),
+        ):
+            results = expand_symbol_smart(
+                populated_conn, "Child", "class",
+                seen_ids=set(), macro_id=1,
+            )
         found_ids = {r[0] for r in results}
         assert "TestNode" not in found_ids
 

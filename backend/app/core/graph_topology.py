@@ -1,199 +1,307 @@
 """
-Phase 2 Graph Topology Enrichment.
+Phase 2 — Edge Weighting, Hub Detection & Semantic Edge Injection
 
-Injects synthetic edges to enrich the AST-derived code graph:
-- Orphan resolution (FTS5 lexical → semantic vector → directory fallback)
-- Document↔code edges (hyperlinks, backtick mentions, proximity)
-- Component bridging (fully connected graph)
-- Inverse-in-degree edge weighting
-- Hub detection and flagging
+Takes the unified graph (from Phase 1 ``unified_db.py``) and reshapes its
+topology so that downstream clustering (Phase 3) produces meaningful,
+capability-based partitions rather than noisy, hub-dominated groups.
 
-Ported from DeepWiki plugin_implementation/graph_topology.py (~1050 lines).
+Three transformations applied in order:
 
-Dependencies:
-- networkx (hard)
-- numpy (soft — falls back to pure Python for mean/std)
+1. **Inverse in-degree weighting** — Every edge (u, v) gets
+   ``weight = 1 / log(InDegree(v) + 2)``. High-fan-in utility nodes
+   (loggers, base classes, config) receive tiny weights; direct
+   capability edges stay strong.
+
+2. **Hub quarantine** — Nodes with in-degree Z-score > 3.0 are flagged
+   ``is_hub = 1`` and will be *excluded* from Louvain clustering
+   (Phase 3), then reattached via majority-vote assignment.
+
+3. **Semantic edge injection** — Orphan nodes (in-degree == 0 AND
+   out-degree == 0) are linked to the graph via:
+   a. FTS5 lexical matching (symbol name → code symbols)
+   b. Vector KNN (embedding similarity with expanding path prefix)
+   This is the key innovation: docs ↔ code, event handlers ↔ emitters,
+   cross-language bindings all become first-class edges.
+
+Feature-flagged via ``WIKIS_UNIFIED_DB=1`` (same flag as Phase 1).
+
+Usage::
+
+    from .graph_topology import apply_edge_weights, detect_hubs, resolve_orphans
+
+    apply_edge_weights(G)           # mutates G in-place
+    hubs = detect_hubs(G)           # returns Set[str]
+    edges_added = resolve_orphans(  # injects lexical/semantic edges
+        db, G, embedding_fn=embed_text
+    )
+    persist_weights_to_db(db, G)    # syncs all weights back to SQLite
 """
 
-from __future__ import annotations
-
-import json
 import logging
 import math
 import os
 import re
 from collections import Counter
-from typing import Any, Callable
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
 logger = logging.getLogger(__name__)
 
+# We intentionally avoid importing numpy as a hard dependency.
+# The hub detection Z-score math only needs mean/std over a list of ints.
+# If numpy is available we use it for speed; otherwise pure Python.
 try:
     import numpy as np
-
     _HAS_NUMPY = True
 except ImportError:
     _HAS_NUMPY = False
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
-# Edge weight floor for synthetic (non-AST) edges
+# Weight floor for synthetic edges (orphan resolution, doc injection).
+# Equivalent to a structural edge pointing at a node with in-degree ~5.
+# Ensures these edges are strong enough for Leiden to group on.
 SYNTHETIC_WEIGHT_FLOOR = 0.5
-
-# Regex patterns for Markdown content parsing
-_MD_LINK_RE = re.compile(r"\[(?:[^\]]*)\]\(([^)]+)\)")
-_BACKTICK_REF_RE = re.compile(r"`([A-Za-z_]\w+(?:\.\w+)*)`")
-
-# Document node kinds
-_DOC_KINDS = frozenset(
-    {
-        "module_doc",
-        "file_doc",
-        "doc",
-        "readme",
-        "documentation",
-        "markdown",
-        "markdown_document",
-        "rst",
-        "text",
-    }
-)
-
-# Synthetic edge classes (excluded from structural in-degree computation)
-_SYNTHETIC_CLASSES = frozenset(
-    {
-        "directory",
-        "lexical",
-        "semantic",
-        "doc",
-        "bridge",
-    }
-)
-
-# Doc directory prefixes stripped for proximity matching
-_DOC_PREFIXES = ("docs/", "doc/", "documentation/")
-
-# Batch size for edge persistence
 PERSIST_BATCH_SIZE = 5000
 
 
-def _symbol_attr(node_data: dict, attr: str, default: str = "") -> str:
-    """Safely extract a symbol attribute from a graph node.
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. Inverse In-Degree Edge Weighting
+# ═══════════════════════════════════════════════════════════════════════════
 
-    The ``symbol`` value on a graph node may be a dict (deepwiki / DB round-trip)
-    or a dataclass (fresh graph-builder output).  This helper handles both.
-    Falls back to the flat ``symbol_<attr>`` key that the graph builder also stores.
+def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
+    """Assign inverse in-degree weights to every edge in *G* (in-place).
+
+    For each edge (u, v):
+
+        weight = 1 / log(InDegree(v) + 2)
+
+    **In-degree is computed from structural edges only** — synthetic edges
+    injected by orphan resolution (``directory_link``, ``lexical_link``,
+    ``semantic_link``) and doc edges are excluded from the degree count.
+    This prevents orphan anchors from having their genuine structural
+    edges crushed by inflated in-degree.
+
+    Synthetic edges receive a **weight floor** of ``SYNTHETIC_WEIGHT_FLOOR``
+    so that Leiden treats them as meaningful community signals rather than
+    noise.
+
+    Returns:
+        Stats dict with min/max/mean weight and distribution info.
     """
-    sym = node_data.get("symbol")
-    if sym is not None:
-        if isinstance(sym, dict):
-            val = sym.get(attr, "")
-        else:
-            val = getattr(sym, attr, "")
-        if val:
-            return str(val)
-    return node_data.get(f"symbol_{attr}", default)
+    if G.number_of_edges() == 0:
+        return {"edges_weighted": 0, "min": 0, "max": 0, "mean": 0}
 
+    # Compute in-degree using ONLY structural edges (AST-derived).
+    # Synthetic edges (orphan resolution, doc injection) are excluded
+    # so they don't inflate anchor degrees and crush real edges.
+    _SYNTHETIC_CLASSES = frozenset({"directory", "lexical", "semantic", "doc", "bridge"})
+    structural_in: Dict[str, int] = {}
+    for _u, v, data in G.edges(data=True):
+        if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:
+            continue
+        structural_in[v] = structural_in.get(v, 0) + 1
 
-# ---------------------------------------------------------------------------
-# Orphan detection
-# ---------------------------------------------------------------------------
+    weights = []
+    synthetic_count = 0
+    for u, v, key, data in G.edges(data=True, keys=True):
+        in_deg = structural_in.get(v, 0)
+        w = 1.0 / math.log(in_deg + 2)
 
+        # Synthetic recovery edges get a weight floor so Leiden
+        # actually groups orphan nodes with their anchors.
+        if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:
+            w = max(w, SYNTHETIC_WEIGHT_FLOOR)
+            synthetic_count += 1
 
-def find_orphans(G: nx.MultiDiGraph) -> list[str]:
-    """Find degree-0 nodes (no incoming AND no outgoing edges)."""
-    return [n for n in G.nodes() if G.in_degree(n) == 0 and G.out_degree(n) == 0]
+        data["weight"] = w
+        weights.append(w)
 
-
-# ---------------------------------------------------------------------------
-# Edge helper
-# ---------------------------------------------------------------------------
-
-
-def _add_edge(
-    db: Any,
-    G: nx.MultiDiGraph,
-    source: str,
-    target: str,
-    rel_type: str,
-    edge_class: str,
-    created_by: str,
-    raw_similarity: float | None = None,
-    *,
-    skip_db: bool = False,
-) -> None:
-    """Add a synthetic edge to both the in-memory graph AND the DB.
-
-    When *skip_db* is True the edge is added only to the in-memory graph.
-    Use this inside ``resolve_orphans`` / ``inject_doc_edges`` /
-    ``bridge_disconnected_components`` because ``persist_weights_to_db``
-    rewrites **all** edges to the DB at the end of Phase 2 anyway — the
-    per-edge DB upserts would be thrown away.
-    """
-    attrs: dict[str, Any] = {
-        "relationship_type": rel_type,
-        "edge_class": edge_class,
-        "created_by": created_by,
-        "weight": 1.0,
+    stats = {
+        "edges_weighted": len(weights),
+        "synthetic_floored": synthetic_count,
+        "min": round(min(weights), 4),
+        "max": round(max(weights), 4),
+        "mean": round(sum(weights) / len(weights), 4),
     }
-    if raw_similarity is not None:
-        attrs["raw_similarity"] = raw_similarity
 
-    G.add_edge(source, target, **attrs)
-    if not skip_db and db is not None:
-        db.upsert_edge(source, target, rel_type, **attrs)
-
-
-# ---------------------------------------------------------------------------
-# Orphan resolution (3-pass cascade)
-# ---------------------------------------------------------------------------
+    logger.info(
+        "Edge weighting complete: %d edges (%d synthetic floored at %.2f), "
+        "weight range [%.4f, %.4f], mean %.4f",
+        stats["edges_weighted"], synthetic_count, SYNTHETIC_WEIGHT_FLOOR,
+        stats["min"], stats["max"], stats["mean"],
+    )
+    return stats
 
 
-def _expanding_prefixes(rel_path: str) -> list[str]:
-    """Generate expanding directory prefixes for a file path.
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. Hub Detection (Z-Score on In-Degree)
+# ═══════════════════════════════════════════════════════════════════════════
 
-    Example: "src/auth/token.py" → ["src/auth", "src", ""]
-    "" (empty string) means global (no prefix filter).
+def detect_hubs(
+    G: nx.MultiDiGraph,
+    z_threshold: float = 3.0,
+) -> Set[str]:
+    """Return node IDs whose in-degree Z-score exceeds *z_threshold*.
+
+    A hub is a node that is imported/called by a disproportionate number
+    of other nodes — e.g. loggers, base classes, config singletons.
+    Including them in Louvain clustering distorts communities because
+    they pull unrelated nodes together.
+
+    Args:
+        G: The graph (after weighting).
+        z_threshold: Standard deviations above mean to flag as hub.
+            Default 3.0 (≈ top 0.13% under normal distribution).
+
+    Returns:
+        Set of hub node IDs.
+    """
+    if G.number_of_nodes() < 3:
+        return set()
+
+    nodes_list = list(G.nodes())
+    degrees = [G.in_degree(n) for n in nodes_list]
+
+    if _HAS_NUMPY:
+        arr = np.array(degrees, dtype=float)
+        mean = arr.mean()
+        std = arr.std()
+    else:
+        n = len(degrees)
+        mean = sum(degrees) / n
+        variance = sum((d - mean) ** 2 for d in degrees) / n
+        std = math.sqrt(variance)
+
+    if std == 0:
+        return set()
+
+    hubs = set()
+    for i, deg in enumerate(degrees):
+        z = (deg - mean) / std
+        if z > z_threshold:
+            hubs.add(nodes_list[i])
+
+    if hubs:
+        logger.info(
+            "Hub detection: %d hubs found (Z > %.1f) out of %d nodes. "
+            "Mean in-degree=%.1f, std=%.1f",
+            len(hubs), z_threshold, G.number_of_nodes(), mean, std,
+        )
+        # Log the top-5 hubs by degree for debugging
+        hub_degs = sorted(
+            [(n, G.in_degree(n)) for n in hubs],
+            key=lambda x: x[1], reverse=True,
+        )
+        for nid, deg in hub_degs[:5]:
+            logger.debug("  Hub: %s (in-degree=%d)", nid, deg)
+    else:
+        logger.info(
+            "Hub detection: no hubs found (Z > %.1f). "
+            "Mean in-degree=%.1f, std=%.1f",
+            z_threshold, mean, std,
+        )
+
+    return hubs
+
+
+def flag_hubs_in_db(db, hubs: Set[str]) -> None:
+    """Persist hub flags into the unified DB.
+
+    Args:
+        db: ``UnifiedWikiDB`` instance.
+        hubs: Set of node IDs flagged as hubs.
+    """
+    if not hubs or db is None:
+        return
+
+    for nid in hubs:
+        db.set_hub(nid, is_hub=True)
+    if hasattr(db, 'commit'):
+        db.commit()
+    elif hasattr(db, 'conn'):
+        db.conn.commit()
+
+    logger.info("Flagged %d hubs in unified DB", len(hubs))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. Semantic Edge Injection (Orphan Resolution)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _expanding_prefixes(rel_path: str) -> List[str]:
+    """Generate expanding path prefixes for locality-biased search.
+
+    Given ``src/auth/handlers/login.py`` returns:
+    - ``src/auth/handlers``   (same directory)
+    - ``src/auth``            (parent directory)
+    - ``src``                 (grandparent)
+    - ``""``                  (global / root)
+
+    The caller searches each prefix in order, stopping at the first
+    one that yields results. This ensures locality: same-directory
+    matches are preferred over distant ones.
     """
     parts = rel_path.replace("\\", "/").split("/")
+    # Drop the filename itself
     dir_parts = parts[:-1] if len(parts) > 1 else []
-    prefixes: list[str] = []
+
+    prefixes = []
     while dir_parts:
         prefixes.append("/".join(dir_parts))
         dir_parts = dir_parts[:-1]
-    prefixes.append("")
+
+    prefixes.append("")  # global fallback (no prefix filter)
     return prefixes
 
 
+def find_orphans(G: nx.MultiDiGraph) -> List[str]:
+    """Return node IDs with both in-degree == 0 and out-degree == 0.
+
+    These are completely disconnected nodes — documentation files,
+    standalone scripts, event handlers, cross-language stubs, etc.
+    They need synthetic edges to participate in clustering.
+    """
+    return [
+        n for n in G.nodes()
+        if G.in_degree(n) == 0 and G.out_degree(n) == 0
+    ]
+
+
 def _resolve_orphans_by_directory(
-    db: Any,
+    db,
     G: nx.MultiDiGraph,
-    orphan_ids: list[str],
+    orphan_ids: List[str],
 ) -> int:
     """Connect remaining orphans to the best anchor in same/parent directory.
 
-    For each orphan walk up the directory tree and attach to the
-    highest-degree non-orphan node at the first level that has one.
+    For each orphan:
+    1. Look up its ``rel_path`` from the DB.
+    2. Walk up the directory tree (same dir → parent → grandparent → root).
+    3. At each level, find the connected (non-orphan) node with the
+       highest total degree — the best "anchor" to attach to.
+    4. Add a ``directory_link`` edge (orphan → anchor).
 
-    Copied from deepwiki ``_resolve_orphans_by_directory`` — orphans
-    that have no ``rel_path`` or whose prefix chain finds no bucket
-    are silently skipped (no global-anchor fabrication).
+    This is the last-resort fallback when semantic embeddings are
+    unavailable.  It ensures that files in the same directory end up
+    in the same Leiden community rather than creating thousands of
+    singleton components.
+
+    Returns:
+        Number of edges added.
     """
     if not orphan_ids:
         return 0
 
     orphan_set = set(orphan_ids)
 
-    # Build directory → [(node_id, total_degree)] for NON-orphan nodes only
-    dir_index: dict[str, list[tuple[str, int]]] = {}
+    # Build directory → [(node_id, total_degree)] for NON-orphan nodes
+    dir_index: Dict[str, List[Tuple[str, int]]] = {}
     for nid, data in G.nodes(data=True):
         if nid in orphan_set:
             continue
         rp = data.get("rel_path", "")
-        if not rp and db is not None:
+        if not rp:
             row = db.get_node(nid)
             rp = row.get("rel_path", "") if row else ""
         if not rp:
@@ -202,11 +310,12 @@ def _resolve_orphans_by_directory(
         deg = G.in_degree(nid) + G.out_degree(nid)
         dir_index.setdefault(d, []).append((nid, deg))
 
-    # Sort each bucket by degree descending (best anchors first)
+    # Sort each directory bucket by degree descending (best anchors first)
     for d in dir_index:
         dir_index[d].sort(key=lambda x: x[1], reverse=True)
 
     edges_added = 0
+
     for orphan_id in orphan_ids:
         node = db.get_node(orphan_id) if db is not None else None
         rp = ""
@@ -215,40 +324,44 @@ def _resolve_orphans_by_directory(
         if not rp:
             rp = G.nodes.get(orphan_id, {}).get("rel_path", "")
         if not rp:
-            continue  # match deepwiki: silently skip orphans without rel_path
+            continue
 
+        # Walk up the directory tree
         for prefix in _expanding_prefixes(rp):
             d = prefix if prefix else "<root>"
             candidates = dir_index.get(d, [])
             if candidates:
-                anchor_id = candidates[0][0]
+                anchor_id = candidates[0][0]  # highest-degree node
                 _add_edge(
-                    db,
-                    G,
-                    orphan_id,
-                    anchor_id,
-                    "directory_link",
-                    "directory",
-                    "dir_proximity_fallback",
+                    db, G,
+                    source=orphan_id,
+                    target=anchor_id,
+                    rel_type="directory_link",
+                    edge_class="directory",
+                    created_by="dir_proximity_fallback",
                     skip_db=True,
                 )
                 edges_added += 1
-                break
+                break  # resolved — stop climbing
 
+    logger.info(
+        "Directory proximity fallback: %d/%d orphans connected",
+        edges_added, len(orphan_ids),
+    )
     return edges_added
 
 
 def resolve_orphans(
-    db: Any,
+    db,
     G: nx.MultiDiGraph,
-    embedding_fn: Callable | None = None,
-    embed_batch_fn: Callable | None = None,
+    embedding_fn: Optional[Callable] = None,
+    embed_batch_fn: Optional[Callable] = None,
     fts_limit: int = 3,
     vec_k: int = 3,
     vec_distance_threshold: float = 0.15,
     max_lexical_edges: int = 2,
     embed_batch_size: int = 64,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     """3-pass orphan resolution cascade (batched for performance).
 
     Pass 1: FTS5 lexical search by symbol_name
@@ -257,85 +370,105 @@ def resolve_orphans(
 
     Edge writes are graph-only (skip_db=True) because persist_weights_to_db
     rewrites all edges at the end of Phase 2.
+
+    Args:
+        db: ``UnifiedWikiDB`` instance (must have FTS5 index populated).
+        G:  The in-memory ``nx.MultiDiGraph``.
+        embedding_fn: ``Callable[[str], List[float]]`` — single text → embedding.
+            Used as fallback if ``embed_batch_fn`` is not provided.
+        embed_batch_fn: ``Callable[[List[str]], List[List[float]]]`` — batch
+            text → embeddings.  Preferred over ``embedding_fn`` for speed.
+        fts_limit: Max FTS5 candidates per orphan.
+        vec_k: Number of KNN neighbors per vector query.
+        vec_distance_threshold: Max cosine distance for a semantic match.
+        max_lexical_edges: Max lexical edges to add per orphan.
+        embed_batch_size: Number of texts per batch embedding call.
+
+    Returns:
+        Stats dict with orphan count, edges added by type, etc.
     """
     import time as _time
 
-    orphan_ids = find_orphans(G)
-    if not orphan_ids:
-        return {"orphans_found": 0, "resolved": 0, "lexical": 0, "semantic": 0, "directory": 0}
+    orphans = find_orphans(G)
 
-    t0 = _time.monotonic()
-    stats: dict[str, Any] = {
-        "orphans_found": len(orphan_ids),
+    stats: Dict[str, Any] = {
+        "orphans_found": len(orphans),
         "lexical": 0,
         "semantic": 0,
         "directory": 0,
+        "resolved": 0,
+        "orphans_remaining": 0,
     }
-    resolved: set[str] = set()
 
-    # ── Pass 1: FTS5 Lexical ──
-    # Matches deepwiki: symbol_name sourced from DB; counts EDGES added,
-    # not resolved orphans.  Hit filter is just ``hit_id != nid`` (no
-    # ``in G`` gate) so FTS results for nodes not in the current subgraph
-    # are still linked (they share the same DB).
-    lexical_edges = 0
-    if db is not None:
-        orphan_names: list[tuple[str, str]] = []
-        for nid in orphan_ids:
-            symbol_name = ""
-            node = db.get_node(nid)
-            if node:
-                symbol_name = node.get("symbol_name", "") or ""
+    if not orphans:
+        logger.info("Orphan resolution: no orphans found")
+        return stats
+
+    t0 = _time.monotonic()
+    logger.info("Orphan resolution: processing %d orphan nodes", len(orphans))
+
+    resolved: Set[str] = set()
+
+    # ── Pass 1: FTS5 lexical match ───────────────────────────
+    for node_id in orphans:
+        node = db.get_node(node_id) if db is not None else None
+
+        # Get symbol_name from DB first, fall back to graph attributes
+        symbol_name = ""
+        if node:
+            symbol_name = node.get("symbol_name", "") or ""
+        if not symbol_name:
+            node_data = G.nodes.get(node_id, {})
+            sym = node_data.get("symbol")
+            if isinstance(sym, dict):
+                symbol_name = sym.get("name", "")
+            elif sym is not None:
+                symbol_name = getattr(sym, "name", "")
             if not symbol_name:
-                # Fall back to graph attribute if DB lookup failed
-                symbol_name = _symbol_attr(G.nodes.get(nid, {}), "name")
-            if symbol_name and len(symbol_name) >= 2:
-                orphan_names.append((nid, symbol_name))
+                symbol_name = node_data.get("symbol_name", "")
+        if not symbol_name or len(symbol_name) < 2:
+            continue
 
-        for nid, symbol_name in orphan_names:
-            hits = db.search_fts5(query=symbol_name, limit=fts_limit)
-            # Filter self-hits BEFORE slicing (matches deepwiki).  FTS5 often
-            # ranks the orphan's own row first on exact symbol_name matches;
-            # slicing before filtering would silently drop a real edge.
-            hits = [h for h in hits if h.get("node_id", "") != nid]
-            added = 0
-            for hit in hits[:max_lexical_edges]:
-                hit_id = hit.get("node_id", "")
-                _add_edge(db, G, nid, hit_id, "lexical_link", "lexical", "fts5_lexical",
-                          skip_db=True)
-                added += 1
-                lexical_edges += 1
+        fts_hits = db.search_fts5(query=symbol_name, limit=fts_limit)
+        fts_hits = [h for h in fts_hits if h.get("node_id", "") != node_id]
 
-            if added > 0:
-                resolved.add(nid)
+        if fts_hits:
+            for hit in fts_hits[:max_lexical_edges]:
+                _add_edge(
+                    db, G,
+                    source=node_id,
+                    target=hit["node_id"],
+                    rel_type="lexical_link",
+                    edge_class="lexical",
+                    created_by="fts5_lexical",
+                    skip_db=True,
+                )
+                stats["lexical"] += 1
+            resolved.add(node_id)
 
-        stats["lexical"] = lexical_edges
-        t1 = _time.monotonic()
-        logger.info(
-            "[ORPHAN] Pass 1 (FTS lexical): %d edges added (%d orphans resolved) in %.1fs",
-            lexical_edges, len(resolved), t1 - t0,
-        )
+    t1 = _time.monotonic()
+    logger.info(
+        "[ORPHAN] Pass 1 (FTS lexical): %d edges, %d orphans resolved in %.1fs",
+        stats["lexical"], len(resolved), t1 - t0,
+    )
 
-    # ── Pass 2: Semantic Vector (batched embeddings) ──
-    # Matches deepwiki: text sourced from DB (source_text / docstring),
-    # candidate only if lexical pass didn't resolve.  Hit filter is only
-    # ``hit_id != nid`` + distance threshold (no extra ``in G`` gate).
+    # ── Pass 2: Semantic Vector (batched embeddings) ─────────
     _effective_embed = embed_batch_fn or embedding_fn
-    if _effective_embed and db is not None and db.vec_available:
-        vec_candidates: list[tuple[str, str, str]] = []
-        for nid in orphan_ids:
-            if nid in resolved:
+    if _effective_embed is not None and db.vec_available:
+        # Collect candidates (skip already-resolved orphans)
+        vec_candidates: List[Tuple[str, str, str]] = []  # (node_id, text, rel_path)
+        for node_id in orphans:
+            if node_id in resolved:
                 continue
-            # DB-first (matches deepwiki); fall back to graph attributes so
-            # in-memory-only callers still work.
-            node = db.get_node(nid)
+
+            node = db.get_node(node_id) if db is not None else None
             text = ""
             rel_path = ""
             if node:
                 text = node.get("source_text", "") or node.get("docstring", "") or ""
                 rel_path = node.get("rel_path", "") or ""
             if not text:
-                node_data = G.nodes.get(nid, {})
+                node_data = G.nodes.get(node_id, {})
                 text = node_data.get("source_text", "") or node_data.get("docstring", "") or ""
                 if not rel_path:
                     rel_path = (
@@ -344,80 +477,132 @@ def resolve_orphans(
                     )
             if not text or len(text.strip()) < 10:
                 continue
-            vec_candidates.append((nid, text, rel_path))
+            vec_candidates.append((node_id, text, rel_path))
 
         t2 = _time.monotonic()
 
+        # Process in batches — single API call per batch
         for batch_start in range(0, len(vec_candidates), embed_batch_size):
-            batch = vec_candidates[batch_start : batch_start + embed_batch_size]
+            batch = vec_candidates[batch_start:batch_start + embed_batch_size]
             texts = [t for _, t, _ in batch]
 
-            # Batch embed — single API call for *embed_batch_size* texts
+            # Batch embed: one call for embed_batch_size texts
             if embed_batch_fn:
                 embeddings = embed_batch_fn(texts)
             else:
+                # Fallback: serial calls (still grouped logically)
                 embeddings = [embedding_fn(t) for t in texts]
 
             for (nid, _text, rel_path), emb in zip(batch, embeddings):
                 if nid in resolved:
                     continue
 
-                prefixes = _expanding_prefixes(rel_path)
-                for prefix in prefixes:
-                    hits = db.search_vec(
-                        embedding=emb, k=vec_k,
-                        path_prefix=prefix or None,
+                for prefix in _expanding_prefixes(rel_path):
+                    vec_hits = db.search_vec(
+                        embedding=emb,
+                        k=vec_k,
+                        path_prefix=prefix if prefix else None,
                     )
-                    valid_hits = [
-                        h for h in hits
+                    vec_hits = [
+                        h for h in vec_hits
                         if h.get("node_id") != nid
                         and h.get("vec_distance", 1.0) < vec_distance_threshold
                     ]
-                    if valid_hits:
-                        for hit in valid_hits:
+
+                    if vec_hits:
+                        for hit in vec_hits:
                             _add_edge(
-                                db, G, nid, hit["node_id"],
-                                "semantic_link", "semantic", "vec_semantic",
+                                db, G,
+                                source=nid,
+                                target=hit["node_id"],
+                                rel_type="semantic_link",
+                                edge_class="semantic",
+                                created_by="vec_semantic",
                                 raw_similarity=1.0 - hit.get("vec_distance", 0),
                                 skip_db=True,
                             )
                             stats["semantic"] += 1
                         resolved.add(nid)
-                        break
+                        break  # Stop expanding prefix chain
 
         t3 = _time.monotonic()
         logger.info(
-            "[ORPHAN] Pass 2 (semantic vector): %d edges added from %d candidates in %.1fs",
+            "[ORPHAN] Pass 2 (semantic vector): %d edges from %d candidates in %.1fs",
             stats["semantic"], len(vec_candidates), t3 - t2,
         )
 
-    # ── Pass 3: Directory Fallback ──
+    # ── Pass 3: Directory proximity fallback ─────────────────
     t4 = _time.monotonic()
-    remaining_orphans = find_orphans(G)
-    dir_resolved = _resolve_orphans_by_directory(db, G, remaining_orphans)
-    stats["directory"] = dir_resolved
+    remaining = find_orphans(G)
+    if remaining:
+        dir_edges = _resolve_orphans_by_directory(db, G, remaining)
+        stats["directory"] = dir_edges
+
     t5 = _time.monotonic()
     logger.info(
         "[ORPHAN] Pass 3 (directory): %d resolved in %.1fs",
-        dir_resolved, t5 - t4,
+        stats["directory"], t5 - t4,
     )
 
     stats["orphans_remaining"] = len(find_orphans(G))
     stats["resolved"] = stats["orphans_found"] - stats["orphans_remaining"]
+
     logger.info(
         "[ORPHAN] Total: %d/%d orphans resolved in %.1fs "
         "(lexical=%d, semantic=%d, directory=%d), %d remaining",
         stats["resolved"], stats["orphans_found"], t5 - t0,
-        stats["lexical"], stats["semantic"], stats["directory"],
+        stats["lexical"], stats["semantic"],
+        stats["directory"],
         stats["orphans_remaining"],
     )
 
     return stats
 
 
-# ---------------------------------------------------------------------------
-# Document edge injection
-# ---------------------------------------------------------------------------
+def _add_edge(
+    db, G: nx.MultiDiGraph,
+    source: str, target: str,
+    rel_type: str, edge_class: str, created_by: str,
+    raw_similarity: Optional[float] = None,
+    *,
+    skip_db: bool = False,
+) -> None:
+    """Add a synthetic edge to both the in-memory graph AND the DB.
+
+    When *skip_db* is True the edge is added only to the in-memory graph.
+    Use this inside ``resolve_orphans`` / ``inject_doc_edges`` /
+    ``bridge_disconnected_components`` because ``persist_weights_to_db``
+    rewrites **all** edges to the DB at the end of Phase 2 anyway.
+    """
+    attrs: Dict[str, Any] = {
+        "relationship_type": rel_type,
+        "edge_class": edge_class,
+        "created_by": created_by,
+    }
+    if raw_similarity is not None:
+        attrs["raw_similarity"] = raw_similarity
+
+    G.add_edge(source, target, **attrs)
+
+    if not skip_db and db is not None:
+        db.upsert_edge(source, target, rel_type, **attrs)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3b. Doc Edge Injection — Hyperlink (Tier 1) + Proximity (Tier 2)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Regex for Markdown links: [text](target_path)
+_MD_LINK_RE = re.compile(r'\[(?:[^\]]*)\]\(([^)]+)\)')
+
+# Regex for inline code references: `SymbolName`
+_BACKTICK_REF_RE = re.compile(r'`([A-Za-z_]\w+(?:\.\w+)*)`')
+
+# Doc-related symbol kinds (mirror constants.py DOC_SYMBOL_TYPES + legacy types)
+_DOC_KINDS = frozenset({
+    "module_doc", "file_doc", "doc", "readme", "documentation",
+    "markdown", "rst", "text",
+})
 
 
 def _is_doc_node(G: nx.MultiDiGraph, node_id: str) -> bool:
@@ -434,37 +619,48 @@ def _is_doc_node(G: nx.MultiDiGraph, node_id: str) -> bool:
 
 
 def _normalize_path(ref_path: str, source_dir: str) -> str:
-    """Resolve a relative path reference against the source document's directory.
+    """Resolve a relative path reference against the source file's directory.
 
-    Returns "" for external URLs, mailto:, and #-only anchors.
+    Normalises ``../src/foo.py`` relative to ``docs/guide/`` into
+    ``src/foo.py``.
     """
+    # Skip URLs, anchors, and email links
     if ref_path.startswith(("http://", "https://", "mailto:", "#")):
         return ""
-    ref_path = ref_path.split("#")[0].strip()
+    # Strip fragment anchors (e.g. file.py#L10 -> file.py)
+    if "#" in ref_path:
+        ref_path = ref_path.split("#", 1)[0]
     if not ref_path:
         return ""
-    combined = os.path.normpath(os.path.join(source_dir, ref_path))
-    combined = combined.replace("\\", "/")
-    return combined.lstrip("./").lstrip("/")
+    # Strip optional leading ./ (but not ../)
+    if ref_path.startswith("./"):
+        ref_path = ref_path[2:]
+    joined = os.path.normpath(os.path.join(source_dir, ref_path))
+    # normpath on pure relative gives us the cleaned relative path
+    return joined.replace("\\", "/")
 
 
-def _build_path_index(G: nx.MultiDiGraph) -> dict[str, str]:
-    """Map rel_path → node_id for all nodes."""
-    index: dict[str, str] = {}
+def _build_path_index(G: nx.MultiDiGraph) -> Dict[str, str]:
+    """Build a mapping from rel_path → node_id for all graph nodes."""
+    index: Dict[str, str] = {}
     for nid, data in G.nodes(data=True):
-        rp = data.get("location", {}).get("rel_path", "") or data.get("rel_path", "")
+        rp = data.get("rel_path", "")
+        if not rp:
+            loc = data.get("location")
+            if isinstance(loc, dict):
+                rp = loc.get("rel_path", "")
         if rp:
             index[rp] = nid
     return index
 
 
-def _build_name_index(G: nx.MultiDiGraph) -> dict[str, list[str]]:
-    """Map symbol_name → [node_ids] for all code nodes."""
-    index: dict[str, list[str]] = {}
+def _build_name_index(G: nx.MultiDiGraph) -> Dict[str, List[str]]:
+    """Build mapping from symbol_name → [node_id, ...] for code nodes."""
+    index: Dict[str, List[str]] = {}
     for nid, data in G.nodes(data=True):
         if _is_doc_node(G, nid):
             continue
-        name = _symbol_attr(data, "name")
+        name = data.get("symbol_name", "")
         if name:
             index.setdefault(name, []).append(nid)
     return index
@@ -472,81 +668,76 @@ def _build_name_index(G: nx.MultiDiGraph) -> dict[str, list[str]]:
 
 def _extract_hyperlink_edges(
     G: nx.MultiDiGraph,
-    path_index: dict[str, str],
-    name_index: dict[str, list[str]],
-) -> list[tuple[str, str]]:
-    """Extract edges from Markdown hyperlinks and backtick mentions."""
-    edges: list[tuple[str, str]] = []
+    path_index: Dict[str, str],
+    name_index: Dict[str, List[str]],
+) -> List[Tuple[str, str]]:
+    """Tier 1: Extract edges from Markdown links and backtick references.
+
+    For each doc node, parse its ``source_text`` for:
+    - ``[text](relative/path)`` → directed edge doc → target file
+    - `` `SymbolName` `` → directed edge doc → code symbol
+
+    Returns list of (source_id, target_id) pairs.
+    """
+    edges: List[Tuple[str, str]] = []
+
     for nid, data in G.nodes(data=True):
         if not _is_doc_node(G, nid):
             continue
-
-        content = data.get("source_text", "") or data.get("content", "")
-        if not content:
+        source_text = data.get("source_text", "") or ""
+        if not source_text:
             continue
 
-        source_dir = data.get("location", {}).get("rel_path", "") or data.get("rel_path", "")
-        source_dir = "/".join(source_dir.replace("\\", "/").split("/")[:-1])
+        rel_path = data.get("rel_path", "")
+        source_dir = os.path.dirname(rel_path) if rel_path else ""
 
-        # Tier 1: Markdown [text](path) links
-        for match in _MD_LINK_RE.finditer(content):
-            ref_path = match.group(1)
-            resolved = _normalize_path(ref_path, source_dir)
+        # Parse markdown links
+        for match in _MD_LINK_RE.finditer(source_text):
+            ref = match.group(1).split("#")[0].strip()  # strip anchors
+            if not ref:
+                continue
+            resolved = _normalize_path(ref, source_dir)
             if not resolved:
                 continue
-            target = path_index.get(resolved)
-            if target and target != nid:
-                edges.append((nid, target))
+            target_nid = path_index.get(resolved)
+            if target_nid and target_nid != nid:
+                edges.append((nid, target_nid))
 
-        # Tier 2: Backtick `SymbolName` mentions (capped at 2 per mention)
-        for match in _BACKTICK_REF_RE.finditer(content):
-            symbol_ref = match.group(1)
-            targets = name_index.get(symbol_ref, [])
-            # Dotted-name fallback: `module.ClassName` → try `ClassName`
-            if not targets and "." in symbol_ref:
-                targets = name_index.get(symbol_ref.rsplit(".", 1)[-1], [])
-            for target in targets[:2]:
-                if target != nid:
-                    edges.append((nid, target))
+        # Parse backtick code references
+        for match in _BACKTICK_REF_RE.finditer(source_text):
+            symbol = match.group(1)
+            # Try exact match first, then last segment (e.g. module.Class → Class)
+            targets = name_index.get(symbol, [])
+            if not targets and "." in symbol:
+                targets = name_index.get(symbol.rsplit(".", 1)[-1], [])
+            for tid in targets[:2]:  # Cap at 2 matches per reference
+                if tid != nid:
+                    edges.append((nid, tid))
 
     return edges
 
 
 def _extract_proximity_edges(
     G: nx.MultiDiGraph,
-    path_index: dict[str, str],
-) -> list[tuple[str, str]]:
-    """Match doc directories to code directories.
+    path_index: Dict[str, str],
+) -> List[Tuple[str, str]]:
+    """Tier 2: Extract edges between files in related directories.
 
-    Strips docs/, doc/, documentation/ prefixes from doc paths and
-    matches to code paths sharing the same directory structure.
+    Heuristic: ``docs/api/README.md`` relates to ``src/api/*.py``.
+    We strip common doc prefixes (docs/, doc/) and match the remaining
+    directory structure against code node paths.
 
-    Algorithm (copied from deepwiki _extract_proximity_edges):
-    1. Pre-build ``dir → [code_nodes]`` map, excluding doc nodes.
-    2. For each doc node, compute its bare directory (no trailing slash)
-       and strip a leading doc prefix if present.
-    3. Match only when a code directory equals the stripped topic dir OR
-       ends with ``/topic_dir`` (suffix match, not ``startswith``).
-    4. Cap at 5 edges per matched directory.
-
-    Previous implementation had three bugs that caused 70× more edges:
-    - ``doc_dir`` always had a trailing ``/`` which made stripping produce
-      empty ``code_dir`` for top-level docs (e.g. ``docs/README.md``).
-    - Candidate pool was ``path_index`` (all nodes, incl. doc targets).
-    - Used ``path.startswith(code_dir)`` which matches every file
-      recursively under a directory; empty prefix matched everything.
+    Returns list of (source_id, target_id) pairs.
     """
-    edges: list[tuple[str, str]] = []
+    edges: List[Tuple[str, str]] = []
+    _DOC_PREFIXES = ("docs/", "doc/", "documentation/")
 
-    # Pre-build dir → [code node_ids] map, excluding doc nodes.
-    dir_to_code: dict[str, list[str]] = {}
+    # Build directory → [node_id] mapping for code nodes
+    dir_to_code: Dict[str, List[str]] = {}
     for nid, data in G.nodes(data=True):
         if _is_doc_node(G, nid):
             continue
-        rp = (
-            data.get("location", {}).get("rel_path", "")
-            or data.get("rel_path", "")
-        )
+        rp = data.get("rel_path", "")
         if rp:
             d = os.path.dirname(rp).replace("\\", "/")
             if d:
@@ -555,10 +746,7 @@ def _extract_proximity_edges(
     for nid, data in G.nodes(data=True):
         if not _is_doc_node(G, nid):
             continue
-        rp = (
-            data.get("location", {}).get("rel_path", "")
-            or data.get("rel_path", "")
-        )
+        rp = data.get("rel_path", "")
         if not rp:
             continue
 
@@ -566,20 +754,21 @@ def _extract_proximity_edges(
         if not doc_dir:
             continue
 
+        # Strip doc prefix to get the "topic" directory
         topic_dir = doc_dir
         for prefix in _DOC_PREFIXES:
-            # _DOC_PREFIXES include trailing slash (e.g. "docs/"), so
-            # startswith only matches when doc_dir has subdirectories.
             if topic_dir.startswith(prefix):
                 topic_dir = topic_dir[len(prefix):]
                 break
 
         if not topic_dir:
-            continue  # guard: empty topic would match everything
+            continue
 
+        # Look for code in matching directories:
+        # src/api, lib/api, api, etc.
         for code_dir, code_nodes in dir_to_code.items():
             if code_dir == topic_dir or code_dir.endswith("/" + topic_dir):
-                for cnid in code_nodes[:5]:
+                for cnid in code_nodes[:5]:  # Cap to avoid hairballs
                     if cnid != nid:
                         edges.append((nid, cnid))
 
@@ -593,15 +782,12 @@ def _enrich_graph_nodes_from_db(db, G: nx.MultiDiGraph) -> None:
     look them up from the unified DB. This ensures doc edge extraction works
     even when graph nodes were created with minimal attributes.
     """
-    if db is None:
-        return
-
     _NEEDED = {"rel_path", "source_text", "symbol_type"}
     to_enrich = [
         nid for nid in G.nodes()
         if not (_NEEDED <= set(G.nodes[nid].keys()))
     ]
-    if not to_enrich:
+    if db is None or not to_enrich:
         return
 
     for nid in to_enrich:
@@ -615,75 +801,214 @@ def _enrich_graph_nodes_from_db(db, G: nx.MultiDiGraph) -> None:
                 node_data[key] = row[key]
 
 
-def inject_doc_edges(db: Any, G: nx.MultiDiGraph) -> dict[str, Any]:
-    """Inject documentation → code edges.
+def inject_doc_edges(
+    db,
+    G: nx.MultiDiGraph,
+) -> Dict[str, Any]:
+    """Inject Tier 1 (hyperlink) and Tier 2 (proximity) doc edges.
 
-    Tier 1: Hyperlinks [text](path) + backtick `Symbol` mentions
-    Tier 2: Directory proximity (docs/ → src/)
+    Must be called AFTER orphan resolution but BEFORE edge weighting,
+    so that these edges get proper inverse in-degree weights.
+
+    Returns:
+        Stats dict with counts by tier.
     """
+    stats = {
+        "hyperlink_edges": 0,
+        "proximity_edges": 0,
+        "total_edges_added": 0,
+    }
+
+    # Ensure graph nodes have attributes needed for doc edge extraction
     _enrich_graph_nodes_from_db(db, G)
 
     path_index = _build_path_index(G)
     name_index = _build_name_index(G)
-    seen: set[tuple[str, str]] = set()
 
-    hyperlink_edges = _extract_hyperlink_edges(G, path_index, name_index)
-    hyperlink_count = 0
-    for src, tgt in hyperlink_edges:
+    # Tier 1: Hyperlink edges
+    seen: Set[Tuple[str, str]] = set()
+    for src, tgt in _extract_hyperlink_edges(G, path_index, name_index):
         if (src, tgt) not in seen and not G.has_edge(src, tgt):
-            _add_edge(db, G, src, tgt, "hyperlink", "doc", "md_hyperlink", skip_db=True)
+            _add_edge(
+                db, G,
+                source=src, target=tgt,
+                rel_type="hyperlink",
+                edge_class="doc",
+                created_by="md_hyperlink",
+                skip_db=True,
+            )
             seen.add((src, tgt))
-            hyperlink_count += 1
+            stats["hyperlink_edges"] += 1
 
-    proximity_edges = _extract_proximity_edges(G, path_index)
-    proximity_count = 0
-    for src, tgt in proximity_edges:
+    # Tier 2: Proximity edges
+    for src, tgt in _extract_proximity_edges(G, path_index):
         if (src, tgt) not in seen and not G.has_edge(src, tgt):
-            _add_edge(db, G, src, tgt, "proximity", "doc", "dir_proximity", skip_db=True)
+            _add_edge(
+                db, G,
+                source=src, target=tgt,
+                rel_type="proximity",
+                edge_class="doc",
+                created_by="dir_proximity",
+                skip_db=True,
+            )
             seen.add((src, tgt))
-            proximity_count += 1
+            stats["proximity_edges"] += 1
 
-    return {
-        "hyperlink_edges": hyperlink_count,
-        "proximity_edges": proximity_count,
-    }
+    stats["total_edges_added"] = (
+        stats["hyperlink_edges"] + stats["proximity_edges"]
+    )
+
+    logger.info(
+        "Doc edge injection: %d hyperlink + %d proximity = %d total edges",
+        stats["hyperlink_edges"],
+        stats["proximity_edges"],
+        stats["total_edges_added"],
+    )
+
+    return stats
 
 
-# ---------------------------------------------------------------------------
-# Component bridging
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. Persist Weights Back to DB
+# ═══════════════════════════════════════════════════════════════════════════
+
+def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
+    """Write computed edge weights from NetworkX back to the unified DB.
+
+    This re-reads *all* edges from the DB, matches them to the in-memory
+    graph by (source, target, rel_type) ordering, and batch-updates
+    weights.
+
+    For large graphs we do a full overwrite of edge weights rather than
+    trying to match by edge PK (the DB edges have autoincrement IDs that
+    don't correspond to NetworkX edge keys).
+
+    Returns:
+        Number of edges updated.
+    """
+    if db is None or G.number_of_edges() == 0:
+        return 0
+
+    # Strategy: delete all edges, re-insert with weights from the graph.
+    if hasattr(db, 'delete_all_edges'):
+        db.delete_all_edges()
+    else:
+        db.conn.execute("DELETE FROM repo_edges")
+
+    edge_batch = []
+
+    for u, v, key, data in G.edges(data=True, keys=True):
+        annotations = data.get("annotations", {})
+        if isinstance(annotations, dict):
+            import json
+            annotations = json.dumps(annotations)
+
+        edge_batch.append({
+            "source_id": str(u),
+            "target_id": str(v),
+            "rel_type": data.get("relationship_type", ""),
+            "edge_class": data.get("edge_class", "structural"),
+            "analysis_level": data.get("analysis_level", "comprehensive"),
+            "weight": data.get("weight", 1.0),
+            "raw_similarity": data.get("raw_similarity"),
+            "source_file": data.get("source_file", ""),
+            "target_file": data.get("target_file", ""),
+            "language": data.get("language", ""),
+            "annotations": annotations,
+            "created_by": data.get("created_by", "ast"),
+        })
+
+        if len(edge_batch) >= PERSIST_BATCH_SIZE:
+            db.upsert_edges_batch(edge_batch)
+            edge_batch.clear()
+
+    if edge_batch:
+        db.upsert_edges_batch(edge_batch)
+
+    if hasattr(db, 'commit'):
+        db.commit()
+    elif hasattr(db, 'conn'):
+        db.conn.commit()
+
+    count = db.edge_count()
+    logger.info("Persisted %d weighted edges to unified DB", count)
+    return count
 
 
-def bridge_disconnected_components(db: Any, G: nx.MultiDiGraph) -> dict[str, Any]:
-    """Connect disconnected components via bridge edges.
+# ═══════════════════════════════════════════════════════════════════════════
+# 4b. Component Bridging — connect disconnected components
+# ═══════════════════════════════════════════════════════════════════════════
 
-    Uses weakly_connected_components on the DiGraph (not to_undirected).
-    Linear pass — each smaller component bridges to best-matching larger
-    component (by directory histogram similarity).
+def bridge_disconnected_components(
+    db,
+    G: nx.MultiDiGraph,
+) -> Dict[str, Any]:
+    """Connect disconnected components via directory-proximity bridge edges.
+
+    After orphan resolution and doc edge injection, the graph may still
+    contain many small disconnected components — clusters of 2+ nodes
+    with internal edges but no edges to the rest of the graph.  Leiden
+    produces at minimum one community per connected component regardless
+    of the resolution parameter, so bridging is essential.
+
+    Algorithm:
+    1. Find all weakly connected components.
+    2. Sort largest-first.
+    3. For each non-largest component, find the most directory-similar
+       larger (earlier) component using min-intersection of directory
+       histograms.
+    4. Add a lightweight bridge edge between each pair's highest-degree
+       representative nodes.
+
+    Bridge edges get ``edge_class='bridge'`` so the weighting step
+    treats them as synthetic (excluded from structural in-degree and
+    floored at ``SYNTHETIC_WEIGHT_FLOOR``).
+
+    Mutates *G* in place and persists edges to *db*.
+
+    Returns:
+        Stats dict with component counts and bridges added.
     """
     components = list(nx.weakly_connected_components(G))
+    n_before = len(components)
 
-    if len(components) <= 1:
-        return {"components_before": len(components), "bridges_added": 0}
+    stats = {
+        "components_before": n_before,
+        "components_after": n_before,
+        "bridges_added": 0,
+    }
 
-    def _dir_hist(comp: set[str]) -> Counter:
-        hist: Counter = Counter()
+    if n_before <= 1:
+        logger.info("Component bridging: graph is fully connected (1 component)")
+        return stats
+
+    # Sort largest-first so index 0 is the biggest component
+    components.sort(key=len, reverse=True)
+
+    # Build directory histogram for each component
+    def _dir_hist(comp):
+        c: Counter = Counter()
         for nid in comp:
             data = G.nodes.get(nid, {})
             rp = data.get("rel_path") or data.get("file_name") or ""
             d = rp.rsplit("/", 1)[0] if "/" in rp else "<root>"
-            hist[d] += 1
-        return hist
+            c[d] += 1
+        return c
+
+    comp_dirs = [_dir_hist(comp) for comp in components]
+
+    # Representative node per component (highest total degree)
+    comp_reps = [
+        max(comp, key=lambda n: G.in_degree(n) + G.out_degree(n))
+        for comp in components
+    ]
 
     def _dir_sim(a: Counter, b: Counter) -> int:
-        return sum((a & b).values())
+        return sum(min(a[d], b[d]) for d in a if d in b)
 
-    comp_list = sorted([set(c) for c in components], key=len, reverse=True)
-    n_before = len(comp_list)
-    comp_dirs = [_dir_hist(c) for c in comp_list]
     bridges_added = 0
-
     for i in range(1, n_before):
+        # Find the most directory-similar earlier (larger) component
         best_target = 0
         best_sim = _dir_sim(comp_dirs[i], comp_dirs[0])
 
@@ -693,227 +1018,118 @@ def bridge_disconnected_components(db: Any, G: nx.MultiDiGraph) -> dict[str, Any
                 best_sim = sim
                 best_target = j
 
-        center_i = max(comp_list[i], key=lambda n: G.degree(n))
-        center_j = max(comp_list[best_target], key=lambda n: G.degree(n))
+        src = comp_reps[i]
+        dst = comp_reps[best_target]
 
-        _add_edge(db, G, center_i, center_j, "component_bridge", "bridge", "component_bridging", skip_db=True)
-        _add_edge(db, G, center_j, center_i, "component_bridge", "bridge", "component_bridging", skip_db=True)
+        # Bidirectional bridge edge
+        _add_edge(
+            db, G, source=src, target=dst,
+            rel_type="component_bridge",
+            edge_class="bridge",
+            created_by="component_bridging",
+            skip_db=True,
+        )
+        _add_edge(
+            db, G, source=dst, target=src,
+            rel_type="component_bridge",
+            edge_class="bridge",
+            created_by="component_bridging",
+            skip_db=True,
+        )
         bridges_added += 2
 
     n_after = nx.number_weakly_connected_components(G)
+    stats["components_after"] = n_after
+    stats["bridges_added"] = bridges_added
 
-    return {
-        "components_before": n_before,
-        "components_after": n_after,
-        "bridges_added": bridges_added,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Edge weighting
-# ---------------------------------------------------------------------------
-
-
-def apply_edge_weights(G: nx.MultiDiGraph) -> dict[str, Any]:
-    """Apply inverse-in-degree edge weighting to ALL edges.
-
-    Formula: weight = 1 / log(structural_in_degree + 2)
-    Synthetic edges get a weight floor of SYNTHETIC_WEIGHT_FLOOR (0.5).
-    """
-    if G.number_of_edges() == 0:
-        return {"edges_weighted": 0, "synthetic_floored": 0, "min": 0, "max": 0, "mean": 0}
-
-    structural_in: dict[str, int] = {n: 0 for n in G.nodes()}
-    for _u, v, data in G.edges(data=True):
-        ec = data.get("edge_class", "structural")
-        if ec not in _SYNTHETIC_CLASSES:
-            structural_in[v] = structural_in.get(v, 0) + 1
-
-    weighted = 0
-    synthetic_count = 0
-    weights: list[float] = []
-    for u, v, key, data in G.edges(data=True, keys=True):
-        in_deg = structural_in.get(v, 0)
-        w = 1.0 / math.log(in_deg + 2)
-
-        ec = data.get("edge_class", "structural")
-        if ec in _SYNTHETIC_CLASSES:
-            w = max(w, SYNTHETIC_WEIGHT_FLOOR)
-            synthetic_count += 1
-
-        data["weight"] = w
-        weights.append(w)
-        weighted += 1
-
-    stats = {
-        "edges_weighted": weighted,
-        "synthetic_floored": synthetic_count,
-        "min": round(min(weights), 4),
-        "max": round(max(weights), 4),
-        "mean": round(sum(weights) / len(weights), 4),
-    }
     logger.info(
-        "[EDGE_WEIGHTS] %d edges weighted (synthetic_floored=%d, "
-        "min=%.4f, max=%.4f, mean=%.4f)",
-        weighted, synthetic_count, stats["min"], stats["max"], stats["mean"],
+        "Component bridging: %d → %d components (%d bridge edges added)",
+        n_before, n_after, bridges_added,
     )
+
     return stats
 
 
-# ---------------------------------------------------------------------------
-# Hub detection
-# ---------------------------------------------------------------------------
-
-
-def detect_hubs(G: nx.MultiDiGraph, z_threshold: float = 3.0) -> set[str]:
-    """Detect hub nodes via Z-score on in-degree."""
-    if G.number_of_nodes() < 3:
-        return set()
-
-    degrees = [G.in_degree(n) for n in G.nodes()]
-
-    if _HAS_NUMPY:
-        arr = np.array(degrees, dtype=float)
-        mean = float(np.mean(arr))
-        std = float(np.std(arr))
-    else:
-        mean = sum(degrees) / len(degrees)
-        variance = sum((d - mean) ** 2 for d in degrees) / len(degrees)
-        std = variance**0.5
-
-    if std == 0:
-        return set()
-
-    hubs: set[str] = set()
-    for nid, deg in zip(G.nodes(), degrees):
-        z = (deg - mean) / std
-        if z > z_threshold:
-            hubs.add(nid)
-
-    return hubs
-
-
-def flag_hubs_in_db(db: Any, hubs: set[str]) -> None:
-    """Persist hub flags to the unified DB."""
-    if db is None:
-        return
-    for nid in hubs:
-        db.set_hub(nid, is_hub=True)
-    db.commit()
-
-
-# ---------------------------------------------------------------------------
-# Edge persistence
-# ---------------------------------------------------------------------------
-
-
-def persist_weights_to_db(db: Any, G: nx.MultiDiGraph) -> int:
-    """Write all weighted edges back to the DB (full replace)."""
-    if db is None:
-        return 0
-
-    db.delete_all_edges()
-
-    batch: list[dict[str, Any]] = []
-    for u, v, _key, data in G.edges(data=True, keys=True):
-        edge_dict: dict[str, Any] = {
-            "source_id": u,
-            "target_id": v,
-            "rel_type": data.get("relationship_type", ""),
-            "edge_class": data.get("edge_class", "structural"),
-            "analysis_level": data.get("analysis_level", "comprehensive"),
-            "weight": data.get("weight", 1.0),
-            "raw_similarity": data.get("raw_similarity"),
-            "source_file": data.get("source_file", ""),
-            "target_file": data.get("target_file", ""),
-            "language": data.get("language", ""),
-            "annotations": (
-                json.dumps(data["annotations"])
-                if isinstance(data.get("annotations"), dict)
-                else data.get("annotations", "")
-            ),
-            "created_by": data.get("created_by", "ast"),
-        }
-        batch.append(edge_dict)
-
-        if len(batch) >= PERSIST_BATCH_SIZE:
-            db.upsert_edges_batch(batch)
-            batch = []
-
-    if batch:
-        db.upsert_edges_batch(batch)
-
-    db.commit()
-    return db.edge_count()
-
-
-# ---------------------------------------------------------------------------
-# Main orchestrator
-# ---------------------------------------------------------------------------
-
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. Orchestrator — run full Phase 2 pipeline
+# ═══════════════════════════════════════════════════════════════════════════
 
 def run_phase2(
-    db: Any,
+    db,
     G: nx.MultiDiGraph,
-    embedding_fn: Callable | None = None,
-    embed_batch_fn: Callable | None = None,
+    embedding_fn: Optional[Callable] = None,
+    embed_batch_fn: Optional[Callable] = None,
     z_threshold: float = 3.0,
     vec_distance_threshold: float = 0.15,
-) -> dict[str, Any]:
-    """Run the complete Phase 2 enrichment pipeline.
+) -> Dict[str, Any]:
+    """Execute the complete Phase 2 pipeline on a graph + unified DB.
 
-    Execution order (DeepWiki "corrected order — 7F"):
-    1. resolve_orphans → inject semantic/lexical/directory edges
-    2. inject_doc_edges → inject hyperlink + proximity doc edges
-    3. bridge_disconnected_components → connect disconnected components
-    4. apply_edge_weights → inverse in-degree weighting on ALL edges
-    5. detect_hubs + flag_hubs_in_db → hub detection & DB flagging
-    6. persist_weights_to_db → write all weighted edges back to DB
-    7. Store metadata
+    Steps (corrected order — 7F):
+        1. Resolve orphans (FTS5 lexical + vector semantic)
+        2. Inject doc edges (hyperlink + proximity)
+        3. Bridge disconnected components (directory proximity)
+        4. Apply inverse in-degree edge weights on ALL edges
+        5. Detect and flag hubs on complete degree distribution
+        6. Persist final weights back to DB
+
+    Args:
+        db: ``UnifiedWikiDB`` instance (already populated by Phase 1).
+        G: In-memory ``nx.MultiDiGraph`` (same graph as in DB).
+        embedding_fn: Optional single-text → embedding callable.
+        embed_batch_fn: Optional batch-text → embeddings callable (preferred).
+        z_threshold: Hub detection Z-score threshold.
+        vec_distance_threshold: Max distance for semantic links.
+
+    Returns:
+        Combined stats dict from all sub-steps.
     """
-    results: dict[str, Any] = {}
+    results: Dict[str, Any] = {}
 
-    # Step 1: Orphan resolution
-    orphan_stats = resolve_orphans(
-        db,
-        G,
-        embedding_fn,
+    # Step 1: Orphan resolution — inject semantic/lexical edges FIRST
+    # so that weighting and hub detection see the COMPLETE edge set.
+    results["orphan_resolution"] = resolve_orphans(
+        db, G,
+        embedding_fn=embedding_fn,
         embed_batch_fn=embed_batch_fn,
         vec_distance_threshold=vec_distance_threshold,
     )
-    results["orphan_resolution"] = orphan_stats
-    logger.info("Orphan resolution: %s", orphan_stats)
 
-    # Step 2: Document edges
-    doc_stats = inject_doc_edges(db, G)
-    results["doc_edges"] = doc_stats
-    logger.info("Doc edges: %s", doc_stats)
+    # Step 2: Doc edge injection (hyperlink + proximity)
+    results["doc_edges"] = inject_doc_edges(db, G)
 
-    # Step 3: Component bridging
-    bridge_stats = bridge_disconnected_components(db, G)
-    results["bridging"] = bridge_stats
-    logger.info("Bridging: %s", bridge_stats)
+    # Step 3: Bridge disconnected components — BEFORE weighting so
+    # bridge edges receive proper weights in step 4.
+    results["bridging"] = bridge_disconnected_components(db, G)
 
-    # Step 4: Edge weighting
-    weight_stats = apply_edge_weights(G)
-    results["weighting"] = weight_stats
-    logger.info("Weighting: %s", weight_stats)
+    # Step 4: Edge weighting — on ALL edges (structural + semantic + lexical + doc + bridge)
+    results["weighting"] = apply_edge_weights(G)
 
-    # Step 5: Hub detection
-    hubs = detect_hubs(G, z_threshold)
+    # Step 5: Hub detection — on complete degree distribution
+    hubs = detect_hubs(G, z_threshold=z_threshold)
     flag_hubs_in_db(db, hubs)
-    results["hubs"] = {"count": len(hubs), "nodes": list(hubs)[:20]}
-    logger.info("Hubs detected: %d", len(hubs))
+    results["hubs"] = {
+        "count": len(hubs),
+        "node_ids": sorted(hubs)[:20],  # Cap at 20 for readability
+    }
 
-    # Step 6: Persist weighted edges
-    edge_count = persist_weights_to_db(db, G)
-    results["persisted_edges"] = edge_count
-    logger.info("Persisted %d edges", edge_count)
+    # Step 6: Persist weights
+    results["persisted_edges"] = persist_weights_to_db(db, G)
 
-    # Step 7: Metadata
-    G.graph["phase2_enriched"] = True
+    # Store phase 2 metadata
     if db is not None:
         db.set_meta("phase2_completed", True)
         db.set_meta("phase2_stats", results)
+
+    logger.info(
+        "Phase 2 complete: %d orphans resolved, %d doc edges injected, "
+        "%d→%d components bridged, %d edges weighted, %d hubs, %d edges persisted",
+        results["orphan_resolution"]["resolved"],
+        results["doc_edges"].get("total_edges_added", 0),
+        results["bridging"]["components_before"],
+        results["bridging"]["components_after"],
+        results["weighting"]["edges_weighted"],
+        results["hubs"]["count"],
+        results["persisted_edges"],
+    )
 
     return results

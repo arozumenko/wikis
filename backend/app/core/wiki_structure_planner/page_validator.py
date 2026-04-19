@@ -11,7 +11,7 @@ The final ``shape_decision`` is one of:
 - ``promote_docs``  — promote to docs-only page (doc-dominant)
 - ``demote``        — demote to context-only (no value as standalone)
 
-Gated behind env var ``WIKIS_CANDIDATE_VALIDATION=1``.
+Gated behind ``FeatureFlags.capability_validation``.
 """
 
 from __future__ import annotations
@@ -38,11 +38,23 @@ PROMOTE_DOCS = "promote_docs"
 DEMOTE = "demote"
 
 # ── Thresholds ──────────────────────────────────────────────────────
+#: Minimum code-identity score to pass the identity check.
 MIN_IDENTITY_SCORE = 0.1
+
+#: Minimum number of nodes for a page to be viable.
 MIN_PAGE_SIZE = 2
+
+#: Default maximum number of nodes before considering a split.
+#: Dynamically scaled in ``validate_all`` based on average candidate size.
 MAX_PAGE_SIZE = 60
+
+#: Maximum utility contamination before flagging.
 MAX_UTILITY_CONTAMINATION = 0.5
+
+#: Minimum implementation evidence for code pages.
 MIN_IMPL_EVIDENCE = 0.2
+
+#: Docs-dominance threshold for promote_docs action.
 DOCS_PROMOTE_THRESHOLD = 0.7
 
 
@@ -61,7 +73,7 @@ class ValidationResult:
     candidate: CandidateRecord
     checks: List[CheckResult] = field(default_factory=list)
     shape_decision: str = KEEP
-    merge_target: Optional[int] = None
+    merge_target: Optional[int] = None  # micro_id to merge with
 
 
 def validate_candidate(
@@ -69,15 +81,33 @@ def validate_candidate(
     sibling_candidates: Optional[List[CandidateRecord]] = None,
     max_page_size: int = MAX_PAGE_SIZE,
 ) -> ValidationResult:
-    """Run the 5-check pipeline on a candidate page."""
+    """Run the 5-check pipeline on a candidate page.
+
+    Parameters
+    ----------
+    candidate : CandidateRecord
+        The candidate to validate.
+    sibling_candidates : list[CandidateRecord], optional
+        Other candidates in the same macro-cluster (for merge decisions).
+    max_page_size : int, optional
+        Override for the maximum page size threshold used in the
+        coherence check.  Defaults to the module-level ``MAX_PAGE_SIZE``.
+
+    Returns
+    -------
+    ValidationResult
+        Complete validation result with shape decision.
+    """
     result = ValidationResult(candidate=candidate)
 
+    # Run all checks
     result.checks.append(_check_identity(candidate))
     result.checks.append(_check_coherence(candidate, max_page_size=max_page_size))
     result.checks.append(_check_grounding(candidate))
     result.checks.append(_check_coverage(candidate))
     result.checks.append(_check_shape(candidate))
 
+    # Determine final shape decision from check results
     result.shape_decision = _decide_shape(
         candidate, result.checks, sibling_candidates,
     )
@@ -92,7 +122,14 @@ def validate_all(
 
     Dynamically scales ``max_page_size`` based on the average candidate
     size so that large repos don't trigger split_by on every page.
+
+    Returns
+    -------
+    list[ValidationResult]
+        One result per candidate, in the same order.
     """
+    # Scale max_page_size to avoid mass-splitting in large repos.
+    # Threshold = max(default=60, 1.5 × average candidate size).
     if candidates:
         total_nodes = sum(len(c.node_ids) for c in candidates)
         avg_size = total_nodes / len(candidates)
@@ -100,6 +137,7 @@ def validate_all(
     else:
         effective_max = MAX_PAGE_SIZE
 
+    # Group by macro_id for sibling context
     by_macro: dict[int, List[CandidateRecord]] = {}
     for c in candidates:
         by_macro.setdefault(c.macro_id, []).append(c)
@@ -114,6 +152,7 @@ def validate_all(
             candidate, siblings, max_page_size=effective_max,
         ))
 
+    # Summary logging
     actions = {}
     for r in results:
         actions[r.shape_decision] = actions.get(r.shape_decision, 0) + 1
@@ -180,7 +219,7 @@ def _check_coherence(candidate: CandidateRecord, max_page_size: int = MAX_PAGE_S
 
 
 def _check_grounding(candidate: CandidateRecord) -> CheckResult:
-    """Check 3: Does this page have implementation evidence?"""
+    """Check 3: Does this page have implementation evidence (not declarations-only)?"""
     if candidate.classification == CLASS_DOCS:
         return CheckResult(
             name="grounding", severity="pass",
@@ -247,29 +286,35 @@ def _decide_shape(
     siblings: Optional[List[CandidateRecord]],
 ) -> str:
     """Decide the final shape action based on check results."""
+    # Collect all suggested actions from failing/warning checks
+    actions = [
+        c.suggested_action for c in checks
+        if c.suggested_action and c.severity in ("fail", "warn")
+    ]
+
+    # Fail actions take priority over warnings
     fail_actions = [
         c.suggested_action for c in checks
         if c.suggested_action and c.severity == "fail"
     ]
 
     if fail_actions:
+        # If identity fails → demote; if coverage fails → merge
         if DEMOTE in fail_actions:
             return DEMOTE
         if MERGE_WITH in fail_actions:
             return MERGE_WITH
 
+    # Docs pages → promote
     if candidate.classification == CLASS_DOCS:
         return PROMOTE_DOCS
 
-    actions = [
-        c.suggested_action for c in checks
-        if c.suggested_action and c.severity in ("fail", "warn")
-    ]
-
+    # Warn-level: split beats merge
     if SPLIT_BY in actions:
         return SPLIT_BY
 
     if MERGE_WITH in actions:
+        # Only merge if there's a sibling to merge with
         if siblings:
             return MERGE_WITH
 

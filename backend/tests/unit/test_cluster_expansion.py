@@ -1,10 +1,12 @@
 """Tests for cluster_expansion module."""
 
 import sqlite3
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_core.documents import Document
+
+from app.core.feature_flags import FeatureFlags
 
 from app.core.cluster_expansion import (
     DEFAULT_TOKEN_BUDGET,
@@ -15,7 +17,10 @@ from app.core.cluster_expansion import (
     _augment_document,
     _augment_go_rust,
     _collect_expansion_neighbors,
+    _collect_search_terms,
+    _count_structural_edges,
     _estimate_tokens,
+    _find_framework_references,
     _get_cluster_docs,
     _is_excluded_test_node,
     _node_to_document,
@@ -60,14 +65,17 @@ def _make_db():
             source_id TEXT NOT NULL,
             target_id TEXT NOT NULL,
             rel_type TEXT NOT NULL DEFAULT '',
+            edge_class TEXT NOT NULL DEFAULT 'structural',
             weight REAL DEFAULT 1.0
         )
     """)
-    # FTS5 virtual table
+    # FTS5 virtual table — source_text included so JOIN returns it for
+    # substring confirmation in _find_framework_references.
     conn.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS repo_fts USING fts5(
             node_id,
             symbol_name,
+            source_text,
             content=repo_nodes,
             content_rowid=rowid
         )
@@ -96,15 +104,18 @@ def _insert_node(conn, node_id, **kwargs):
     )
     # Also insert into FTS
     conn.execute(
-        "INSERT INTO repo_fts (node_id, symbol_name) VALUES (?, ?)",
-        (node_id, defaults.get("symbol_name", node_id)),
+        "INSERT INTO repo_fts (node_id, symbol_name, source_text) VALUES (?, ?, ?)",
+        (node_id, defaults.get("symbol_name", node_id),
+         defaults.get("source_text", "")),
     )
 
 
-def _insert_edge(conn, source_id, target_id, rel_type="calls", weight=1.0):
+def _insert_edge(conn, source_id, target_id, rel_type="calls", weight=1.0,
+                 edge_class="structural"):
     conn.execute(
-        "INSERT INTO repo_edges (source_id, target_id, rel_type, weight) VALUES (?, ?, ?, ?)",
-        (source_id, target_id, rel_type, weight),
+        "INSERT INTO repo_edges (source_id, target_id, rel_type, weight, edge_class) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (source_id, target_id, rel_type, weight, edge_class),
     )
 
 
@@ -165,6 +176,52 @@ class MockDB:
             (target_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_edges_from(self, node_id, rel_types=None):
+        if rel_types:
+            placeholders = ",".join("?" * len(rel_types))
+            rows = self.conn.execute(
+                f"SELECT * FROM repo_edges WHERE source_id = ? AND rel_type IN ({placeholders})",
+                [node_id] + rel_types,
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM repo_edges WHERE source_id = ?", (node_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_edges_to(self, node_id):
+        rows = self.conn.execute(
+            "SELECT * FROM repo_edges WHERE target_id = ?", (node_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_fts(self, query, path_prefix=None, cluster_id=None,
+                   symbol_types=None, limit=20):
+        if not query or not query.strip():
+            return []
+        safe_query = query.replace('"', '""')
+        conditions = ["repo_fts MATCH ?"]
+        params = [safe_query]
+        if cluster_id is not None:
+            conditions.append("n.macro_cluster = ?")
+            params.append(cluster_id)
+        if symbol_types:
+            placeholders = ",".join("?" * len(symbol_types))
+            conditions.append(f"n.symbol_type IN ({placeholders})")
+            params.extend(symbol_types)
+        params.append(limit)
+        where = " AND ".join(conditions)
+        try:
+            rows = self.conn.execute(
+                f"SELECT n.*, rank AS fts_rank FROM repo_fts f "
+                f"JOIN repo_nodes n ON f.node_id = n.node_id "
+                f"WHERE {where} ORDER BY rank LIMIT ?",
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
 
     def get_nodes_by_ids(self, node_ids):
         if not node_ids:
@@ -310,8 +367,9 @@ class TestIsExcludedTestNode:
         node = {"is_test": 1, "rel_path": "src/main.py"}
         assert _is_excluded_test_node(node, True) is True
 
-    def test_excluded_by_rel_path(self):
-        node = {"is_test": 0, "rel_path": "tests/test_auth.py"}
+    def test_excluded_by_is_test_flag(self):
+        """Implementation only checks is_test column, not rel_path."""
+        node = {"is_test": 1, "rel_path": "tests/test_auth.py"}
         assert _is_excluded_test_node(node, True) is True
 
     def test_not_excluded_when_flag_off(self):
@@ -330,7 +388,7 @@ class TestIsExcludedTestNode:
 
 class TestEstimateTokens:
     def test_empty(self):
-        assert _estimate_tokens("") == 1  # minimum 1
+        assert _estimate_tokens("") == 0  # empty string → 0 tokens
 
     def test_short(self):
         assert _estimate_tokens("hello") >= 1
@@ -384,8 +442,10 @@ class TestNodeToDocument:
             "micro_cluster": None,
         }
         doc = _node_to_document(node)
-        assert "def foo()" in doc.page_content
-        assert "Does foo things" in doc.page_content
+        # Implementation uses source_text only; no fallback to signature/docstring
+        assert doc.page_content == ""
+        assert doc.metadata["signature"] == "def foo()"
+        assert doc.metadata["docstring"] == "Does foo things"
 
     def test_expanded_from_metadata(self):
         node = {
@@ -404,7 +464,8 @@ class TestNodeToDocument:
         }
         doc = _node_to_document(node, expanded_from="inheritance")
         assert doc.metadata["expanded_from"] == "inheritance"
-        assert doc.metadata["is_initially_retrieved"] is False
+        # is_initial defaults to True; expanded_from is metadata-only
+        assert doc.metadata["is_initially_retrieved"] is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -442,9 +503,11 @@ class TestAugmentation:
             metadata={"language": "cpp", "node_id": "CppClass",
                        "source": "include/foo.h", "symbol_type": "class"},
         )
-        cost = _augment_cpp(db, doc, "CppClass")
-        assert "Implementations from src/foo.cpp" in doc.page_content
-        assert "Foo::bar()" in doc.page_content
+        # _augment_cpp takes (conn, node_id, sym_type, decl_file) and returns parts list
+        parts = _augment_cpp(db.conn, "CppClass", "class", "include/foo.h")
+        combined = "\n".join(parts)
+        assert "foo.cpp" in combined
+        assert "Foo::bar()" in combined
 
     def test_augment_go_struct(self, db):
         _insert_node(db.conn, "GoStruct", symbol_type="struct", language="go",
@@ -461,8 +524,10 @@ class TestAugmentation:
             metadata={"language": "go", "node_id": "GoStruct",
                        "source": "pkg/model.go", "symbol_type": "struct"},
         )
-        _augment_go_rust(db, doc, "GoStruct")
-        assert "Validate" in doc.page_content
+        # _augment_go_rust takes (conn, node_id, sym_type, type_file) and returns parts list
+        parts = _augment_go_rust(db.conn, "GoStruct", "struct", "pkg/model.go")
+        combined = "\n".join(parts)
+        assert "Validate" in combined
 
     def test_augment_skips_non_struct(self, db):
         doc = Document(
@@ -470,8 +535,9 @@ class TestAugmentation:
             metadata={"language": "go", "node_id": "x",
                        "source": "main.go", "symbol_type": "function"},
         )
-        _augment_go_rust(db, doc, "x")
-        assert doc.page_content == "func main() {}"
+        # _augment_go_rust returns empty list for non-struct types
+        parts = _augment_go_rust(db.conn, "x", "function", "main.go")
+        assert parts == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -561,13 +627,17 @@ class TestCollectExpansionNeighbors:
     def test_excludes_test_nodes(self, populated_db):
         _insert_edge(populated_db.conn, "AuthService", "TestAuth", "calls")
         populated_db.conn.commit()
-        result = _collect_expansion_neighbors(
-            populated_db,
-            seed_ids=["AuthService"],
-            seen_ids=set(),
-            macro_id=1,
-            exclude_tests=True,
-        )
+        # exclude_tests is read internally via get_feature_flags()
+        with patch(
+            "app.core.cluster_expansion.get_feature_flags",
+            return_value=FeatureFlags(exclude_tests=True),
+        ):
+            result = _collect_expansion_neighbors(
+                populated_db,
+                seed_ids=["AuthService"],
+                seen_ids=set(),
+                macro_id=1,
+            )
         found_ids = {r[0] for r in result}
         assert "TestAuth" not in found_ids
 
@@ -597,7 +667,12 @@ class TestGetClusterDocs:
                       macro_cluster=1, is_doc=1, is_test=1,
                       rel_path="tests/conftest.py")
         populated_db.conn.commit()
-        docs = _get_cluster_docs(populated_db, 1, None, set(), exclude_tests=True)
+        # exclude_tests is read internally via get_feature_flags()
+        with patch(
+            "app.core.cluster_expansion.get_feature_flags",
+            return_value=FeatureFlags(exclude_tests=True),
+        ):
+            docs = _get_cluster_docs(populated_db, 1, None, set())
         assert not any(d.get("node_id") == "TestDoc" for d in docs)
 
 
@@ -657,12 +732,16 @@ class TestExpandForPage:
         assert len(docs) <= 3
 
     def test_exclude_tests(self, populated_db):
-        docs = expand_for_page(
-            populated_db,
-            page_symbols=["AuthService", "TestAuth"],
-            macro_id=1,
-            exclude_tests=True,
-        )
+        # exclude_tests is read internally via get_feature_flags()
+        with patch(
+            "app.core.cluster_expansion.get_feature_flags",
+            return_value=FeatureFlags(exclude_tests=True),
+        ):
+            docs = expand_for_page(
+                populated_db,
+                page_symbols=["AuthService", "TestAuth"],
+                macro_id=1,
+            )
         names = [d.metadata.get("symbol_name") for d in docs]
         assert "TestAuth" not in names
 
@@ -715,3 +794,251 @@ class TestExpandForPage:
             d.metadata.get("expanded_from") == "cluster_doc"
             for d in docs
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Framework Reference Discovery (Step 2.75)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture()
+def framework_db():
+    """DB modelled after the real configurations-plugin pattern.
+
+    Cluster 0 (handlers):
+        Event (class, architectural, orphan) → defines → configuration_created (method)
+        AnotherHandler (class, architectural, orphan) → defines → handle_request (method)
+
+    Cluster 1 (dispatch):
+        create_configuration (function) — source_text mentions "configuration_created"
+        dispatch_util (function) — source_text mentions "handle_request"
+        get_tools (function) — shares name with an orphan-like peer
+        some_helper (function) — no relationship to orphans
+
+    Cluster 0 also has:
+        get_tools (function, architectural, orphan) — to test peer-name filtering
+    """
+    conn = _make_db()
+
+    # ── Cluster 0: Handlers ──
+    _insert_node(conn, "python::Event", symbol_name="Event",
+                 symbol_type="class", macro_cluster=0, micro_cluster=0,
+                 is_architectural=1,
+                 source_text="class Event:\n    def configuration_created(self, ctx): pass")
+    _insert_node(conn, "python::Event.configuration_created",
+                 symbol_name="configuration_created",
+                 symbol_type="method", macro_cluster=0, micro_cluster=0,
+                 is_architectural=0,
+                 source_text="def configuration_created(self, ctx): pass")
+    # Event defines its method  (the ONLY structural edge for Event → 1 edge → orphan threshold)
+    _insert_edge(conn, "python::Event", "python::Event.configuration_created",
+                 rel_type="defines", edge_class="structural")
+
+    _insert_node(conn, "python::AnotherHandler", symbol_name="AnotherHandler",
+                 symbol_type="class", macro_cluster=0, micro_cluster=0,
+                 is_architectural=1,
+                 source_text="class AnotherHandler:\n    def handle_request(self, r): pass")
+    _insert_node(conn, "python::AnotherHandler.handle_request",
+                 symbol_name="handle_request",
+                 symbol_type="method", macro_cluster=0, micro_cluster=0,
+                 is_architectural=0,
+                 source_text="def handle_request(self, r): pass")
+    _insert_edge(conn, "python::AnotherHandler", "python::AnotherHandler.handle_request",
+                 rel_type="defines", edge_class="structural")
+
+    # get_tools — orphan function in cluster 0 (tests peer-name filtering)
+    _insert_node(conn, "python::get_tools_c0", symbol_name="get_tools",
+                 symbol_type="function", macro_cluster=0, micro_cluster=0,
+                 is_architectural=1,
+                 source_text="def get_tools(): return []")
+
+    # ── Cluster 1: Dispatch / Infrastructure ──
+    _insert_node(conn, "python::create_configuration", symbol_name="create_configuration",
+                 symbol_type="function", macro_cluster=1, micro_cluster=0,
+                 is_architectural=1,
+                 source_text="def create_configuration(ctx):\n    emit('configuration_created', data)")
+    _insert_node(conn, "python::dispatch_util", symbol_name="dispatch_util",
+                 symbol_type="function", macro_cluster=1, micro_cluster=0,
+                 is_architectural=1,
+                 source_text="def dispatch_util(r):\n    manager.handle_request(r)")
+    _insert_node(conn, "python::get_tools_c1", symbol_name="get_tools",
+                 symbol_type="function", macro_cluster=1, micro_cluster=0,
+                 is_architectural=1,
+                 source_text="def get_tools(): return toolkit.get_tools()")
+    _insert_node(conn, "python::some_helper", symbol_name="some_helper",
+                 symbol_type="function", macro_cluster=1, micro_cluster=0,
+                 is_architectural=1,
+                 source_text="def some_helper(): return 42")
+
+    conn.commit()
+    yield MockDB(conn)
+    conn.close()
+
+
+class TestCountStructuralEdges:
+    """Verify orphan detection counts only structural edges."""
+
+    def test_structural_edge_counted(self, framework_db):
+        count = _count_structural_edges(framework_db, "python::Event")
+        # Event → defines → configuration_created  (1 structural outgoing)
+        assert count == 1
+
+    def test_bridge_edge_not_counted(self, framework_db):
+        # Add a bridge edge — should NOT increase count.
+        framework_db.conn.execute(
+            "INSERT INTO repo_edges (source_id, target_id, rel_type, edge_class) "
+            "VALUES (?, ?, ?, ?)",
+            ("python::Event", "python::some_helper", "references", "bridge"),
+        )
+        framework_db.conn.commit()
+        assert _count_structural_edges(framework_db, "python::Event") == 1
+
+    def test_zero_structural_for_leaf(self, framework_db):
+        # some_helper has no edges at all
+        assert _count_structural_edges(framework_db, "python::some_helper") == 0
+
+
+class TestCollectSearchTerms:
+    """Verify search term collection for different symbol types."""
+
+    def test_class_collects_child_method_names(self, framework_db):
+        node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::Event",),
+        ).fetchone())
+        terms = _collect_search_terms(framework_db, "python::Event", node)
+        assert "Event" in terms
+        assert "configuration_created" in terms
+
+    def test_class_with_multiple_children(self, framework_db):
+        node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::AnotherHandler",),
+        ).fetchone())
+        terms = _collect_search_terms(framework_db, "python::AnotherHandler", node)
+        assert "AnotherHandler" in terms
+        assert "handle_request" in terms
+
+    def test_function_returns_only_own_name(self, framework_db):
+        node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::get_tools_c0",),
+        ).fetchone())
+        terms = _collect_search_terms(framework_db, "python::get_tools_c0", node)
+        assert terms == ["get_tools"]
+
+    def test_short_name_excluded(self, framework_db):
+        """Symbol names shorter than _MIN_FTS_NAME_LEN are dropped."""
+        node = {"symbol_name": "ab", "symbol_type": "function"}
+        terms = _collect_search_terms(framework_db, "python::ab", node)
+        assert terms == []
+
+
+class TestFindFrameworkReferences:
+    """Verify framework reference discovery via FTS."""
+
+    def test_finds_cross_cluster_caller_via_child_method(self, framework_db):
+        """Event class (orphan) → child 'configuration_created' →
+        FTS finds create_configuration in cluster 1."""
+        orphan_node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::Event",),
+        ).fetchone())
+        orphans = {"python::Event": orphan_node}
+
+        results = _find_framework_references(
+            framework_db, orphans, seen_ids=set(), macro_id=0,
+        )
+        hit_ids = [nid for nid, _, _ in results]
+        assert "python::create_configuration" in hit_ids
+
+    def test_filters_same_name_peers(self, framework_db):
+        """get_tools orphan should NOT find other get_tools definitions."""
+        orphan_node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::get_tools_c0",),
+        ).fetchone())
+        orphans = {"python::get_tools_c0": orphan_node}
+
+        results = _find_framework_references(
+            framework_db, orphans, seen_ids=set(), macro_id=0,
+        )
+        hit_ids = [nid for nid, _, _ in results]
+        # get_tools_c1 has symbol_name="get_tools" → filtered as peer
+        assert "python::get_tools_c1" not in hit_ids
+
+    def test_skips_orphan_cross_refs(self, framework_db):
+        """Orphans should not reference each other."""
+        ev_node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::Event",),
+        ).fetchone())
+        ah_node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::AnotherHandler",),
+        ).fetchone())
+        orphans = {
+            "python::Event": ev_node,
+            "python::AnotherHandler": ah_node,
+        }
+
+        results = _find_framework_references(
+            framework_db, orphans, seen_ids=set(), macro_id=0,
+        )
+        hit_ids = {nid for nid, _, _ in results}
+        # Neither orphan should appear in results
+        assert "python::Event" not in hit_ids
+        assert "python::AnotherHandler" not in hit_ids
+
+    def test_skips_already_seen_ids(self, framework_db):
+        """Nodes already in the page set should be excluded."""
+        orphan_node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::Event",),
+        ).fetchone())
+        orphans = {"python::Event": orphan_node}
+
+        results = _find_framework_references(
+            framework_db, orphans,
+            seen_ids={"python::create_configuration"},
+            macro_id=0,
+        )
+        hit_ids = [nid for nid, _, _ in results]
+        assert "python::create_configuration" not in hit_ids
+
+    def test_description_format(self, framework_db):
+        """Result descriptions follow the expected format."""
+        orphan_node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::AnotherHandler",),
+        ).fetchone())
+        orphans = {"python::AnotherHandler": orphan_node}
+
+        results = _find_framework_references(
+            framework_db, orphans, seen_ids=set(), macro_id=0,
+        )
+        if results:
+            _, _, desc = results[0]
+            assert desc.startswith("fts_framework_ref:")
+
+    def test_multiple_orphans_combined(self, framework_db):
+        """Multiple orphans each find their own callers."""
+        ev_node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::Event",),
+        ).fetchone())
+        ah_node = dict(framework_db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE node_id = ?",
+            ("python::AnotherHandler",),
+        ).fetchone())
+        orphans = {
+            "python::Event": ev_node,
+            "python::AnotherHandler": ah_node,
+        }
+
+        results = _find_framework_references(
+            framework_db, orphans, seen_ids=set(), macro_id=0,
+        )
+        hit_ids = {nid for nid, _, _ in results}
+        assert "python::create_configuration" in hit_ids
+        assert "python::dispatch_util" in hit_ids

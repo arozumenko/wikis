@@ -1,8 +1,8 @@
 """
-Cluster-Based Structure Planner
+Phase 4 — Cluster-Based Structure Planner
 
-Converts pre-computed graph clusters into a full ``WikiStructureSpec``
-with cheap LLM naming calls.
+Converts pre-computed math clusters (Phases 1-3) into a full
+``WikiStructureSpec`` with cheap LLM naming calls.
 
 **Two-pass naming** eliminates "centroid bleed" — where macro-cluster
 dominant symbols would shadow per-page content:
@@ -12,19 +12,15 @@ dominant symbols would shadow per-page content:
 - **Pass 2** (page naming): one LLM call per micro-cluster using
   *only that page's own* enriched symbols → page name + description.
 
-Unlike the DeepWiki version (which depends on a SQL database), this
-implementation works entirely with in-memory data: a ``ClusterAssignment``
-from the clustering engine and the original NetworkX ``MultiDiGraph``.
+Activation::
+
+    WIKIS_STRUCTURE_PLANNER=cluster
 
 Usage::
 
     from .cluster_planner import ClusterStructurePlanner
 
-    planner = ClusterStructurePlanner(
-        graph=G,
-        cluster_assignment=assignment,
-        llm=chat_model,
-    )
+    planner = ClusterStructurePlanner(db, llm)
     spec = planner.plan_structure()
 """
 
@@ -33,32 +29,22 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import time
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import networkx as nx
 
-from ..cluster_constants import (
-    DOC_DOMINANT_THRESHOLD,
-    PAGE_IDENTITY_SYMBOLS,
-    SUPPORTING_CODE_SYMBOLS,
-    DOC_CLUSTER_SYMBOLS,
-    SYMBOL_TYPE_PRIORITY,
-    is_test_path,
-)
-from ..constants import ARCHITECTURAL_SYMBOLS, DOC_SYMBOL_TYPES
-from ..graph_clustering import ClusterAssignment, select_central_symbols
+from ..constants import PAGE_IDENTITY_SYMBOLS, SUPPORTING_CODE_SYMBOLS, DOC_CLUSTER_SYMBOLS, SYMBOL_TYPE_PRIORITY
+from ..feature_flags import get_feature_flags
+from ..graph_clustering import select_central_symbols
 from ..state.wiki_state import PageSpec, SectionSpec, WikiStructureSpec
-from .cluster_prompts import (
-    PAGE_NAMING_SYSTEM,
-    PAGE_NAMING_USER,
-    SECTION_NAMING_SYSTEM,
-    SECTION_NAMING_USER,
-)
+from ..unified_db import UnifiedWikiDB
+from .candidate_builder import build_candidates
+from .coverage_ledger import CoverageLedger
+from .page_validator import validate_all, KEEP, MERGE_WITH, DEMOTE
 
 logger = logging.getLogger(__name__)
 
@@ -72,105 +58,147 @@ MAX_DOMINANT_SYMBOLS = 10
 #: Maximum symbols summarised per micro-cluster in the prompt
 MAX_MICRO_SUMMARY_SYMBOLS = 8
 
-#: Maximum symbols sent to the page-naming LLM call
-MAX_PAGE_NAMING_SYMBOLS = 12
-
 #: Truncation length for signatures and docstrings in prompts
 SIGNATURE_TRUNC = 200
 DOCSTRING_TRUNC = 200
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Prompts — Two-pass naming
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Pass 1: Section naming (one call per macro-cluster) ──────────────
+
+SECTION_NAMING_SYSTEM = """\
+You are a documentation architect writing for a mixed audience: product \
+managers, team leads, and engineers.  You are given the most representative \
+code symbols from a group of related source files.
+
+Your job: create a short, user-facing **capability name** and a one-sentence \
+description for this section of a wiki.  The name must describe WHAT the \
+software does for its users — not how it is implemented.
+
+Rules:
+- Use plain language a non-developer stakeholder can understand.
+- Name the CAPABILITY or DOMAIN, not file names or class names.
+- Good: "Leader Election & Health Monitoring", "Payment Processing", \
+"Real-time Data Transformation SDK"
+- Bad: "leader_balancer.cc and related files", "Class AuthService", \
+"src/v/resource_mgmt"
+- The name must be ≤ 8 words."""
+
+SECTION_NAMING_USER = """\
+SECTION CLUSTER — {node_count} symbols across {file_count} files
+
+TOP SYMBOLS (most connected and documented in this section):
+{dominant_symbols_json}
+
+SUB-GROUPS (page-level groupings — shown only for context; name the section, \
+not individual pages):
+{micro_summaries_json}
+
+Output ONLY valid JSON (no markdown fences):
+{{
+  "section_name": "...",
+  "section_description": "..."
+}}"""
+
+# ── Pass 2: Page naming (one call per micro-cluster) ─────────────────
+
+PAGE_NAMING_SYSTEM = """\
+You are a documentation architect writing page titles for a technical wiki.  \
+The audience includes non-technical stakeholders, so page names must describe \
+the CAPABILITY or FUNCTIONALITY in plain language — never use class names, \
+file names, or implementation jargon as the page title.
+
+You are given the symbols that belong to ONE specific page.  Name this page \
+based ONLY on these symbols — ignore anything outside this list.
+
+Rules:
+- Name the CAPABILITY (what does this code accomplish for its users?).
+- Good: "Record Batch Decoding & Output Routing", "Disk Space Reclamation"
+- Bad: "disk_space_manager and storage.h", "JS VM Bridge"
+- The name must be ≤ 10 words.
+- Description: one sentence explaining the page's value to a reader.
+- retrieval_query: 3-6 keyword phrase for documentation search."""
+
+PAGE_NAMING_USER = """\
+PAGE CLUSTER — {symbol_count} symbols in {file_count} files
+Parent section: "{section_name}"
+
+PAGE SYMBOLS (this page's own representative code elements):
+{page_symbols_json}
+
+DIRECTORIES:
+{directories_json}
+
+Output ONLY valid JSON (no markdown fences):
+{{
+  "page_name": "...",
+  "description": "...",
+  "retrieval_query": "..."
+}}"""
+
+# Legacy constant kept for backward compatibility in tests
+CLUSTER_NAMING_SYSTEM = SECTION_NAMING_SYSTEM
+CLUSTER_NAMING_USER = SECTION_NAMING_USER
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Planner
 # ═══════════════════════════════════════════════════════════════════════════
 
-
 class ClusterStructurePlanner:
     """Build a WikiStructureSpec from pre-computed clusters + cheap LLM naming.
 
     Parameters
     ----------
-    graph : nx.MultiDiGraph
-        Full code graph with node attributes (``symbol_name``, ``symbol_type``,
-        ``rel_path``, ``signature``, ``docstring``, etc.).
-    cluster_assignment : ClusterAssignment
-        Pre-computed cluster assignments from ``run_clustering()``.
+    db : UnifiedWikiDB
+        Unified DB with Phase 3 cluster assignments already persisted.
     llm : BaseLanguageModel
         LangChain LLM used exclusively for naming (cheap, small prompts).
     wiki_title : str, optional
-        Override wiki title; if *None*, derived from repo name.
-    repo_name : str, optional
-        Repository name for title derivation.
-    exclude_tests : bool
-        Whether to exclude test nodes from the planner output.
+        Override wiki title; if *None*, derived from repo metadata.
     """
 
     def __init__(
         self,
-        graph: nx.MultiDiGraph,
-        cluster_assignment: ClusterAssignment,
+        db: UnifiedWikiDB,
         llm: BaseLanguageModel,
-        wiki_title: str | None = None,
-        repo_name: str | None = None,
-        exclude_tests: bool = True,
-        db=None,
+        wiki_title: Optional[str] = None,
     ):
-        self.graph = graph
-        self.cluster_assignment = cluster_assignment
-        self.llm = llm
-        self.repo_name = repo_name or ""
-        self.wiki_title = wiki_title or self._derive_wiki_title()
-        self.exclude_tests = exclude_tests
         self.db = db
-        self._central_k: int | None = None
+        self.llm = llm
+        self.wiki_title = wiki_title or self._derive_wiki_title()
+        self._cluster_graph: Optional[nx.MultiDiGraph] = None
+        self._central_k: Optional[int] = None
 
-    # ── Node access helpers ──────────────────────────────────────────
-
-    def _get_node(self, node_id: str) -> dict[str, Any] | None:
-        """Fetch node attributes from the graph.  Returns ``None`` if missing."""
-        if node_id not in self.graph:
-            return None
-        data = dict(self.graph.nodes[node_id])
-        # Ensure node_id is accessible as an attribute
-        data.setdefault("node_id", node_id)
-        return data
-
-    def _is_architectural(self, node_data: dict[str, Any]) -> bool:
-        """Return True if the node represents an architectural symbol."""
-        stype = (node_data.get("symbol_type") or "").lower()
-        return stype in ARCHITECTURAL_SYMBOLS
-
-    def _is_doc_node(self, node_data: dict[str, Any]) -> bool:
-        stype = (node_data.get("symbol_type") or "").lower()
-        return stype in DOC_SYMBOL_TYPES
-
-    def _is_test_node(self, node_data: dict[str, Any]) -> bool:
-        if not self.exclude_tests:
-            return False
-        rel_path = node_data.get("rel_path") or node_data.get("file_path") or ""
-        return is_test_path(rel_path)
-
-    def _edge_count_for(self, node_id: str) -> int:
-        """Count outgoing edges as a connectivity proxy."""
-        if node_id not in self.graph:
-            return 0
-        return self.graph.out_degree(node_id)
+        # Pre-compute test-exclusion SQL fragment once
+        flags = get_feature_flags()
+        self._exclude_tests = flags.exclude_tests
+        self._test_sql = " AND is_test = 0" if self._exclude_tests else ""
 
     # ── adaptive central-k ────────────────────────────────────────────
 
     def _adaptive_central_k(self) -> int:
         """Scale central symbol count with repo size.
 
-        | Nodes      | k |
-        |------------|---|
-        | < 200      | 5 |
-        | 200–999    | 8 |
-        | 1000–4999  | 12|
-        | 5000+      | 15|
+        Smaller repos need fewer representative symbols per page;
+        larger repos need more to capture the breadth of each cluster.
+
+        | Nodes      | k (central symbols) |
+        |------------|---------------------|
+        | < 200      | 5                   |
+        | 200–999    | 8                   |
+        | 1000–4999  | 12                  |
+        | 5000+      | 15                  |
         """
         if self._central_k is not None:
             return self._central_k
-        n = self.graph.number_of_nodes()
+
+        G = self._get_cluster_graph()
+        n = G.number_of_nodes()
         if n >= 5000:
             k = 15
         elif n >= 1000:
@@ -182,52 +210,6 @@ class ClusterStructurePlanner:
         self._central_k = k
         return k
 
-    # ── Cluster map construction ─────────────────────────────────────
-
-    def _build_architectural_cluster_map(
-        self,
-    ) -> dict[int, dict[int, list[str]]]:
-        """Build ``{macro: {micro: [node_ids]}}`` from the ClusterAssignment.
-
-        Uses the ``sections`` dict which stores
-        ``{section_id: {"pages": {page_id: [node_ids]}, ...}}``.
-        Filters to architectural nodes only, optionally excluding test nodes.
-        """
-        result: dict[int, dict[int, list[str]]] = {}
-
-        for section_id, section_data in self.cluster_assignment.sections.items():
-            pages = section_data.get("pages", {})
-            for page_id, node_ids in pages.items():
-                for node_id in node_ids:
-                    node = self._get_node(node_id)
-                    if node is None:
-                        continue
-                    if not self._is_architectural(node):
-                        continue
-                    if self._is_test_node(node):
-                        continue
-                    result.setdefault(section_id, {}).setdefault(
-                        page_id, []
-                    ).append(node_id)
-
-        # Remove empty entries
-        for macro in list(result.keys()):
-            for micro in list(result[macro].keys()):
-                if not result[macro][micro]:
-                    del result[macro][micro]
-            if not result[macro]:
-                del result[macro]
-
-        total_nodes = sum(
-            len(nids) for mm in result.values() for nids in mm.values()
-        )
-        logger.info(
-            "Built architectural cluster map: %d macro-clusters, %d nodes",
-            len(result),
-            total_nodes,
-        )
-        return result
-
     # ── public API ────────────────────────────────────────────────────
 
     def plan_structure(self) -> WikiStructureSpec:
@@ -237,22 +219,107 @@ class ClusterStructurePlanner:
         """
         t0 = time.time()
 
-        cluster_map = self._build_architectural_cluster_map()
+        # 1. Load cluster map from DB: macro → micro → [node_ids]
+        #    Filter to architectural nodes only — methods/fields were propagated
+        #    into clusters by Phase 3 but they inflate the cluster count and
+        #    prompt size.  The expansion module already filters to architectural
+        #    nodes (is_architectural = 1), so the planner should do the same.
+        cluster_map = self._load_architectural_cluster_map()
         if not cluster_map:
-            logger.warning(
-                "ClusterStructurePlanner: no clusters — returning fallback"
-            )
+            logger.warning("ClusterStructurePlanner: no clusters in DB — returning fallback")
             return self._fallback_spec()
-
-        # ── Phase 5/6: Optional candidate validation & coverage ──────
-        cluster_map = self._maybe_validate_candidates(cluster_map)
 
         logger.info(
             "ClusterStructurePlanner: %d macro-clusters to name",
             len(cluster_map),
         )
 
-        sections: list[SectionSpec] = []
+        # 1b. Optional: candidate validation (Phase 5)
+        flags = get_feature_flags()
+        if flags.capability_validation:
+            candidates = build_candidates(self.db, cluster_map)
+            validations = validate_all(candidates)
+
+            # Pass 1 — Remove DEMOTE candidates
+            for vr in validations:
+                if vr.shape_decision == DEMOTE:
+                    mid = vr.candidate.macro_id
+                    pid = vr.candidate.micro_id
+                    if mid in cluster_map and pid in cluster_map[mid]:
+                        del cluster_map[mid][pid]
+                        logger.debug(
+                            "ClusterStructurePlanner: demoted micro %d.%d",
+                            mid, pid,
+                        )
+
+            # Pass 2 — Merge MERGE_WITH candidates into their largest
+            # surviving sibling (same macro-cluster).
+            merge_count = 0
+            for vr in validations:
+                if vr.shape_decision != MERGE_WITH:
+                    continue
+                mid = vr.candidate.macro_id
+                pid = vr.candidate.micro_id
+                if mid not in cluster_map or pid not in cluster_map[mid]:
+                    continue
+                # Find largest surviving sibling in this macro
+                best_sibling = None
+                best_size = 0
+                for other_pid, other_nids in cluster_map[mid].items():
+                    if other_pid == pid:
+                        continue
+                    if len(other_nids) > best_size:
+                        best_size = len(other_nids)
+                        best_sibling = other_pid
+                if best_sibling is not None:
+                    cluster_map[mid][best_sibling].extend(
+                        cluster_map[mid].pop(pid),
+                    )
+                    merge_count += 1
+
+            if merge_count:
+                logger.info(
+                    "ClusterStructurePlanner: merged %d MERGE_WITH candidates",
+                    merge_count,
+                )
+
+            # Clean up empty macros
+            cluster_map = {
+                m: micros for m, micros in cluster_map.items() if micros
+            }
+
+            total_surviving_pages = sum(
+                len(micros) for micros in cluster_map.values()
+            )
+            logger.info(
+                "ClusterStructurePlanner: after validation — %d sections, "
+                "%d pages surviving",
+                len(cluster_map), total_surviving_pages,
+            )
+
+        # 1c. Optional: coverage ledger (Phase 6)
+        coverage_report = None
+        if flags.coverage_ledger:
+            # Rebuild candidates after any demotion so ledger sees current state
+            ledger_candidates = build_candidates(self.db, cluster_map)
+            ledger = CoverageLedger(self.db, ledger_candidates)
+            coverage_report = ledger.report()
+            logger.info(
+                "CoverageLedger: symbols %d/%d (%.0f%%), docs %d/%d, dirs %d/%d, "
+                "uncovered HV: %d, overlaps: %d",
+                coverage_report.covered_symbols,
+                coverage_report.total_symbols,
+                coverage_report.symbol_coverage * 100,
+                coverage_report.covered_doc_domains,
+                coverage_report.total_doc_domains,
+                coverage_report.covered_directories,
+                coverage_report.total_directories,
+                len(coverage_report.uncovered_high_value),
+                len(coverage_report.page_overlap_pairs),
+            )
+
+        # 2. Name each macro-cluster via one LLM call
+        sections: List[SectionSpec] = []
         section_order = 1
 
         for macro_id in sorted(cluster_map.keys()):
@@ -268,12 +335,11 @@ class ClusterStructurePlanner:
             except Exception as exc:
                 logger.warning(
                     "LLM naming failed for macro %d, using fallback: %s",
-                    macro_id,
-                    exc,
+                    macro_id, exc,
                 )
-                sections.append(
-                    self._fallback_section(macro_id, micro_map, section_order)
-                )
+                sections.append(self._fallback_section(
+                    macro_id, micro_map, section_order,
+                ))
                 section_order += 1
 
         total_pages = sum(len(s.pages) for s in sections)
@@ -281,9 +347,7 @@ class ClusterStructurePlanner:
 
         logger.info(
             "ClusterStructurePlanner: %d sections, %d pages in %.1fs",
-            len(sections),
-            total_pages,
-            elapsed,
+            len(sections), total_pages, elapsed,
         )
 
         return WikiStructureSpec(
@@ -293,29 +357,90 @@ class ClusterStructurePlanner:
             total_pages=total_pages,
         )
 
-    # ── Two-pass naming ───────────────────────────────────────────────
+    # ── Architectural cluster map ──────────────────────────────────
+
+    def _load_architectural_cluster_map(
+        self,
+    ) -> Dict[int, Dict[int, List[str]]]:
+        """Load cluster map filtered to architectural nodes only.
+
+        Phase 3 propagates assignments to child nodes (methods, fields, etc.)
+        so that the unified DB has a complete mapping.  However, the structure
+        planner should only consider top-level *architectural* symbols — the
+        same set used by the content expansion module — to avoid inflating
+        section and page counts.
+
+        When ``exclude_tests`` is enabled, test nodes (``is_test = 1``) are
+        also excluded — they should not form wiki pages.
+
+        Returns ``{macro_id: {micro_id: [node_ids]}}`` where every node_id
+        belongs to a non-test architectural symbol.
+        """
+        flags = get_feature_flags()
+        test_filter = self._test_sql
+
+        rows = self.db.conn.execute(
+            "SELECT node_id, macro_cluster, micro_cluster "
+            "FROM repo_nodes "
+            "WHERE macro_cluster IS NOT NULL AND is_architectural = 1"
+            + test_filter
+        ).fetchall()
+
+        result: Dict[int, Dict[int, List[str]]] = {}
+        for row in rows:
+            macro = row["macro_cluster"]
+            micro = row["micro_cluster"] or 0
+            result.setdefault(macro, {}).setdefault(micro, []).append(row["node_id"])
+
+        # Remove empty micro-clusters (all their arch nodes were in a
+        # different micro).  This shouldn't happen often, but guard anyway.
+        for macro in list(result.keys()):
+            for micro in list(result[macro].keys()):
+                if not result[macro][micro]:
+                    del result[macro][micro]
+            if not result[macro]:
+                del result[macro]
+
+        total_nodes = sum(
+            len(nids) for mm in result.values() for nids in mm.values()
+        )
+        logger.info(
+            "Loaded architectural cluster map: %d macro-clusters, %d nodes "
+            "(filtered from full cluster map)",
+            len(result), total_nodes,
+        )
+        return result
+
+    # ── LLM naming per macro-cluster ─────────────────────────────────
 
     def _name_macro_cluster(
         self,
         macro_id: int,
-        micro_map: dict[int, list[str]],
+        micro_map: Dict[int, List[str]],
         section_order: int,
     ) -> SectionSpec:
-        """Two-pass naming: section name first, then each page independently."""
-        all_node_ids: set[str] = set()
+        """Two-pass naming: section name first, then each page independently.
+
+        Pass 1 — Section naming: one LLM call with macro-cluster dominant
+        symbols to produce section_name + section_description.
+
+        Pass 2 — Page naming: one LLM call **per micro-cluster** using
+        only that micro-cluster's own enriched symbols (with signatures
+        and docstrings).  This eliminates the "centroid bleed" problem
+        where macro-level dominant symbols would shadow page-level content.
+        """
+
+        all_node_ids = set()
         for nids in micro_map.values():
             all_node_ids.update(nids)
 
-        file_count = len(
-            {
-                (self._get_node(nid) or {}).get("rel_path", "")
-                for nid in list(all_node_ids)[:200]
-            }
-            - {""}
-        )
+        file_count = len({
+            (self.db.get_node(nid) or {}).get("rel_path", "")
+            for nid in list(all_node_ids)[:200]
+        } - {""})
 
         # ── Pass 1: Section naming ──────────────────────────────────
-        dominant = self._get_dominant_symbols(list(all_node_ids))
+        dominant = self._get_dominant_symbols(macro_id)
         micro_summaries = self._get_micro_summaries(micro_map)
 
         section_prompt = SECTION_NAMING_USER.format(
@@ -325,37 +450,31 @@ class ClusterStructurePlanner:
             micro_summaries_json=json.dumps(micro_summaries, indent=2),
         )
 
-        section_response = self.llm.invoke(
-            [
-                SystemMessage(content=SECTION_NAMING_SYSTEM),
-                HumanMessage(content=section_prompt),
-            ]
-        )
+        section_response = self.llm.invoke([
+            SystemMessage(content=SECTION_NAMING_SYSTEM),
+            HumanMessage(content=section_prompt),
+        ])
         section_naming = _parse_json_response(_extract_text(section_response))
-        section_name = (
-            section_naming.get("section_name") or f"Section {macro_id}"
-        )
+        section_name = section_naming.get("section_name") or f"Section {macro_id}"
         section_desc = (
             section_naming.get("section_description")
             or f"Section covering {len(all_node_ids)} symbols"
         )
 
         # ── Pass 2: Page naming (one call per micro-cluster) ────────
-        pages: list[PageSpec] = []
+        pages: List[PageSpec] = []
         page_order = 1
 
         for micro_id in sorted(micro_map.keys()):
             node_ids = micro_map[micro_id]
 
+            # Build enriched page-level symbols (with signatures + docstrings)
             page_symbols = self._get_page_symbols(node_ids)
             page_dirs = self._node_ids_to_folders(node_ids)
-            page_file_count = len(
-                {
-                    (self._get_node(nid) or {}).get("rel_path", "")
-                    for nid in node_ids[:100]
-                }
-                - {""}
-            )
+            page_file_count = len(set(
+                (self.db.get_node(nid) or {}).get("rel_path", "")
+                for nid in node_ids[:100]
+            ) - {""})
 
             page_prompt = PAGE_NAMING_USER.format(
                 symbol_count=len(node_ids),
@@ -366,21 +485,15 @@ class ClusterStructurePlanner:
             )
 
             try:
-                page_response = self.llm.invoke(
-                    [
-                        SystemMessage(content=PAGE_NAMING_SYSTEM),
-                        HumanMessage(content=page_prompt),
-                    ]
-                )
-                page_naming = _parse_json_response(
-                    _extract_text(page_response)
-                )
+                page_response = self.llm.invoke([
+                    SystemMessage(content=PAGE_NAMING_SYSTEM),
+                    HumanMessage(content=page_prompt),
+                ])
+                page_naming = _parse_json_response(_extract_text(page_response))
             except Exception as exc:
                 logger.warning(
                     "Page naming failed for macro %d micro %d: %s",
-                    macro_id,
-                    micro_id,
-                    exc,
+                    macro_id, micro_id, exc,
                 )
                 page_naming = {}
 
@@ -392,82 +505,82 @@ class ClusterStructurePlanner:
                 page_naming.get("description")
                 or f"Page covering {len(node_ids)} symbols"
             )
-            retrieval_query = page_naming.get("retrieval_query") or page_name
+            retrieval_query = (
+                page_naming.get("retrieval_query")
+                or page_name
+            )
 
+            # Select central symbols via PageRank (Phase 7F)
             central_ids = self._select_central_node_ids(
-                node_ids,
-                k=self._adaptive_central_k(),
+                node_ids, k=self._adaptive_central_k(),
             )
             target_symbols = self._node_ids_to_symbol_names(central_ids)
             key_files = self._node_ids_to_paths(node_ids)
-            target_folders = page_dirs
+            target_folders = self._node_ids_to_folders(node_ids)
             target_docs = self._node_ids_to_doc_paths(node_ids)
 
-            pages.append(
-                PageSpec(
-                    page_name=page_name,
-                    page_order=page_order,
-                    description=page_desc,
-                    content_focus=page_desc,
-                    rationale=(
-                        f"Grouped by graph clustering "
-                        f"(macro={macro_id}, micro={micro_id}, "
-                        f"{len(node_ids)} symbols)"
-                    ),
-                    target_symbols=target_symbols,
-                    target_docs=target_docs,
-                    target_folders=target_folders,
-                    key_files=key_files,
-                    retrieval_query=retrieval_query,
-                    metadata={
-                        "planner_mode": "cluster",
-                        "section_id": macro_id,
-                        "page_id": micro_id,
-                        "cluster_node_ids": list(node_ids),
-                    },
-                )
-            )
+            pages.append(PageSpec(
+                page_name=page_name,
+                page_order=page_order,
+                description=page_desc,
+                content_focus=page_desc,
+                rationale=f"Grouped by graph clustering (macro={macro_id}, micro={micro_id}, {len(node_ids)} symbols)",
+                target_symbols=target_symbols,
+                target_docs=target_docs,
+                target_folders=target_folders,
+                key_files=key_files,
+                retrieval_query=retrieval_query,
+                metadata={
+                    "planner_mode": "cluster",
+                    "section_id": macro_id,
+                    "page_id": micro_id,
+                    "cluster_node_ids": list(node_ids),
+                },
+            ))
             page_order += 1
 
         return SectionSpec(
             section_name=section_name,
             section_order=section_order,
             description=section_desc,
-            rationale=(
-                f"Mathematical clustering: macro={macro_id}, "
-                f"{len(micro_map)} pages, {len(all_node_ids)} symbols"
-            ),
+            rationale=f"Mathematical clustering: macro={macro_id}, {len(micro_map)} pages, {len(all_node_ids)} symbols",
             pages=pages,
         )
 
     # ── Dominant symbols for prompt ──────────────────────────────────
 
-    def _get_dominant_symbols(
-        self, node_ids: list[str]
-    ) -> list[dict[str, Any]]:
-        """Get top-N most representative architectural symbols.
+    def _get_dominant_symbols(self, macro_id: int) -> List[Dict[str, Any]]:
+        """Get top-N most representative *architectural* symbols from a macro-cluster.
 
-        Scoring: ``min(edge_count, 10) + has_docstring(2)``
+        Scoring: min(edge_count, 10) + has_docstring(2)
+        Only architectural nodes are considered — methods, fields, etc. are excluded.
         """
-        scored: list[tuple[int, dict[str, Any]]] = []
+        nodes = self.db.get_nodes_by_cluster(macro=macro_id)
+        if not nodes:
+            return []
 
-        for nid in node_ids:
-            node = self._get_node(nid)
-            if node is None or not self._is_architectural(node):
-                continue
-            if self._is_test_node(node):
-                continue
-            edge_count = self._edge_count_for(nid)
-            score = min(edge_count, 10) + (2 if node.get("docstring") else 0)
-            scored.append((score, node))
+        # Filter to architectural nodes only (and exclude test nodes when flag is on)
+        nodes = [n for n in nodes if n.get("is_architectural")]
+        if self._exclude_tests:
+            nodes = [n for n in nodes if not n.get("is_test")]
+
+        scored = []
+        for n in nodes:
+            # Count outgoing edges as proxy for connectivity
+            edge_count = len(self.db.get_edges_from(n["node_id"]))
+            score = (
+                min(edge_count, 10)
+                + (2 if n.get("docstring") else 0)
+            )
+            scored.append((score, n))
 
         scored.sort(key=lambda x: -x[0])
 
         return [
             {
-                "name": n.get("symbol_name") or n.get("name", ""),
-                "type": n.get("symbol_type") or "",
-                "path": n.get("rel_path") or "",
+                "name": n["symbol_name"],
+                "type": n["symbol_type"],
+                "path": n["rel_path"],
                 "signature": (n.get("signature") or "")[:SIGNATURE_TRUNC],
                 "docstring": (n.get("docstring") or "")[:DOCSTRING_TRUNC],
             }
@@ -475,154 +588,208 @@ class ClusterStructurePlanner:
         ]
 
     def _get_micro_summaries(
-        self, micro_map: dict[int, list[str]]
-    ) -> list[dict[str, Any]]:
+        self, micro_map: Dict[int, List[str]]
+    ) -> List[Dict[str, Any]]:
         """Build compact summaries of each micro-cluster for the LLM prompt."""
-        summaries: list[dict[str, Any]] = []
-
+        summaries = []
         for micro_id in sorted(micro_map.keys()):
             node_ids = micro_map[micro_id]
-            nodes = []
-            for nid in node_ids[: MAX_MICRO_SUMMARY_SYMBOLS * 3]:
-                node = self._get_node(nid)
-                if node and self._is_architectural(node):
-                    nodes.append(node)
+            # Fetch a sample of architectural nodes for the summary
+            nodes = [
+                self.db.get_node(nid)
+                for nid in node_ids[:MAX_MICRO_SUMMARY_SYMBOLS * 3]
+            ]
+            nodes = [n for n in nodes if n and n.get("is_architectural")]
             nodes = nodes[:MAX_MICRO_SUMMARY_SYMBOLS]
 
             symbols = [
                 {
-                    "name": n.get("symbol_name") or n.get("name", ""),
-                    "type": n.get("symbol_type") or "",
-                    "path": n.get("rel_path") or "",
+                    "name": n["symbol_name"],
+                    "type": n["symbol_type"],
+                    "path": n["rel_path"],
                 }
                 for n in nodes
             ]
 
-            dirs = sorted(
-                {
-                    n["rel_path"].rsplit("/", 1)[0]
-                    for n in nodes
-                    if "/" in (n.get("rel_path") or "")
-                }
-            )
+            # Unique directories
+            dirs = sorted({
+                n["rel_path"].rsplit("/", 1)[0]
+                for n in nodes
+                if "/" in n.get("rel_path", "")
+            })
 
-            summaries.append(
-                {
-                    "micro_id": micro_id,
-                    "symbol_count": len(node_ids),
-                    "symbols": symbols,
-                    "directories": dirs[:5],
-                }
-            )
+            summaries.append({
+                "micro_id": micro_id,
+                "symbol_count": len(node_ids),
+                "symbols": symbols,
+                "directories": dirs[:5],
+            })
 
         return summaries
 
     # ── Page-level symbols for Pass 2 ────────────────────────────────
 
-    def _get_page_symbols(
-        self, node_ids: list[str]
-    ) -> list[dict[str, Any]]:
+    #: Maximum symbols sent to the page-naming LLM call
+    MAX_PAGE_NAMING_SYMBOLS = 12
+
+    def _get_page_symbols(self, node_ids: List[str]) -> List[Dict[str, Any]]:
         """Get enriched symbols for a single micro-cluster (page-level naming).
 
-        Returns signatures and docstrings so the page-naming LLM has
-        enough context to produce a meaningful capability-based title.
+        Unlike ``_get_micro_summaries`` (which is lean: name/type/path only),
+        this returns signatures and docstrings so the page-naming LLM has
+        enough context to produce a meaningful capability-based title from
+        *only* this page's own content.
 
-        Scoring: ``min(edge_count, 10) + has_docstring(2)``
+        Scoring: min(edge_count, 10) + has_docstring(2)
         """
-        scored: list[tuple[int, dict[str, Any]]] = []
+        nodes = [self.db.get_node(nid) for nid in node_ids]
+        nodes = [n for n in nodes if n and n.get("is_architectural")]
+        if self._exclude_tests:
+            nodes = [n for n in nodes if not n.get("is_test")]
 
-        for nid in node_ids:
-            node = self._get_node(nid)
-            if node is None or not self._is_architectural(node):
-                continue
-            if self._is_test_node(node):
-                continue
-            edge_count = self._edge_count_for(nid)
-            score = min(edge_count, 10) + (2 if node.get("docstring") else 0)
-            scored.append((score, node))
+        if not nodes:
+            return []
+
+        scored = []
+        for n in nodes:
+            edge_count = len(self.db.get_edges_from(n["node_id"]))
+            score = (
+                min(edge_count, 10)
+                + (2 if n.get("docstring") else 0)
+            )
+            scored.append((score, n))
 
         scored.sort(key=lambda x: -x[0])
 
         return [
             {
-                "name": n.get("symbol_name") or n.get("name", ""),
-                "type": n.get("symbol_type") or "",
-                "path": n.get("rel_path") or "",
+                "name": n["symbol_name"],
+                "type": n["symbol_type"],
+                "path": n["rel_path"],
                 "signature": (n.get("signature") or "")[:SIGNATURE_TRUNC],
                 "docstring": (n.get("docstring") or "")[:DOCSTRING_TRUNC],
             }
-            for _, n in scored[:MAX_PAGE_NAMING_SYMBOLS]
+            for _, n in scored[:self.MAX_PAGE_NAMING_SYMBOLS]
         ]
 
-    # ── Node-to-field helpers ─────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────
 
-    def _node_ids_to_symbol_names(self, node_ids: list[str]) -> list[str]:
-        """Convert node IDs to symbol names (architectural code nodes only)."""
-        names: list[str] = []
+    def _node_ids_to_symbol_names(self, node_ids: List[str]) -> List[str]:
+        """Convert node_ids to symbol names (for target_symbols field).
+
+        Only architectural *code* nodes are included — methods/fields are
+        excluded because the expansion module resolves symbols with
+        ``is_architectural = 1`` filter.  Documentation nodes (``is_doc = 1``)
+        are also excluded here — they go into ``target_docs`` via
+        :meth:`_node_ids_to_doc_paths` instead.
+        """
+        names = []
         for nid in node_ids:
-            node = self._get_node(nid)
-            if node and self._is_architectural(node) and not self._is_doc_node(node):
-                name = node.get("symbol_name") or node.get("name")
-                if name:
-                    names.append(name)
+            node = self.db.get_node(nid)
+            if node and node.get("is_architectural") and not node.get("is_doc"):
+                names.append(node["symbol_name"])
         return names
 
-    def _node_ids_to_paths(self, node_ids: list[str]) -> list[str]:
-        """Extract unique file paths from node IDs (capped at 20)."""
-        paths: set[str] = set()
+    def _node_ids_to_paths(self, node_ids: List[str]) -> List[str]:
+        """Extract unique file paths from node_ids."""
+        paths = set()
         for nid in node_ids:
-            node = self._get_node(nid)
+            node = self.db.get_node(nid)
             if node and node.get("rel_path"):
                 paths.add(node["rel_path"])
-        return sorted(paths)[:20]
+        return sorted(paths)[:20]  # Cap at 20
 
-    def _node_ids_to_folders(self, node_ids: list[str]) -> list[str]:
-        """Extract unique directory prefixes from node IDs (capped at 10)."""
-        folders: set[str] = set()
+    def _node_ids_to_folders(self, node_ids: List[str]) -> List[str]:
+        """Extract unique directory prefixes from node_ids."""
+        folders = set()
         for nid in node_ids:
-            node = self._get_node(nid)
+            node = self.db.get_node(nid)
             if node and "/" in (node.get("rel_path") or ""):
                 folders.add(node["rel_path"].rsplit("/", 1)[0])
         return sorted(folders)[:10]
 
-    def _node_ids_to_doc_paths(self, node_ids: list[str]) -> list[str]:
-        """Extract documentation file paths from node IDs (capped at 20)."""
-        paths: set[str] = set()
+    def _node_ids_to_doc_paths(self, node_ids: List[str]) -> List[str]:
+        """Extract documentation file paths from node_ids.
+
+        Returns ``rel_path`` for every node that has ``is_doc = 1``.
+        These paths are used as ``target_docs`` on :class:`PageSpec`,
+        enabling the MIXED retrieval path (code + docs) during content
+        expansion.
+        """
+        paths = set()
         for nid in node_ids:
-            node = self._get_node(nid)
-            if node and self._is_doc_node(node) and node.get("rel_path"):
+            node = self.db.get_node(nid)
+            if node and node.get("is_doc") and node.get("rel_path"):
                 paths.add(node["rel_path"])
         return sorted(paths)[:20]
 
-    # ── Central symbol selection ──────────────────────────────────────
+    # ── Central symbol selection (Phase 7F) ──────────────────────────
+
+    def _get_cluster_graph(self) -> nx.MultiDiGraph:
+        """Lazily reconstruct an NX graph from DB edges for PageRank.
+
+        The graph is cached for the lifetime of the planner instance to
+        avoid rebuilding it for every micro-cluster.
+        """
+        if self._cluster_graph is not None:
+            return self._cluster_graph
+
+        G = nx.MultiDiGraph()
+
+        # Add all architectural nodes (excluding test nodes when flag is on)
+        rows = self.db.conn.execute(
+            "SELECT node_id FROM repo_nodes WHERE is_architectural = 1"
+            + self._test_sql
+        ).fetchall()
+        for row in rows:
+            G.add_node(row["node_id"])
+
+        # Add all edges with weights
+        edge_rows = self.db.conn.execute(
+            "SELECT source_id, target_id, rel_type, weight FROM repo_edges"
+        ).fetchall()
+        for row in edge_rows:
+            src, tgt = row["source_id"], row["target_id"]
+            if src in G and tgt in G:
+                G.add_edge(
+                    src, tgt,
+                    relationship_type=row["rel_type"],
+                    weight=row["weight"] or 1.0,
+                )
+
+        self._cluster_graph = G
+        logger.debug(
+            "Built cluster graph from DB: %d nodes, %d edges",
+            G.number_of_nodes(), G.number_of_edges(),
+        )
+        return G
 
     def _select_central_node_ids(
-        self,
-        node_ids: list[str],
-        k: int = 10,
-    ) -> list[str]:
+        self, node_ids: List[str], k: int = 10,
+    ) -> List[str]:
         """Select the top-k most central node IDs from a micro-cluster.
 
-        Code-first priority:
+        Code-first priority (Phase 3):
         1. PAGE_IDENTITY_SYMBOLS (class, interface, function, …) ranked by PageRank
         2. SUPPORTING_CODE_SYMBOLS (constant, type_alias, …) ranked by PageRank
         3. DOC_CLUSTER_SYMBOLS (module_doc, file_doc) only if budget remains
 
-        Doc-dominant clusters (≥70% doc nodes) yield docs-only pages.
+        Doc-dominant clusters (>70% doc nodes) yield docs-only pages.
         """
-        cluster_set = set(node_ids) & set(self.graph.nodes())
+        G = self._get_cluster_graph()
+        cluster_set = set(node_ids) & set(G.nodes())
 
         if len(cluster_set) <= k:
             return list(cluster_set)
 
         # Partition by symbol type tier
-        identity_ids: list[str] = []
-        supporting_ids: list[str] = []
-        doc_ids: list[str] = []
-        other_ids: list[str] = []
+        identity_ids = []
+        supporting_ids = []
+        doc_ids = []
+        other_ids = []
 
         for nid in cluster_set:
-            node = self._get_node(nid)
+            node = self.db.get_node(nid)
             if not node:
                 continue
             stype = (node.get("symbol_type") or "").lower()
@@ -635,30 +802,20 @@ class ClusterStructurePlanner:
             else:
                 other_ids.append(nid)
 
-        # Detect doc-dominant cluster
-        total = (
-            len(identity_ids)
-            + len(supporting_ids)
-            + len(doc_ids)
-            + len(other_ids)
-        )
-        if total > 0 and len(doc_ids) / total >= DOC_DOMINANT_THRESHOLD:
-            central = (
-                select_central_symbols(self.graph, set(doc_ids), k=k)
-                if doc_ids
-                else []
-            )
+        # Detect doc-dominant cluster (≥70% doc nodes)
+        total = len(identity_ids) + len(supporting_ids) + len(doc_ids) + len(other_ids)
+        if total > 0 and len(doc_ids) / total >= 0.7:
+            # Docs-only page: prefer doc nodes as seeds
+            central = select_central_symbols(G, set(doc_ids), k=k) if doc_ids else []
             if len(central) < k:
                 extras = select_central_symbols(
-                    self.graph,
-                    cluster_set - set(central),
-                    k=k - len(central),
+                    G, cluster_set - set(central), k=k - len(central)
                 )
                 central.extend(extras)
             return central[:k]
 
-        # Code-first: fill from identity → supporting → other → doc
-        result: list[str] = []
+        # Code-first: fill from identity → supporting → doc → other
+        result = []
         for tier_ids in [identity_ids, supporting_ids, other_ids, doc_ids]:
             if len(result) >= k:
                 break
@@ -667,164 +824,29 @@ class ClusterStructurePlanner:
             if not tier_set:
                 continue
             if len(tier_set) <= remaining:
-                ranked = select_central_symbols(
-                    self.graph, tier_set, k=len(tier_set)
-                )
+                # Rank by PageRank within tier
+                ranked = select_central_symbols(G, tier_set, k=len(tier_set))
                 result.extend(ranked if ranked else list(tier_set))
             else:
-                ranked = select_central_symbols(
-                    self.graph, tier_set, k=remaining
-                )
-                result.extend(
-                    ranked if ranked else list(tier_set)[:remaining]
-                )
+                ranked = select_central_symbols(G, tier_set, k=remaining)
+                result.extend(ranked if ranked else list(tier_set)[:remaining])
 
         if not result:
-            central = select_central_symbols(self.graph, cluster_set, k=k)
+            # Fallback: plain PageRank
+            central = select_central_symbols(G, cluster_set, k=k)
             return central if central else node_ids[:k]
         return result[:k]
 
-    # ── Title / overview / fallbacks ──────────────────────────────────
-
     def _derive_wiki_title(self) -> str:
-        if self.repo_name:
-            name = (
-                self.repo_name.split("/")[-1].split(":")[0]
-                if "/" in self.repo_name
-                else self.repo_name
-            )
+        """Try to derive the wiki title from DB metadata."""
+        repo_id = self.db.get_meta("repo_identifier")
+        if repo_id:
+            name = repo_id.split("/")[-1].split(":")[0] if "/" in repo_id else repo_id
             return f"{name} — Technical Documentation"
         return "Repository Technical Documentation"
 
-    # ── Phase 5/6: Candidate validation & coverage ──────────────────
-
-    def _maybe_validate_candidates(
-        self,
-        cluster_map: dict[int, dict[int, list[str]]],
-    ) -> dict[int, dict[int, list[str]]]:
-        """Run candidate validation + coverage ledger when enabled.
-
-        Gated behind env vars:
-        - ``WIKIS_CANDIDATE_VALIDATION=1`` — Phase 5 (validate & reshape)
-        - ``WIKIS_COVERAGE_LEDGER=1``       — Phase 6 (coverage metrics)
-
-        Requires ``self.db`` to be set (protocol storage instance).
-        Returns the (possibly modified) cluster_map.
-        """
-        validate_enabled = os.environ.get("WIKIS_CANDIDATE_VALIDATION") == "1"
-        coverage_enabled = os.environ.get("WIKIS_COVERAGE_LEDGER") == "1"
-
-        if not (validate_enabled or coverage_enabled):
-            return cluster_map
-
-        if self.db is None:
-            logger.debug(
-                "ClusterStructurePlanner: validation/coverage requested "
-                "but no db provided — skipping"
-            )
-            return cluster_map
-
-        try:
-            from .candidate_builder import build_candidates
-            from .page_validator import (
-                DEMOTE,
-                MERGE_WITH,
-                PROMOTE_DOCS,
-                SPLIT_BY,
-                validate_all,
-            )
-
-            candidates = build_candidates(self.db, cluster_map)
-
-            if validate_enabled:
-                results = validate_all(candidates)
-
-                # Pass 1 — Remove DEMOTE candidates
-                for vr in results:
-                    if vr.shape_decision == DEMOTE:
-                        mid = vr.candidate.macro_id
-                        pid = vr.candidate.micro_id
-                        if mid in cluster_map and pid in cluster_map[mid]:
-                            del cluster_map[mid][pid]
-                            logger.info(
-                                "[VALIDATION] Demoting micro %d (macro %d)",
-                                pid, mid,
-                            )
-
-                # Pass 2 — Merge MERGE_WITH candidates into their
-                # largest surviving sibling (same macro-cluster).
-                merge_count = 0
-                for vr in results:
-                    if vr.shape_decision != MERGE_WITH:
-                        continue
-                    mid = vr.candidate.macro_id
-                    pid = vr.candidate.micro_id
-                    if mid not in cluster_map or pid not in cluster_map[mid]:
-                        continue
-                    # Find largest surviving sibling in this macro
-                    best_sibling = None
-                    best_size = 0
-                    for other_pid, other_nids in cluster_map[mid].items():
-                        if other_pid == pid:
-                            continue
-                        if len(other_nids) > best_size:
-                            best_size = len(other_nids)
-                            best_sibling = other_pid
-                    if best_sibling is not None:
-                        cluster_map[mid][best_sibling].extend(
-                            cluster_map[mid].pop(pid),
-                        )
-                        merge_count += 1
-
-                if merge_count:
-                    logger.info(
-                        "[VALIDATION] Merged %d MERGE_WITH candidates",
-                        merge_count,
-                    )
-
-                # Clean up empty macros
-                cluster_map = {
-                    m: micros for m, micros in cluster_map.items() if micros
-                }
-
-                total_surviving = sum(
-                    len(micros) for micros in cluster_map.values()
-                )
-                logger.info(
-                    "[VALIDATION] After validation — %d sections, "
-                    "%d pages surviving",
-                    len(cluster_map), total_surviving,
-                )
-
-            if coverage_enabled:
-                from .coverage_ledger import CoverageLedger
-
-                # Rebuild candidates from (possibly modified) cluster_map
-                candidates = build_candidates(self.db, cluster_map)
-                ledger = CoverageLedger(self.db, candidates)
-                report = ledger.report()
-                logger.info(
-                    "[COVERAGE] symbol=%.1f%% (%d/%d) doc=%.1f%% dir=%.1f%% "
-                    "high_value_uncovered=%d overlaps=%d",
-                    report.symbol_coverage * 100,
-                    report.covered_symbols,
-                    report.total_symbols,
-                    report.doc_coverage * 100,
-                    report.dir_coverage * 100,
-                    len(report.uncovered_high_value),
-                    len(report.page_overlap_pairs),
-                )
-
-        except Exception as exc:
-            logger.warning(
-                "[VALIDATION] Candidate validation failed — "
-                "continuing with original cluster_map: %s",
-                exc,
-            )
-
-        return cluster_map
-
-    def _build_overview(self, sections: list[SectionSpec]) -> str:
+    def _build_overview(self, sections: List[SectionSpec]) -> str:
+        """Generate a brief overview from section names."""
         section_list = ", ".join(s.section_name for s in sections)
         return (
             f"This wiki covers {sum(len(s.pages) for s in sections)} pages "
@@ -860,11 +882,11 @@ class ClusterStructurePlanner:
     def _fallback_section(
         self,
         macro_id: int,
-        micro_map: dict[int, list[str]],
+        micro_map: Dict[int, List[str]],
         section_order: int,
     ) -> SectionSpec:
         """Fallback section when LLM naming fails for a cluster."""
-        all_node_ids: list[str] = []
+        all_node_ids = []
         for nids in micro_map.values():
             all_node_ids.extend(nids)
 
@@ -876,42 +898,35 @@ class ClusterStructurePlanner:
         else:
             section_name = f"Section {macro_id}"
 
-        pages: list[PageSpec] = []
+        pages = []
         page_order = 1
-
         for micro_id in sorted(micro_map.keys()):
             node_ids = micro_map[micro_id]
+            # Central symbol selection (Phase 7F)
             central_ids = self._select_central_node_ids(
-                node_ids,
-                k=self._adaptive_central_k(),
+                node_ids, k=self._adaptive_central_k(),
             )
             target_symbols = self._node_ids_to_symbol_names(central_ids)
             key_files = self._node_ids_to_paths(node_ids)
 
-            pages.append(
-                PageSpec(
-                    page_name=f"{section_name} — Page {micro_id}",
-                    page_order=page_order,
-                    description=f"Page with {len(node_ids)} symbols",
-                    content_focus=f"Symbols in cluster {macro_id}/{micro_id}",
-                    rationale=(
-                        f"Grouped by graph clustering "
-                        f"(macro={macro_id}, micro={micro_id}, "
-                        f"{len(node_ids)} symbols)"
-                    ),
-                    target_symbols=target_symbols,
-                    target_docs=self._node_ids_to_doc_paths(node_ids),
-                    target_folders=self._node_ids_to_folders(node_ids),
-                    key_files=key_files,
-                    retrieval_query=" ".join(target_symbols[:5]),
-                    metadata={
-                        "planner_mode": "cluster",
-                        "section_id": macro_id,
-                        "page_id": micro_id,
-                        "cluster_node_ids": list(node_ids),
-                    },
-                )
-            )
+            pages.append(PageSpec(
+                page_name=f"{section_name} — Page {micro_id}",
+                page_order=page_order,
+                description=f"Page with {len(node_ids)} symbols",
+                content_focus=f"Symbols in cluster {macro_id}/{micro_id}",
+                rationale=f"Grouped by graph clustering (macro={macro_id}, micro={micro_id}, {len(node_ids)} symbols)",
+                target_symbols=target_symbols,
+                target_docs=self._node_ids_to_doc_paths(node_ids),
+                target_folders=self._node_ids_to_folders(node_ids),
+                key_files=key_files,
+                retrieval_query=" ".join(target_symbols[:5]),
+                metadata={
+                    "planner_mode": "cluster",
+                    "section_id": macro_id,
+                    "page_id": micro_id,
+                    "cluster_node_ids": list(node_ids),
+                },
+            ))
             page_order += 1
 
         return SectionSpec(
@@ -927,30 +942,29 @@ class ClusterStructurePlanner:
 # JSON parsing helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-
 def _extract_text(response: Any) -> str:
     """Pull plain text from a LangChain AI message."""
     content = getattr(response, "content", response)
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts: list[str] = []
+        parts = []
         for item in content:
             if isinstance(item, str):
                 parts.append(item)
             elif isinstance(item, dict):
-                parts.append(
-                    str(item.get("text") or item.get("content") or "")
-                )
+                parts.append(str(item.get("text") or item.get("content") or ""))
         return "\n".join(parts)
     return str(content)
 
 
-def _parse_json_response(raw: str) -> dict[str, Any]:
+def _parse_json_response(raw: str) -> Dict[str, Any]:
     """Best-effort JSON extraction from LLM output.
 
     Handles markdown fences, leading text, trailing commas, etc.
     """
+    import re
+
     text = raw.strip()
 
     # Strip markdown code fences

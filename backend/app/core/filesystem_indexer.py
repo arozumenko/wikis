@@ -531,33 +531,20 @@ class FilesystemRepositoryIndexer:
 
             # Phase 3 — Hierarchical Leiden clustering
             try:
-                from .graph_clustering import run_clustering
+                from .graph_clustering import run_phase3
 
                 phase2_hubs = set()
                 if phase2_stats:
                     phase2_hubs = set(phase2_stats.get("hubs", {}).get("node_ids", []))
-                clustering = run_clustering(
+                phase3_stats = run_phase3(
+                    db=udb,
                     G=self.relationship_graph,
-                    exclude_tests=False,  # Exclude-tests is applied at planner level
+                    hubs=phase2_hubs or None,
                 )
 
-                # Persist cluster assignments to DB
-                assignments = []
-                for nid, macro_id in clustering.macro_clusters.items():
-                    micro_id = None
-                    micro_map = clustering.micro_clusters.get(macro_id, {})
-                    if isinstance(micro_map, dict):
-                        micro_id = micro_map.get(nid)
-                    assignments.append((nid, macro_id, micro_id))
-                if assignments:
-                    udb.set_clusters_batch(assignments)
-                    udb.commit()
-
                 logger.info(
-                    "Phase 3 complete: %d sections, %d pages, %d hubs",
-                    clustering.section_count,
-                    clustering.page_count,
-                    len(clustering.hub_assignments),
+                    "Phase 3 complete: %s",
+                    phase3_stats.get("persistence", {}),
                 )
             except Exception as exc:
                 logger.warning("Phase 3 clustering failed (non-fatal): %s", exc)

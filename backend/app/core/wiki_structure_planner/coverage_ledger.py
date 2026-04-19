@@ -1,13 +1,17 @@
 """
-Coverage Ledger — Phase 6.
+Coverage Ledger + Compact LLM Refiner — Phase 6.
 
-Tracks what the current set of pages covers:
-- Architectural symbol coverage (identity + supporting)
-- Documentation domain coverage (by directory)
-- Directory coverage
-- Page overlap detection
+1. **CoverageLedger** tracks what the current set of pages covers:
+   - Architectural symbol coverage (identity + supporting)
+   - Public API coverage (symbols without leading underscore)
+   - Documentation domain coverage (by directory)
+   - Directory coverage (all source dirs)
 
-Gated behind env var ``WIKIS_COVERAGE_LEDGER=1``.
+2. **compact_refine_section()** is a single-call LLM refiner that
+   receives a section summary + quality flags and returns structured
+   page actions.
+
+Gated behind ``FeatureFlags.coverage_ledger``.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ..cluster_constants import (
+from ..constants import (
     DOC_CLUSTER_SYMBOLS,
     PAGE_IDENTITY_SYMBOLS,
     SUPPORTING_CODE_SYMBOLS,
@@ -64,8 +68,8 @@ class CoverageLedger:
 
     Parameters
     ----------
-    db : WikiStorageProtocol
-        Open storage instance.
+    db : UnifiedWikiDB
+        Open database connection.
     candidates : list[CandidateRecord]
         All candidate pages being considered.
     """
@@ -85,12 +89,15 @@ class CoverageLedger:
 
     def _load_universe(self):
         """Load the full universe of architectural symbols and directories."""
-        rows = self.db.get_architectural_nodes()
+        conn = self.db.conn
+        rows = conn.execute(
+            "SELECT node_id, symbol_name, symbol_type, rel_path, is_doc "
+            "FROM repo_nodes WHERE is_architectural = 1"
+        ).fetchall()
 
-        for node in rows:
-            nid = node.get("node_id", "")
-            if not nid:
-                continue
+        for row in rows:
+            node = dict(row)
+            nid = node["node_id"]
             self._all_symbols[nid] = node
 
             rel_path = node.get("rel_path") or ""
@@ -115,12 +122,26 @@ class CoverageLedger:
                         self._covered_doc_dirs.add(dir_path)
 
     def report(self, macro_id: Optional[int] = None) -> CoverageReport:
-        """Generate a coverage report, optionally scoped to a macro-cluster."""
+        """Generate a coverage report, optionally scoped to a macro-cluster.
+
+        Parameters
+        ----------
+        macro_id : int, optional
+            If provided, report only for symbols in this macro-cluster.
+
+        Returns
+        -------
+        CoverageReport
+        """
+        # Filter to macro if requested
         if macro_id is not None:
-            scope_ids = {
-                nid for nid, node in self._all_symbols.items()
-                if node.get("macro_cluster") == macro_id
-            }
+            conn = self.db.conn
+            rows = conn.execute(
+                "SELECT node_id FROM repo_nodes "
+                "WHERE macro_cluster = ? AND is_architectural = 1",
+                (macro_id,),
+            ).fetchall()
+            scope_ids = {dict(r)["node_id"] for r in rows}
         else:
             scope_ids = set(self._all_symbols.keys())
 
@@ -128,12 +149,13 @@ class CoverageLedger:
         covered = len(scope_ids & self._covered_ids)
         uncovered = scope_ids - self._covered_ids
 
+        # High-value uncovered symbols: those with high SYMBOL_TYPE_PRIORITY
         uncovered_hv = []
         for nid in uncovered:
             node = self._all_symbols.get(nid, {})
             stype = (node.get("symbol_type") or "").lower()
             priority = SYMBOL_TYPE_PRIORITY.get(stype, 0)
-            if priority >= 7:
+            if priority >= 7:  # function or higher
                 uncovered_hv.append({
                     "node_id": nid,
                     "symbol_name": node.get("symbol_name", ""),
@@ -141,16 +163,20 @@ class CoverageLedger:
                     "priority": priority,
                 })
 
+        # Sort by priority descending
         uncovered_hv.sort(key=lambda x: -x["priority"])
 
+        # Doc domain coverage
         total_doc = len(self._all_doc_dirs)
         covered_doc = len(self._all_doc_dirs & self._covered_doc_dirs)
         uncovered_doc = sorted(self._all_doc_dirs - self._covered_doc_dirs)
 
+        # Directory coverage
         all_dirs = self._all_source_dirs | self._all_doc_dirs
         total_dirs = len(all_dirs)
         covered_dirs = len(all_dirs & self._covered_dirs)
 
+        # Page overlap: pairs of candidates sharing >50% node overlap
         overlap_pairs = self._find_overlap_pairs()
 
         return CoverageReport(
@@ -166,7 +192,7 @@ class CoverageLedger:
         )
 
     def _find_overlap_pairs(self) -> List[Tuple[int, int, int]]:
-        """Find candidate pairs with >50% shared nodes."""
+        """Find candidate pairs with significant overlap (>50% shared nodes)."""
         pairs: List[Tuple[int, int, int]] = []
         for i, a in enumerate(self.candidates):
             a_set = set(a.node_ids)
@@ -182,6 +208,8 @@ class CoverageLedger:
 # ═════════════════════════════════════════════════════════════════════
 # Compact LLM Refiner
 # ═════════════════════════════════════════════════════════════════════
+
+# ── Prompt template ─────────────────────────────────────────────────
 
 REFINER_SYSTEM_PROMPT = """\
 You are a wiki page naming assistant. Given a section's symbols and quality \
@@ -215,14 +243,31 @@ def build_refiner_prompt(
     candidate_summaries: List[Dict[str, Any]],
     quality_flags: Dict[str, Any],
 ) -> str:
-    """Build a compact user prompt for the LLM refiner."""
+    """Build a compact user prompt for the LLM refiner.
+
+    Parameters
+    ----------
+    section_symbols : list[dict]
+        Top symbols in this section: [{name, type, file}].
+    candidate_summaries : list[dict]
+        Per-page summaries: [{micro_id, classification, identity_score, symbols}].
+    quality_flags : dict
+        Coverage and quality metrics for this section.
+
+    Returns
+    -------
+    str
+        The user prompt string.
+    """
     prompt_parts = []
 
+    # Section symbols (compact)
     sym_lines = []
     for s in section_symbols[:15]:
         sym_lines.append(f"  {s.get('type','?')}: {s.get('name','?')} ({s.get('file','')})")
     prompt_parts.append("## Section Symbols\n" + "\n".join(sym_lines))
 
+    # Candidate summaries
     cand_lines = []
     for c in candidate_summaries:
         micro = c.get("micro_id", "?")
@@ -235,6 +280,7 @@ def build_refiner_prompt(
         )
     prompt_parts.append("## Candidates\n" + "\n".join(cand_lines))
 
+    # Quality flags
     flag_lines = []
     for k, v in quality_flags.items():
         flag_lines.append(f"  {k}: {v}")
@@ -244,9 +290,17 @@ def build_refiner_prompt(
 
 
 def parse_refiner_output(raw: str) -> Optional[Dict[str, Any]]:
-    """Parse LLM refiner output, extracting JSON from the response."""
+    """Parse LLM refiner output, extracting JSON from the response.
+
+    Returns
+    -------
+    dict or None
+        Parsed JSON object, or None if parsing fails.
+    """
+    # Try direct parse
     raw = raw.strip()
     if raw.startswith("```"):
+        # Strip markdown code fence
         lines = raw.split("\n")
         lines = [l for l in lines if not l.strip().startswith("```")]
         raw = "\n".join(lines).strip()
@@ -258,6 +312,7 @@ def parse_refiner_output(raw: str) -> Optional[Dict[str, Any]]:
     except json.JSONDecodeError:
         pass
 
+    # Try to find JSON object in the response
     start = raw.find("{")
     end = raw.rfind("}")
     if start != -1 and end > start:
