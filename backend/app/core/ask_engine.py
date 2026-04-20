@@ -20,9 +20,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-import app.events as _events
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
+
+import app.events as _events
+from app.core.chat_utils import format_chat_history
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,7 @@ class AskEngine:
         backend: object | None = None,
         llm_settings: dict | None = None,
         config: AskConfig | None = None,
-        storage: Any = None,  # WikiStorageProtocol
+        query_service: Any = None,  # Pre-built GraphQueryService or MultiGraphQueryService
     ):
         """
         Initialize the Ask engine.
@@ -94,6 +96,7 @@ class AskEngine:
             backend: DeepAgents backend factory or instance
             llm_settings: LLM config (used only if llm_client is None)
             config: Ask configuration
+            query_service: Pre-built query service (for multi-wiki projects)
         """
         self.retriever_stack = retriever_stack
         self.graph_manager = graph_manager
@@ -103,7 +106,7 @@ class AskEngine:
         self.backend = backend
         self.llm_settings = llm_settings or {}
         self.config = config or AskConfig()
-        self.storage = storage
+        self.query_service = query_service
 
         # Session state
         self.final_answer: str = ""
@@ -152,25 +155,29 @@ class AskEngine:
 
         model = self.llm_client or self._build_model()
 
-        # Prefer a unified DB-backed FTS adapter when available.
+        # Get FTS5 index from graph_manager if available
         fts_index = getattr(self.graph_manager, "fts_index", None) if self.graph_manager else None
-        if fts_index is None:
-            db = self.storage if self.storage is not None else getattr(self.retriever_stack, "db", None)
-            if db is not None:
-                from .storage.text_index import StorageTextIndex
 
-                fts_index = StorageTextIndex(db)
-
-        custom_tools = create_codebase_tools(
-            retriever_stack=self.retriever_stack,
-            graph_manager=self.graph_manager,
-            code_graph=self.code_graph,
-            repo_analysis=self.repo_analysis,
-            event_callback=None,  # Events come from LangGraph stream
-            graph_text_index=fts_index,
-            similarity_threshold=self.config.similarity_threshold,
-            storage=self.storage,
-        )
+        # Force progressive tools for the agentic Ask
+        _orig = os.environ.get("WIKIS_PROGRESSIVE_TOOLS", "")
+        os.environ["WIKIS_PROGRESSIVE_TOOLS"] = "1"
+        try:
+            custom_tools = create_codebase_tools(
+                retriever_stack=self.retriever_stack,
+                graph_manager=self.graph_manager,
+                code_graph=self.code_graph,
+                repo_analysis=self.repo_analysis,
+                event_callback=None,  # Events come from LangGraph stream
+                graph_text_index=fts_index,
+                similarity_threshold=self.config.similarity_threshold,
+                query_service=self.query_service,
+            )
+        finally:
+            # Restore original env
+            if _orig:
+                os.environ["WIKIS_PROGRESSIVE_TOOLS"] = _orig
+            else:
+                os.environ.pop("WIKIS_PROGRESSIVE_TOOLS", None)
 
         # Compute summarization defaults matching deepagents/graph.py logic:
         # If the model exposes a profile with max_input_tokens use fraction-based
@@ -244,11 +251,7 @@ class AskEngine:
 
             # Build user prompt with repo context + history
             repo_context = self._get_repo_context()
-            history_str = ""
-            if chat_history:
-                history_str = "\n".join(
-                    f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:300]}" for m in chat_history[-4:]
-                )
+            history_str = format_chat_history(chat_history) if chat_history else ""
 
             user_prompt = get_ask_prompt(
                 question=question,
@@ -353,7 +356,13 @@ class AskEngine:
 
     def _get_repo_context(self) -> str:
         """Build repository context string from analysis."""
+        if not self.repo_analysis:
+            return "No repository overview available."
+
         parts = []
+
+        if self.repo_analysis.get("description"):
+            parts.append(f"Project Description: {self.repo_analysis['description']}")
 
         if self.repo_analysis.get("summary"):
             parts.append(f"Repository Summary: {self.repo_analysis['summary']}")

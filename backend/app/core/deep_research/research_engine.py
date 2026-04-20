@@ -1,12 +1,13 @@
 """
-Deep Research Engine - Using deepagents.create_deep_agent
+Deep Research Engine - Using langchain.agents.create_agent
 
-``create_deep_agent`` provisions the standard deepagents middleware stack
-(TodoListMiddleware, FilesystemMiddleware backed by the ``backend`` we pass
-in, SubAgentMiddleware, a model-aware SummarizationMiddleware,
-PatchToolCallsMiddleware and AnthropicPromptCachingMiddleware). On top of
-that we wire:
-- Custom tools wrapping UnifiedRetriever and GraphManager
+This is the main orchestration for deep research using LangChain's create_agent
+with explicit middleware stack:
+- TodoListMiddleware for planning and progress tracking (write_todos, read_todos)
+- FilesystemMiddleware for context offloading (outputs >20K tokens → files)
+- SummarizationMiddleware for auto-summarising at context limit
+- AnthropicPromptCachingMiddleware for prompt caching on Anthropic models
+- Custom tools wrapping WikiRetrieverStack and GraphManager
 
 Events are captured via LangGraph's native astream with stream_mode=["messages", "updates"].
 """
@@ -17,10 +18,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-import app.events as _events
-from deepagents import create_deep_agent
+from deepagents import FilesystemMiddleware
+from langchain.agents import create_agent
+from langchain.agents.middleware.summarization import SummarizationMiddleware
+from langchain.agents.middleware.todo import TodoListMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
+
+import app.events as _events
+from app.core.chat_utils import format_chat_history
 
 from .research_prompts import RESEARCH_INSTRUCTIONS, get_research_prompt
 from .research_tools import create_codebase_tools
@@ -50,7 +56,7 @@ class DeepResearchEngine:
     This creates a proper DeepAgents agent with:
     - TodoListMiddleware for planning (write_todos, read_todos)
     - FilesystemMiddleware for context offloading (read_file, write_file, etc.)
-    - Custom tools for codebase search and graph analysis (search_symbols, get_code, get_relationships_tool, think)
+    - Custom tools for codebase search and graph analysis (search_codebase, get_symbol_relationships, think)
 
     Events are captured using LangGraph's native astream with dual stream mode
     (messages + updates) - NOT LangChain callbacks.
@@ -69,7 +75,7 @@ class DeepResearchEngine:
 
     def __init__(
         self,
-        retriever_stack: Any,  # UnifiedRetriever
+        retriever_stack: Any,  # WikiRetrieverStack
         graph_manager: Any,  # GraphManager
         code_graph: Any,  # NetworkX graph
         repo_analysis: dict | None = None,
@@ -78,19 +84,20 @@ class DeepResearchEngine:
         llm_settings: dict | None = None,
         config: ResearchConfig | None = None,
         repo_path: str | None = None,
-        storage: Any = None,  # WikiStorageProtocol
+        query_service: Any = None,  # Pre-built GraphQueryService or MultiGraphQueryService
     ):
         """
         Initialize the research engine.
 
         Args:
-            retriever_stack: UnifiedRetriever for codebase search
+            retriever_stack: WikiRetrieverStack for codebase search
             graph_manager: GraphManager for relationship analysis
             code_graph: Loaded NetworkX code graph
             repo_analysis: Pre-loaded repository analysis
             llm_settings: LLM configuration dict
             config: Research configuration
             repo_path: Path to cloned repo for direct file access
+            query_service: Pre-built query service (for multi-wiki projects)
         """
         self.retriever_stack = retriever_stack
         self.graph_manager = graph_manager
@@ -101,7 +108,7 @@ class DeepResearchEngine:
         self.llm_settings = llm_settings or {}
         self.config = config or ResearchConfig()
         self.repo_path = repo_path
-        self.storage = storage
+        self.query_service = query_service
 
         # Session tracking (simplified - no redundant state)
         self.session_id: str | None = None
@@ -137,22 +144,17 @@ class DeepResearchEngine:
 
     def _create_agent(self):
         """
-        Create the agent via ``deepagents.create_deep_agent``.
+        Create the agent with full middleware stack via langchain.agents.create_agent.
 
-        ``create_deep_agent`` provisions the full default deepagents middleware
-        stack (todos, filesystem backed by ``backend``, subagents, summarisation,
-        patch tool calls, Anthropic prompt caching) so we don't pass any extra
-        middleware here.
+        Middleware:
+        - TodoListMiddleware  — write_todos / read_todos for planning
+        - FilesystemMiddleware — ls, read_file, write_file, edit_file, glob, grep
+        - SummarizationMiddleware — auto-summarise when context hits limit
+        - AnthropicPromptCachingMiddleware — prompt caching on Anthropic models
         """
         model = self.llm_client or self._build_model()
 
         fts_index = getattr(self.graph_manager, "fts_index", None) if self.graph_manager else None
-        if fts_index is None:
-            db = self.storage if self.storage is not None else getattr(self.retriever_stack, "db", None)
-            if db is not None:
-                from ..storage.text_index import StorageTextIndex
-
-                fts_index = StorageTextIndex(db)
         custom_tools = create_codebase_tools(
             retriever_stack=self.retriever_stack,
             graph_manager=self.graph_manager,
@@ -162,39 +164,52 @@ class DeepResearchEngine:
             graph_text_index=fts_index,
             similarity_threshold=self.config.similarity_threshold,
             repo_path=self.repo_path,
-            storage=self.storage,
+            query_service=self.query_service,
         )
 
-        fs_backend = self.backend
-        if fs_backend is None and self.repo_path:
-            from pathlib import Path
+        _profile = getattr(model, "profile", None)
+        if isinstance(_profile, dict) and isinstance(_profile.get("max_input_tokens"), int):
+            trigger = ("fraction", 0.85)
+            keep = ("fraction", 0.10)
+        else:
+            trigger = ("tokens", 170_000)
+            keep = ("messages", 6)
 
-            from deepagents.backends import FilesystemBackend
+        try:
+            from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 
-            # virtual_mode=True sandboxes the agent to repo_path so absolute
-            # paths like "/src/auth/..." resolve under the cloned repo and
-            # cannot escape it. root_dir must be an absolute path.
-            fs_backend = FilesystemBackend(
-                root_dir=Path(self.repo_path).resolve(),
-                virtual_mode=True,
-            )
+            caching_mw = AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore")
+        except ImportError:
+            caching_mw = None
 
-        # create_deep_agent already wires the standard deepagents middleware
-        # stack (TodoListMiddleware, FilesystemMiddleware, SubAgentMiddleware,
-        # a model-aware SummarizationMiddleware, PatchToolCallsMiddleware and
-        # AnthropicPromptCachingMiddleware). Adding our own duplicates would
-        # trip create_agent's "duplicate middleware" check, so we let
-        # deepagents own that stack and pass no extra middleware here.
-        agent = create_deep_agent(
+        middleware = [
+            TodoListMiddleware(),
+            FilesystemMiddleware(backend=self.backend),
+            SummarizationMiddleware(
+                model=model,
+                trigger=trigger,
+                keep=keep,
+                trim_tokens_to_summarize=None,
+            ),
+        ]
+        if caching_mw is not None:
+            middleware.append(caching_mw)
+
+        agent = create_agent(
             model=model,
             tools=custom_tools,
             system_prompt=RESEARCH_INSTRUCTIONS,
-            backend=fs_backend,
+            middleware=middleware,
         )
 
         return agent
 
-    async def research(self, question: str, session_id: str | None = None) -> AsyncGenerator[dict, None]:
+    async def research(
+        self,
+        question: str,
+        session_id: str | None = None,
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """
         Conduct deep research on a question.
 
@@ -206,6 +221,8 @@ class DeepResearchEngine:
         Args:
             question: The research question
             session_id: Optional session identifier
+            chat_history: Optional prior conversation as list of
+                ``{"role": "user"|"assistant", "content": "..."}`` dicts.
 
         Yields:
             Event dictionaries for UI updates
@@ -227,10 +244,14 @@ class DeepResearchEngine:
             # Create the agent
             agent = self._create_agent()
 
-            # Build research prompt with context
+            # Build research prompt with context (and optional conversation history)
             repo_context = self._get_repo_context()
+            history_str = format_chat_history(chat_history) if chat_history else ""
             research_prompt = get_research_prompt(
-                research_type=self.config.research_type, topic=question, context=repo_context
+                research_type=self.config.research_type,
+                topic=question,
+                context=repo_context,
+                chat_history=history_str,
             )
 
             # Prepare input message
@@ -339,7 +360,13 @@ class DeepResearchEngine:
 
     def _get_repo_context(self) -> str:
         """Get repository context string"""
+        if not self.repo_analysis:
+            return "No repository overview available."
+
         parts = []
+
+        if self.repo_analysis.get("description"):
+            parts.append(f"Project Description: {self.repo_analysis['description']}")
 
         if self.repo_analysis.get("summary"):
             parts.append(f"Repository Summary: {self.repo_analysis['summary']}")
@@ -352,13 +379,19 @@ class DeepResearchEngine:
 
         return "\n".join(parts) if parts else "No repository overview available."
 
-    def research_sync(self, question: str, on_event: Callable[[dict], None] | None = None) -> str:
+    def research_sync(
+        self,
+        question: str,
+        on_event: Callable[[dict], None] | None = None,
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> str:
         """
         Synchronous wrapper for deep research.
 
         Args:
             question: Research question
             on_event: Optional callback for events
+            chat_history: Optional prior conversation history
 
         Returns:
             Final research report
@@ -367,7 +400,7 @@ class DeepResearchEngine:
 
         async def _run():
             report = ""
-            async for event in self.research(question):
+            async for event in self.research(question, chat_history=chat_history):
                 if on_event:
                     on_event(event)
                 if event.get("event_type") == "research_complete":
@@ -408,7 +441,7 @@ def create_deep_research_engine(
     This is the main entry point for creating research engines.
 
     Args:
-        retriever_stack: UnifiedRetriever for codebase search
+        retriever_stack: WikiRetrieverStack for codebase search
         graph_manager: GraphManager for relationship analysis
         code_graph: Loaded NetworkX code graph
         repo_analysis: Pre-loaded repository analysis

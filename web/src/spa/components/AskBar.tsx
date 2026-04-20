@@ -10,25 +10,28 @@ import {
 } from '@mui/material';
 import SendIcon from '@mui/icons-material/Send';
 import BoltIcon from '@mui/icons-material/Bolt';
+import SearchIcon from '@mui/icons-material/Search';
+import AccountTreeIcon from '@mui/icons-material/AccountTree';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 
+export type AskMode = 'fast' | 'deep' | 'codemap';
+
 interface AskBarProps {
-  onSubmit: (question: string, deepResearch: boolean) => void;
+  onSubmit: (question: string, mode: AskMode) => void;
   disabled?: boolean;
   repoLabel?: string;
+  placeholder?: string;
 }
 
-type Mode = 'fast' | 'deep';
-
-export function AskBar({ onSubmit, disabled = false, repoLabel }: AskBarProps) {
+export function AskBar({ onSubmit, disabled = false, repoLabel, placeholder: placeholderProp }: AskBarProps) {
   const [input, setInput] = useState('');
-  const [mode, setMode] = useState<Mode>('fast');
+  const [mode, setMode] = useState<AskMode>('fast');
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
 
   const handleSubmit = useCallback(() => {
     const question = input.trim();
     if (!question || disabled) return;
-    onSubmit(question, mode === 'deep');
+    onSubmit(question, mode);
     setInput('');
   }, [input, mode, disabled, onSubmit]);
 
@@ -42,7 +45,7 @@ export function AskBar({ onSubmit, disabled = false, repoLabel }: AskBarProps) {
     [handleSubmit],
   );
 
-  const placeholder = repoLabel ? `Ask about ${repoLabel}...` : 'Ask about this repository...';
+  const placeholder = placeholderProp ?? (repoLabel ? `Ask about ${repoLabel}...` : 'Ask about this repository...');
 
   return (
     <Box
@@ -115,14 +118,15 @@ export function AskBar({ onSubmit, disabled = false, repoLabel }: AskBarProps) {
                     transition: 'background-color 0.15s',
                   }}
                 >
-                  <BoltIcon sx={{ fontSize: 16, color: mode === 'deep' ? '#8B5CF6' : '#F59E0B' }} />
+                  {mode === 'fast' && <BoltIcon sx={{ fontSize: 16, color: '#F59E0B' }} />}
+                  {mode === 'deep' && <SearchIcon sx={{ fontSize: 16, color: '#8B5CF6' }} />}
+                  {mode === 'codemap' && <AccountTreeIcon sx={{ fontSize: 16, color: '#22C55E' }} />}
                   <Typography
                     variant="caption"
                     sx={{ fontWeight: 600, color: 'text.primary', fontSize: '0.72rem' }}
                   >
-                    {mode === 'fast' ? 'Fast' : 'Deep'}
-                  </Typography>
-                  <KeyboardArrowDownIcon sx={{ fontSize: 14, color: 'text.secondary' }} />
+                    {mode === 'fast' ? 'Fast' : mode === 'deep' ? 'Deep' : 'Code Map'}
+                  </Typography>                  <KeyboardArrowDownIcon sx={{ fontSize: 14, color: 'text.secondary' }} />
                 </Box>
               </InputAdornment>
             ),
@@ -159,23 +163,24 @@ export function AskBar({ onSubmit, disabled = false, repoLabel }: AskBarProps) {
         >
           <MenuItem
             selected={mode === 'fast'}
-            onClick={() => {
-              setMode('fast');
-              setAnchorEl(null);
-            }}
+            onClick={() => { setMode('fast'); setAnchorEl(null); }}
           >
             <BoltIcon sx={{ fontSize: 16, color: '#F59E0B', mr: 1 }} />
             <Typography variant="body2">Fast</Typography>
           </MenuItem>
           <MenuItem
             selected={mode === 'deep'}
-            onClick={() => {
-              setMode('deep');
-              setAnchorEl(null);
-            }}
+            onClick={() => { setMode('deep'); setAnchorEl(null); }}
           >
-            <BoltIcon sx={{ fontSize: 16, color: '#8B5CF6', mr: 1 }} />
+            <SearchIcon sx={{ fontSize: 16, color: '#8B5CF6', mr: 1 }} />
             <Typography variant="body2">Deep Research</Typography>
+          </MenuItem>
+          <MenuItem
+            selected={mode === 'codemap'}
+            onClick={() => { setMode('codemap'); setAnchorEl(null); }}
+          >
+            <AccountTreeIcon sx={{ fontSize: 16, color: '#22C55E', mr: 1 }} />
+            <Typography variant="body2">Code Map</Typography>
           </MenuItem>
         </Menu>
       </Box>

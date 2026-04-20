@@ -10,8 +10,13 @@ RRF formula:
 with the standard constant *k = 60*.
 
 RRF is rank-based (not score-based), so it gracefully handles backends that
-produce incomparable score scales (FTS5 floats vs cosine similarity vs ad-hoc
+produce incomparable score scales (BM25 floats vs cosine similarity vs ad-hoc
 keyword match scores).
+
+Feature flag
+~~~~~~~~~~~~
+``WIKIS_HYBRID_FUSION=1`` enables RRF in ``search_codebase``.
+When OFF, the original simple concatenation logic is used.
 
 References
 ~~~~~~~~~~
@@ -22,6 +27,7 @@ individual Rank Learning Methods", SIGIR 2009.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 from langchain_core.documents import Document
@@ -29,9 +35,9 @@ from langchain_core.documents import Document
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Hybrid fusion is always enabled (no feature flag gating)
+# Feature flag
 # ---------------------------------------------------------------------------
-HYBRID_FUSION_ENABLED: bool = True
+HYBRID_FUSION_ENABLED: bool = os.environ.get("WIKIS_HYBRID_FUSION", "0") == "1"
 
 # ---------------------------------------------------------------------------
 # RRF constant (standard value from Cormack et al. 2009)
@@ -73,7 +79,7 @@ def reciprocal_rank_fusion(
     ----------
     ranked_lists:
         Mapping of source name → ordered list of Documents.
-        Example: ``{"semantic": vs_docs, "fts5": fts_docs}``
+        Example: ``{"vectorstore": vs_docs, "fts5": fts_docs}``
     k:
         RRF constant (default 60).  Higher values compress rank differences.
     cap:

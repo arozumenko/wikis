@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from 'react';
-import { Box, Collapse, List, ListItemButton, ListItemText, Typography } from '@mui/material';
+import { Box, Collapse, IconButton, List, ListItemButton, ListItemText, Typography } from '@mui/material';
 
 export interface WikiPage {
   id: string;
@@ -16,6 +16,7 @@ interface WikiSidebarProps {
 
 interface Section {
   name: string;
+  indexPage?: WikiPage;
   pages: WikiPage[];
 }
 
@@ -29,9 +30,18 @@ function groupBySection(pages: WikiPage[]): Section[] {
     if (sectionName) {
       const existing = sections.find((s) => s.name === sectionName);
       if (existing) {
-        existing.pages.push(page);
+        // _index pages become the section header page, not a list item
+        if (page.id.endsWith('/_index')) {
+          existing.indexPage = page;
+        } else {
+          existing.pages.push(page);
+        }
       } else {
-        sections.push({ name: sectionName, pages: [page] });
+        if (page.id.endsWith('/_index')) {
+          sections.push({ name: sectionName, indexPage: page, pages: [] });
+        } else {
+          sections.push({ name: sectionName, pages: [page] });
+        }
       }
     } else {
       unsectioned.push(page);
@@ -117,11 +127,31 @@ export function WikiSidebar({ pages, activePageId, onSelectPage }: WikiSidebarPr
           return (
             <Box key={section.name} sx={{ mb: 0.5 }}>
               <ListItemButton
-                onClick={() => toggleSection(section.name)}
+                selected={hasActivePage && !section.pages.some((p) => p.id === activePageId)}
+                onClick={() => {
+                  if (section.indexPage) {
+                    onSelectPage(section.indexPage.id);
+                    // Ensure section is open when navigating to its index
+                    setCollapsed((prev) => {
+                      const next = new Set(prev);
+                      next.delete(section.name);
+                      return next;
+                    });
+                  } else {
+                    toggleSection(section.name);
+                  }
+                }}
                 sx={{
                   px: 2,
                   py: 0.5,
                   minHeight: 28,
+                  pr: 1,
+                  '&.Mui-selected': {
+                    bgcolor: 'transparent',
+                    borderLeft: '2px solid',
+                    borderColor: 'primary.main',
+                    '&:hover': { bgcolor: 'action.hover' },
+                  },
                 }}
               >
                 <Typography
@@ -132,10 +162,23 @@ export function WikiSidebar({ pages, activePageId, onSelectPage }: WikiSidebarPr
                     letterSpacing: '0.05em',
                     color: hasActivePage ? 'text.primary' : 'text.secondary',
                     fontSize: '0.68rem',
+                    flex: 1,
                   }}
                 >
-                  {isOpen ? '▾' : '▸'} {section.name}
+                  {section.name}
                 </Typography>
+                <IconButton
+                  size="small"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleSection(section.name);
+                  }}
+                  sx={{ p: 0.25, ml: 0.5, color: 'text.secondary' }}
+                >
+                  <Typography variant="caption" sx={{ fontSize: '0.7rem', lineHeight: 1 }}>
+                    {isOpen ? '▾' : '▸'}
+                  </Typography>
+                </IconButton>
               </ListItemButton>
               <Collapse in={isOpen}>
                 {section.pages.map((page) => (

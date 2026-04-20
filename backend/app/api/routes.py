@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import json as _json
+import re
 from dataclasses import asdict
+from datetime import datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from app.auth import CurrentUser, get_current_user
 from app.dependencies import (
     get_ask_service,
+    get_export_service,
+    get_import_service,
+    get_project_service,
     get_qa_service,
     get_research_service,
+    get_wiki_index_cache,
     get_wiki_management,
     get_wiki_service,
 )
@@ -32,9 +39,31 @@ from app.models import (
     WikiListResponse,
     WikiSummary,
 )
+from app.models.api import (
+    ProjectAddWikiRequest,
+    ProjectCreateRequest,
+    ProjectListResponse,
+    ProjectResponse,
+    ProjectUpdateRequest,
+    UpdateWikiDescriptionRequest,
+)
 from app.models.invocation import Invocation
 from app.models.qa_api import QAListResponse, QARecordResponse, QAStatsResponse, QAStatus
+from app.models.search import (
+    PageListItem,
+    PageNeighbor,
+    PageNeighborsResponse,
+    ProjectSearchResponse,
+    SearchResultItem,
+    WikiPageListResponse,
+    WikiPageResponse,
+    WikiSearchResponse,
+    WikiSummaryItem as SearchWikiSummaryItem,
+)
 from app.services.ask_service import AskService
+from app.services.export_service import ExportService, WikiNotFoundError
+from app.services.import_service import BundleValidationError, BundleVersionError, ImportService
+from app.services.project_service import ProjectService
 from app.services.qa_service import QAService
 from app.services.research_service import ResearchService
 from app.services.wiki_management import WikiManagementService
@@ -66,7 +95,7 @@ async def generate_wiki(
     try:
         invocation = await service.generate(request, owner_id=user.id if user else "")
     except WikiAlreadyExistsError as e:
-        raise HTTPException(
+        raise HTTPException(  # noqa: B904
             status_code=409,
             detail={"error": str(e), "wiki_id": e.wiki_id},
         )
@@ -142,23 +171,26 @@ async def ask(
     qa_service: QAService = Depends(get_qa_service),
     accept: str = "application/json",
 ) -> AskResponse | StreamingResponse:
+    user_id = user.id if user else None
     try:
         if "text/event-stream" in accept:
             # SSE: generator handles its own recording via try/finally
             async def stream():
-                async for event in service.ask_stream(request):
+                async for event in service.ask_stream(request, user_id=user_id):
                     event_type = event.get("event_type", "message")
                     yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         # Sync: BackgroundTask for recording
-        result = await service.ask_sync(request)
+        result = await service.ask_sync(request, user_id=user_id)
         if result.recording:
             background_tasks.add_task(qa_service.record_interaction, **asdict(result.recording))
         return result.response
     except FileNotFoundError as e:
-        raise HTTPException(404, f"Wiki not found: {request.wiki_id}") from e
+        raise HTTPException(404, f"Wiki not found: {request.wiki_id or request.project_id}") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     except RuntimeError as e:
         raise HTTPException(501, str(e)) from e
 
@@ -170,18 +202,31 @@ async def research(
     service: ResearchService = Depends(get_research_service),
     accept: str = "application/json",
 ) -> ResearchResponse | StreamingResponse:
+    user_id = user.id if user else None
     try:
+        if request.research_type == "codemap":
+            if "text/event-stream" in accept:
+
+                async def codemap_sse():
+                    async for event in service.codemap_stream(request, user_id=user_id):
+                        event_type = event.get("event_type", "message")
+                        yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
+
+                return StreamingResponse(codemap_sse(), media_type="text/event-stream")
+            return await service.codemap_sync(request, user_id=user_id)
         if "text/event-stream" in accept:
 
             async def stream():
-                async for event in service.research_stream(request):
+                async for event in service.research_stream(request, user_id=user_id):
                     event_type = event.get("event_type", "message")
                     yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
 
             return StreamingResponse(stream(), media_type="text/event-stream")
-        return await service.research_sync(request)
+        return await service.research_sync(request, user_id=user_id)
     except FileNotFoundError as e:
-        raise HTTPException(404, f"Wiki not found: {request.wiki_id}") from e
+        raise HTTPException(404, f"Wiki not found: {request.wiki_id or request.project_id}") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     except RuntimeError as e:
         raise HTTPException(501, str(e)) from e
 
@@ -259,7 +304,7 @@ async def list_wikis(
                         )
                     )
                     continue
-                except Exception:
+                except Exception:  # noqa: S110
                     pass  # fall through to append as invocation-only
             result.wikis.append(
                 WikiSummary(
@@ -279,6 +324,30 @@ async def list_wikis(
                 )
             )
     return result
+
+
+def _extract_frontmatter_title_section(content: str) -> tuple[str, str]:
+    """Parse YAML frontmatter and return (title, section) from it, or ('', '') if absent."""
+    if not content.startswith("---"):
+        return "", ""
+    end = content.find("\n---", 3)
+    if end == -1:
+        return "", ""
+    yaml_block = content[4:end]
+    title = ""
+    section = ""
+    for line in yaml_block.splitlines():
+        if not title:
+            m = re.match(r'^title\s*:\s*["\']?(.+?)["\']?\s*$', line)
+            if m:
+                title = m.group(1).strip()
+        if not section:
+            m = re.match(r'^section\s*:\s*["\']?(.+?)["\']?\s*$', line)
+            if m:
+                section = m.group(1).strip()
+        if title and section:
+            break
+    return title, section
 
 
 @router.get("/wikis/{wiki_id}")
@@ -323,6 +392,8 @@ async def get_wiki(
             "invocation_id": None,
             "error": wiki_meta.error,
             "requires_token": wiki_meta.requires_token,
+            "description": wiki_meta.description,
+            "is_owner": wiki_meta.is_owner,
         }
 
     if not wiki_meta:
@@ -341,7 +412,7 @@ async def get_wiki(
                     )
                     wiki_record = await management.get_wiki(wiki_id, user_id=user_id)
                     wiki_meta = WikiManagementService._record_to_summary(wiki_record, user_id) if wiki_record else None
-                except Exception:
+                except Exception:  # noqa: S110
                     pass
             # Still generating or failed — return minimal info so the UI
             # can show repo details and offer a retry button (backward compat for pre-migration wikis).
@@ -359,6 +430,8 @@ async def get_wiki(
                     "invocation_id": active_invocation.id,
                     "error": active_invocation.error,
                     "requires_token": False,
+                    "description": None,
+                    "is_owner": False,
                 }
         if not wiki_meta:
             raise HTTPException(404, f"Wiki not found: {wiki_id}")
@@ -401,11 +474,16 @@ async def get_wiki(
         except Exception:
             content_str = ""
 
+        # Prefer frontmatter title/section over filename-derived values
+        fm_title, fm_section = _extract_frontmatter_title_section(content_str)
+        display_title = fm_title or page_name.replace("-", " ").replace("_", " ").title().strip()
+        display_section = fm_section or section_name.replace("-", " ").replace("_", " ").title().strip()
+
         pages.append(
             {
                 "id": page_id,
-                "title": page_name.replace("-", " ").replace("_", " ").title(),
-                "section": section_name.replace("-", " ").replace("_", " ").title(),
+                "title": display_title,
+                "section": display_section,
                 "order": i,
                 "content": content_str,
             }
@@ -428,6 +506,8 @@ async def get_wiki(
         "status": wiki_meta.status or "complete",
         "requires_token": wiki_meta.requires_token,
         "error": wiki_meta.error,
+        "description": wiki_meta.description,
+        "is_owner": wiki_meta.is_owner,
     }
     if active_invocation:
         response["invocation_id"] = active_invocation.id
@@ -438,6 +518,171 @@ async def get_wiki(
         if active_invocation.status == "generating":
             response["status"] = active_invocation.status
     return response
+
+
+# ---------------------------------------------------------------------------
+# Wiki Search, Pages, and Neighbors
+# NOTE: these routes MUST appear before the legacy get_wiki_page route
+# below because FastAPI uses first-match-wins for path parameters.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/wikis/{wiki_id}/search", response_model=WikiSearchResponse)
+async def search_wiki(
+    wiki_id: str,
+    request: Request,
+    q: str = Query(...),
+    hop_depth: int = Query(default=1, ge=1, le=5),
+    top_k: int = Query(default=10, ge=1),
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+    index_cache=Depends(get_wiki_index_cache),
+) -> WikiSearchResponse:
+    """Full-text search over wiki pages with graph-expansion re-ranking."""
+    from app.core.wiki_search_engine import WikiSearchEngine
+
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    page_index = await index_cache.get(wiki_id)
+
+    # Lazy backfill: ensure old wikis have pages indexed for FTS.
+    await management.ensure_pages_indexed(wiki_id)
+
+    session_factory = request.app.state.session_factory
+    wiki_name = getattr(wiki, "title", wiki_id) or wiki_id
+    engine = WikiSearchEngine(wiki_id, wiki_name, session_factory, page_index)
+    result = await engine.search(q, hop_depth=hop_depth, top_k=top_k)
+
+    return WikiSearchResponse(
+        query=result.query,
+        results=[
+            SearchResultItem(
+                wiki_id=item.wiki_id,
+                wiki_name=item.wiki_name,
+                page_title=item.page_title,
+                snippet=item.snippet,
+                score=item.score,
+                neighbors=[PageNeighbor(title=n.title, rel=n.rel) for n in item.neighbors],
+            )
+            for item in result.results
+        ],
+        wiki_summary=[
+            SearchWikiSummaryItem(
+                wiki_id=s.wiki_id,
+                wiki_name=s.wiki_name,
+                match_count=s.match_count,
+                relevance=s.relevance,
+            )
+            for s in result.wiki_summary
+        ],
+    )
+
+
+@router.get("/wikis/{wiki_id}/pages", response_model=WikiPageListResponse)
+async def list_wiki_pages(
+    wiki_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+    index_cache=Depends(get_wiki_index_cache),
+) -> WikiPageListResponse:
+    """List all pages in a wiki with their titles and descriptions."""
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    page_index = await index_cache.get(wiki_id)
+
+    pages = []
+    for title, meta in page_index.pages.items():
+        # Determine section: first path component before '/' if the path has a
+        # subdirectory component (i.e. more than one path segment).
+        section: str | None = None
+        if meta.file_path:
+            # file_path is like {wiki_id}/{repo}/wiki_pages/{section}/{page}.md
+            # Extract the part after wiki_pages/ if present.
+            if "wiki_pages/" in meta.file_path:
+                rel = meta.file_path.split("wiki_pages/", 1)[1]
+                if "/" in rel:
+                    section = rel.split("/", 1)[0]
+        pages.append(PageListItem(page_title=title, description=meta.description, section=section))
+
+    return WikiPageListResponse(wiki_id=wiki_id, pages=pages)
+
+
+@router.get("/wikis/{wiki_id}/pages/{page_title}/neighbors", response_model=PageNeighborsResponse)
+async def get_page_neighbors(
+    wiki_id: str,
+    page_title: str,
+    hop_depth: int = Query(default=1, ge=1, le=5),
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+    index_cache=Depends(get_wiki_index_cache),
+) -> PageNeighborsResponse:
+    """Return the wikilink graph neighborhood for a single wiki page."""
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    page_index = await index_cache.get(wiki_id)
+    if page_title not in page_index.pages:
+        raise HTTPException(404, f"Page not found: {page_title}")
+
+    forward_metas = page_index.neighbors(page_title, hop_depth=hop_depth)
+    links_to = [m.title for m in forward_metas]
+    linked_from = page_index.backlinks(page_title)
+
+    return PageNeighborsResponse(
+        wiki_id=wiki_id,
+        page_title=page_title,
+        links_to=links_to,
+        linked_from=linked_from,
+    )
+
+
+@router.get("/wikis/{wiki_id}/pages/{page_title}", response_model=WikiPageResponse)
+async def get_wiki_page_by_title(
+    wiki_id: str,
+    page_title: str,
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+    index_cache=Depends(get_wiki_index_cache),
+) -> WikiPageResponse:
+    """Return the full content of a single wiki page identified by its title."""
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    page_index = await index_cache.get(wiki_id)
+    if page_title not in page_index.pages:
+        raise HTTPException(404, f"Page not found: {page_title}")
+
+    meta = page_index.pages[page_title]
+    try:
+        raw = await management.storage.download("wiki_artifacts", meta.file_path)
+        content = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+    except Exception as exc:
+        raise HTTPException(404, f"Page content not found: {page_title}") from exc
+
+    # Extract section headings (# and ## lines)
+    sections = []
+    for line in content.splitlines():
+        if line.startswith("## "):
+            sections.append(line[3:].strip())
+        elif line.startswith("# "):
+            sections.append(line[2:].strip())
+
+    return WikiPageResponse(
+        wiki_id=wiki_id,
+        page_title=page_title,
+        content=content,
+        sections=sections,
+    )
 
 
 @router.get("/wikis/{wiki_id}/pages/{page_id:path}")
@@ -639,6 +884,415 @@ async def update_wiki_visibility(
             raise HTTPException(404, f"Wiki not found: {wiki_id}")
         raise HTTPException(403, "Only the wiki owner can change visibility")
     return updated
+
+
+@router.patch("/wikis/{wiki_id}/description")
+async def update_wiki_description(
+    wiki_id: str,
+    body: UpdateWikiDescriptionRequest,
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+) -> dict:
+    """Update the user-provided description for a wiki."""
+    user_id = user.id if user else ""
+    record = await management.update_description(wiki_id, user_id=user_id, description=body.description)
+    if record is None:
+        # Either wiki not found or caller is not the owner
+        wiki_record = await management.get_wiki(wiki_id, user_id=user_id or None)
+        if wiki_record is None:
+            raise HTTPException(404, f"Wiki not found: {wiki_id}")
+        raise HTTPException(403, "Only the wiki owner can update the description")
+    return {"wiki_id": record.id, "description": record.description}
+
+
+# ---------------------------------------------------------------------------
+# Export / Import
+# ---------------------------------------------------------------------------
+
+_EXPORT_FORMAT_OBSIDIAN = "obsidian"
+_EXPORT_FORMAT_WIKIS = "wikis"
+_VALID_EXPORT_FORMATS = {_EXPORT_FORMAT_OBSIDIAN, _EXPORT_FORMAT_WIKIS}
+_MAX_IMPORT_BYTES = 500 * 1024 * 1024  # 500 MB
+
+
+@router.get(
+    "/wikis/{wiki_id}/export",
+    responses={
+        200: {"content": {"application/zip": {}}},
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        501: {"model": ErrorResponse},
+    },
+)
+async def export_wiki(
+    wiki_id: str,
+    format: str = Query(default="obsidian", description="Export format: 'obsidian' or 'wikis'"),
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+    export_service: ExportService = Depends(get_export_service),
+) -> StreamingResponse:
+    """Export a wiki as a downloadable ZIP archive.
+
+    Supports two formats:
+    - ``obsidian`` — Obsidian vault layout with YAML frontmatter
+    - ``wikis`` — Wikis-to-Wikis bundle for re-importing into another instance
+    """
+    if format not in _VALID_EXPORT_FORMATS:
+        raise HTTPException(
+            400, f"Invalid format '{format}'. Must be one of: {', '.join(sorted(_VALID_EXPORT_FORMATS))}"
+        )
+
+    user_id = user.id if user else None
+    wiki_record = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki_record is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+
+    if wiki_record.status != "complete":
+        raise HTTPException(409, "Wiki must be fully generated before export")
+
+    safe_title = re.sub(r"[^\w\s\-]", "", wiki_record.title or wiki_id).strip() or "wiki"
+    if format == _EXPORT_FORMAT_WIKIS:
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        filename = f"{safe_title}_{timestamp}.wikiexport"
+    else:
+        filename = f"{safe_title}.zip"
+
+    if format == _EXPORT_FORMAT_OBSIDIAN:
+        raw_generator = export_service.build_obsidian_zip(wiki_id)
+    else:
+        raw_generator = export_service.build_wikis_bundle(wiki_id)
+
+    # Prime the generator so any early exceptions (raised before the first yield)
+    # propagate here where we can still return a proper HTTP error response.
+    try:
+        first_chunk = await raw_generator.__anext__()
+    except StopAsyncIteration:
+        first_chunk = b""
+    except WikiNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except NotImplementedError as exc:
+        raise HTTPException(501, str(exc)) from exc
+
+    async def _prepend(first: bytes, rest):
+        if first:
+            yield first
+        async for chunk in rest:
+            yield chunk
+
+    return StreamingResponse(
+        _prepend(first_chunk, raw_generator),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post(
+    "/wikis/import",
+    status_code=201,
+    response_model=WikiSummary,
+    responses={
+        422: {"model": ErrorResponse},
+        413: {"model": ErrorResponse},
+        501: {"model": ErrorResponse},
+    },
+)
+async def import_wiki(
+    bundle: UploadFile,
+    user: CurrentUser = Depends(get_current_user),
+    import_service: ImportService = Depends(get_import_service),
+) -> WikiSummary:
+    """Import a wiki from a ``.wikiexport`` bundle produced by the wikis export."""
+    user_id = user.id if user else None
+
+    # Size guard — reject overly large uploads before reading
+    if bundle.size is not None and bundle.size > _MAX_IMPORT_BYTES:
+        raise HTTPException(413, "Bundle exceeds 500 MB limit")
+
+    bundle_bytes = await bundle.read()
+    if len(bundle_bytes) > _MAX_IMPORT_BYTES:
+        raise HTTPException(413, "Bundle exceeds 500 MB limit")
+
+    try:
+        wiki_record = await import_service.restore_wiki(bundle_bytes, owner_id=user_id)
+    except (BundleValidationError, BundleVersionError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except NotImplementedError as exc:
+        raise HTTPException(501, str(exc)) from exc
+
+    return WikiManagementService._record_to_summary(wiki_record, user_id)
+
+
+# ---------------------------------------------------------------------------
+# Projects
+# ---------------------------------------------------------------------------
+
+
+def _project_response(project, wiki_count: int = 0, user_id: str | None = None) -> ProjectResponse:
+    return ProjectResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        visibility=project.visibility,
+        owner_id=project.owner_id,
+        is_owner=(user_id is not None and (project.owner_id == user_id or not project.owner_id)),
+        created_at=project.created_at,
+        wiki_count=wiki_count,
+    )
+
+
+@router.post("/projects", response_model=ProjectResponse, status_code=201)
+async def create_project(
+    body: ProjectCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> ProjectResponse:
+    project = await svc.create_project(
+        owner_id=user.id,
+        name=body.name,
+        description=body.description,
+        visibility=body.visibility,
+    )
+    return _project_response(project, user_id=user.id)
+
+
+@router.get("/projects", response_model=ProjectListResponse)
+async def list_projects(
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> ProjectListResponse:
+    projects = await svc.list_projects(user_id=user.id)
+    counts = await svc.batch_get_wiki_counts([p.id for p in projects])
+    items = [_project_response(p, counts.get(p.id, 0), user_id=user.id) for p in projects]
+    return ProjectListResponse(projects=items)
+
+
+@router.get("/projects/{project_id}", response_model=ProjectResponse)
+async def get_project(
+    project_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> ProjectResponse:
+    project = await svc.get_project(project_id, user_id=user.id)
+    if project is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    count = await svc.get_wiki_count(project_id)
+    return _project_response(project, count, user_id=user.id)
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectResponse)
+async def update_project(
+    project_id: str,
+    body: ProjectUpdateRequest,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> ProjectResponse:
+    # First verify project exists and is accessible (to distinguish 404 vs 403)
+    existing = await svc.get_project(project_id, user_id=user.id)
+    if existing is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+
+    fields = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    updated = await svc.update_project(project_id, owner_id=user.id, **fields)
+    if updated is None:
+        raise HTTPException(403, "Only the project owner can modify this project")
+    count = await svc.get_wiki_count(project_id)
+    return _project_response(updated, count, user_id=user.id)
+
+
+@router.delete("/projects/{project_id}", status_code=200)
+async def delete_project(
+    project_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> JSONResponse:
+    # Check existence first
+    existing = await svc.get_project(project_id, user_id=user.id)
+    if existing is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    deleted = await svc.delete_project(project_id, owner_id=user.id)
+    if not deleted:
+        raise HTTPException(403, "Only the project owner can delete this project")
+    return JSONResponse({"deleted": True, "project_id": project_id})
+
+
+@router.post("/projects/{project_id}/wikis", response_model=ProjectResponse, status_code=201)
+async def add_wiki_to_project(
+    project_id: str,
+    body: ProjectAddWikiRequest,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> ProjectResponse:
+    existing = await svc.get_project(project_id, user_id=user.id)
+    if existing is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    if existing.owner_id != user.id:
+        raise HTTPException(403, "Only the project owner can add wikis")
+    result = await svc.add_wiki(
+        project_id=project_id,
+        wiki_id=body.wiki_id,
+        owner_id=user.id,
+        added_by=user.id,
+    )
+    if result is None and existing.owner_id == user.id:
+        # Wiki already in project — idempotent, return current state
+        pass
+    count = await svc.get_wiki_count(project_id)
+    return _project_response(existing, count, user_id=user.id)
+
+
+@router.delete("/projects/{project_id}/wikis/{wiki_id}", status_code=200)
+async def remove_wiki_from_project(
+    project_id: str,
+    wiki_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+) -> JSONResponse:
+    existing = await svc.get_project(project_id, user_id=user.id)
+    if existing is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    removed = await svc.remove_wiki(project_id, wiki_id=wiki_id, owner_id=user.id)
+    if not removed:
+        raise HTTPException(403, "Only the project owner can remove wikis")
+    return JSONResponse({"removed": True, "project_id": project_id, "wiki_id": wiki_id})
+
+
+@router.get("/projects/{project_id}/wikis", response_model=WikiListResponse)
+async def list_project_wikis(
+    project_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+    management: WikiManagementService = Depends(get_wiki_management),
+) -> WikiListResponse:
+    wikis = await svc.list_project_wikis(project_id, user_id=user.id)
+    if wikis is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    summaries = [WikiManagementService._record_to_summary(w, user.id) for w in wikis]
+
+    # Enrich with actual page count (DB page_count may be stale)
+    for wiki in summaries:
+        try:
+            artifacts = await management.storage.list_artifacts("wiki_artifacts", prefix=wiki.wiki_id)
+            actual_pages = sum(1 for a in artifacts if a.endswith(".md") and "wiki_pages" in a)
+            if actual_pages > 0:
+                wiki.page_count = actual_pages
+        except Exception:  # noqa: S110
+            pass
+
+    return WikiListResponse(wikis=summaries)
+
+
+@router.get("/projects/{project_id}/search", response_model=ProjectSearchResponse)
+async def search_project(
+    project_id: str,
+    request: Request,
+    q: str = Query(...),
+    hop_depth: int = Query(default=1, ge=1, le=5),
+    top_k: int = Query(default=10, ge=1),
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+    index_cache=Depends(get_wiki_index_cache),
+) -> ProjectSearchResponse:
+    """Full-text search over all wiki pages in a project with graph-expansion re-ranking."""
+    from app.core.project_search_engine import ProjectSearchEngine
+    from app.core.wiki_search_engine import WikiSearchEngine
+
+    user_id = user.id if user else ""
+    wikis = await svc.list_project_wikis(project_id, user_id=user_id)
+    if wikis is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+
+    session_factory = request.app.state.session_factory
+
+    # Pre-load page indexes and lazy-backfill FTS for old wikis.
+    wiki_tuples = [(w.id, getattr(w, "title", w.id) or w.id) for w in wikis]
+    management = request.app.state.wiki_management
+    page_indexes = {}
+    for wiki_id, _ in wiki_tuples:
+        page_indexes[wiki_id] = await index_cache.get(wiki_id)
+        await management.ensure_pages_indexed(wiki_id)
+
+    def wiki_engine_factory(wiki_id: str, wiki_name: str) -> WikiSearchEngine:
+        page_index = page_indexes[wiki_id]
+        return WikiSearchEngine(wiki_id, wiki_name, session_factory, page_index)
+
+    engine = ProjectSearchEngine(wiki_engine_factory)
+    result = await engine.search(q, wikis=wiki_tuples, hop_depth=hop_depth, top_k=top_k)
+
+    return ProjectSearchResponse(
+        query=result.query,
+        results=[
+            SearchResultItem(
+                wiki_id=item.wiki_id,
+                wiki_name=item.wiki_name,
+                page_title=item.page_title,
+                snippet=item.snippet,
+                score=item.score,
+                neighbors=[PageNeighbor(title=n.title, rel=n.rel) for n in item.neighbors],
+            )
+            for item in result.results
+        ],
+        wiki_summary=[
+            SearchWikiSummaryItem(
+                wiki_id=s.wiki_id,
+                wiki_name=s.wiki_name,
+                match_count=s.match_count,
+                relevance=s.relevance,
+            )
+            for s in result.wiki_summary
+        ],
+    )
+
+
+class _ProjectCodeMapRequest(BaseModel):
+    """Request body for the project code-map endpoint."""
+
+    question: str
+
+
+@router.post("/projects/{project_id}/map", response_model=ResearchResponse)
+async def project_codemap(
+    project_id: str,
+    body: _ProjectCodeMapRequest,
+    user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
+    service: ResearchService = Depends(get_research_service),
+    accept: str = "application/json",
+) -> ResearchResponse | StreamingResponse:
+    """Build a code-map for all wikis in a project.
+
+    Proxies to the codemap pipeline with ``project_id`` set and
+    ``research_type=codemap``.
+    """
+    user_id = user.id if user else None
+
+    # Verify the project exists and is accessible
+    project = await svc.get_project(project_id, user_id=user_id or "")
+    if project is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+
+    request = ResearchRequest(
+        project_id=project_id,
+        question=body.question,
+        research_type="codemap",
+    )
+
+    try:
+        if "text/event-stream" in accept:
+
+            async def codemap_sse():
+                async for event in service.codemap_stream(request, user_id=user_id):
+                    event_type = event.get("event_type", "message")
+                    yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
+
+            return StreamingResponse(codemap_sse(), media_type="text/event-stream")
+        return await service.codemap_sync(request, user_id=user_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(501, str(e)) from e
 
 
 # ---------------------------------------------------------------------------

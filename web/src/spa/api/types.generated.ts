@@ -314,19 +314,7 @@ export interface components {
              * Visibility
              * @default personal
              */
-            visibility?: 'personal' | 'shared';
-            /**
-             * Planner Type
-             * @description Structure planner override (agent or cluster). Null falls back to server config.
-             * @default null
-             */
-            planner_type?: 'agent' | 'cluster' | null;
-            /**
-             * Exclude Tests
-             * @description When true, soft-skip test nodes during clustering. Null falls back to server config.
-             * @default null
-             */
-            exclude_tests?: boolean | null;
+            visibility: string;
         };
         /**
          * GenerateWikiResponse
@@ -442,6 +430,8 @@ export interface components {
             sources?: components["schemas"]["SourceReference"][];
             /** Research Steps */
             research_steps?: string[];
+            /** Code Map */
+            code_map?: components["schemas"]["CodeMapData"] | null;
         };
         /**
          * SourceReference
@@ -465,6 +455,16 @@ export interface components {
              * @default null
              */
             snippet: string | null;
+            /**
+             * Wiki Id
+             * @default null
+             */
+            wiki_id: string | null;
+            /**
+             * Wiki Title
+             * @default null
+             */
+            wiki_title: string | null;
         };
         /** ValidationError */
         ValidationError: {
@@ -528,20 +528,35 @@ export interface components {
              */
             error: string | null;
             /**
+             * Indexed At
+             * @default null
+             */
+            indexed_at: string | null;
+            /**
+             * Commit Hash
+             * @default null
+             */
+            commit_hash: string | null;
+            /**
              * Owner Id
              * @default null
              */
-            owner_id?: string | null;
+            owner_id: string | null;
             /**
              * Visibility
              * @default personal
              */
-            visibility?: 'personal' | 'shared';
+            visibility: string;
             /**
              * Is Owner
-             * @default true
+             * @default false
              */
-            is_owner?: boolean;
+            is_owner: boolean;
+            /**
+             * Requires Token
+             * @default false
+             */
+            requires_token: boolean;
         };
         /**
          * SSEEvent
@@ -626,6 +641,100 @@ export interface components {
              * @default false
              */
             recoverable: boolean;
+        };
+        /** CodeMapSymbol */
+        CodeMapSymbol: {
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /**
+             * Symbol Type
+             * @default
+             */
+            symbol_type: string;
+            /**
+             * File Path
+             * @default
+             */
+            file_path: string;
+            /** Line Start */
+            line_start?: number | null;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Relationships
+             * @default []
+             */
+            relationships: string[];
+        };
+        /** CodeMapSection */
+        CodeMapSection: {
+            /** Id */
+            id: string;
+            /** Title */
+            title: string;
+            /**
+             * File Path
+             * @default
+             */
+            file_path: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Symbols
+             * @default []
+             */
+            symbols: components["schemas"]["CodeMapSymbol"][];
+        };
+        /** CodeMapData */
+        CodeMapData: {
+            /**
+             * Summary
+             * @default
+             */
+            summary: string;
+            /**
+             * Call Stacks
+             * @default []
+             */
+            call_stacks: components["schemas"]["CallStack"][];
+            /**
+             * Sections
+             * @default []
+             */
+            sections: components["schemas"]["CodeMapSection"][];
+        };
+        /** CallStackStep */
+        CallStackStep: {
+            /** Symbol */
+            symbol: string;
+            /**
+             * File Path
+             * @default
+             */
+            file_path: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+        };
+        /** CallStack */
+        CallStack: {
+            /** Title */
+            title: string;
+            /**
+             * Steps
+             * @default []
+             */
+            steps: components["schemas"]["CallStackStep"][];
         };
     };
     responses: never;

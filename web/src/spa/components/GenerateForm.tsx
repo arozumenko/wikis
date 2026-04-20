@@ -2,12 +2,6 @@ import { useCallback, useState } from 'react';
 import {
   Box,
   Button,
-  Checkbox,
-  FormControl,
-  FormControlLabel,
-  InputLabel,
-  MenuItem,
-  Select,
   TextField,
 } from '@mui/material';
 import type { components } from '../api/types.generated';
@@ -37,8 +31,6 @@ export function GenerateForm({ onSubmit, disabled = false, initialUrl = '' }: Ge
   const [repoUrl, setRepoUrl] = useState(initialUrl);
   const [branch, setBranch] = useState('main');
   const [accessToken, setAccessToken] = useState('');
-  const [plannerType, setPlannerType] = useState<'agent' | 'cluster'>('agent');
-  const [excludeTests, setExcludeTests] = useState(true);
 
   const provider = detectProvider(repoUrl);
   const isLocal = provider === 'local';
@@ -58,11 +50,9 @@ export function GenerateForm({ onSubmit, disabled = false, initialUrl = '' }: Ge
         llm_model: null,
         embedding_model: null,
         visibility: 'personal',
-        planner_type: plannerType,
-        exclude_tests: excludeTests,
       });
     },
-    [repoUrl, branch, provider, isLocal, accessToken, plannerType, excludeTests, onSubmit],
+    [repoUrl, branch, provider, isLocal, accessToken, onSubmit],
   );
 
   return (
@@ -106,31 +96,6 @@ export function GenerateForm({ onSubmit, disabled = false, initialUrl = '' }: Ge
           disabled={disabled}
         />
       )}
-
-      <FormControl fullWidth margin="normal" disabled={disabled}>
-        <InputLabel id="planner-type-label">Structure Planner</InputLabel>
-        <Select
-          labelId="planner-type-label"
-          value={plannerType}
-          label="Structure Planner"
-          onChange={(e) => setPlannerType(e.target.value as 'agent' | 'cluster')}
-        >
-          <MenuItem value="agent">Agent (LLM-guided)</MenuItem>
-          <MenuItem value="cluster">Cluster (graph-based)</MenuItem>
-        </Select>
-      </FormControl>
-
-      <FormControlLabel
-        control={
-          <Checkbox
-            checked={excludeTests}
-            onChange={(e) => setExcludeTests(e.target.checked)}
-            disabled={disabled}
-          />
-        }
-        label="Exclude test files from wiki structure"
-        sx={{ mt: 1 }}
-      />
 
       <Button
         type="submit"

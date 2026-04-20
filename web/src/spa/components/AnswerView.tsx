@@ -26,6 +26,11 @@ interface AnswerViewProps {
 
 export function AnswerView({ question, answer, loading, mode = 'dark' }: AnswerViewProps) {
   const components: Components = {
+    // Strip the outer <pre> that rehype-highlight wraps around <code>
+    // to avoid double-card rendering (CodeBlock already provides its own <pre>)
+    pre({ children }) {
+      return <>{children}</>;
+    },
     code({ className, children }) {
       const match = /language-(\w+)/.exec(className ?? '');
       const language = match?.[1];

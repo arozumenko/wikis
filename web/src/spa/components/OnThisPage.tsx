@@ -24,17 +24,14 @@ export function OnThisPage({ contentRef }: OnThisPageProps) {
     const extract = () => {
       const nodes = el.querySelectorAll('h2, h3');
       const result: Heading[] = [];
+      const seenIds = new Set<string>();
       nodes.forEach((node) => {
         const text = node.textContent?.trim() ?? '';
         if (!text) return;
-        let id = node.id;
-        if (!id) {
-          id = text
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, '-')
-            .replace(/^-|-$/g, '');
-          node.id = id;
-        }
+        // rehype-slug sets the id; fall back to slugifying if missing
+        const id = node.id || text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        if (!id || seenIds.has(id)) return;
+        seenIds.add(id);
         result.push({ id, text, level: node.tagName === 'H2' ? 2 : 3 });
       });
       setHeadings(result);

@@ -13,7 +13,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.api import DeleteWikiResponse, WikiListResponse, WikiSummary
-from app.models.db_models import WikiRecord
+from app.models.db_models import WikiPageRecord, WikiRecord
 from app.storage.base import ArtifactStorage
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,121 @@ class WikiManagementService:
                             record.visibility = visibility
 
         logger.info("Registered wiki: %s (owner=%s, status=%s)", wiki_id, owner_id, status)
+
+    async def index_wiki_pages(
+        self,
+        wiki_id: str,
+        pages: dict[str, str],
+    ) -> int:
+        """Index wiki pages for full-text search (PG tsvector / SQLite FTS5).
+
+        Replaces any existing pages for *wiki_id* (idempotent on re-generation).
+
+        Args:
+            wiki_id: Wiki identifier.
+            pages: Mapping of ``{page_id: markdown_content}``.
+
+        Returns:
+            Number of pages indexed.
+        """
+        from app.core.wiki_page_index import _parse_frontmatter
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(WikiPageRecord).where(WikiPageRecord.wiki_id == wiki_id)
+                )
+
+                count = 0
+                for page_id, content in pages.items():
+                    title, description = _parse_frontmatter(content)
+                    if not title:
+                        title = page_id
+
+                    record = WikiPageRecord(
+                        id=f"{wiki_id}/{title}",
+                        wiki_id=wiki_id,
+                        page_title=title,
+                        description=description,
+                        content=content,
+                    )
+                    session.add(record)
+                    count += 1
+
+        logger.info("Indexed %d wiki pages for %s", count, wiki_id)
+        return count
+
+    async def ensure_pages_indexed(self, wiki_id: str) -> None:
+        """Lazy backfill: index pages from artifact storage if not yet in DB.
+
+        Called before search to ensure old wikis (generated before the FTS
+        migration) have their pages indexed. Idempotent — returns immediately
+        when at least one row exists in ``wiki_page`` for this wiki.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(WikiPageRecord.id).where(WikiPageRecord.wiki_id == wiki_id).limit(1)
+            )
+            if result.scalar_one_or_none() is not None:
+                return
+
+        try:
+            artifacts = await self.storage.list_artifacts("wiki_artifacts", prefix=wiki_id)
+        except Exception:
+            logger.warning("Lazy backfill: failed to list artifacts for %s", wiki_id)
+            return
+
+        md_artifacts = [a for a in artifacts if a.endswith(".md") and "wiki_pages/" in a]
+        if not md_artifacts:
+            return
+
+        pages: dict[str, str] = {}
+        for artifact_key in md_artifacts:
+            try:
+                raw = await self.storage.download("wiki_artifacts", artifact_key)
+                content = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+                page_id = artifact_key.rsplit("/", 1)[-1][:-3]
+                pages[page_id] = content
+            except Exception:
+                logger.warning("Lazy backfill: failed to read %s", artifact_key)
+
+        if pages:
+            await self.index_wiki_pages(wiki_id, pages)
+            logger.info("Lazy backfill: indexed %d pages for wiki %s", len(pages), wiki_id)
+
+    async def delete_wiki_pages(self, wiki_id: str) -> None:
+        """Remove all indexed pages for a wiki."""
+        async with self.session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(WikiPageRecord).where(WikiPageRecord.wiki_id == wiki_id)
+                )
+
+    async def update_description(
+        self,
+        wiki_id: str,
+        user_id: str,
+        description: str | None,
+    ) -> WikiRecord | None:
+        """Update the user-provided description for a wiki. Owner-only.
+
+        Returns the updated WikiRecord, or None when not found / caller is not
+        the owner.
+        """
+        async with self.session_factory() as session:
+            async with session.begin():
+                result = await session.execute(select(WikiRecord).where(WikiRecord.id == wiki_id))
+                record = result.scalar_one_or_none()
+                if record is None:
+                    return None
+                if record.owner_id and record.owner_id != user_id:
+                    return None
+                record.description = description
+                record.updated_at = datetime.now()
+                await session.flush()
+                await session.refresh(record)
+
+        return record
 
     async def update_visibility(
         self,
@@ -222,9 +337,10 @@ class WikiManagementService:
                 _cleanup_cache_files, cache_dir, record.repo_url, record.branch or "main"
             )
 
-        # Remove the metadata record
+        # Remove indexed pages and metadata record
         async with self.session_factory() as session:
             async with session.begin():
+                await session.execute(delete(WikiPageRecord).where(WikiPageRecord.wiki_id == wiki_id))
                 await session.execute(delete(WikiRecord).where(WikiRecord.id == wiki_id))
 
         logger.info("Deleted wiki: %s", wiki_id)
@@ -251,6 +367,7 @@ class WikiManagementService:
             status=record.status or "complete",
             requires_token=bool(record.requires_token),
             error=record.error,
+            description=record.description,
         )
 
 

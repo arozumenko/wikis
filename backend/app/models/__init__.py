@@ -4,11 +4,15 @@ from .api import (
     AskRequest,
     AskResponse,
     ChatMessage,
+    CodeMapData,
+    CodeMapSection,
+    CodeMapSymbol,
     DeleteWikiResponse,
     ErrorResponse,
     GenerateWikiRequest,
     GenerateWikiResponse,
     HealthResponse,
+    ProjectCodeMapRequest,
     RefreshWikiRequest,
     ResearchRequest,
     ResearchResponse,
@@ -27,6 +31,17 @@ from .events import (
     WikiCompleteEvent,
 )
 from .invocation import Invocation
+from .search import (
+    PageListItem,
+    PageNeighbor,
+    PageNeighborsResponse,
+    ProjectSearchResponse,
+    SearchResultItem,
+    WikiPageListResponse,
+    WikiPageResponse,
+    WikiSearchResponse,
+    WikiSummaryItem,
+)
 
 __all__ = [
     # API models
@@ -38,6 +53,9 @@ __all__ = [
     "AskResponse",
     "ResearchRequest",
     "ResearchResponse",
+    "CodeMapSection",
+    "CodeMapSymbol",
+    "CodeMapData",
     "WikiSummary",
     "WikiListResponse",
     "DeleteWikiResponse",
@@ -45,8 +63,19 @@ __all__ = [
     "RefreshWikiRequest",
     "HealthResponse",
     "ErrorResponse",
+    "ProjectCodeMapRequest",
     # Invocation
     "Invocation",
+    # Search models
+    "PageNeighbor",
+    "SearchResultItem",
+    "WikiSummaryItem",
+    "WikiSearchResponse",
+    "ProjectSearchResponse",
+    "PageListItem",
+    "WikiPageListResponse",
+    "WikiPageResponse",
+    "PageNeighborsResponse",
     # SSE events
     "SSEEvent",
     "ProgressEvent",

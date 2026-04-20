@@ -35,6 +35,7 @@ class EngineComponents:
     llm: Any = None  # BaseChatModel
     repo_path: str | None = None  # Path to cloned repo (if still on disk)
     unified_db_path: str | None = None  # Path to .wiki.db
+    query_service: Any = None  # GraphQueryService / StorageQueryService / MultiGraphQueryService
 
 
 class ComponentCache:
@@ -363,6 +364,15 @@ def _load_cached_artifacts(
         # ``StorageQueryService`` + ``StorageTextIndex`` instead of a
         # rehydrated NX graph.
         components.storage = db
+
+        # Build a storage-native query service so research/ask tools can
+        # treat single- and multi-wiki components uniformly.
+        try:
+            from app.core.code_graph.storage_query_service import StorageQueryService
+
+            components.query_service = StorageQueryService(db)
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning("Failed to build StorageQueryService for %s: %s", cache_key, e)
 
         # Load repository analysis from unified DB (Ask tool context)
         raw_analysis = db.get_meta("repository_analysis")

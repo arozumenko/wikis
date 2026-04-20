@@ -89,6 +89,9 @@ async def create_tables(engine: AsyncEngine) -> None:
     # Auto-migrate: add columns that create_all can't add to existing tables.
     # Each statement is idempotent (IF NOT EXISTS / OR IGNORE).
     await _add_missing_columns(engine)
+
+    # Wiki page FTS — backend-specific. PG: tsvector + GIN index. SQLite: FTS5 vtable + triggers.
+    await _ensure_wiki_page_fts(engine)
     logger.info("Database tables ensured")
 
 
@@ -102,6 +105,7 @@ async def _add_missing_columns(engine: AsyncEngine) -> None:
         ("wiki", "status", "VARCHAR", "'complete'"),
         ("wiki", "requires_token", "INTEGER", "0"),
         ("wiki", "error", "VARCHAR", None),
+        ("wiki", "description", "VARCHAR", None),
     ]
 
     # All identifiers are hardcoded constants — no user input in SQL.
@@ -124,6 +128,82 @@ async def _add_missing_columns(engine: AsyncEngine) -> None:
                         pass  # Column already exists
                     else:
                         logger.warning("Migration failed for %s.%s: %s", table, column, e)
+
+
+async def _ensure_wiki_page_fts(engine: AsyncEngine) -> None:
+    """Create backend-specific FTS index for wiki_page (idempotent).
+
+    PostgreSQL: a STORED ``search_vector`` (tsvector) column with a GIN index.
+    Weights: title=A, description=B, content=C — queried via ``ts_rank``.
+
+    SQLite: a contentless-style FTS5 virtual table named ``wiki_page_fts`` with
+    sync triggers (insert/update/delete) and rowid mirroring ``wiki_page.rowid``.
+    Queried via ``bm25(wiki_page_fts, w_title, w_desc, w_content)`` — weights
+    chosen to mirror PG's A/B/C scaling (10/5/1 ≈ 1.0/0.4/0.2 normalized).
+    """
+    from sqlalchemy import text
+
+    is_pg = "postgresql" in str(engine.url)
+
+    if is_pg:
+        async with engine.begin() as conn:
+            # Generated tsvector column with weighted A/B/C terms.
+            await conn.execute(text(
+                "ALTER TABLE wiki_page ADD COLUMN IF NOT EXISTS "
+                "search_vector tsvector "
+                "GENERATED ALWAYS AS ("
+                "  setweight(to_tsvector('english', coalesce(page_title, '')), 'A') || "
+                "  setweight(to_tsvector('english', coalesce(description, '')), 'B') || "
+                "  setweight(to_tsvector('english', coalesce(content, '')), 'C')"
+                ") STORED"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_wiki_page_search "
+                "ON wiki_page USING gin(search_vector)"
+            ))
+        logger.info("wiki_page FTS column + GIN index ensured (PostgreSQL)")
+        return
+
+    # SQLite path — FTS5 virtual table + sync triggers.
+    async with engine.begin() as conn:
+        # Create FTS5 vtable (porter unicode61 tokenizer to mirror PG 'english').
+        # contentless-delete is required for fast UPDATE/DELETE in modern SQLite.
+        await conn.execute(text(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS wiki_page_fts USING fts5("
+            "  page_title, description, content,"
+            "  content='wiki_page', content_rowid='rowid',"
+            "  tokenize='porter unicode61'"
+            ")"
+        ))
+        # Sync triggers — keep the FTS table aligned with wiki_page.
+        await conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS wiki_page_ai AFTER INSERT ON wiki_page BEGIN "
+            "  INSERT INTO wiki_page_fts(rowid, page_title, description, content) "
+            "  VALUES (new.rowid, new.page_title, new.description, new.content); "
+            "END"
+        ))
+        await conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS wiki_page_ad AFTER DELETE ON wiki_page BEGIN "
+            "  INSERT INTO wiki_page_fts(wiki_page_fts, rowid, page_title, description, content) "
+            "  VALUES ('delete', old.rowid, old.page_title, old.description, old.content); "
+            "END"
+        ))
+        await conn.execute(text(
+            "CREATE TRIGGER IF NOT EXISTS wiki_page_au AFTER UPDATE ON wiki_page BEGIN "
+            "  INSERT INTO wiki_page_fts(wiki_page_fts, rowid, page_title, description, content) "
+            "  VALUES ('delete', old.rowid, old.page_title, old.description, old.content); "
+            "  INSERT INTO wiki_page_fts(rowid, page_title, description, content) "
+            "  VALUES (new.rowid, new.page_title, new.description, new.content); "
+            "END"
+        ))
+        # Backfill any rows that pre-existed before triggers were installed.
+        await conn.execute(text(
+            "INSERT INTO wiki_page_fts(rowid, page_title, description, content) "
+            "SELECT wp.rowid, wp.page_title, wp.description, wp.content "
+            "FROM wiki_page wp "
+            "WHERE wp.rowid NOT IN (SELECT rowid FROM wiki_page_fts)"
+        ))
+    logger.info("wiki_page FTS5 vtable + triggers ensured (SQLite)")
 
 
 def get_engine() -> AsyncEngine:

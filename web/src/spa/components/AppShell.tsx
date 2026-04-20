@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   AppBar,
   Avatar,
@@ -21,10 +21,13 @@ import LogoutIcon from '@mui/icons-material/Logout';
 import SettingsIcon from '@mui/icons-material/Settings';
 import GitHubIcon from '@mui/icons-material/GitHub';
 import RefreshIcon from '@mui/icons-material/Refresh';
-import { Link, Outlet, useNavigate } from 'react-router-dom';
+import FileUploadIcon from '@mui/icons-material/FileUpload';
+import SearchIcon from '@mui/icons-material/Search';
+import { Link, Outlet, useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import { refreshWiki } from '../api/wiki';
 import { ConfirmDialog } from './ConfirmDialog';
+import { QuickSearch } from './QuickSearch';
 import { STALE_MS } from '../constants';
 
 interface AppShellProps {
@@ -59,10 +62,35 @@ function relativeTime(iso: string): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+const isMac =
+  typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('MAC');
+const shortcutHint = isMac ? '⌘K' : 'Ctrl+K';
+
+export interface AppShellOutletContext {
+  importDialogOpen: boolean;
+  setImportDialogOpen: (open: boolean) => void;
+}
+
 export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
+  const { wikiId, projectId } = useParams<{ wikiId?: string; projectId?: string }>();
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const isDashboard = !wikiId && !projectId;
+
+  useEffect(() => {
+    if (isDashboard) return;
+    function handleKeyDown(e: KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        setSearchOpen(true);
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isDashboard]);
 
   const handleOpenMenu = useCallback((e: React.MouseEvent<HTMLElement>) => {
     setAnchorEl(e.currentTarget);
@@ -234,6 +262,33 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
             </Tooltip>
           )}
 
+          {/* Import wiki button (dashboard only) */}
+          {isDashboard && (
+            <Tooltip title="Import wiki">
+              <IconButton
+                onClick={() => setImportDialogOpen(true)}
+                size="small"
+                sx={{ color: 'text.secondary', mr: 0.5, '&:hover': { color: 'primary.main' } }}
+              >
+                <FileUploadIcon sx={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          )}
+
+          {/* Search button — only shown on wiki/project pages */}
+          {!isDashboard && (
+            <Tooltip title={shortcutHint}>
+              <IconButton
+                onClick={() => setSearchOpen(true)}
+                aria-label="Search"
+                size="small"
+                sx={{ color: 'text.secondary', mr: 0.5, '&:hover': { color: 'text.primary' } }}
+              >
+                <SearchIcon sx={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          )}
+
           {/* Theme toggle */}
           <IconButton
             onClick={onToggleTheme}
@@ -319,7 +374,7 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
           '& > *': { animation: 'fadeInUp 0.3s ease-out' },
         }}
       >
-        <Outlet />
+        <Outlet context={{ importDialogOpen, setImportDialogOpen } satisfies AppShellOutletContext} />
       </Box>
 
       <ConfirmDialog
@@ -329,6 +384,13 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
         confirmLabel="Refresh"
         onConfirm={handleRefresh}
         onCancel={() => setShowRefreshConfirm(false)}
+      />
+
+      <QuickSearch
+        open={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        wikiId={wikiId}
+        projectId={projectId}
       />
     </Box>
   );

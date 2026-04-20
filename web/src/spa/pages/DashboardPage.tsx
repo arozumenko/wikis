@@ -29,15 +29,20 @@ import LockOutlinedIcon from '@mui/icons-material/LockOutlined';
 import PublicOutlinedIcon from '@mui/icons-material/PublicOutlined';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import ShareIcon from '@mui/icons-material/Share';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useOutletContext } from 'react-router-dom';
+import type { AppShellOutletContext } from '../components/AppShell';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { GenerateForm } from '../components/GenerateForm';
+import { ImportWikiDialog } from '../components/ImportWikiDialog';
+import { ProjectCard } from '../components/ProjectCard';
+import { CreateProjectDialog } from '../components/CreateProjectDialog';
 import { listWikis, deleteWiki, generateWiki, updateWikiVisibility } from '../api/wiki';
+import { listProjects, type ProjectResponse } from '../api/project';
 import { ApiError } from '../api/client';
 import type { components } from '../api/types.generated';
 
 type WikiSummary = components['schemas']['WikiSummary'];
-type VisibilityFilter = 'all' | 'mine' | 'shared';
+type VisibilityFilter = 'all' | 'mine' | 'shared' | 'projects';
 
 const CARD_GRADIENTS = [
   'linear-gradient(135deg, #A855F7, #6366F1)', // violet → indigo
@@ -82,12 +87,16 @@ function extractOwnerRepo(url: string): string {
 
 export function DashboardPage() {
   const navigate = useNavigate();
+  const { importDialogOpen, setImportDialogOpen } = useOutletContext<AppShellOutletContext>();
   const [wikis, setWikis] = useState<WikiSummary[]>([]);
+  const [projects, setProjects] = useState<ProjectResponse[]>([]);
+  const [loadingProjects, setLoadingProjects] = useState(false);
   const [loading, setLoading] = useState(true);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [searchUrl, setSearchUrl] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [showGenerateModal, setShowGenerateModal] = useState(false);
+  const [showCreateProjectDialog, setShowCreateProjectDialog] = useState(false);
   const [visibilityFilter, setVisibilityFilter] = useState<VisibilityFilter>('all');
   const [togglingVisibility, setTogglingVisibility] = useState<string | null>(null);
   const [snackbarMessage, setSnackbarMessage] = useState<string | null>(null);
@@ -105,9 +114,23 @@ export function DashboardPage() {
       .finally(() => setLoading(false));
   }, []);
 
+  const fetchProjects = useCallback(() => {
+    setLoadingProjects(true);
+    listProjects()
+      .then((data) => setProjects(data.projects ?? []))
+      .catch(() => setProjects([]))
+      .finally(() => setLoadingProjects(false));
+  }, []);
+
   useEffect(() => {
     fetchWikis();
   }, [fetchWikis]);
+
+  useEffect(() => {
+    if (visibilityFilter === 'projects') {
+      fetchProjects();
+    }
+  }, [visibilityFilter, fetchProjects]);
 
   // Auto-refresh every 10s while any wiki is generating
   useEffect(() => {
@@ -316,6 +339,7 @@ export function DashboardPage() {
             <ToggleButton value="all">All</ToggleButton>
             <ToggleButton value="mine">My Wikis</ToggleButton>
             <ToggleButton value="shared">Shared</ToggleButton>
+            <ToggleButton value="projects">Projects</ToggleButton>
           </ToggleButtonGroup>
         </Box>
       </Box>
@@ -357,7 +381,59 @@ export function DashboardPage() {
         </Box>
       )}
 
-      <Grid container spacing={2.5}>
+      {visibilityFilter === 'projects' ? (
+        <Grid container spacing={2.5}>
+          {loadingProjects ? (
+            <Grid item xs={12}>
+              <Box display="flex" justifyContent="center" py={4}>
+                <CircularProgress />
+              </Box>
+            </Grid>
+          ) : (
+            <>
+              <Grid item xs={12} sm={6} md={4}>
+                <Card
+                  variant="outlined"
+                  sx={{
+                    height: 140,
+                    borderRadius: 3,
+                    border: '2px dashed',
+                    borderColor: 'divider',
+                    '&:hover': { borderColor: 'primary.main' },
+                  }}
+                >
+                  <CardActionArea
+                    onClick={() => setShowCreateProjectDialog(true)}
+                    sx={{
+                      height: '100%',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <AddIcon sx={{ fontSize: 32, color: 'text.secondary', mb: 1 }} />
+                    <Typography variant="body2" color="text.secondary">
+                      Add a project
+                    </Typography>
+                  </CardActionArea>
+                </Card>
+              </Grid>
+              {projects.map((project) => (
+                <Grid item xs={12} sm={6} md={4} key={project.id}>
+                  <ProjectCard
+                    project={project}
+                    gradient={cardGradient(project.id)}
+                    onDelete={() => setProjects((prev) => prev.filter((p) => p.id !== project.id))}
+                    onUpdate={(updated) => setProjects((prev) => prev.map((p) => p.id === updated.id ? updated : p))}
+                  />
+                </Grid>
+              ))}
+            </>
+          )}
+        </Grid>
+      ) : null}
+
+      {visibilityFilter !== 'projects' && <Grid container spacing={2.5}>
         {!hasSearchWithNoResults && (
           <Grid item xs={12} sm={6} md={4}>
             <Card
@@ -619,7 +695,7 @@ export function DashboardPage() {
             </Grid>
           );
         })}
-      </Grid>
+      </Grid>}
 
       <Dialog
         open={showGenerateModal}
@@ -662,12 +738,33 @@ export function DashboardPage() {
         </DialogContent>
       </Dialog>
 
+      <ImportWikiDialog
+        open={importDialogOpen}
+        onClose={() => setImportDialogOpen(false)}
+        onSuccess={(wiki) => {
+          setWikis((prev) => [wiki, ...prev]);
+          setImportDialogOpen(false);
+          showSnackbar('Wiki imported successfully', 'success');
+          navigate(`/wiki/${wiki.wiki_id}`);
+        }}
+      />
+
       <ConfirmDialog
         open={deleteTarget !== null}
         title="Delete Wiki"
         message="Are you sure? This cannot be undone."
         onConfirm={confirmDelete}
         onCancel={() => setDeleteTarget(null)}
+      />
+
+      <CreateProjectDialog
+        open={showCreateProjectDialog}
+        onClose={() => setShowCreateProjectDialog(false)}
+        availableWikis={wikis}
+        onCreated={(project) => {
+          setProjects((prev) => [project, ...prev]);
+          setShowCreateProjectDialog(false);
+        }}
       />
 
       <Snackbar
