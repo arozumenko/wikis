@@ -205,6 +205,10 @@ class WikiService:
                 force_rebuild_index=request.force_rebuild_index,
                 llm_low=llm_low,
                 progress_callback=progress_callback,
+                # Keep the cloned repo on disk so Deep Research's
+                # FilesystemBackend can read source files post-generation.
+                # Explicit cleanup happens via delete_wiki().
+                cleanup_repos_on_exit=False,
             )
 
             # Token pre-estimation after toolkit init

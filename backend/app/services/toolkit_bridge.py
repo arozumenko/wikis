@@ -201,10 +201,12 @@ def _find_repo_clone(
 ) -> str | None:
     """Find the cloned repo directory on disk.
 
-    Uses the same path convention as LocalRepositoryManager:
-      {cache_dir}/{owner_repo}_{branch}_{commit_short}
+    LocalRepositoryManager (used by FilesystemIndexer) clones into the
+    ``repositories/`` subdirectory of the cache:
+      {cache_dir}/repositories/{owner_repo}_{branch}_{commit_short}
 
-    Returns the path if it exists, else None.
+    Older deployments may have placed clones directly under ``cache_dir``,
+    so we check both layouts. Returns the path if it exists, else None.
     """
     import os
 
@@ -217,21 +219,27 @@ def _find_repo_clone(
     else:
         safe_name = url.replace("/", "_")
 
+    # Search both the canonical "repositories/" subdir and the legacy
+    # cache_dir root.
+    search_roots = [os.path.join(cache_dir, "repositories"), cache_dir]
+
     # Exact match with commit hash
     if commit_hash:
-        candidate = os.path.join(cache_dir, f"{safe_name}_{branch}_{commit_hash[:8]}")
-        if os.path.isdir(candidate):
-            logger.info("Found repo clone at %s", candidate)
-            return candidate
+        for root in search_roots:
+            candidate = os.path.join(root, f"{safe_name}_{branch}_{commit_hash[:8]}")
+            if os.path.isdir(candidate):
+                logger.info("Found repo clone at %s", candidate)
+                return candidate
 
     # Fallback: glob for any clone matching owner_repo_branch_*
     import glob as glob_mod
 
-    pattern = os.path.join(cache_dir, f"{safe_name}_{branch}_*")
-    matches = sorted(glob_mod.glob(pattern), key=os.path.getmtime, reverse=True)
-    if matches and os.path.isdir(matches[0]):
-        logger.info("Found repo clone (glob fallback) at %s", matches[0])
-        return matches[0]
+    for root in search_roots:
+        pattern = os.path.join(root, f"{safe_name}_{branch}_*")
+        matches = sorted(glob_mod.glob(pattern), key=os.path.getmtime, reverse=True)
+        if matches and os.path.isdir(matches[0]):
+            logger.info("Found repo clone (glob fallback) at %s", matches[0])
+            return matches[0]
 
     logger.info("No repo clone found for %s branch=%s", repo_url, branch)
     return None

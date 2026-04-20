@@ -150,7 +150,7 @@ class TestE2ESmokeFlow:
             return_value=ResearchResponse(
                 answer="Detailed analysis shows microservice pattern.",
                 sources=[],
-                research_steps=["search_codebase", "analyze_graph"],
+                research_steps=["search_symbols", "analyze_graph"],
             )
         )
         resp = await c.post(

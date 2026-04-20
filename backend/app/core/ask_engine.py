@@ -159,25 +159,15 @@ class AskEngine:
 
                 fts_index = StorageTextIndex(db)
 
-        # Force progressive tools for the agentic Ask
-        _orig = os.environ.get("WIKIS_PROGRESSIVE_TOOLS", "")
-        os.environ["WIKIS_PROGRESSIVE_TOOLS"] = "1"
-        try:
-            custom_tools = create_codebase_tools(
-                retriever_stack=self.retriever_stack,
-                graph_manager=self.graph_manager,
-                code_graph=self.code_graph,
-                repo_analysis=self.repo_analysis,
-                event_callback=None,  # Events come from LangGraph stream
-                graph_text_index=fts_index,
-                similarity_threshold=self.config.similarity_threshold,
-            )
-        finally:
-            # Restore original env
-            if _orig:
-                os.environ["WIKIS_PROGRESSIVE_TOOLS"] = _orig
-            else:
-                os.environ.pop("WIKIS_PROGRESSIVE_TOOLS", None)
+        custom_tools = create_codebase_tools(
+            retriever_stack=self.retriever_stack,
+            graph_manager=self.graph_manager,
+            code_graph=self.code_graph,
+            repo_analysis=self.repo_analysis,
+            event_callback=None,  # Events come from LangGraph stream
+            graph_text_index=fts_index,
+            similarity_threshold=self.config.similarity_threshold,
+        )
 
         # Compute summarization defaults matching deepagents/graph.py logic:
         # If the model exposes a profile with max_input_tokens use fraction-based

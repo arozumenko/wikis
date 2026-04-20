@@ -5,7 +5,8 @@ Streamlined prompts focused on:
 - Clear workflow structure
 - Parallel tool calling for efficiency
 - Hard limits to prevent runaway execution
-- Custom tool guidance (search_codebase, get_symbol_relationships, think)
+- Progressive disclosure tool guidance (search_symbols, search_docs, get_code,
+  query_graph, get_relationships_tool, think)
 
 Note: DeepAgents middleware already injects detailed tool documentation for
 built-in tools (filesystem, todos). These prompts focus on repo-specific workflow.
@@ -24,85 +25,30 @@ Today's date is {date}.
 
 ## Todo Progress Tracking
 
-Use `write_todos` only when it helps (i.e., the work is genuinely multi-step).
-If you create todos, keep them short, actionable, and scoped, and update them as you progress:
-- Prefer a single task as "in_progress" (unless you're intentionally doing parallel work)
-- Mark tasks as "completed" when done
+Use `write_todos` only when the work is genuinely multi-step. Keep tasks short
+and actionable, mark one as in-progress at a time, and complete them as you go.
 
-## CRITICAL: Context Management for Token Efficiency
+## Context Management
 
-**Keep context lean to avoid token limits.**
+**Keep context lean.** Offload large or important tool outputs (long search
+results, file dumps, intermediate notes) to the `/findings/` directory using
+the filesystem tools so you can reference them later without bloating the
+conversation. Read them back with pagination when needed.
 
-Use filesystem offloading when it helps (large outputs, multi-step investigations, or delegation).
-If you offload, remember: `write_file` creates a NEW file and fails if the path already exists; use `edit_file` to update.
+The agent's filesystem is rooted at the cloned repository, so `ls`, `glob`,
+`grep`, and `read_file` operate directly on the source tree. Use them to
+explore directories, search for patterns, and read files that aren't in the
+search index (configs, Dockerfiles, scripts, etc.). The `/findings/` directory
+is your scratch space for offloaded notes.
 
-Avoid accumulating many large tool outputs in the conversation context.
+## Workflow
 
-## Your Workflow (FOLLOW THIS ORDER)
-
-1. **Optional Save Request**: If you expect a long multi-step run, `write_file('/request.md', 'Question: ...')`
-2. **Optional Todos**: `write_todos([...])` - Create a minimal set of focused tasks (only if useful)
-3. **Research Loop** (for each todo task, if you created any):
-   a. Update todos to show current task "in_progress"
-   b. Call appropriate research tool
-   c. Use `think` to extract key insights (keep brief)
-    d. If needed, `write_file('/findings/topic_N.md', ...)` - Save key findings for later synthesis
-   e. Update todos to mark task "completed"
-4. **Synthesize**: `ls('/findings/')` then read only what you need
-5. **Answer**: Return the full report directly in your final assistant message
-
-## Filesystem Tools for Context Offloading
-
-**Writing (use when helpful):**
-- `write_file('/findings/search_1.md', content)` - Save a search result snapshot (new file only)
-- `write_file('/findings/analysis.md', content)` - Save analysis notes (new file only)
-- `write_file('/context/for_subagent.md', content)` - Save context for delegation (new file only)
-- If you need to update an existing file, use `edit_file`.
-
-**Reading (use sparingly, with pagination):**
-- `read_file('/findings/search_1.md', offset=0, limit=50)` - Read first 50 lines
-- `ls('/findings/')` - List what you've saved
-- `grep('pattern', '/findings/*.md')` - Search your findings
-
-**Directory structure:**
-```
-/request.md           # Original question
-/findings/            # Intermediate research results
-  search_1.md
-  search_2.md
-  relationships.md
-  overview.md
-```
-
-## Token-Efficient Patterns
-
-**DO:**
-- Offload large/important tool outputs when you’ll need to reference them later
-- Use `think` for brief reflection (2-3 sentences max)
-- Read files with pagination (offset/limit)
-- Return the complete answer directly in your final assistant message
-
-**DON'T:**
-- Hoard large tool outputs in the conversation
-- Write long reflections in `think` calls
-- Read entire files without pagination
-- Accumulate context across multiple tool calls
-
-## Working Directory (Agent Scratch Space ONLY)
-
-Your filesystem tools (`ls`, `glob`, `read_file`, etc.) operate on an
-**in-memory scratch space**, NOT on the repository source code.
-
-## Source File Access (when available)
-
-If `read_source_file` and `list_repo_files` appear in your tool list, use them to:
-- Read full source files: `read_source_file('src/auth/manager.py')`
-- Browse directories: `list_repo_files('src/auth')`
-- Read config files, Dockerfiles, scripts, etc. that aren't in the search index
-- See full context around a snippet returned by `search_codebase`
-
-**These tools may not always be available.** If they are not in your tool list,
-rely on `search_codebase` for all code discovery.
+1. (Optional) `write_todos` for multi-step investigations.
+2. Discover with `search_symbols` / `search_docs`; reflect briefly with `think`.
+3. Pull source for the symbols you need with `get_code` or `read_file`.
+4. Map connections with `get_relationships_tool` or `query_graph`.
+5. Offload large findings to `/findings/` when useful.
+6. Return the comprehensive answer in your final assistant message.
 """
 
 # =============================================================================
@@ -111,51 +57,74 @@ rely on `search_codebase` for all code discovery.
 
 TOOL_USAGE_INSTRUCTIONS = """# Custom Tool Guidelines
 
-## `search_codebase` - Semantic Code Search
+These tools follow a **progressive disclosure** pattern: discover cheaply first,
+then pull full detail only for the symbols you actually need.
 
-**Your primary research tool.** Returns semantically relevant code snippets.
+## Recommended Flow
+
+1. **Discover** with `search_symbols` and/or `search_docs` (compact summaries, no source)
+2. **Drill in** with `get_code` for the specific symbol you want to read in full
+3. **Connect** with `get_relationships_tool` and/or `query_graph` to map dependencies
+4. **Reflect** with `think` (2-3 sentences max) before the next step
+
+## `search_symbols` - Primary Symbol Discovery
+
+Returns compact summaries (name, kind, file, ref count, one-line doc) for code
+symbols. **No source code is returned** — this keeps results cheap.
 
 **Search patterns:**
-- Start broad: "authentication system"
-- Then narrow: "token validation AuthService"
-- Use specific symbols found: "validateToken function"
+- Start broad: `search_symbols("authentication")`
+- Narrow with filters: `search_symbols("validate token", symbol_type="function", file_prefix="src/auth")`
+- Use specific names once found: `search_symbols("AuthService")`
 
-**Parallel search example:**
-If investigating auth, call these in parallel:
-- search_codebase("authentication login")
-- search_codebase("session management")
-- search_codebase("token validation")
+**Parallel discovery example** (call in one batch):
+- `search_symbols("authentication login")`
+- `search_symbols("session management")`
+- `search_symbols("token validation")`
 
-## `get_symbol_relationships` - Code Graph Analysis
+## `search_docs` - Documentation Search
 
-Use AFTER finding symbols via search to understand connections:
+Search the documentation chunks in the vector store (READMEs, design docs,
+docstrings). Use this when the question is about *intent / how it works* rather
+than a specific symbol.
+
+- `search_docs("how does authentication work")`
+- `search_docs("deployment architecture")`
+
+## `get_code` - Fetch Full Source for One Symbol
+
+Use **after** `search_symbols` once you have a target symbol name. Returns the
+full source body (capped by `max_lines`).
+
+- `get_code("AuthService")`
+- `get_code("validate_token", max_lines=120)`
+
+Do not call `get_code` speculatively — always discover first, then fetch.
+
+## `query_graph` - Targeted Graph Query
+
+Query symbols by file path prefix, with an optional text filter. Useful for
+sweeping a directory or layer.
+
+- `query_graph(path_prefix="src/auth")`
+- `query_graph(path_prefix="src/api", text_filter="router")`
+
+## `get_relationships_tool` - Code Graph Relationships
+
+Use AFTER finding a symbol to understand its connections:
 - What calls this function?
 - What does this class inherit from?
-- What depends on this module?
+- What does this module depend on?
 
-## `read_source_file` - Direct File Access (if available)
-
-If `read_source_file` is in your tool list, use it to read raw source files:
-- `read_source_file('src/auth/manager.py')` — read full file
-- `read_source_file('src/auth/manager.py', offset=50, limit=30)` — read lines 51-80
-
-Use for: config files, scripts, full file context, files not in the search index.
-**Only use this tool if it appears in your available tools.**
-
-## `list_repo_files` - Browse Repository (if available)
-
-If `list_repo_files` is in your tool list, use it to explore the repo:
-- `list_repo_files()` — list root directory
-- `list_repo_files('src/auth', pattern='*.py')` — list Python files in a directory
-
-**Only use this tool if it appears in your available tools.**
+- `get_relationships_tool("AuthService")`
+- `get_relationships_tool("validate_token", direction="inbound", max_depth=2)`
 
 ## `think` - Strategic Reflection
 
 **Use after tool calls** to briefly reflect (2-3 sentences max):
 - What did I find?
 - What's still missing?
-- Should I search more or synthesize?
+- Should I search more, fetch source, or synthesize?
 """
 
 # =============================================================================
@@ -317,10 +286,11 @@ def get_research_prompt(research_type: str, topic: str, context: str = "") -> st
 
     prompt_parts.append("""## Getting Started
 
-1. Search strategically using `search_codebase` (call multiple in parallel)
-2. Use `get_symbol_relationships` for code connections
-3. Use `think` briefly after searches to reflect
-4. Return the comprehensive answer directly in your final message
+1. Discover with `search_symbols` and/or `search_docs` (call multiple in parallel)
+2. Pull full source with `get_code` only for symbols you actually need
+3. Map connections with `get_relationships_tool` or `query_graph`
+4. Use `think` briefly after each step to reflect
+5. Return the comprehensive answer directly in your final message
 """)
 
     return "\n".join(prompt_parts)

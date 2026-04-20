@@ -202,18 +202,14 @@ class WikiStructurePlannerEngine:
         # directly.
         model = self._unwrap_chat_model(base_model)
 
-        # Create a backend factory that returns FilesystemBackend with virtual_mode=True
-        # This sandboxes all file operations to repo_root
-        repo_root = self.repo_root
-
-        def backend_factory(runtime, root_dir=repo_root):
-            _ = runtime  # runtime intentionally unused
-            try:
-                # virtual_mode=True ensures paths are sandboxed to root_dir
-                return FilesystemBackend(root_dir=root_dir, virtual_mode=True)
-            except TypeError:
-                # Fallback for older versions without virtual_mode
-                return FilesystemBackend(root_dir=root_dir)
+        # Build the FilesystemBackend directly (deepagents 0.5.0+ accepts a
+        # backend instance; the factory pattern is deprecated). virtual_mode=True
+        # sandboxes all file operations to repo_root.
+        try:
+            fs_backend = FilesystemBackend(root_dir=self.repo_root, virtual_mode=True)
+        except TypeError:
+            # Fallback for older deepagents without virtual_mode
+            fs_backend = FilesystemBackend(root_dir=self.repo_root)
 
         # Compute repo-aware symbol cap for the prompt
         from ..agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
@@ -245,7 +241,7 @@ class WikiStructurePlannerEngine:
             model=model,
             tools=output_tools,  # Output tools; FilesystemMiddleware adds fs tools
             system_prompt=system_prompt,
-            backend=backend_factory,
+            backend=fs_backend,
             middleware=custom_middleware,
         )
 

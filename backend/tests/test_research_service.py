@@ -32,8 +32,8 @@ def service(storage):
 async def _mock_research_events(*args, **kwargs):
     """Simulate DeepResearchEngine.research() yielding events."""
     yield {"event_type": "research_start", "data": {"session_id": "s1"}}
-    yield {"event_type": "thinking_step", "data": {"tool": "search_codebase", "result": "found 5 symbols"}}
-    yield {"event_type": "thinking_step", "data": {"tool": "get_symbol_relationships", "result": "3 deps"}}
+    yield {"event_type": "thinking_step", "data": {"tool": "search_symbols", "result": "found 5 symbols"}}
+    yield {"event_type": "thinking_step", "data": {"tool": "get_relationships_tool", "result": "3 deps"}}
     yield {
         "event_type": "research_complete",
         "data": {
@@ -112,8 +112,8 @@ class TestResearchServiceUnit:
         ):
             result = await service.research_sync(req)
 
-        assert "search_codebase" in result.research_steps
-        assert "get_symbol_relationships" in result.research_steps
+        assert "search_symbols" in result.research_steps
+        assert "get_relationships_tool" in result.research_steps
 
 
 class TestResearchTypePassthrough:

@@ -1,12 +1,11 @@
 """
-Deep Research Engine - Using langchain.agents.create_agent
+Deep Research Engine - Using deepagents.create_deep_agent
 
-This is the main orchestration for deep research using LangChain's create_agent
-with explicit middleware stack:
-- TodoListMiddleware for planning and progress tracking (write_todos, read_todos)
-- FilesystemMiddleware for context offloading (outputs >20K tokens → files)
-- SummarizationMiddleware for auto-summarising at context limit
-- AnthropicPromptCachingMiddleware for prompt caching on Anthropic models
+``create_deep_agent`` provisions the standard deepagents middleware stack
+(TodoListMiddleware, FilesystemMiddleware backed by the ``backend`` we pass
+in, SubAgentMiddleware, a model-aware SummarizationMiddleware,
+PatchToolCallsMiddleware and AnthropicPromptCachingMiddleware). On top of
+that we wire:
 - Custom tools wrapping UnifiedRetriever and GraphManager
 
 Events are captured via LangGraph's native astream with stream_mode=["messages", "updates"].
@@ -19,10 +18,7 @@ from datetime import datetime
 from typing import Any
 
 import app.events as _events
-from deepagents import FilesystemMiddleware
-from langchain.agents import create_agent
-from langchain.agents.middleware.summarization import SummarizationMiddleware
-from langchain.agents.middleware.todo import TodoListMiddleware
+from deepagents import create_deep_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -54,7 +50,7 @@ class DeepResearchEngine:
     This creates a proper DeepAgents agent with:
     - TodoListMiddleware for planning (write_todos, read_todos)
     - FilesystemMiddleware for context offloading (read_file, write_file, etc.)
-    - Custom tools for codebase search and graph analysis (search_codebase, get_symbol_relationships, think)
+    - Custom tools for codebase search and graph analysis (search_symbols, get_code, get_relationships_tool, think)
 
     Events are captured using LangGraph's native astream with dual stream mode
     (messages + updates) - NOT LangChain callbacks.
@@ -139,13 +135,12 @@ class DeepResearchEngine:
 
     def _create_agent(self):
         """
-        Create the agent with full middleware stack via langchain.agents.create_agent.
+        Create the agent via ``deepagents.create_deep_agent``.
 
-        Middleware:
-        - TodoListMiddleware  — write_todos / read_todos for planning
-        - FilesystemMiddleware — ls, read_file, write_file, edit_file, glob, grep
-        - SummarizationMiddleware — auto-summarise when context hits limit
-        - AnthropicPromptCachingMiddleware — prompt caching on Anthropic models
+        ``create_deep_agent`` provisions the full default deepagents middleware
+        stack (todos, filesystem backed by ``backend``, subagents, summarisation,
+        patch tool calls, Anthropic prompt caching) so we don't pass any extra
+        middleware here.
         """
         model = self.llm_client or self._build_model()
 
@@ -167,39 +162,31 @@ class DeepResearchEngine:
             repo_path=self.repo_path,
         )
 
-        _profile = getattr(model, "profile", None)
-        if isinstance(_profile, dict) and isinstance(_profile.get("max_input_tokens"), int):
-            trigger = ("fraction", 0.85)
-            keep = ("fraction", 0.10)
-        else:
-            trigger = ("tokens", 170_000)
-            keep = ("messages", 6)
+        fs_backend = self.backend
+        if fs_backend is None and self.repo_path:
+            from pathlib import Path
 
-        try:
-            from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
+            from deepagents.backends import FilesystemBackend
 
-            caching_mw = AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore")
-        except ImportError:
-            caching_mw = None
+            # virtual_mode=True sandboxes the agent to repo_path so absolute
+            # paths like "/src/auth/..." resolve under the cloned repo and
+            # cannot escape it. root_dir must be an absolute path.
+            fs_backend = FilesystemBackend(
+                root_dir=Path(self.repo_path).resolve(),
+                virtual_mode=True,
+            )
 
-        middleware = [
-            TodoListMiddleware(),
-            FilesystemMiddleware(backend=self.backend),
-            SummarizationMiddleware(
-                model=model,
-                trigger=trigger,
-                keep=keep,
-                trim_tokens_to_summarize=None,
-            ),
-        ]
-        if caching_mw is not None:
-            middleware.append(caching_mw)
-
-        agent = create_agent(
+        # create_deep_agent already wires the standard deepagents middleware
+        # stack (TodoListMiddleware, FilesystemMiddleware, SubAgentMiddleware,
+        # a model-aware SummarizationMiddleware, PatchToolCallsMiddleware and
+        # AnthropicPromptCachingMiddleware). Adding our own duplicates would
+        # trip create_agent's "duplicate middleware" check, so we let
+        # deepagents own that stack and pass no extra middleware here.
+        agent = create_deep_agent(
             model=model,
             tools=custom_tools,
             system_prompt=RESEARCH_INSTRUCTIONS,
-            middleware=middleware,
+            backend=fs_backend,
         )
 
         return agent

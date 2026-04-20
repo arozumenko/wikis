@@ -1,13 +1,16 @@
 """
-Research Tools - Custom tools for DeepAgents
+Research Tools - Custom tools for Deep Research and Ask agents
 
-These tools wrap our existing infrastructure with bounded, high-quality results.
-EmbeddingsFilter provides semantic reranking and threshold filtering to ensure
-only relevant results are returned.
+These tools wrap our existing infrastructure with bounded, high-quality results,
+following a progressive disclosure pattern: cheap discovery first, then targeted
+detail fetches.
 
 Tools included:
-- search_codebase: Search repository using vector store + code graph hybrid
-- get_symbol_relationships: Analyze code graph relationships
+- search_symbols: Discover symbols by name/keywords (compact summaries, no source)
+- search_docs: Search documentation chunks in the vector store
+- get_code: Fetch full source for a specific symbol
+- query_graph: Query symbols by path prefix and optional text filter
+- get_relationships_tool: Inspect code graph relationships of a symbol
 - think: Strategic reflection and planning
 - read_source_file: Read raw source files from the cloned repository
 - list_repo_files: Browse the repository directory structure
@@ -25,10 +28,6 @@ from langchain_core.tools import tool
 
 from ..code_graph.graph_query_service import GraphQueryService
 from ..constants import ARCHITECTURAL_SYMBOLS, DOC_SYMBOL_TYPES
-from .hybrid_fusion import (
-    HYBRID_FUSION_ENABLED,
-    fuse_search_results,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -375,12 +374,11 @@ def create_codebase_tools(
     repo_path: str | None = None,  # Path to cloned repo for direct file access
 ) -> list:
     """
-    Create custom tools for deep research.
+    Create custom tools for deep research and Ask agents.
 
-    search_codebase now uses EmbeddingsFilter for:
-    - Semantic reranking of results
-    - Bounded output (configurable k)
-    - Threshold filtering (default 0.75)
+    Returns the progressive disclosure tool set: cheap discovery
+    (search_symbols, search_docs, query_graph, get_relationships_tool)
+    plus the expensive detail fetch (get_code).
 
     When ``code_graph`` is None but ``unified_db_path`` is set, graph
     search branches fall back to FTS5 queries against the ``.wiki.db``.
@@ -414,480 +412,6 @@ def create_codebase_tools(
     if _use_db_fallback:
         logger.info("[RESEARCH_TOOLS] Unified DB fallback enabled: %s", _udb_path)
 
-    # Get embeddings from retriever_stack for reranking
-    embeddings = None
-    if retriever_stack:
-        embeddings = getattr(retriever_stack, "embeddings", None)
-        if embeddings is None and hasattr(retriever_stack, "vectorstore_manager"):
-            embeddings = getattr(retriever_stack.vectorstore_manager, "embeddings", None)
-
-    # Doc search cap: the vector store mostly holds documentation chunks,
-    # so we cap its contribution to avoid drowning out code results from FTS5.
-    _MAX_DOC_RESULTS = int(os.environ.get("WIKIS_MAX_DOC_RESULTS", "3"))
-
-    @tool(parse_docstring=True)
-    def search_codebase(query: str, k: int = 10) -> str:
-        """Search the repository codebase for relevant code, classes, functions, and documentation.
-
-        Uses hybrid search: vector store (semantic, capped at 3 doc results)
-        + code graph FTS5 (full-text, up to k results).
-        Returns actual code symbols even when docs are separated from code.
-
-        Args:
-            query: Search query describing what you're looking for
-            k: Maximum number of results after reranking (default 10)
-        """
-        emit({"type": "tool_start", "tool": "search_codebase", "input": query, "timestamp": datetime.now().isoformat()})
-
-        try:
-            all_docs = []
-
-            # === Branch 1: Semantic search (doc-heavy, capped) ===
-            # The retriever primarily surfaces documentation chunks.
-            # We cap results to _MAX_DOC_RESULTS (default 3) so code results
-            # from FTS5 aren't drowned out.
-            k_doc = min(k, _MAX_DOC_RESULTS)
-            if retriever_stack:
-                try:
-                    # Skip EmbeddingsFilter reranking — the unified DB's
-                    # RRF hybrid search already ranks results well.
-                    vs_docs = retriever_stack.search_repository(query=query, k=k_doc, apply_expansion=False)
-
-                    for doc in vs_docs:
-                        doc.metadata["search_source"] = "semantic"
-                    all_docs.extend(vs_docs)
-                    logger.info(f"[SEARCH_CODEBASE] VS returned {len(vs_docs)} docs (cap={k_doc}, query={query!r:.60})")
-                except Exception as e:
-                    logger.warning(f"[SEARCH_CODEBASE] Vector store search failed: {e}")
-
-            # === Branch 2: Graph full-text search (code symbols, at least k) ===
-            # Always run graph search to ensure code symbols are found even when
-            # SEPARATE_DOC_INDEX routes docs away from the graph.
-            k_code = max(k, 10)  # At least 10 code results from FTS5
-            graph_docs = []
-            try:
-                if graph_text_index is not None and graph_text_index.is_open:
-                    # FTS5-backed search: use search_smart for better query
-                    # construction (keyword extraction + intent-aware FTS5).
-                    graph_docs = graph_text_index.search_smart(
-                        query,
-                        k=k_code,
-                        intent="general",
-                        exclude_types=DOC_SYMBOL_TYPES,
-                    )
-                    if graph_docs:
-                        top_names = [d.metadata.get("symbol_name", "?") for d in graph_docs[:5]]
-                        logger.info(
-                            f"[SEARCH_CODEBASE][FTS5] {len(graph_docs)} results "
-                            f"(k={k_code}, query={query!r:.60}, "
-                            f"top={top_names})"
-                        )
-                    else:
-                        logger.info(f"[SEARCH_CODEBASE][FTS5] 0 results (query={query!r:.60})")
-                elif code_graph is not None:
-                    # Fallback: brute-force keyword scan
-                    graph_docs = _search_graph_by_text(code_graph, query, k=k_code)
-                    logger.info(f"[SEARCH_CODEBASE][BRUTE] {len(graph_docs)} results (query={query!r:.60})")
-                elif _use_db_fallback:
-                    # Phase 6 fallback: FTS5 search against unified .wiki.db
-                    graph_docs = _search_unified_db_fts(_udb_path, query, k=k_code)
-                    logger.info(f"[SEARCH_CODEBASE][UNIFIED_DB] {len(graph_docs)} results (query={query!r:.60})")
-            except Exception as e:
-                logger.warning(f"[SEARCH_CODEBASE] Graph search failed: {e}")
-
-            # Tag graph results with source (preserve 'graph_fts' if set by FTS5)
-            for doc in graph_docs:
-                doc.metadata.setdefault("search_source", "graph")
-
-            # === Fusion: combine VS + graph results ===
-            if HYBRID_FUSION_ENABLED and (all_docs or graph_docs):
-                # Reciprocal Rank Fusion: rank-based merging of both lists.
-                # Produces a single ranked list where documents appearing in
-                # BOTH sources get boosted.
-                ranked_lists = {}
-                if all_docs:
-                    ranked_lists["semantic"] = all_docs
-                if graph_docs:
-                    ranked_lists["graph"] = graph_docs
-                all_docs = fuse_search_results(
-                    ranked_lists,
-                    cap=k * 2,
-                    dedup_key="symbol_name",
-                )
-                logger.info(f"[SEARCH_CODEBASE][RRF] Fused {len(all_docs)} results from {list(ranked_lists.keys())}")
-            else:
-                # Legacy path: simple concatenation (VS first, graph deduped)
-                if graph_docs:
-                    vs_symbols = {
-                        doc.metadata.get("symbol_name", "").lower()
-                        for doc in all_docs
-                        if doc.metadata.get("symbol_name")
-                    }
-                    for doc in graph_docs:
-                        sym = doc.metadata.get("symbol_name", "").lower()
-                        if sym and sym not in vs_symbols:
-                            all_docs.append(doc)
-                            vs_symbols.add(sym)
-
-                # Sort: prefer vector store results (semantic), then graph
-                all_docs.sort(key=lambda d: 0 if d.metadata.get("search_source") == "vectorstore" else 1)
-
-                # Cap total results
-                all_docs = all_docs[: k * 2]
-
-            results = []
-            for i, doc in enumerate(all_docs):
-                source = doc.metadata.get("source", doc.metadata.get("rel_path", "unknown"))
-                symbol = doc.metadata.get("symbol_name", "")
-                symbol_type = doc.metadata.get("symbol_type", "")
-                start_line = doc.metadata.get("start_line", "")
-                end_line = doc.metadata.get("end_line", "")
-                search_src = doc.metadata.get("search_source", "?")
-
-                result_block = f"""
-### [{i + 1}] {source} ({search_src})
-**Symbol:** `{symbol}` ({symbol_type})
-**Lines:** {start_line}-{end_line}
-
-```
-{doc.page_content}
-```
-"""
-                results.append(result_block)
-
-            emit(
-                {
-                    "type": "tool_end",
-                    "tool": "search_codebase",
-                    "result_count": len(all_docs),
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
-
-            if not results:
-                return f"No results found for query: {query}"
-
-            return f"## Search Results for: {query}\n\nFound {len(all_docs)} relevant items:\n" + "\n---\n".join(
-                results
-            )
-
-        except Exception as e:
-            logger.error(f"Search failed: {e}", exc_info=True)
-            emit(
-                {
-                    "type": "tool_error",
-                    "tool": "search_codebase",
-                    "error": str(e),
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
-            return f"Search failed: {str(e)}"
-
-    @tool(parse_docstring=True)
-    def get_symbol_relationships(symbol_name: str, max_depth: int = 2) -> str:
-        """Get relationships for a code symbol (class, function, module).
-
-        Use this to understand how a symbol connects to other parts of the codebase:
-        - What classes it inherits from or implements
-        - What functions it calls or is called by
-        - What modules depend on it
-
-        Args:
-            symbol_name: Name of the symbol to analyze (e.g., "AuthService", "login")
-            max_depth: How many relationship levels to traverse (default 2)
-        """
-        emit(
-            {
-                "type": "tool_start",
-                "tool": "get_symbol_relationships",
-                "input": symbol_name,
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
-
-        if code_graph is None:
-            # Phase 6: try unified DB fallback for relationships
-            if _use_db_fallback:
-                db_result = _get_unified_db_relationships(_udb_path, symbol_name, max_depth)
-                if db_result:
-                    emit(
-                        {
-                            "type": "tool_end",
-                            "tool": "get_symbol_relationships",
-                            "result_count": 1,
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                    )
-                    return db_result
-            return "Code graph not available for relationship analysis"
-
-        try:
-            # Use GraphQueryService for O(1) resolution (SPEC-1)
-            target_node = None
-            matching_nodes = []
-            if query_service:
-                target_node = query_service.resolve_symbol(symbol_name)
-                if target_node:
-                    matching_nodes = [target_node]
-
-            # Fallback: brute-force scan if service didn't find it
-            if not target_node:
-                for node_id in code_graph.nodes():
-                    if symbol_name.lower() in node_id.lower():
-                        matching_nodes.append(node_id)
-                if matching_nodes:
-                    target_node = min(matching_nodes, key=len)
-
-            if not target_node:
-                return f"Symbol '{symbol_name}' not found in code graph. Try using search_codebase first to find exact symbol names."
-
-            # Use service for bounded traversal (SPEC-1)
-            if query_service:
-                rels = query_service.get_relationships(
-                    target_node,
-                    direction="both",
-                    max_depth=max_depth,
-                    max_results=50,
-                )
-
-                lines = [f"# Relationships for `{symbol_name}`\n"]
-                lines.append(f"**Matched Node:** `{target_node}`")
-                lines.append(f"**Total Related Nodes:** {len(rels)}\n")
-
-                if len(matching_nodes) > 1:
-                    lines.append(
-                        f"**Other Matching Nodes:** {', '.join(f'`{n}`' for n in matching_nodes[:10] if n != target_node)}\n"
-                    )
-
-                # Group by depth and direction
-                [r for r in rels if r.source_name != symbol_name or r.hop_distance > 0]
-                incoming = [
-                    r
-                    for r in rels
-                    if r.target_name == target_node
-                    or (r.source_name != target_node and any(r.target_name == target_node for _ in [1]))
-                ]
-
-                by_depth = {}
-                for r in rels:
-                    depth = r.hop_distance
-                    if depth not in by_depth:
-                        by_depth[depth] = []
-                    by_depth[depth].append(r)
-
-                for depth in sorted(by_depth.keys()):
-                    depth_rels = by_depth[depth]
-                    lines.append(f"\n## Depth {depth} Relationships")
-                    for rel in depth_rels:
-                        lines.append(f"- `{rel.source_name}` → `{rel.target_name}` [{rel.relationship_type}]")
-
-                emit(
-                    {
-                        "type": "tool_end",
-                        "tool": "get_symbol_relationships",
-                        "result_count": len(rels),
-                        "timestamp": datetime.now().isoformat(),
-                    }
-                )
-
-                return "\n".join(lines)
-
-            # Legacy fallback: manual graph traversal
-
-            # Get neighbors at different depths
-            neighbors_by_depth = {}
-            visited = {target_node}
-            current_level = {target_node}
-
-            for depth in range(1, max_depth + 1):
-                next_level = set()
-                for node in current_level:
-                    for neighbor in code_graph.neighbors(node):
-                        if neighbor not in visited:
-                            if depth not in neighbors_by_depth:
-                                neighbors_by_depth[depth] = []
-                            neighbors_by_depth[depth].append(
-                                {"node": neighbor, "from": node, "edge_data": code_graph.get_edge_data(node, neighbor)}
-                            )
-                            next_level.add(neighbor)
-                            visited.add(neighbor)
-                current_level = next_level
-
-            # Also check incoming edges
-            incoming = []
-            for predecessor in code_graph.predecessors(target_node):
-                edge_data = code_graph.get_edge_data(predecessor, target_node)
-                incoming.append({"node": predecessor, "edge_data": edge_data})
-
-            # Format comprehensive output (NO truncation)
-            lines = [f"# Relationships for `{symbol_name}`\n"]
-            lines.append(f"**Matched Node:** `{target_node}`")
-            lines.append(f"**Total Related Nodes:** {len(visited) - 1}\n")
-
-            if matching_nodes and len(matching_nodes) > 1:
-                lines.append(
-                    f"**Other Matching Nodes:** {', '.join(f'`{n}`' for n in matching_nodes[:10] if n != target_node)}\n"
-                )
-
-            # Outgoing relationships by depth
-            for depth, neighbors in neighbors_by_depth.items():
-                lines.append(f"\n## Depth {depth} Relationships (Outgoing)")
-                for rel in neighbors:
-                    edge_info = ""
-                    if rel["edge_data"]:
-                        for _key, data in rel["edge_data"].items():
-                            if isinstance(data, dict):
-                                rel_type = data.get("relationship_type", "related")
-                                edge_info = f" [{rel_type}]"
-                    lines.append(f"- `{rel['from']}` → `{rel['node']}`{edge_info}")
-
-            # Incoming relationships
-            if incoming:
-                lines.append("\n## Incoming Relationships (called by / used by)")
-                for rel in incoming:
-                    edge_info = ""
-                    if rel["edge_data"]:
-                        for _key, data in rel["edge_data"].items():
-                            if isinstance(data, dict):
-                                rel_type = data.get("relationship_type", "related")
-                                edge_info = f" [{rel_type}]"
-                    lines.append(f"- `{rel['node']}` → `{target_node}`{edge_info}")
-
-            emit(
-                {
-                    "type": "tool_end",
-                    "tool": "get_symbol_relationships",
-                    "result_count": len(visited) - 1,
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            logger.error(f"Graph analysis failed: {e}")
-            return f"Relationship analysis failed: {str(e)}"
-
-    @tool(parse_docstring=True)
-    def search_graph(query: str, k: int = 5, include_neighbors: bool = True) -> str:
-        """Search for code symbols and return them with their graph relationships.
-
-        Combines FTS5 full-text search with graph traversal to return rich context:
-        each matched symbol comes with its immediate neighbors (callers, callees,
-        parent classes, implementations, etc.).
-
-        Use this when you need to understand HOW a symbol fits into the codebase,
-        not just WHAT it contains.  For pure content search, use search_codebase.
-
-        Args:
-            query: Search query (symbol name, concept, or keywords)
-            k: Maximum number of primary symbols to return (default 5)
-            include_neighbors: Whether to include 1-hop graph neighbors (default True)
-        """
-        emit({"type": "tool_start", "tool": "search_graph", "input": query, "timestamp": datetime.now().isoformat()})
-
-        if code_graph is None:
-            # Phase 6: return FTS5 results from unified DB (no neighbors available)
-            if _use_db_fallback:
-                db_docs = _search_unified_db_fts(_udb_path, query, k=k)
-                if db_docs:
-                    sections = []
-                    for i, doc in enumerate(db_docs[:k]):
-                        sym_name = doc.metadata.get("symbol_name", "")
-                        sym_type = doc.metadata.get("symbol_type", "")
-                        rel_path = doc.metadata.get("rel_path", "")
-                        start_line = doc.metadata.get("start_line", "")
-                        end_line = doc.metadata.get("end_line", "")
-                        content_preview = (doc.page_content or "")[:500]
-                        if len(doc.page_content or "") > 500:
-                            content_preview += "\n... (truncated)"
-                        sections.append(
-                            f"### [{i + 1}] `{sym_name}` ({sym_type})\n"
-                            f"**File:** {rel_path}  **Lines:** {start_line}-{end_line}\n"
-                            f"\n```\n{content_preview}\n```\n"
-                            f"*(graph neighbors unavailable — unified DB mode)*"
-                        )
-                    emit(
-                        {
-                            "type": "tool_end",
-                            "tool": "search_graph",
-                            "result_count": len(sections),
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                    )
-                    return (
-                        f"## Graph Search: {query}\n\nFound {len(sections)} symbols (unified DB):\n\n"
-                        + "\n\n---\n\n".join(sections)
-                    )
-            return "Code graph not available for graph search."
-
-        try:
-            # Step 1: Find matching symbols via FTS5 or brute-force
-            matched_docs: list[Document] = []
-            if graph_text_index is not None and graph_text_index.is_open:
-                matched_docs = graph_text_index.search_smart(
-                    query,
-                    k=k,
-                    intent="symbol",
-                    exclude_types=DOC_SYMBOL_TYPES,
-                )
-            if not matched_docs and code_graph is not None:
-                matched_docs = _search_graph_by_text(code_graph, query, k=k)
-
-            if not matched_docs:
-                return f"No symbols found matching: {query}"
-
-            # Step 2: For each match, gather graph neighbors
-            sections: list[str] = []
-            for i, doc in enumerate(matched_docs[:k]):
-                sym_name = doc.metadata.get("symbol_name", "") or doc.metadata.get("name", "")
-                sym_type = doc.metadata.get("symbol_type", "")
-                rel_path = doc.metadata.get("rel_path", doc.metadata.get("source", ""))
-                start_line = doc.metadata.get("start_line", "")
-                end_line = doc.metadata.get("end_line", "")
-
-                section_lines = [
-                    f"### [{i + 1}] `{sym_name}` ({sym_type})",
-                    f"**File:** {rel_path}  **Lines:** {start_line}-{end_line}",
-                ]
-
-                # Truncate content for summary (full content in search_codebase)
-                content_preview = (doc.page_content or "")[:500]
-                if len(doc.page_content or "") > 500:
-                    content_preview += "\n... (truncated, use search_codebase for full)"
-                section_lines.append(f"\n```\n{content_preview}\n```")
-
-                if include_neighbors:
-                    # Use GraphQueryService for O(1) resolution (SPEC-1)
-                    node_id = None
-                    if query_service:
-                        node_id = query_service.resolve_symbol(sym_name, file_path=rel_path)
-                    if not node_id:
-                        node_id = _find_graph_node(code_graph, sym_name, rel_path)
-                    if node_id:
-                        neighbor_lines = _format_neighbors(code_graph, node_id)
-                        if neighbor_lines:
-                            section_lines.append("\n**Relationships:**")
-                            section_lines.extend(neighbor_lines)
-
-                sections.append("\n".join(section_lines))
-
-            emit(
-                {
-                    "type": "tool_end",
-                    "tool": "search_graph",
-                    "result_count": len(sections),
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
-
-            header = f"## Graph Search: {query}\n\nFound {len(sections)} symbols with relationships:\n"
-            return header + "\n\n---\n\n".join(sections)
-
-        except Exception as e:
-            logger.error(f"search_graph failed: {e}", exc_info=True)
-            return f"Graph search failed: {str(e)}"
-
     @tool(parse_docstring=True)
     def think(reflection: str) -> str:
         """Strategic reflection tool for analyzing findings and planning next steps.
@@ -910,11 +434,10 @@ def create_codebase_tools(
         return f"✓ Thinking recorded.\n\nReflection:\n{reflection}"
 
     # ================================================================
-    # SPEC-5: Progressive Disclosure Tools
+    # Progressive Disclosure Tools
     # ================================================================
     # Cheap discovery tools (search_symbols, get_relationships_tool, search_docs)
     # + expensive detail tool (get_code).
-    # Gated by WIKIS_PROGRESSIVE_TOOLS=1 (off by default).
 
     @tool(parse_docstring=True)
     def search_symbols(query: str, k: int = 20, symbol_type: str = "", file_prefix: str = "") -> str:
@@ -980,7 +503,7 @@ def create_codebase_tools(
                         }
                     )
             else:
-                return "No search index available. Use search_codebase instead."
+                return "No search index available."
 
             emit(
                 {
@@ -1441,7 +964,7 @@ def create_codebase_tools(
     def read_source_file(file_path: str, offset: int = 0, limit: int = 200) -> str:
         """Read a source file directly from the repository.
 
-        Use this to read files that weren't returned by search_codebase,
+        Use this to read files that weren't returned by search_symbols / search_docs,
         such as config files, Dockerfiles, Makefiles, scripts, or to see
         full file context around a search result snippet.
 
@@ -1451,7 +974,7 @@ def create_codebase_tools(
             limit: Maximum number of lines to return (default 200)
         """
         if not _repo_available:
-            return "Error: Repository clone is not available on disk. Use search_codebase instead."
+            return "Error: Repository clone is not available on disk. Use search_symbols / get_code instead."
 
         # Resolve and validate the path stays within the repo
         try:
@@ -1488,7 +1011,7 @@ def create_codebase_tools(
             pattern: Optional glob pattern to filter results (e.g. '*.py', '*.yml')
         """
         if not _repo_available:
-            return "Error: Repository clone is not available on disk. Use search_codebase instead."
+            return "Error: Repository clone is not available on disk. Use search_symbols / get_code instead."
 
         try:
             full = os.path.realpath(os.path.join(repo_path, directory))
@@ -1523,30 +1046,18 @@ def create_codebase_tools(
             return f"Error listing {directory}: {e}"
 
     # ================================================================
-    # Tool Selection: feature-flag gated
+    # Tool Selection
     # ================================================================
-    _progressive = os.environ.get("WIKIS_PROGRESSIVE_TOOLS", "").strip()
-    _use_progressive = _progressive in ("1", "true", "yes")
-
     # File access tools — included only when the cloned repo is on disk
     _file_tools = [read_source_file, list_repo_files] if _repo_available else []
     if _repo_available:
         logger.info("[RESEARCH_TOOLS] read_source_file + list_repo_files enabled (repo_path=%s)", repo_path)
 
-    if _use_progressive:
-        logger.info("[RESEARCH_TOOLS] Using progressive disclosure tools (SPEC-5)")
-        return [
-            search_symbols,
-            get_relationships_tool,
-            get_code,
-            search_docs,
-            query_graph,
-            think,
-        ] + _file_tools
-    else:
-        return [
-            search_codebase,
-            get_symbol_relationships,
-            search_graph,
-            think,
-        ] + _file_tools
+    return [
+        search_symbols,
+        get_relationships_tool,
+        get_code,
+        search_docs,
+        query_graph,
+        think,
+    ] + _file_tools
