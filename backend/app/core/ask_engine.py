@@ -80,6 +80,7 @@ class AskEngine:
         backend: object | None = None,
         llm_settings: dict | None = None,
         config: AskConfig | None = None,
+        storage: Any = None,  # WikiStorageProtocol
     ):
         """
         Initialize the Ask engine.
@@ -102,6 +103,7 @@ class AskEngine:
         self.backend = backend
         self.llm_settings = llm_settings or {}
         self.config = config or AskConfig()
+        self.storage = storage
 
         # Session state
         self.final_answer: str = ""
@@ -153,7 +155,7 @@ class AskEngine:
         # Prefer a unified DB-backed FTS adapter when available.
         fts_index = getattr(self.graph_manager, "fts_index", None) if self.graph_manager else None
         if fts_index is None:
-            db = getattr(self.retriever_stack, "db", None)
+            db = self.storage if self.storage is not None else getattr(self.retriever_stack, "db", None)
             if db is not None:
                 from .storage.text_index import StorageTextIndex
 
@@ -167,6 +169,7 @@ class AskEngine:
             event_callback=None,  # Events come from LangGraph stream
             graph_text_index=fts_index,
             similarity_threshold=self.config.similarity_threshold,
+            storage=self.storage,
         )
 
         # Compute summarization defaults matching deepagents/graph.py logic:

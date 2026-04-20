@@ -29,7 +29,8 @@ class EngineComponents:
 
     retriever_stack: Any = None  # UnifiedRetriever
     graph_manager: Any = None  # GraphManager
-    code_graph: Any = None  # NetworkX DiGraph
+    code_graph: Any = None  # NetworkX DiGraph (legacy; None when storage is loaded directly)
+    storage: Any = None  # WikiStorageProtocol (UnifiedWikiDB / PostgresWikiStorage)
     repo_analysis: dict | None = None
     llm: Any = None  # BaseChatModel
     repo_path: str | None = None  # Path to cloned repo (if still on disk)
@@ -174,12 +175,12 @@ async def build_engine_components(
 
     await asyncio.to_thread(_load_cached_artifacts, components, settings.cache_dir, wiki_id, repo_identifier, settings)
 
-    # Ensure code_graph exists (empty graph for small repos without one)
+    # Ask/Research run storage-native: no NX rehydration.  A tiny empty graph
+    # is kept only for legacy callers that still check ``number_of_nodes()``.
     if components.code_graph is None:
         import networkx as nx
 
         components.code_graph = nx.DiGraph()
-        logger.info(f"Created empty code graph for {wiki_id} (small repo)")
 
     # Try to locate the cloned repo on disk for direct file access
     if wiki_meta:
@@ -358,8 +359,10 @@ def _load_cached_artifacts(
             embeddings=embeddings,
         )
 
-        # Reconstruct NX code graph from DB
-        components.code_graph = db.to_networkx()
+        # Expose the storage handle directly — ask/research tools use
+        # ``StorageQueryService`` + ``StorageTextIndex`` instead of a
+        # rehydrated NX graph.
+        components.storage = db
 
         # Load repository analysis from unified DB (Ask tool context)
         raw_analysis = db.get_meta("repository_analysis")

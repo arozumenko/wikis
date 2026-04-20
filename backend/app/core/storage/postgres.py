@@ -1487,6 +1487,36 @@ class PostgresWikiStorage:
             ).fetchall()
             return [self._row_to_dict(r) for r in rows]
 
+    def find_node_exact(
+        self,
+        symbol_name: str,
+        rel_path: str,
+        language: str,
+    ) -> dict[str, Any] | None:
+        """Exact ``(symbol_name, rel_path, language)`` lookup.
+
+        Storage-native equivalent of the NX ``_node_index`` used by
+        ``GraphQueryService.resolve_symbol`` strategy 1.  When multiple
+        rows match, the highest architectural priority wins.
+        """
+        if not symbol_name or not rel_path or not language:
+            return None
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT * FROM {self._schema}.repo_nodes "
+                    "WHERE symbol_name = :name AND rel_path = :path "
+                    "AND LOWER(language) = LOWER(:lang)"
+                ),
+                {"name": symbol_name, "path": rel_path, "lang": language},
+            ).fetchall()
+        if not rows:
+            return None
+        from ..code_graph.symbol_priority import symbol_priority
+
+        candidates = [self._row_to_dict(r) for r in rows]
+        return max(candidates, key=lambda r: symbol_priority(r.get("symbol_type")))
+
     def search_fts_by_symbol_name(
         self,
         name: str,

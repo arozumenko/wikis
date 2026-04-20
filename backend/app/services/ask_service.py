@@ -113,6 +113,7 @@ class AskService:
             repo_analysis=components.repo_analysis,
             llm_client=components.llm,
             config=AskConfig(similarity_threshold=self.settings.ask_similarity_threshold),
+            storage=components.storage,
         )
 
         async for event in engine.ask(

@@ -298,6 +298,21 @@ class WikiStorageProtocol(Protocol):
         """
         ...
 
+    def find_node_exact(
+        self,
+        symbol_name: str,
+        rel_path: str,
+        language: str,
+    ) -> dict[str, Any] | None:
+        """Resolve a node by the exact ``(symbol_name, rel_path, language)`` triple.
+
+        Storage-native equivalent of the NX ``_node_index`` lookup used by
+        ``GraphQueryService.resolve_symbol`` strategy 1. When multiple rows
+        match, the candidate with the highest architectural type priority
+        wins (class > interface > ... > variable).
+        """
+        ...
+
     def search_fts_by_symbol_name(
         self,
         name: str,

@@ -1461,6 +1461,33 @@ class UnifiedWikiDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def find_node_exact(
+        self,
+        symbol_name: str,
+        rel_path: str,
+        language: str,
+    ) -> dict[str, Any] | None:
+        """Exact ``(symbol_name, rel_path, language)`` lookup.
+
+        Storage-native equivalent of the NX ``_node_index`` lookup. Uses
+        the existing indexes on ``symbol_name``, ``rel_path``, ``language``.
+        When multiple rows match, the candidate with the highest
+        architectural priority (class > function > method > variable) wins.
+        """
+        if not symbol_name or not rel_path or not language:
+            return None
+        rows = self.conn.execute(
+            "SELECT * FROM repo_nodes "
+            "WHERE symbol_name = ? AND rel_path = ? AND LOWER(language) = LOWER(?)",
+            (symbol_name, rel_path, language),
+        ).fetchall()
+        if not rows:
+            return None
+        from .code_graph.symbol_priority import symbol_priority
+
+        best = max(rows, key=lambda r: symbol_priority(r["symbol_type"]))
+        return dict(best)
+
     def search_fts_by_symbol_name(
         self,
         name: str,

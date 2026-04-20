@@ -18,15 +18,14 @@ Tools included:
 
 import logging
 import os
-import re
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from langchain_core.documents import Document
 from langchain_core.tools import tool
 
 from ..code_graph.graph_query_service import GraphQueryService
+from ..code_graph.storage_query_service import StorageQueryService
 from ..constants import ARCHITECTURAL_SYMBOLS, DOC_SYMBOL_TYPES
 
 logger = logging.getLogger(__name__)
@@ -46,332 +45,18 @@ except ImportError:
     logger.warning("langchain_classic EmbeddingsFilter not available - search results won't be reranked")
 
 
-def _search_graph_by_text(code_graph: Any, query: str, k: int = 10) -> list[Document]:
-    """Full-text search over code graph node names, content, and docstrings.
-
-    This is the graph-as-first-class-citizen search: queries go directly to the
-    graph instead of (or in addition to) the vector store.  Works even when
-    SEPARATE_DOC_INDEX is enabled and the vector store only contains docs.
-
-    Matching strategy (scored):
-      1. Exact symbol name match (highest priority)
-      2. Substring match in symbol name
-      3. Keyword match in content/docstring
-    """
-    if code_graph is None or code_graph.number_of_nodes() == 0:
-        return []
-
-    # Tokenize query into searchable keywords
-    query_lower = query.lower()
-    keywords = [w for w in re.split(r"\W+", query_lower) if len(w) >= 2]
-    if not keywords:
-        return []
-
-    scored: list[tuple] = []  # (score, node_id, node_data)
-
-    for node_id, node_data in code_graph.nodes(data=True):
-        symbol_name = (node_data.get("symbol_name", "") or node_data.get("name", "")).lower()
-        symbol_type = (node_data.get("symbol_type") or "").lower()
-        content = (node_data.get("content", "") or "").lower()
-        docstring = (node_data.get("docstring", "") or "").lower()
-        if not docstring:
-            _sym_obj = node_data.get("symbol")
-            if _sym_obj and hasattr(_sym_obj, "docstring") and _sym_obj.docstring:
-                docstring = _sym_obj.docstring.lower()
-
-        # Skip doc nodes — those come from the vector store
-        if symbol_type in DOC_SYMBOL_TYPES:
-            continue
-
-        score = 0
-
-        # 1. Exact symbol name match (case-insensitive)
-        if query_lower == symbol_name:
-            score += 100
-        # 2. Query appears as substring in symbol name
-        elif query_lower in symbol_name:
-            score += 50
-
-        # 3. Individual keyword matches in name
-        name_kw_hits = sum(1 for kw in keywords if kw in symbol_name)
-        score += name_kw_hits * 10
-
-        # 4. Keyword matches in docstring (medium value)
-        if docstring:
-            doc_kw_hits = sum(1 for kw in keywords if kw in docstring)
-            score += doc_kw_hits * 3
-
-        # 5. Keyword matches in content (lower value — content is large)
-        if content and score < 20:  # Only check content if no strong name match
-            content_kw_hits = sum(1 for kw in keywords if kw in content[:2000])
-            score += content_kw_hits * 1
-
-        if score > 0:
-            scored.append((score, node_id, node_data))
-
-    # Sort by score descending, take top k
-    scored.sort(key=lambda x: -x[0])
-
-    documents = []
-    for score, _node_id, node_data in scored[:k]:
-        content = node_data.get("content", "") or node_data.get("docstring", "") or ""
-        if not content:
-            # Comprehensive parser nodes store source/docstring inside Symbol object
-            _sym_obj = node_data.get("symbol")
-            if _sym_obj:
-                content = getattr(_sym_obj, "source_text", "") or getattr(_sym_obj, "docstring", "") or ""
-        if not content.strip():
-            continue
-
-        doc = Document(
-            page_content=content,
-            metadata={
-                "source": node_data.get("rel_path", node_data.get("file_path", "unknown")),
-                "rel_path": node_data.get("rel_path", ""),
-                "symbol_name": node_data.get("symbol_name", "") or node_data.get("name", ""),
-                "symbol_type": node_data.get("symbol_type", "unknown"),
-                "start_line": node_data.get("start_line", ""),
-                "end_line": node_data.get("end_line", ""),
-                "search_score": score,
-                "search_source": "graph",
-            },
-        )
-        documents.append(doc)
-
-    return documents
-
-
-# ---------------------------------------------------------------------------
-# Unified-DB-backed helpers (used as fallback when there is no in-memory
-# NX code_graph or FTS5 index).
-# ---------------------------------------------------------------------------
-
-
-def _open_unified_db_readonly(db_path: str):
-    """Open a UnifiedWikiDB in read-only mode, or return None on failure."""
-    try:
-        from ..storage import open_storage, repo_id_from_path
-
-        repo_id = repo_id_from_path(db_path)
-        return open_storage(repo_id=repo_id, db_path=db_path, readonly=True)
-    except Exception as exc:
-        logger.warning("[RESEARCH_TOOLS] Failed to open unified DB %s: %s", db_path, exc)
-        return None
-
-
-def _search_unified_db_fts(db_path: str, query: str, k: int = 10) -> list[Document]:
-    """FTS5 full-text search against the unified .wiki.db.
-
-    Equivalent of _search_graph_by_text / graph_text_index.search_smart but
-    backed by the FTS index in the storage backend.
-
-    Returns up to *k* LangChain Documents.
-    """
-    db = _open_unified_db_readonly(db_path)
-    if db is None:
-        return []
-    try:
-        # Build FTS query: split on non-word chars, join with OR
-        keywords = [w for w in re.split(r"\W+", query) if len(w) >= 2]
-        if not keywords:
-            return []
-        fts_query = " OR ".join(keywords)
-
-        _SKIP_TYPES = frozenset({"module_doc", "file_doc", "readme"})
-        rows = db.search_fts(fts_query, limit=k * 2)
-
-        docs: list[Document] = []
-        for row in rows:
-            sym_type = row.get("symbol_type", "")
-            if sym_type in _SKIP_TYPES:
-                continue
-            page_content = row.get("content") or row.get("source_text") or row.get("docstring") or ""
-            if not page_content.strip():
-                continue
-            docs.append(
-                Document(
-                    page_content=page_content,
-                    metadata={
-                        "source": row.get("rel_path") or "unknown",
-                        "rel_path": row.get("rel_path") or "",
-                        "symbol_name": row.get("symbol_name") or "",
-                        "symbol_type": sym_type or "unknown",
-                        "start_line": row.get("start_line") or "",
-                        "end_line": row.get("end_line") or "",
-                        "search_source": "unified_db_fts",
-                    },
-                )
-            )
-            if len(docs) >= k:
-                break
-        return docs
-    except Exception as exc:
-        logger.warning("[RESEARCH_TOOLS] Unified DB FTS search failed: %s", exc)
-        return []
-    finally:
-        try:
-            db.close()
-        except Exception:  # noqa: S110
-            pass
-
-
-def _get_unified_db_relationships(db_path: str, symbol_name: str, max_depth: int = 2) -> str | None:
-    """Look up symbol relationships via SQL against unified DB edges table.
-
-    Returns a formatted Markdown string, or None if the DB is unavailable.
-    """
-    db = _open_unified_db_readonly(db_path)
-    if db is None:
-        return None
-    try:
-        # Resolve symbol to node_id (best match)
-        rows = db.find_nodes_by_name(symbol_name, limit=5)
-        if not rows:
-            return f"Symbol '{symbol_name}' not found in unified DB."
-
-        target_id = rows[0].get("node_id", "")
-        target_name = rows[0].get("symbol_name", symbol_name)
-
-        # Outgoing edges
-        out_edges = db.get_edge_targets(target_id)
-        out_node_ids = [e.get("target_id", "") for e in out_edges]
-        out_nodes = {n["node_id"]: n for n in db.get_nodes_by_ids(out_node_ids)} if out_node_ids else {}
-
-        # Incoming edges
-        in_edges = db.get_edge_sources(target_id)
-        in_node_ids = [e.get("source_id", "") for e in in_edges]
-        in_nodes = {n["node_id"]: n for n in db.get_nodes_by_ids(in_node_ids)} if in_node_ids else {}
-
-        lines = [
-            f"# Relationships for `{target_name}`\n",
-            f"**Matched Node:** `{target_id}`",
-            f"**Outgoing:** {len(out_edges)}, **Incoming:** {len(in_edges)}\n",
-        ]
-
-        if len(rows) > 1:
-            others = ", ".join(f"`{r.get('symbol_name', '')}`" for r in rows[1:])
-            lines.append(f"**Other Matches:** {others}\n")
-
-        if out_edges:
-            lines.append("\n## Outgoing Relationships")
-            for edge in out_edges[:50]:
-                tid = edge.get("target_id", "")
-                rel_type = edge.get("rel_type", "")
-                node = out_nodes.get(tid, {})
-                sym_name = node.get("symbol_name", tid)
-                sym_type = node.get("symbol_type", "unknown")
-                lines.append(f"- `{target_name}` → `{sym_name}` ({sym_type}) [{rel_type}]")
-
-        if in_edges:
-            lines.append("\n## Incoming Relationships")
-            for edge in in_edges[:50]:
-                sid = edge.get("source_id", "")
-                rel_type = edge.get("rel_type", "")
-                node = in_nodes.get(sid, {})
-                sym_name = node.get("symbol_name", sid)
-                sym_type = node.get("symbol_type", "unknown")
-                lines.append(f"- `{sym_name}` ({sym_type}) → `{target_name}` [{rel_type}]")
-
-        return "\n".join(lines)
-    except Exception as exc:
-        logger.warning("[RESEARCH_TOOLS] Unified DB relationship query failed: %s", exc)
-        return None
-    finally:
-        try:
-            db.close()
-        except Exception:  # noqa: S110
-            pass
-
-
-def _find_graph_node(code_graph: Any, symbol_name: str, rel_path: str = "") -> str | None:
-    """Find the best-matching node ID in the graph for a given symbol.
-
-    Tries exact node_id first (often ``rel_path::symbol_name``), then falls
-    back to substring matching on symbol_name.
-    """
-    if code_graph is None or not symbol_name:
-        return None
-
-    # Strategy 1: exact composite key (common format: "path/file.py::ClassName")
-    if rel_path:
-        candidate = f"{rel_path}::{symbol_name}"
-        if candidate in code_graph:
-            return candidate
-
-    # Strategy 2: scan for best substring match
-    candidates = []
-    name_lower = symbol_name.lower()
-    for node_id in code_graph.nodes():
-        if name_lower in node_id.lower():
-            candidates.append(node_id)
-
-    if not candidates:
-        return None
-
-    # Prefer shortest (most specific) match
-    return min(candidates, key=len)
-
-
-def _format_neighbors(code_graph: Any, node_id: str, max_per_direction: int = 8) -> list[str]:
-    """Format 1-hop neighbors of *node_id* as readable lines.
-
-    Returns a list like:
-        - → `ChildClass` [inherits]
-        - ← `CallerFunction` [calls]
-    """
-    lines: list[str] = []
-
-    # Outgoing edges
-    out_count = 0
-    for successor in code_graph.successors(node_id):
-        if out_count >= max_per_direction:
-            remaining = sum(1 for _ in code_graph.successors(node_id)) - max_per_direction
-            if remaining > 0:
-                lines.append(f"  - → ... and {remaining} more")
-            break
-        edge_data = code_graph.get_edge_data(node_id, successor)
-        rel_type = _extract_rel_type(edge_data)
-        lines.append(f"  - → `{successor}` [{rel_type}]")
-        out_count += 1
-
-    # Incoming edges
-    in_count = 0
-    for predecessor in code_graph.predecessors(node_id):
-        if in_count >= max_per_direction:
-            remaining = sum(1 for _ in code_graph.predecessors(node_id)) - max_per_direction
-            if remaining > 0:
-                lines.append(f"  - ← ... and {remaining} more")
-            break
-        edge_data = code_graph.get_edge_data(predecessor, node_id)
-        rel_type = _extract_rel_type(edge_data)
-        lines.append(f"  - ← `{predecessor}` [{rel_type}]")
-        in_count += 1
-
-    return lines
-
-
-def _extract_rel_type(edge_data: Any) -> str:
-    """Extract relationship type from edge data (handles MultiDiGraph format)."""
-    if not edge_data:
-        return "related"
-    # MultiDiGraph: edge_data is {key: {attr_dict}}
-    if isinstance(edge_data, dict):
-        for _key, data in edge_data.items():
-            if isinstance(data, dict):
-                return data.get("relationship_type", "related")
-    return "related"
-
 
 def create_codebase_tools(
     retriever_stack: Any,  # UnifiedRetriever
     graph_manager: Any,  # GraphManager
-    code_graph: Any,  # NetworkX graph
+    code_graph: Any,  # NetworkX graph (may be None when `storage` is provided)
     repo_analysis: dict | None = None,
     event_callback: Callable | None = None,
     similarity_threshold: float = 0.75,
-    graph_text_index: Any = None,  # GraphTextIndex (FTS5)
+    graph_text_index: Any = None,  # GraphTextIndex / StorageTextIndex (FTS5)
     unified_db_path: str | None = None,  # Path to .wiki.db
     repo_path: str | None = None,  # Path to cloned repo for direct file access
+    storage: Any = None,  # WikiStorageProtocol (UnifiedWikiDB / PostgresWikiStorage)
 ) -> list:
     """
     Create custom tools for deep research and Ask agents.
@@ -380,35 +65,124 @@ def create_codebase_tools(
     (search_symbols, search_docs, query_graph, get_relationships_tool)
     plus the expensive detail fetch (get_code).
 
-    When ``code_graph`` is None but ``unified_db_path`` is set, graph
-    search branches fall back to FTS5 queries against the ``.wiki.db``.
+    When ``storage`` is provided (and ``code_graph`` is either ``None``
+    or an empty placeholder), tools bind to ``StorageQueryService`` and
+    read node metadata directly from the unified DB.  Otherwise they
+    use ``GraphQueryService`` over the in-memory NX graph.
 
     Args:
         retriever_stack: UnifiedRetriever instance for codebase search
         graph_manager: GraphManager instance for graph operations
-        code_graph: The loaded code graph (NetworkX)
+        code_graph: The loaded code graph (NetworkX) — may be None when
+            ``storage`` is supplied.
         repo_analysis: Pre-loaded repository analysis (optional)
         event_callback: Callback for emitting thinking events
         similarity_threshold: Minimum similarity for EmbeddingsFilter (0.0-1.0)
-        unified_db_path: Path to unified .wiki.db (used when code_graph is None)
+        unified_db_path: Path to unified .wiki.db (legacy; prefer ``storage``)
+        repo_path: Path to cloned repo for direct file access
+        storage: ``WikiStorageProtocol`` for storage-native symbol/edge lookups
 
     Returns:
         List of LangChain tools for DeepAgents
     """
     emit = event_callback or (lambda x: None)
 
-    # Build unified query service (SPEC-1: replaces scattered O(N) scans)
-    query_service = GraphQueryService(code_graph, fts_index=graph_text_index) if code_graph else None
+    # ------------------------------------------------------------------
+    # Decide which query service to use.
+    # Priority: explicit ``storage`` wins when the graph is unusable
+    # (None or empty), even if a retriever-attached DB is present.
+    # ------------------------------------------------------------------
+    def _graph_has_nodes(g: Any) -> bool:
+        if g is None:
+            return False
+        try:
+            return g.number_of_nodes() > 0
+        except Exception:
+            return False
+
+    use_storage = storage is not None and not _graph_has_nodes(code_graph)
+
+    if use_storage:
+        # ``graph_text_index`` should already be a StorageTextIndex backed
+        # by ``storage``.  Fall back to building one if the caller didn't
+        # provide it.
+        if graph_text_index is None:
+            try:
+                from ..storage.text_index import StorageTextIndex
+
+                graph_text_index = StorageTextIndex(storage)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to build StorageTextIndex: %s", exc)
+        query_service: Any = StorageQueryService(
+            storage=storage, text_index=graph_text_index
+        )
+        logger.info("[RESEARCH_TOOLS] Using StorageQueryService (storage-native)")
+    else:
+        query_service = (
+            GraphQueryService(code_graph, fts_index=graph_text_index)
+            if code_graph is not None
+            else None
+        )
+
+    def _node_data(nid: str) -> dict[str, Any]:
+        """Unified node metadata lookup — graph or storage."""
+        if not nid:
+            return {}
+        if use_storage:
+            return storage.get_node(nid) or {}
+        if code_graph is not None and nid in code_graph:
+            return dict(code_graph.nodes.get(nid, {}) or {})
+        return {}
+
+    def _defines_children(nid: str) -> list[dict[str, Any]]:
+        """Return child nodes (methods/functions) defined by ``nid``."""
+        if not nid:
+            return []
+        if use_storage:
+            try:
+                return storage.find_related_nodes(
+                    nid,
+                    rel_types=["defines"],
+                    direction="out",
+                    target_symbol_types=["method", "function"],
+                    limit=64,
+                )
+            except Exception as exc:
+                logger.debug("_defines_children storage lookup failed: %s", exc)
+                return []
+        # NX fallback preserved for wiki-gen callers.
+        if code_graph is None or nid not in code_graph:
+            return []
+        out: list[dict[str, Any]] = []
+        for succ in code_graph.successors(nid):
+            edge_data = code_graph.get_edge_data(nid, succ)
+            if edge_data is None:
+                continue
+            edges = (
+                edge_data.values()
+                if isinstance(edge_data, dict)
+                and all(isinstance(v, dict) for v in edge_data.values())
+                else [edge_data]
+            )
+            if not any(
+                (e.get("relationship_type") or "").lower() == "defines"
+                for e in edges
+            ):
+                continue
+            data = code_graph.nodes.get(succ, {}) or {}
+            if (data.get("symbol_type") or "").lower() not in ("method", "function"):
+                continue
+            out.append({"node_id": succ, **data})
+        return out
 
     # Resolve unified_db_path: auto-detect when path not provided
     _udb_path = unified_db_path
-    if _udb_path is None and code_graph is None:
-        # Try to get path from retriever_stack (UnifiedRetriever stores it)
+    if _udb_path is None and not use_storage and code_graph is None:
+        # Legacy: try to get path from retriever_stack (UnifiedRetriever stores it)
         _udb_path = getattr(getattr(retriever_stack, "db", None), "db_path", None)
         if _udb_path:
             _udb_path = str(_udb_path)
-    # Only use DB fallback when there's genuinely no NX graph
-    _use_db_fallback = bool(_udb_path and code_graph is None)
+    _use_db_fallback = bool(_udb_path and not use_storage and code_graph is None)
     if _use_db_fallback:
         logger.info("[RESEARCH_TOOLS] Unified DB fallback enabled: %s", _udb_path)
 
@@ -470,8 +244,8 @@ def create_codebase_tools(
                 for r in svc_results:
                     # Extract one-line doc (first sentence of docstring)
                     one_line = ""
-                    if r.node_id and r.node_id in code_graph:
-                        doc = (code_graph.nodes.get(r.node_id, {}) or {}).get("docstring", "") or ""
+                    if r.node_id:
+                        doc = (_node_data(r.node_id).get("docstring") or "")
                         if doc:
                             first_line = doc.strip().split("\n")[0].strip()
                             if len(first_line) > 80:
@@ -535,7 +309,6 @@ def create_codebase_tools(
     # ----------------------------------------------------------------
     def _orphan_fts_fallback(
         node_id: str,
-        graph: Any,
         fts_index: Any,
         emit_fn: Callable,
     ) -> str | None:
@@ -550,14 +323,16 @@ def create_codebase_tools(
         runs FTS5 text search for each name.  Returns a formatted result
         string if any hits are found, otherwise ``None``.
         """
-        if graph is None or fts_index is None:
+        if fts_index is None:
             return None
         if not (hasattr(fts_index, "search") and hasattr(fts_index, "is_open")):
             return None
         if not fts_index.is_open:
             return None
 
-        node_data = graph.nodes.get(node_id, {})
+        node_data = _node_data(node_id)
+        if not node_data:
+            return None
         sym_type = (node_data.get("symbol_type") or "").lower()
         if sym_type not in CONTAINER_SYMBOL_TYPES:
             return None
@@ -566,26 +341,8 @@ def create_codebase_tools(
 
         # Collect child method/function names via 'defines' edges
         method_names: list[str] = []
-        for succ in graph.successors(node_id):
-            # Check all edges between node_id → succ for a 'defines' relationship
-            edge_data = graph.get_edge_data(node_id, succ)
-            if edge_data is None:
-                continue
-            # MultiDiGraph returns {0: {...}, 1: {...}}, DiGraph returns {...}
-            edges = (
-                edge_data.values()
-                if isinstance(edge_data, dict) and all(isinstance(v, dict) for v in edge_data.values())
-                else [edge_data]
-            )
-            is_defines = any(e.get("relationship_type", "").lower() == "defines" for e in edges)
-            if not is_defines:
-                continue
-
-            succ_data = graph.nodes.get(succ, {})
-            succ_type = (succ_data.get("symbol_type") or "").lower()
-            if succ_type not in ("method", "function"):
-                continue
-            name = succ_data.get("symbol_name", "") or succ_data.get("name", "")
+        for child in _defines_children(node_id):
+            name = child.get("symbol_name", "") or child.get("name", "")
             if name and not name.startswith("__"):
                 method_names.append(name)
 
@@ -710,7 +467,6 @@ def create_codebase_tools(
                 # names and search FTS5 for string-based references.
                 orphan_hits = _orphan_fts_fallback(
                     node_id,
-                    code_graph,
                     graph_text_index,
                     emit,
                 )
@@ -740,7 +496,6 @@ def create_codebase_tools(
             if all(r.relationship_type.lower() == "defines" for r in rels):
                 orphan_hits = _orphan_fts_fallback(
                     node_id,
-                    code_graph,
                     graph_text_index,
                     emit,
                 )
@@ -767,19 +522,15 @@ def create_codebase_tools(
         """
         emit({"type": "tool_start", "tool": "get_code", "input": symbol_name, "timestamp": datetime.now().isoformat()})
 
-        if code_graph is None:
+        if query_service is None:
             return "Code graph not available"
 
         try:
-            node_id = None
-            if query_service:
-                node_id = query_service.resolve_symbol(symbol_name)
-            if not node_id:
-                node_id = _find_graph_node(code_graph, symbol_name)
+            node_id = query_service.resolve_symbol(symbol_name)
             if not node_id:
                 return f"Symbol '{symbol_name}' not found. Check the exact name from search_symbols."
 
-            data = code_graph.nodes.get(node_id, {})
+            data = _node_data(node_id)
             if not data:
                 return f"No data for node '{node_id}'"
 

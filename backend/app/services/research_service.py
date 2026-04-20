@@ -55,6 +55,7 @@ class ResearchService:
                 similarity_threshold=self.settings.research_similarity_threshold,
             ),
             repo_path=components.repo_path,
+            storage=components.storage,
         )
 
         async for event in engine.research(question=request.question):

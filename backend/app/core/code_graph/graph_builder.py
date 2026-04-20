@@ -44,17 +44,9 @@ logger = logging.getLogger(__name__)
 # Priority used when picking the "best" candidate for a (name, file, lang) key.
 # Higher = more architecturally significant.  Kept in sync with
 # ``EnhancedUnifiedGraphBuilder._get_type_priority``.
-_GRAPH_INDEX_TYPE_PRIORITY: Dict[str, int] = {
-    'class': 10, 'interface': 10, 'trait': 10, 'protocol': 10,
-    'enum': 9, 'struct': 9, 'record': 9, 'data_class': 9, 'object': 9,
-    'module': 8, 'namespace': 8,
-    'function': 7,
-    'constant': 6, 'type_alias': 6, 'annotation': 6, 'decorator': 6, 'macro': 6,
-    'method': 3,
-    'constructor': 2, 'field': 2, 'property': 2,
-    'parameter': 1, 'variable': 1, 'local_variable': 1, 'argument': 1,
-    'unknown': 0,
-}
+# Single source of truth lives in ``symbol_priority`` so that storage backends
+# can reuse it without pulling the heavy tree-sitter parsers from this module.
+from .symbol_priority import GRAPH_INDEX_TYPE_PRIORITY as _GRAPH_INDEX_TYPE_PRIORITY  # noqa: F401
 
 
 def _simple_symbol_name_for_index(name: str) -> str:

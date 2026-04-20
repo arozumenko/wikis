@@ -78,6 +78,7 @@ class DeepResearchEngine:
         llm_settings: dict | None = None,
         config: ResearchConfig | None = None,
         repo_path: str | None = None,
+        storage: Any = None,  # WikiStorageProtocol
     ):
         """
         Initialize the research engine.
@@ -100,6 +101,7 @@ class DeepResearchEngine:
         self.llm_settings = llm_settings or {}
         self.config = config or ResearchConfig()
         self.repo_path = repo_path
+        self.storage = storage
 
         # Session tracking (simplified - no redundant state)
         self.session_id: str | None = None
@@ -146,7 +148,7 @@ class DeepResearchEngine:
 
         fts_index = getattr(self.graph_manager, "fts_index", None) if self.graph_manager else None
         if fts_index is None:
-            db = getattr(self.retriever_stack, "db", None)
+            db = self.storage if self.storage is not None else getattr(self.retriever_stack, "db", None)
             if db is not None:
                 from ..storage.text_index import StorageTextIndex
 
@@ -160,6 +162,7 @@ class DeepResearchEngine:
             graph_text_index=fts_index,
             similarity_threshold=self.config.similarity_threshold,
             repo_path=self.repo_path,
+            storage=self.storage,
         )
 
         fs_backend = self.backend
