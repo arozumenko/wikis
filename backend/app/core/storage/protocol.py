@@ -185,6 +185,8 @@ class WikiStorageProtocol(Protocol):
         self,
         embedding_fn: Callable[[list[str]], list[list[float]]],
         batch_size: int = 64,
+        architectural_only: bool | None = None,
+        max_workers: int | None = None,
     ) -> int:
         """Embed all nodes' text and populate vectors. Returns count stored."""
         ...
@@ -386,4 +388,70 @@ class WikiStorageProtocol(Protocol):
 
     def detect_dominant_language(self, node_ids: list[str]) -> str | None:
         """Return the most common ``language`` value among *node_ids*, or None."""
+        ...
+
+    # ==================================================================
+    # POST-PASS HYGIENE / OBSERVABILITY (§11.7, §11.8)
+    # ==================================================================
+
+    def demote_local_constants(self) -> int:
+        """Tag `constant` symbols whose every reference is in their defining file
+        as ``is_architectural = 0``.
+
+        Implements §11.8 (P4 local-leakage detection).  Constants with **zero**
+        external references are kept architectural — they may be unused public
+        API.  Returns the number of rows demoted.
+        """
+        ...
+
+    def demote_vendored_code(self) -> int:
+        """Tag nodes living under vendored / third-party paths as
+        ``is_architectural = 0`` (§11.12, P7).
+
+        The detection is purely path-based and conservative; the patterns
+        target obvious vendored locations (``third_party/``, ``vendor/``,
+        ``external/``, bundled ``gtest`` / ``gmock`` / ``googletest`` /
+        ``googlemock`` segments).  Demoted nodes remain fully retrievable
+        — only page eligibility and god-node ranking are affected.
+        Returns the number of rows demoted.
+        """
+        ...
+
+    def promote_class_members(self) -> int:
+        """Synthesize ``member_uses`` edges from class members to cross-file
+        targets they reference (§11.4, P1).
+
+        For each architectural class / struct / interface / trait C, walks
+        its ``defines`` children whose ``symbol_type`` is in
+        ``{'method','field','property','constructor'}`` and aggregates
+        their *cross-file* outgoing references / calls / instantiations.
+        Emits one synthetic edge per (C, T) pair with
+        ``rel_type='member_uses'``, ``weight=<evidence count>`` and
+        ``confidence='INFERRED'``.
+
+        Skip rule (per A2): no edge is emitted if ``(C, *, T)`` already
+        exists with a ``rel_type != 'defines'`` — don't double-count
+        relationships the parser already attributed to C itself.
+
+        Self-loops (T == C) are excluded.  Returns the number of edges
+        actually inserted.
+        """
+        ...
+
+    def compute_god_nodes(self, top_n: int = 20) -> dict[str, Any]:
+        """Return the top-N over-connected symbols and files (§11.7 / B2).
+
+        Pure analytics; no behaviour change.  Output shape::
+
+            {
+                "by_symbol_type": [
+                    {"symbol_id", "name", "symbol_type", "rel_path", "degree"},
+                    ...
+                ],
+                "by_file": [
+                    {"rel_path", "internal_arch", "external_edges"},
+                    ...
+                ],
+            }
+        """
         ...

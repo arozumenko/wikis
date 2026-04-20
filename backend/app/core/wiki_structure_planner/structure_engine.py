@@ -136,6 +136,31 @@ class WikiStructurePlannerEngine:
             max_tokens=4096,  # Reduced for speed - tool-based output needs less tokens
         )
 
+    @staticmethod
+    def _unwrap_chat_model(model: Any) -> BaseChatModel:
+        """Unwrap RunnableRetry / RunnableBinding wrappers around a chat model.
+
+        deepagents' ``resolve_model()`` puts the model in a dict key (i.e.
+        hashes it), and ``RunnableRetry`` / ``RunnableBinding`` are not
+        hashable, so the planner crashes with
+        ``TypeError: unhashable type: 'RunnableRetry'``.
+
+        We follow the ``.bound`` chain (used by both ``RunnableBinding`` and
+        ``RunnableRetry``) until we reach a real ``BaseChatModel``.  Falls
+        back to the original object if no inner chat model is found, so any
+        future wrapper types still surface a clear deepagents error rather
+        than being silently broken.
+        """
+        current = model
+        for _ in range(8):  # arbitrary safety cap; nesting is normally 1
+            if isinstance(current, BaseChatModel):
+                return current
+            inner = getattr(current, "bound", None)
+            if inner is None or inner is current:
+                break
+            current = inner
+        return current
+
     def _create_agent(self, collector):
         """
         Create the DeepAgents agent with FilesystemMiddleware + output tools.
@@ -167,7 +192,15 @@ class WikiStructurePlannerEngine:
         # NOTE: Do NOT call base_model.bind() here — RunnableBinding is not a
         # BaseChatModel, so deepagents' resolve_model() cannot hash it.
         # deepagents handles tool calling configuration internally.
-        model = base_model
+        #
+        # Same problem applies if the caller passes an LLM wrapped in
+        # ``.with_retry()`` (RunnableRetry) or any other RunnableBinding —
+        # deepagents' ``resolve_model()`` tries to hash the model and crashes
+        # with ``unhashable type: 'RunnableRetry'``.  Unwrap to the inner
+        # BaseChatModel here; retry semantics are still applied by the rest
+        # of the wiki-generation pipeline that uses ``self.llm_client``
+        # directly.
+        model = self._unwrap_chat_model(base_model)
 
         # Create a backend factory that returns FilesystemBackend with virtual_mode=True
         # This sandboxes all file operations to repo_root

@@ -500,9 +500,13 @@ class FilesystemRepositoryIndexer:
             # Phase 1b — Populate vector embeddings (repo_vec table)
             if _embed_batch_fn:
                 try:
+                    # Default 256: ``text-embedding-3-large`` accepts up
+                    # to 2048 inputs / 300k tokens per request, and code
+                    # symbols are typically short.  64 was conservative
+                    # and made indexing wall-clock dominated by HTTP RTT.
                     n_embedded = udb.populate_embeddings(
                         embedding_fn=_embed_batch_fn,
-                        batch_size=int(os.getenv("WIKI_EMBED_BATCH_SIZE", "64")),
+                        batch_size=int(os.getenv("WIKI_EMBED_BATCH_SIZE", "256")),
                     )
                     logger.info("Unified DB: %d node embeddings stored", n_embedded)
                 except Exception as exc:
@@ -548,6 +552,58 @@ class FilesystemRepositoryIndexer:
                 )
             except Exception as exc:
                 logger.warning("Phase 3 clustering failed (non-fatal): %s", exc)
+
+            # ────────────────────────────────────────────────
+            # Post-pass hygiene & observability (§11.7, §11.8, §11.12)
+            # Run AFTER clustering so file-contraction/Leiden see the raw
+            # arch graph; demotion only affects retrieval-eligibility flags
+            # and the god-nodes report is purely informational.
+            # Vendored demotion runs FIRST so the local-constant pass and
+            # god-nodes report both reflect the post-vendored state.
+            # ────────────────────────────────────────────────
+            try:
+                vendored = udb.demote_vendored_code()
+                if vendored:
+                    logger.info(
+                        "Post-pass: demoted %d vendored / third-party nodes (§11.12)",
+                        vendored,
+                    )
+            except Exception as exc:
+                logger.warning("demote_vendored_code failed (non-fatal): %s", exc)
+
+            try:
+                demoted = udb.demote_local_constants()
+                if demoted:
+                    logger.info(
+                        "Post-pass: demoted %d file-local constants (§11.8)",
+                        demoted,
+                    )
+            except Exception as exc:
+                logger.warning("demote_local_constants failed (non-fatal): %s", exc)
+
+            # Class member-promotion (§11.4 / P1) — must run AFTER vendored
+            # demotion (so we don't promote bundled gtest classes) and
+            # BEFORE god-nodes computation (so the report reflects the
+            # final connectivity).
+            try:
+                promoted = udb.promote_class_members()
+                if promoted:
+                    logger.info(
+                        "Post-pass: synthesized %d member_uses edges (§11.4)",
+                        promoted,
+                    )
+            except Exception as exc:
+                logger.warning("promote_class_members failed (non-fatal): %s", exc)
+
+            try:
+                god = udb.compute_god_nodes(top_n=20)
+                udb.set_meta("god_nodes", god)
+                logger.info(
+                    "Post-pass: god_nodes report stored (top symbol degree=%s)",
+                    (god.get("by_symbol_type") or [{}])[0].get("degree"),
+                )
+            except Exception as exc:
+                logger.warning("compute_god_nodes failed (non-fatal): %s", exc)
 
             # Store build metadata
             udb.set_meta("repo_identifier", repo_identifier)

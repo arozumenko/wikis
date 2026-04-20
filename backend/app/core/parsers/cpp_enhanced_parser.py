@@ -14,6 +14,7 @@ Based on Python parser architecture but adapted for C++ tree-sitter nodes.
 
 import hashlib
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Union, Any, Tuple
@@ -25,6 +26,100 @@ from .base_parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Hygiene filters — drop non-user-defined / parse-recovery symbols at parse time
+# (See INVESTIGATION_GRAPH_QUALITY.md §11.1)
+# =============================================================================
+
+# Header-include guards: `#define FOO_H_`, `#define FOO_HPP`, etc.
+# Matches all-caps names ending in _H, _H_, _HPP, _HXX (with optional trailing _).
+_HEADER_GUARD_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*_(H|HPP|HXX)_?$")
+
+# stdlib trait-shim type aliases. These are not user-defined types.
+# List-driven (not regex) so it's reviewable and extensible.
+_STDLIB_TYPE_ALIAS_NAMES: frozenset = frozenset({
+    # type-trait result aliases (cv / ref / ptr / extent removal)
+    "decay_t", "remove_cv_t", "remove_const_t", "remove_volatile_t",
+    "remove_reference_t", "remove_cvref_t",
+    "remove_pointer_t", "remove_extent_t", "remove_all_extents_t",
+    # cv / ref / ptr addition
+    "add_const_t", "add_volatile_t", "add_cv_t",
+    "add_pointer_t", "add_lvalue_reference_t", "add_rvalue_reference_t",
+    # void / null / utility
+    "void_t", "void_t_impl", "nullptr_t",
+    # conditional / enable_if
+    "enable_if_t", "conditional_t",
+    # category traits (_v variables — sometimes aliased)
+    "is_same_v", "is_base_of_v", "is_convertible_v",
+    "is_void_v", "is_null_pointer_v",
+    "is_integral_v", "is_floating_point_v", "is_arithmetic_v",
+    "is_signed_v", "is_unsigned_v",
+    "is_const_v", "is_volatile_v",
+    "is_array_v", "is_pointer_v", "is_reference_v",
+    "is_lvalue_reference_v", "is_rvalue_reference_v",
+    "is_function_v",
+    # composite trait aliases
+    "common_type_t", "underlying_type_t", "invoke_result_t", "result_of_t",
+    # generic template trait shim members
+    "type_t", "value_t",
+})
+
+# Tree-sitter parse-recovery garbage symbol names.
+# These appear when the parser fails to identify the construct properly
+# and falls back to a partial recovery (e.g., template parameter packs
+# misread as class names).
+_PARSE_RECOVERY_NAMES: frozenset = frozenset({
+    "typename...", "class...", "template...",
+    "T", "U", "V",  # bare template-parameter names extracted as classes
+})
+
+_AUTO_NAME_PREFIX = "auto "  # e.g., "auto p" — fmt sample showed this as a "class"
+
+
+def _is_header_guard_macro(name: str, value: Optional[str]) -> bool:
+    """True if the macro looks like a `#include` guard.
+
+    A header guard is an all-caps identifier ending in ``_H`` / ``_HPP`` /
+    ``_HXX`` (optionally with a trailing underscore) AND has no
+    replacement value.  Examples from fmt: ``FMT_ARGS_H_``,
+    ``FMT_COMPILE_H_``, ``FMT_OSTREAM_H_``.
+    """
+    if value is not None and value.strip():
+        return False
+    return bool(_HEADER_GUARD_NAME_RE.match(name))
+
+
+def _is_stdlib_type_alias(name: str) -> bool:
+    """True if ``name`` is in the curated stdlib trait-shim allow-list."""
+    return name in _STDLIB_TYPE_ALIAS_NAMES
+
+
+def _is_parse_recovery_name(name: Optional[str]) -> bool:
+    """True if ``name`` is tree-sitter parse-recovery garbage.
+
+    Drops ``auto p``-style class names, bare template parameter names
+    (``T``, ``U``, ``V``), and template-parameter-pack misreads.
+    """
+    if not name:
+        return True  # caller must skip empty names
+    if name in _PARSE_RECOVERY_NAMES:
+        return True
+    if name.startswith(_AUTO_NAME_PREFIX):
+        return True
+    return False
+
+
+def _is_operator_name(name: Optional[str]) -> bool:
+    """True if ``name`` denotes a C++ operator overload.
+
+    Covers `operator+`, `operator[]`, `operator<<`, user-defined
+    literals (``operator""_cf``), conversion operators (``operator int``),
+    etc.  Such symbols are kept in the graph (so CALLS targeting them
+    resolve) but should not drive page generation.
+    """
+    return bool(name) and name.startswith("operator")
+
 
 # Tree-sitter imports
 try:
@@ -455,6 +550,11 @@ class CppEnhancedParser(BaseParser):
                                     break
                     
                     if first_enumerator_name:
+                        # Anonymous enums are kept at every scope: the
+                        # synthetic wrapper is what binds the enumerators
+                        # (which are emitted as CONSTANT children with
+                        # parent_symbol = the wrapper's full_name).
+                        # Dropping the wrapper would orphan those constants.
                         name = f"<anonymous_enum:{first_enumerator_name}>"
                     else:
                         # No enumerators at all, skip
@@ -500,6 +600,13 @@ class CppEnhancedParser(BaseParser):
                     return
                 
                 name = self.parser._get_node_text(name_node)
+
+                # Drop stdlib trait-shim aliases (decay_t, void_t, …).
+                # These are not user-defined types; they pollute the
+                # architectural-symbol set and orphan-rate metrics.
+                if _is_stdlib_type_alias(name):
+                    return
+
                 parent_symbol = '::'.join(self.scope_stack) if self.scope_stack else None
                 full_name = f"{parent_symbol}::{name}" if parent_symbol else name
                 
@@ -652,7 +759,11 @@ class CppEnhancedParser(BaseParser):
                 name = self._extract_function_name(func_declarator)
                 if not name:
                     return
-                
+
+                # Drop tree-sitter parse-recovery garbage function names.
+                if _is_parse_recovery_name(name):
+                    return
+
                 parent_symbol = '::'.join(self.scope_stack) if self.scope_stack else None
                 full_name = f"{parent_symbol}::{name}" if parent_symbol else name
                 
@@ -673,9 +784,15 @@ class CppEnhancedParser(BaseParser):
                 # Check scope to determine if this is truly a method (inside class/struct)
                 # or a free function (at namespace/global scope)
                 is_method = bool(self.class_scope_stack)
+                # Operator overloads are kept in the graph (so CALLS resolve)
+                # but tagged OPERATOR so they don't drive page generation.
+                if _is_operator_name(name):
+                    method_or_func_type = SymbolType.OPERATOR
+                else:
+                    method_or_func_type = SymbolType.METHOD if is_method else SymbolType.FUNCTION
                 symbol = Symbol(
                     name=name,
-                    symbol_type=SymbolType.METHOD if is_method else SymbolType.FUNCTION,
+                    symbol_type=method_or_func_type,
                     scope=Scope.FUNCTION,
                     range=self.parser._node_to_range(decl_node),
                     file_path=file_path,
@@ -721,7 +838,12 @@ class CppEnhancedParser(BaseParser):
                 name = self._extract_class_name(node)
                 if not name:
                     return
-                
+
+                # Drop tree-sitter parse-recovery garbage (e.g., 'auto p',
+                # bare template parameter names, 'typename...').
+                if _is_parse_recovery_name(name):
+                    return
+
                 parent_symbol = '::'.join(self.scope_stack) if self.scope_stack else None
                 full_name = f"{parent_symbol}::{name}" if parent_symbol else name
                 
@@ -868,12 +990,24 @@ class CppEnhancedParser(BaseParser):
                     name = self._extract_function_name(declarator)
                     if not name:
                         return
-                    
+
                     parent_symbol = '::'.join(self.scope_stack) if self.scope_stack else None
                     full_name = f"{parent_symbol}::{name}" if parent_symbol else name
                     # Free functions in namespaces are FUNCTION, methods in classes are METHOD
                     symbol_type = SymbolType.METHOD if self.class_scope_stack else SymbolType.FUNCTION
-                
+
+                # Drop tree-sitter parse-recovery garbage function names.
+                if _is_parse_recovery_name(name):
+                    return
+                # Member operator overloads (operator+, operator[], …) are
+                # kept for call-resolution but tagged OPERATOR so they
+                # don't drive page generation.  Free-standing operators
+                # (e.g. `std::ostream& operator<<(...)`) are real public
+                # API and stay as FUNCTION; we only flag them in metadata.
+                _is_operator = _is_operator_name(name)
+                if _is_operator and symbol_type == SymbolType.METHOD:
+                    symbol_type = SymbolType.OPERATOR
+
                 # Extract return type
                 return_type = self._extract_return_type(node)
                 
@@ -1054,7 +1188,23 @@ class CppEnhancedParser(BaseParser):
                     else:
                         # Free function (possibly in namespace): FUNCTION
                         symbol_type = SymbolType.FUNCTION
-                
+
+                # Drop tree-sitter parse-recovery garbage function names.
+                if _is_parse_recovery_name(name):
+                    return
+                # Member operator overloads (operator+, operator[], …) are
+                # kept for call-resolution but tagged OPERATOR so they
+                # don't drive page generation.  Free-standing operators
+                # (e.g. `std::ostream& operator<<(...)`) are real public
+                # API and stay as FUNCTION.  Conversion-operator
+                # constructors keep their CONSTRUCTOR tag.
+                _is_operator = _is_operator_name(name)
+                if (
+                    _is_operator
+                    and symbol_type == SymbolType.METHOD
+                ):
+                    symbol_type = SymbolType.OPERATOR
+
                 # Extract return type
                 return_type = self._extract_return_type(node)
                 
@@ -1442,7 +1592,11 @@ class CppEnhancedParser(BaseParser):
                 name = self._extract_function_name(func_declarator)
                 if not name:
                     return
-                
+
+                # Drop tree-sitter parse-recovery garbage method names.
+                if _is_parse_recovery_name(name):
+                    return
+
                 parent_symbol = '::'.join(self.scope_stack)
                 full_name = f"{parent_symbol}::{name}"
                 
@@ -1451,6 +1605,13 @@ class CppEnhancedParser(BaseParser):
                     symbol_type = SymbolType.CONSTRUCTOR
                 else:
                     symbol_type = SymbolType.METHOD
+
+                # Operator overloads inside a class are kept (for call
+                # resolution) but tagged OPERATOR so they don't drive page
+                # generation.  Conversion-operator constructors stay as
+                # CONSTRUCTOR.
+                if symbol_type != SymbolType.CONSTRUCTOR and _is_operator_name(name):
+                    symbol_type = SymbolType.OPERATOR
                 
                 # Extract return type
                 return_type = self._extract_return_type(field_decl_node)
@@ -1555,7 +1716,13 @@ class CppEnhancedParser(BaseParser):
                 value_node = self.parser._find_child_by_type(node, 'preproc_arg')
                 if value_node:
                     value = self.parser._get_node_text(value_node)
-                
+
+                # Drop header-include guards (`#define FOO_H_`, `#define FOO_HPP`).
+                # These are not user-defined macros; they pollute orphan metrics
+                # and clutter the architectural-symbol set.
+                if _is_header_guard_macro(name, value):
+                    return
+
                 # Create MACRO symbol for #define
                 parent_symbol = '::'.join(self.scope_stack) if self.scope_stack else None
                 full_name = f"{parent_symbol}::{name}" if parent_symbol else name

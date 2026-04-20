@@ -38,6 +38,140 @@ from ..utils.resource_monitor import resource_monitor
 logger = logging.getLogger(__name__)
 
 # =============================================================================
+# Graph index attachment (used by builder + storage backends)
+# =============================================================================
+
+# Priority used when picking the "best" candidate for a (name, file, lang) key.
+# Higher = more architecturally significant.  Kept in sync with
+# ``EnhancedUnifiedGraphBuilder._get_type_priority``.
+_GRAPH_INDEX_TYPE_PRIORITY: Dict[str, int] = {
+    'class': 10, 'interface': 10, 'trait': 10, 'protocol': 10,
+    'enum': 9, 'struct': 9, 'record': 9, 'data_class': 9, 'object': 9,
+    'module': 8, 'namespace': 8,
+    'function': 7,
+    'constant': 6, 'type_alias': 6, 'annotation': 6, 'decorator': 6, 'macro': 6,
+    'method': 3,
+    'constructor': 2, 'field': 2, 'property': 2,
+    'parameter': 1, 'variable': 1, 'local_variable': 1, 'argument': 1,
+    'unknown': 0,
+}
+
+
+def _simple_symbol_name_for_index(name: str) -> str:
+    """Return the last segment of a dotted/scoped symbol name."""
+    if not name:
+        return ""
+    return name.split('.')[-1].split('::')[-1]
+
+
+def attach_graph_indexes(graph: "nx.MultiDiGraph") -> None:  # noqa: F821
+    """Attach lookup indexes to ``graph`` for O(1) symbol resolution.
+
+    Used both by the builder (after a fresh parse) and by storage backends
+    (after rehydrating a graph via ``to_networkx()``).  Without these
+    indexes ``GraphQueryService`` and the content expander degrade to
+    FTS5/scan fallbacks, breaking ``query_graph`` and similar tools.
+
+    Idempotent — safe to call multiple times on the same graph.
+    """
+    if not graph:
+        return
+
+    type_priority = _GRAPH_INDEX_TYPE_PRIORITY
+
+    graph._node_index = {}
+    graph._simple_name_index = {}
+    graph._full_name_index = {}
+    graph._name_index = defaultdict(list)
+    graph._suffix_index = defaultdict(list)
+    graph._decl_impl_index = defaultdict(list)
+    graph._constant_def_index = defaultdict(list)
+
+    def _symbol_type_of(node_id: str) -> str:
+        node_data = graph.nodes.get(node_id, {})
+        symbol_type_raw = (
+            node_data.get('symbol_type') or node_data.get('type') or 'unknown'
+        )
+        return (
+            symbol_type_raw.value.lower()
+            if hasattr(symbol_type_raw, 'value')
+            else str(symbol_type_raw).lower()
+        )
+
+    def _maybe_set(index: Dict, key, node_id: str) -> None:
+        if key in index:
+            existing_node_id = index[key]
+            if (
+                type_priority.get(_symbol_type_of(node_id), 0)
+                > type_priority.get(_symbol_type_of(existing_node_id), 0)
+            ):
+                index[key] = node_id
+        else:
+            index[key] = node_id
+
+    for node_id, node_data in graph.nodes(data=True):
+        symbol_name = node_data.get('symbol_name') or node_data.get('name') or ''
+        file_path = node_data.get('file_path', '') or node_data.get('rel_path', '')
+        language = (node_data.get('language') or '').lower()
+
+        if symbol_name and file_path and language:
+            _maybe_set(graph._node_index, (symbol_name, file_path, language), node_id)
+
+            simple_name = _simple_symbol_name_for_index(symbol_name)
+            if simple_name:
+                _maybe_set(
+                    graph._simple_name_index,
+                    (simple_name, file_path, language),
+                    node_id,
+                )
+
+            full_name = node_data.get('full_name')
+            if not full_name:
+                symbol_obj = node_data.get('symbol')
+                full_name = (
+                    getattr(symbol_obj, 'full_name', None) if symbol_obj else None
+                )
+            if full_name:
+                _maybe_set(graph._full_name_index, full_name, node_id)
+
+            graph._name_index[symbol_name].append(node_id)
+
+            parts = node_id.split('::', 2)
+            suffix = parts[2] if len(parts) == 3 else node_id
+            graph._suffix_index[suffix].append(node_id)
+
+        symbol_type = _symbol_type_of(node_id)
+        if symbol_name and symbol_type == 'constant':
+            graph._constant_def_index[symbol_name].append(node_id)
+
+    for source, target, edge_data in graph.edges(data=True):
+        rel_type = edge_data.get('relationship_type') or edge_data.get('type') or ''
+        if str(rel_type).lower() != 'defines_body':
+            continue
+
+        graph._decl_impl_index[target].append(source)
+
+        target_type = _symbol_type_of(target)
+        source_type = _symbol_type_of(source)
+        if target_type == 'constant' or source_type == 'constant':
+            source_name = (
+                graph.nodes.get(source, {}).get('symbol_name')
+                or graph.nodes.get(source, {}).get('name')
+            )
+            if source_name:
+                graph._constant_def_index[source_name].append(source)
+
+    def _priority(node_id: str) -> int:
+        return type_priority.get(_symbol_type_of(node_id), 0)
+
+    for nodes in graph._name_index.values():
+        nodes.sort(key=_priority, reverse=True)
+
+    for nodes in graph._suffix_index.values():
+        nodes.sort(key=_priority, reverse=True)
+
+
+# =============================================================================
 # Feature Flags for Doc/Code Separation
 # =============================================================================
 # When enabled, documentation files are NOT added to the graph (code-only graph)
@@ -1162,92 +1296,12 @@ class EnhancedUnifiedGraphBuilder:
         """
         Build lookup indexes on the graph for O(1) resolution in content expansion.
         Indexes are additive and safe for mixed comprehensive/basic nodes.
+
+        Thin wrapper around the module-level :func:`attach_graph_indexes` so
+        that storage backends rehydrating a graph via ``to_networkx()`` can
+        attach the same indexes without depending on a builder instance.
         """
-        if not graph:
-            return
-
-        type_priority = self._get_type_priority()
-
-        graph._node_index = {}
-        graph._simple_name_index = {}
-        graph._full_name_index = {}
-        graph._name_index = defaultdict(list)
-        graph._suffix_index = defaultdict(list)
-        graph._decl_impl_index = defaultdict(list)
-        graph._constant_def_index = defaultdict(list)
-
-        def _symbol_type_of(node_id: str) -> str:
-            node_data = graph.nodes.get(node_id, {})
-            symbol_type_raw = node_data.get('symbol_type') or node_data.get('type') or 'unknown'
-            return symbol_type_raw.value.lower() if hasattr(symbol_type_raw, 'value') else str(symbol_type_raw).lower()
-
-        def _maybe_set(index: Dict, key, node_id: str) -> None:
-            if key in index:
-                existing_node_id = index[key]
-                existing_type = _symbol_type_of(existing_node_id)
-                new_type = _symbol_type_of(node_id)
-                if type_priority.get(new_type, 0) > type_priority.get(existing_type, 0):
-                    index[key] = node_id
-            else:
-                index[key] = node_id
-
-        for node_id, node_data in graph.nodes(data=True):
-            symbol_name = node_data.get('symbol_name') or node_data.get('name') or ''
-            file_path = node_data.get('file_path', '')
-            language = (node_data.get('language') or '').lower()
-
-            if symbol_name and file_path and language:
-                _maybe_set(graph._node_index, (symbol_name, file_path, language), node_id)
-
-                simple_name = self._simple_symbol_name(symbol_name)
-                if simple_name:
-                    _maybe_set(graph._simple_name_index, (simple_name, file_path, language), node_id)
-
-                # Full name index (prefer parser-provided full_name)
-                full_name = node_data.get('full_name')
-                if not full_name:
-                    symbol_obj = node_data.get('symbol')
-                    full_name = getattr(symbol_obj, 'full_name', None) if symbol_obj else None
-                if full_name:
-                    _maybe_set(graph._full_name_index, full_name, node_id)
-
-                graph._name_index[symbol_name].append(node_id)
-
-                # Suffix index from node_id (after language::file::)
-                parts = node_id.split('::', 2)
-                suffix = parts[2] if len(parts) == 3 else node_id
-                graph._suffix_index[suffix].append(node_id)
-
-            # Constant definition index (best-effort, refined via edges below)
-            symbol_type = _symbol_type_of(node_id)
-            if symbol_name and symbol_type == 'constant':
-                graph._constant_def_index[symbol_name].append(node_id)
-
-        # Build decl/impl index from edges (implementation -> declaration)
-        for source, target, edge_data in graph.edges(data=True):
-            rel_type = edge_data.get('relationship_type') or edge_data.get('type') or ''
-            if str(rel_type).lower() != 'defines_body':
-                continue
-
-            graph._decl_impl_index[target].append(source)
-
-            # If this links constants, include in constant definition index
-            target_type = _symbol_type_of(target)
-            source_type = _symbol_type_of(source)
-            if target_type == 'constant' or source_type == 'constant':
-                source_name = graph.nodes.get(source, {}).get('symbol_name') or graph.nodes.get(source, {}).get('name')
-                if source_name:
-                    graph._constant_def_index[source_name].append(source)
-
-        # Sort list-based indexes by type priority (highest first)
-        def _priority(node_id: str) -> int:
-            return type_priority.get(_symbol_type_of(node_id), 0)
-
-        for key, nodes in graph._name_index.items():
-            nodes.sort(key=_priority, reverse=True)
-
-        for key, nodes in graph._suffix_index.items():
-            nodes.sort(key=_priority, reverse=True)
+        attach_graph_indexes(graph)
     
     def _build_comprehensive_language_graph(self, parse_results: Dict[str, ParseResult], language: str) -> nx.MultiDiGraph:
         """Build comprehensive code_graph for rich parsers with sequential processing"""
@@ -2702,26 +2756,59 @@ class EnhancedUnifiedGraphBuilder:
             
             # Split the markdown content
             md_header_splits = markdown_splitter.split_text(content)
-            
-            # Process each markdown section - keep complete sections without further splitting
+
+            # ── Coalesce consecutive single-line splits that share the same
+            # heading metadata.  ``return_each_line=True`` above gives us
+            # one entry per source line — that produces dozens of duplicate
+            # ``markdown_section`` nodes for the same heading (one per
+            # body line).  We collapse them back into one chunk per
+            # heading, recovering correct line numbers as we go.
+            content_lines = content.split("\n")
+            line_cursor = 0  # 0-based index into content_lines
+            coalesced: List[Dict[str, Any]] = []
+            current: Optional[Dict[str, Any]] = None
+
+            def _heading_key(meta: Dict[str, str]) -> tuple:
+                return tuple(
+                    (h, meta[h])
+                    for h in ("Header 1", "Header 2", "Header 3", "Header 4")
+                    if h in meta
+                )
+
             for i, split in enumerate(md_header_splits):
-                section_content = split.page_content
-                section_metadata = split.metadata
-                
-                # Extract section name from metadata or content
-                section_name = self._extract_section_name(section_metadata, section_content, i)
-                
-                # Create chunk with sequential ID for reconstruction
-                chunks.append({
-                    'content': section_content,
-                    'summary': section_name,
-                    'start_line': self._estimate_line_number(content, section_content),
-                    'end_line': self._estimate_line_number(content, section_content) + section_content.count('\n'),
-                    'headers': section_metadata,
-                    'section_type': 'markdown_section',
-                    'section_id': i,  # Sequential ID for reconstruction
-                    'section_order': i  # Explicit order field for sorting during reconstruction
-                })
+                seg_text = split.page_content
+                seg_meta = split.metadata or {}
+                seg_lines = seg_text.count("\n") + (1 if seg_text else 0)
+                seg_start_line = line_cursor + 1  # 1-based
+                line_cursor += seg_lines
+                key = _heading_key(seg_meta)
+
+                if current is not None and current["_key"] == key:
+                    current["content"] += "\n" + seg_text
+                    current["end_line"] = line_cursor
+                else:
+                    if current is not None:
+                        coalesced.append(current)
+                    section_name = self._extract_section_name(
+                        seg_meta, seg_text, len(coalesced),
+                    )
+                    current = {
+                        "content": seg_text,
+                        "summary": section_name,
+                        "start_line": seg_start_line,
+                        "end_line": line_cursor,
+                        "headers": seg_meta,
+                        "section_type": "markdown_section",
+                        "section_id": len(coalesced),
+                        "section_order": len(coalesced),
+                        "_key": key,
+                    }
+            if current is not None:
+                coalesced.append(current)
+
+            for ch in coalesced:
+                ch.pop("_key", None)
+                chunks.append(ch)
                     
         except Exception as e:
             logger.warning(f"Failed to split markdown with LangChain splitter: {e}, falling back to simple splitting")

@@ -132,10 +132,16 @@ def _build_one_candidate(
     conn, macro_id: int, micro_id: int, node_ids: List[str],
 ) -> CandidateRecord:
     """Compute metrics for a single micro-cluster."""
-    # Fetch node metadata
+    # Fetch node metadata.
+    # Only the columns the metric routines actually read are selected.
+    # `source_text` is intentionally excluded — it is multi-KB per node and
+    # we only need its length, which we compute via SQL ``length(...)``.
     placeholders = ",".join("?" * len(node_ids))
     rows = conn.execute(
-        f"SELECT * FROM repo_nodes WHERE node_id IN ({placeholders})",
+        "SELECT node_id, symbol_name, symbol_type, rel_path, "
+        "       COALESCE(length(source_text), 0) AS source_len, "
+        "       docstring "
+        f"FROM repo_nodes WHERE node_id IN ({placeholders})",
         node_ids,
     ).fetchall()
     nodes = [dict(r) for r in rows]
@@ -154,7 +160,7 @@ def _build_one_candidate(
     for node in nodes:
         stype = (node.get("symbol_type") or "").lower()
         name = (node.get("symbol_name") or "").lower()
-        source = node.get("source_text") or ""
+        source_len = int(node.get("source_len") or 0)
         rel_path = node.get("rel_path") or ""
 
         if stype in PAGE_IDENTITY_SYMBOLS:
@@ -165,7 +171,7 @@ def _build_one_candidate(
             doc_count += 1
 
         # Implementation evidence: has substantial source text
-        if stype not in DOC_CLUSTER_SYMBOLS and len(source) >= _MIN_IMPL_LENGTH:
+        if stype not in DOC_CLUSTER_SYMBOLS and source_len >= _MIN_IMPL_LENGTH:
             impl_count += 1
 
         # Public API heuristic: starts with uppercase or no leading underscore

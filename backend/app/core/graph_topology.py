@@ -361,6 +361,8 @@ def resolve_orphans(
     vec_distance_threshold: float = 0.15,
     max_lexical_edges: int = 2,
     embed_batch_size: int = 64,
+    vec_prefix_depth: Optional[int] = None,
+    embed_max_workers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """3-pass orphan resolution cascade (batched for performance).
 
@@ -383,11 +385,31 @@ def resolve_orphans(
         vec_distance_threshold: Max cosine distance for a semantic match.
         max_lexical_edges: Max lexical edges to add per orphan.
         embed_batch_size: Number of texts per batch embedding call.
+        vec_prefix_depth: Maximum number of expanding directory prefixes to
+            try per orphan during semantic search.  ``None`` (default) reads
+            the ``WIKI_VEC_PREFIX_DEPTH`` env var (default ``2`` — local
+            directory + global fallback).  Use ``0`` to keep the legacy
+            "expand all the way to root" behaviour.
+        embed_max_workers: Max in-flight embedding batches in Pass 2.
+            ``None`` (default) reads ``WIKI_VEC_CONCURRENCY`` env var
+            (default ``1`` — sequential).  Only the embedding API call is
+            parallelised; sqlite/vec writes stay on the caller thread.
 
     Returns:
         Stats dict with orphan count, edges added by type, etc.
     """
     import time as _time
+
+    if vec_prefix_depth is None:
+        try:
+            vec_prefix_depth = max(0, int(os.getenv("WIKI_VEC_PREFIX_DEPTH", "2")))
+        except ValueError:
+            vec_prefix_depth = 2
+    if embed_max_workers is None:
+        try:
+            embed_max_workers = max(1, int(os.getenv("WIKI_VEC_CONCURRENCY", "1")))
+        except ValueError:
+            embed_max_workers = 1
 
     orphans = find_orphans(G)
 
@@ -481,23 +503,46 @@ def resolve_orphans(
 
         t2 = _time.monotonic()
 
-        # Process in batches — single API call per batch
-        for batch_start in range(0, len(vec_candidates), embed_batch_size):
-            batch = vec_candidates[batch_start:batch_start + embed_batch_size]
+        # Process in batches — single API call per batch.  When
+        # ``embed_max_workers > 1``, batches are dispatched concurrently
+        # via a thread pool and applied in completion order.  Only the
+        # embedding API call runs in worker threads — sqlite/vec writes
+        # remain on the caller thread.
+        batch_specs = [
+            vec_candidates[i:i + embed_batch_size]
+            for i in range(0, len(vec_candidates), embed_batch_size)
+        ]
+
+        def _embed_batch(batch):
             texts = [t for _, t, _ in batch]
-
-            # Batch embed: one call for embed_batch_size texts
             if embed_batch_fn:
-                embeddings = embed_batch_fn(texts)
-            else:
-                # Fallback: serial calls (still grouped logically)
-                embeddings = [embedding_fn(t) for t in texts]
+                return batch, embed_batch_fn(texts)
+            return batch, [embedding_fn(t) for t in texts]
 
+        if embed_max_workers > 1 and len(batch_specs) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=embed_max_workers) as pool:
+                futures = [pool.submit(_embed_batch, b) for b in batch_specs]
+                completed = (f.result() for f in as_completed(futures))
+                batch_iter = list(completed)
+        else:
+            batch_iter = [_embed_batch(b) for b in batch_specs]
+
+        for batch, embeddings in batch_iter:
             for (nid, _text, rel_path), emb in zip(batch, embeddings):
                 if nid in resolved:
                     continue
 
-                for prefix in _expanding_prefixes(rel_path):
+                prefixes = _expanding_prefixes(rel_path)
+                if vec_prefix_depth > 0:
+                    # Keep the most-local prefixes plus the global "" fallback
+                    # to bound per-orphan vec queries on big repos.
+                    capped: List[str] = prefixes[: max(1, vec_prefix_depth - 1)]
+                    if "" not in capped:
+                        capped.append("")
+                    prefixes = capped
+
+                for prefix in prefixes:
                     vec_hits = db.search_vec(
                         embedding=emb,
                         k=vec_k,

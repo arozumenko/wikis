@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import struct
 import time
 from collections.abc import Callable
@@ -231,6 +232,7 @@ def _define_tables(
         Column("rel_type", Text, nullable=False, server_default=""),
         Column("edge_class", Text, nullable=False, server_default="structural"),
         Column("analysis_level", Text, server_default="comprehensive"),
+        Column("confidence", Text, nullable=False, server_default="EXTRACTED"),
         Column("weight", Float, server_default="1.0"),
         Column("raw_similarity", Float),
         Column("source_file", Text, server_default=""),
@@ -386,6 +388,31 @@ class PostgresWikiStorage:
     def _create_indexes(self) -> None:
         """Create secondary indexes."""
         schema = self._schema
+        # §11.6 / B1 — backfill confidence column on legacy schemas. The
+        # SQLAlchemy create_all() above is idempotent for *new* installs but
+        # does not ALTER existing tables; do that here, then add the CHECK.
+        with self._engine.begin() as conn:
+            conn.execute(text(f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_edges'
+                          AND column_name = 'confidence'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_edges
+                            ADD COLUMN confidence TEXT NOT NULL DEFAULT 'EXTRACTED';
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'repo_edges_confidence_chk'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_edges
+                            ADD CONSTRAINT repo_edges_confidence_chk
+                            CHECK (confidence IN ('EXTRACTED','INFERRED','AMBIGUOUS'));
+                    END IF;
+                END $$;
+            """))
         indexes = [
             f"CREATE INDEX IF NOT EXISTS idx_nodes_path ON {schema}.repo_nodes(rel_path)",
             f"CREATE INDEX IF NOT EXISTS idx_nodes_name ON {schema}.repo_nodes(symbol_name)",
@@ -402,6 +429,7 @@ class PostgresWikiStorage:
             f"CREATE INDEX IF NOT EXISTS idx_edges_type ON {schema}.repo_edges(rel_type)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_class ON {schema}.repo_edges(edge_class)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_weight ON {schema}.repo_edges(weight)",
+            f"CREATE INDEX IF NOT EXISTS idx_edges_confidence ON {schema}.repo_edges(confidence)",
         ]
         with self._engine.begin() as conn:
             for ddl in indexes:
@@ -648,6 +676,30 @@ class PostgresWikiStorage:
         if not edges:
             return
 
+        # Optional in-batch deduplication of (source, target, rel_type)
+        # tuples — collapses duplicates into a single row, summing
+        # ``weight`` and keeping the first occurrence's other attributes.
+        # Disabled by default; opt-in via WIKI_DEDUP_EDGES=1.
+        if os.environ.get("WIKI_DEDUP_EDGES", "0") == "1":
+            collapsed: dict[tuple[str, str, str], dict[str, Any]] = {}
+            for e in edges:
+                key = (
+                    e.get("source_id", ""),
+                    e.get("target_id", ""),
+                    e.get("rel_type", ""),
+                )
+                existing = collapsed.get(key)
+                if existing is None:
+                    collapsed[key] = dict(e)
+                else:
+                    try:
+                        existing["weight"] = float(existing.get("weight", 1.0)) + float(
+                            e.get("weight", 1.0)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+            edges = list(collapsed.values())
+
         _s = self._strip_nul
         schema = self._schema
         rows = []
@@ -661,6 +713,7 @@ class PostgresWikiStorage:
                 "rel_type": _s(e.get("rel_type", "")),
                 "edge_class": _s(e.get("edge_class", "structural")),
                 "analysis_level": _s(e.get("analysis_level", "comprehensive")),
+                "confidence": _s(e.get("confidence", "EXTRACTED")),
                 "weight": e.get("weight", 1.0),
                 "raw_similarity": e.get("raw_similarity"),
                 "source_file": _s(e.get("source_file", "")),
@@ -842,23 +895,33 @@ class PostgresWikiStorage:
         self,
         embedding_fn: Callable[[list[str]], list[list[float]]],
         batch_size: int = 64,
+        architectural_only: bool | None = None,
+        max_workers: int | None = None,
     ) -> int:
         if not self._vec_available:
             logger.warning("populate_embeddings: pgvector not available, skipping")
             return 0
 
+        if architectural_only is None:
+            architectural_only = os.getenv("WIKI_EMBED_ARCH_ONLY", "1") != "0"
+        if max_workers is None:
+            try:
+                max_workers = max(1, int(os.getenv("WIKI_EMBED_CONCURRENCY", "1")))
+            except ValueError:
+                max_workers = 1
+
         with self._engine.connect() as conn:
             # Fetch all nodes; use source_text with fallback to
             # docstring / symbol_name so that nodes with empty
             # source_text still get an embedding vector.
+            arch_filter = " WHERE is_architectural = TRUE" if architectural_only else ""
             rows = conn.execute(
                 text(
                     f"SELECT node_id, source_text, docstring, symbol_name "
-                    f"FROM {self._schema}.repo_nodes"
+                    f"FROM {self._schema}.repo_nodes" + arch_filter
                 ),
             ).fetchall()
 
-        total = 0
         embeddable: list[tuple[str, str]] = []
         for r in rows:
             txt = (r[1] or "").strip()
@@ -869,22 +932,48 @@ class PostgresWikiStorage:
             if txt:
                 embeddable.append((r[0], txt))
 
+        batches: list[tuple[int, list[str], list[str]]] = []
         for i in range(0, len(embeddable), batch_size):
             batch = embeddable[i: i + batch_size]
-            texts = [t for _, t in batch]
-            node_ids = [nid for nid, _ in batch]
+            batches.append((i, [nid for nid, _ in batch], [t for _, t in batch]))
 
+        total = 0
+
+        def _embed_one(idx: int, node_ids: list[str], texts: list[str]):
             try:
                 vectors = embedding_fn(texts)
             except Exception as exc:
-                logger.warning("populate_embeddings: batch %d–%d failed: %s", i, i + len(batch), exc)
-                continue
+                logger.warning(
+                    "populate_embeddings: batch %d–%d failed: %s",
+                    idx, idx + len(node_ids), exc,
+                )
+                return None
+            return list(zip(node_ids, vectors, strict=True))
 
-            pairs = list(zip(node_ids, vectors, strict=True))
-            self.upsert_embeddings_batch(pairs)
-            total += len(pairs)
+        if max_workers > 1 and len(batches) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [
+                    pool.submit(_embed_one, idx, nids, texts)
+                    for idx, nids, texts in batches
+                ]
+                for fut in as_completed(futures):
+                    pairs = fut.result()
+                    if pairs:
+                        self.upsert_embeddings_batch(pairs)
+                        total += len(pairs)
+        else:
+            for idx, nids, texts in batches:
+                pairs = _embed_one(idx, nids, texts)
+                if pairs:
+                    self.upsert_embeddings_batch(pairs)
+                    total += len(pairs)
 
-        logger.info("populate_embeddings: %d/%d nodes embedded", total, len(rows))
+        logger.info(
+            "populate_embeddings: %d/%d nodes embedded "
+            "(arch_only=%s, workers=%d)",
+            total, len(rows), architectural_only, max_workers,
+        )
         return total
 
     def search_vec(
@@ -1268,6 +1357,15 @@ class PostgresWikiStorage:
                 d["relationship_type"] = d.pop("rel_type", "")
                 G.add_edge(src, tgt, **d)
 
+        # Attach lookup indexes so GraphQueryService / content expander
+        # can do O(1) symbol resolution on the rehydrated graph instead of
+        # falling back to FTS-only / full graph scans.
+        try:
+            from app.core.code_graph.graph_builder import attach_graph_indexes
+            attach_graph_indexes(G)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("to_networkx: failed to attach graph indexes: %s", exc)
+
         logger.info(
             "to_networkx: reconstructed %d nodes, %d edges",
             G.number_of_nodes(), G.number_of_edges(),
@@ -1364,7 +1462,9 @@ class PostgresWikiStorage:
         architectural_only: bool = True,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
-        conditions = ["symbol_name = :name"]
+        # P6 (§11.9): case-insensitive lookup so callers don't need to know
+        # the exact casing (`EliteAClient` vs `EliteaClient` etc.).
+        conditions = ["LOWER(symbol_name) = LOWER(:name)"]
         params: dict[str, Any] = {"name": name, "lim": limit}
 
         if macro_cluster is not None:
@@ -1540,3 +1640,175 @@ class PostgresWikiStorage:
                 params,
             ).fetchone()
         return row[0] if row else None
+
+    # ══════════════════════════════════════════════════════════════════
+    # POST-PASS HYGIENE / OBSERVABILITY (§11.7, §11.8, §11.12)
+    # ══════════════════════════════════════════════════════════════════
+
+    def demote_local_constants(self) -> int:
+        """Demote constants whose every reference is in their defining file.
+
+        See §11.8.  Constants with **zero** incoming reference edges are kept
+        architectural (could be unused public API).  Returns rows demoted.
+        """
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    f"""
+                    UPDATE {self._nodes} AS up
+                       SET is_architectural = 0
+                     WHERE up.node_id IN (
+                         SELECT n.node_id
+                           FROM {self._nodes} n
+                           JOIN {self._edges} e   ON e.target_id = n.node_id
+                           JOIN {self._nodes} src ON e.source_id = src.node_id
+                          WHERE n.symbol_type = 'constant'
+                            AND n.is_architectural = TRUE
+                          GROUP BY n.node_id, n.rel_path
+                         HAVING COUNT(DISTINCT src.rel_path) = 1
+                            AND MAX(src.rel_path) = n.rel_path
+                     )
+                    """
+                )
+            )
+        return int(result.rowcount or 0)
+
+    def demote_vendored_code(self) -> int:
+        """Demote nodes living under vendored / third-party paths (§11.12, P7).
+
+        Path-based and conservative: matches obvious vendor locations and
+        bundled test frameworks (gtest / gmock / googletest / googlemock).
+        """
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    f"""
+                    UPDATE {self._nodes}
+                       SET is_architectural = FALSE
+                     WHERE is_architectural = TRUE
+                       AND (
+                            rel_path LIKE 'third_party/%%'
+                         OR rel_path LIKE 'third-party/%%'
+                         OR rel_path LIKE 'vendor/%%'
+                         OR rel_path LIKE 'vendored/%%'
+                         OR rel_path LIKE 'external/%%'
+                         OR rel_path LIKE 'extern/%%'
+                         OR rel_path LIKE 'deps/%%'
+                         OR rel_path LIKE '%%/third_party/%%'
+                         OR rel_path LIKE '%%/third-party/%%'
+                         OR rel_path LIKE '%%/vendor/%%'
+                         OR rel_path LIKE '%%/vendored/%%'
+                         OR rel_path LIKE '%%/external/%%'
+                         OR rel_path LIKE '%%/gtest/%%'
+                         OR rel_path LIKE '%%/gmock/%%'
+                         OR rel_path LIKE '%%/googletest/%%'
+                         OR rel_path LIKE '%%/googlemock/%%'
+                       )
+                    """
+                )
+            )
+        return int(result.rowcount or 0)
+
+    def promote_class_members(self) -> int:
+        """Synthesize ``member_uses`` edges (§11.4, P1).
+
+        See protocol docstring for the rule.
+        """
+        nodes = self._nodes
+        edges = self._edges
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    f"""
+                    INSERT INTO {edges} (
+                        source_id, target_id, rel_type, edge_class,
+                        analysis_level, confidence, weight,
+                        source_file, target_file, language, created_by
+                    )
+                    SELECT
+                        C.node_id,
+                        T.node_id,
+                        'member_uses',
+                        'structural',
+                        'comprehensive',
+                        'INFERRED',
+                        COUNT(*)::float,
+                        COALESCE(C.rel_path, ''),
+                        COALESCE(T.rel_path, ''),
+                        COALESCE(C.language, ''),
+                        'augmentation:11.4'
+                      FROM {nodes} C
+                      JOIN {edges} d
+                        ON d.source_id = C.node_id
+                       AND d.rel_type  = 'defines'
+                      JOIN {nodes} M
+                        ON M.node_id      = d.target_id
+                       AND M.symbol_type IN ('method','field','property','constructor')
+                      JOIN {edges} r
+                        ON r.source_id = M.node_id
+                       AND r.rel_type IN ('references','calls','creates','instantiates')
+                      JOIN {nodes} T
+                        ON T.node_id  = r.target_id
+                       AND T.rel_path != C.rel_path
+                     WHERE C.symbol_type IN ('class','struct','interface','trait')
+                       AND C.is_architectural = TRUE
+                       AND T.node_id != C.node_id
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM {edges} existing
+                            WHERE existing.source_id = C.node_id
+                              AND existing.target_id = T.node_id
+                              AND existing.rel_type != 'defines'
+                       )
+                     GROUP BY C.node_id, T.node_id,
+                              C.rel_path, T.rel_path, C.language
+                    """
+                )
+            )
+        return int(result.rowcount or 0)
+
+    def compute_god_nodes(self, top_n: int = 20) -> dict[str, Any]:
+        """Return top-N over-connected symbols and files (§11.7 / B2)."""
+        with self._engine.connect() as conn:
+            sym_rows = conn.execute(
+                text(
+                    f"""
+                    SELECT n.node_id      AS symbol_id,
+                           n.symbol_name  AS name,
+                           n.symbol_type  AS symbol_type,
+                           n.rel_path     AS rel_path,
+                           ( (SELECT COUNT(*) FROM {self._edges} e1 WHERE e1.source_id = n.node_id)
+                           + (SELECT COUNT(*) FROM {self._edges} e2 WHERE e2.target_id = n.node_id)
+                           ) AS degree
+                      FROM {self._nodes} n
+                     WHERE n.is_architectural = TRUE
+                     ORDER BY degree DESC
+                     LIMIT :lim
+                    """
+                ),
+                {"lim": top_n},
+            ).mappings().fetchall()
+
+            file_rows = conn.execute(
+                text(
+                    f"""
+                    SELECT n.rel_path                                              AS rel_path,
+                           SUM(CASE WHEN n.is_architectural THEN 1 ELSE 0 END)     AS internal_arch,
+                           COUNT(e.id)                                             AS external_edges
+                      FROM {self._nodes} n
+                      LEFT JOIN {self._edges} e   ON e.source_id = n.node_id
+                      LEFT JOIN {self._nodes} tgt ON e.target_id = tgt.node_id
+                                                  AND tgt.rel_path != n.rel_path
+                     WHERE tgt.rel_path IS NOT NULL
+                     GROUP BY n.rel_path
+                     ORDER BY external_edges DESC
+                     LIMIT :lim
+                    """
+                ),
+                {"lim": top_n},
+            ).mappings().fetchall()
+
+        return {
+            "by_symbol_type": [dict(r) for r in sym_rows],
+            "by_file": [dict(r) for r in file_rows],
+        }

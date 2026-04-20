@@ -84,6 +84,7 @@ class SymbolType(Enum):
     ANNOTATION = "annotation"
     DECORATOR = "decorator"
     MACRO = "macro"
+    OPERATOR = "operator"  # Operator overloads (kept for call-resolution; not page-eligible)
 
 
 class Scope(Enum):

@@ -157,6 +157,13 @@ CREATE TABLE IF NOT EXISTS repo_edges (
     edge_class      TEXT NOT NULL DEFAULT 'structural',
     analysis_level  TEXT DEFAULT 'comprehensive',
 
+    -- Provenance / confidence (§11.6 / B1)
+    -- 'EXTRACTED' = parser-derived AST edge
+    -- 'INFERRED'  = synthetic post-pass edge (e.g. §11.4 member_uses)
+    -- 'AMBIGUOUS' = call-resolver picked one of multiple candidates
+    confidence      TEXT NOT NULL DEFAULT 'EXTRACTED'
+                    CHECK (confidence IN ('EXTRACTED','INFERRED','AMBIGUOUS')),
+
     -- Weight (Phase 2 — default 1.0)
     weight          REAL DEFAULT 1.0,
     raw_similarity  REAL DEFAULT NULL,
@@ -180,11 +187,12 @@ CREATE TABLE IF NOT EXISTS repo_edges (
 # edges with different annotations — cross_file=True vs False).
 
 _SCHEMA_EDGES_INDEXES = """
-CREATE INDEX IF NOT EXISTS idx_edges_source  ON repo_edges(source_id);
-CREATE INDEX IF NOT EXISTS idx_edges_target  ON repo_edges(target_id);
-CREATE INDEX IF NOT EXISTS idx_edges_type    ON repo_edges(rel_type);
-CREATE INDEX IF NOT EXISTS idx_edges_class   ON repo_edges(edge_class);
-CREATE INDEX IF NOT EXISTS idx_edges_weight  ON repo_edges(weight);
+CREATE INDEX IF NOT EXISTS idx_edges_source     ON repo_edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target     ON repo_edges(target_id);
+CREATE INDEX IF NOT EXISTS idx_edges_type       ON repo_edges(rel_type);
+CREATE INDEX IF NOT EXISTS idx_edges_class      ON repo_edges(edge_class);
+CREATE INDEX IF NOT EXISTS idx_edges_weight     ON repo_edges(weight);
+CREATE INDEX IF NOT EXISTS idx_edges_confidence ON repo_edges(confidence);
 """
 
 _SCHEMA_FTS5 = """
@@ -388,6 +396,22 @@ class UnifiedWikiDB:
             self.conn.commit()
             self._backfill_is_test()
 
+        # §11.6 / B1: edge confidence column. ALTER TABLE in sqlite cannot
+        # add a CHECK constraint after the fact, but the default + the
+        # application-side discipline (only INFERRED/EXTRACTED/AMBIGUOUS
+        # ever passed through upsert) keeps the invariant intact.
+        if "repo_edges" in tables:
+            edge_cols = {row[1] for row in cur.execute("PRAGMA table_info(repo_edges)")}
+            if "confidence" not in edge_cols:
+                logger.info("Migrating schema: adding confidence column to repo_edges")
+                cur.execute(
+                    "ALTER TABLE repo_edges ADD COLUMN confidence TEXT NOT NULL DEFAULT 'EXTRACTED'"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_edges_confidence ON repo_edges(confidence)"
+                )
+                self.conn.commit()
+
     def _backfill_is_test(self) -> None:
         """Set is_test=1 for existing rows whose rel_path matches test patterns."""
         rows = self.conn.execute(
@@ -577,13 +601,40 @@ class UnifiedWikiDB:
         if not edges:
             return
 
+        # Optional in-batch deduplication of (source, target, rel_type)
+        # tuples — collapses duplicates into a single row, summing
+        # ``weight`` and keeping the first occurrence's other attributes.
+        # Disabled by default so PageRank/centrality stay byte-identical
+        # until callers opt-in via WIKI_DEDUP_EDGES=1.
+        if os.environ.get("WIKI_DEDUP_EDGES", "0") == "1":
+            collapsed: dict[tuple[str, str, str], dict[str, Any]] = {}
+            for e in edges:
+                key = (
+                    e.get("source_id", ""),
+                    e.get("target_id", ""),
+                    e.get("rel_type", ""),
+                )
+                existing = collapsed.get(key)
+                if existing is None:
+                    collapsed[key] = dict(e)
+                else:
+                    try:
+                        existing["weight"] = float(existing.get("weight", 1.0)) + float(
+                            e.get("weight", 1.0)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+            edges = list(collapsed.values())
+
         sql = """
         INSERT INTO repo_edges (
             source_id, target_id, rel_type, edge_class, analysis_level,
+            confidence,
             weight, raw_similarity,
             source_file, target_file, language, annotations, created_by
         ) VALUES (
             :source_id, :target_id, :rel_type, :edge_class, :analysis_level,
+            :confidence,
             :weight, :raw_similarity,
             :source_file, :target_file, :language, :annotations, :created_by
         )
@@ -602,6 +653,7 @@ class UnifiedWikiDB:
                     "rel_type": e.get("rel_type", ""),
                     "edge_class": e.get("edge_class", "structural"),
                     "analysis_level": e.get("analysis_level", "comprehensive"),
+                    "confidence": e.get("confidence", "EXTRACTED"),
                     "weight": e.get("weight", 1.0),
                     "raw_similarity": e.get("raw_similarity"),
                     "source_file": e.get("source_file", ""),
@@ -777,6 +829,8 @@ class UnifiedWikiDB:
         self,
         embedding_fn: Callable[[list[str]], list[list[float]]],
         batch_size: int = 64,
+        architectural_only: bool | None = None,
+        max_workers: int | None = None,
     ) -> int:
         """Embed all nodes' text and populate the ``repo_vec`` table.
 
@@ -790,6 +844,16 @@ class UnifiedWikiDB:
             Typically ``embeddings.embed_documents``.
         batch_size : int
             Number of texts per embedding API call (default 64).
+        architectural_only : bool, optional
+            When True, embed only nodes with ``is_architectural = 1``.
+            When None (default), reads ``WIKI_EMBED_ARCH_ONLY`` env var
+            (default ``"1"`` — enabled).  Set env var to ``"0"`` to embed
+            every node (legacy behaviour).
+        max_workers : int, optional
+            Number of in-flight embedding batches.  When None (default),
+            reads ``WIKI_EMBED_CONCURRENCY`` env var (default ``"1"`` —
+            sequential, legacy behaviour).  Provider-side rate limits
+            should already be respected via ``max_retries`` on the client.
 
         Returns
         -------
@@ -800,36 +864,71 @@ class UnifiedWikiDB:
             logger.warning("populate_embeddings: sqlite-vec not available, skipping")
             return 0
 
+        if architectural_only is None:
+            architectural_only = os.getenv("WIKI_EMBED_ARCH_ONLY", "1") != "0"
+        if max_workers is None:
+            try:
+                max_workers = max(1, int(os.getenv("WIKI_EMBED_CONCURRENCY", "1")))
+            except ValueError:
+                max_workers = 1
+
         # SQLite trim() only strips spaces; use explicit whitespace chars
         _ws = " ' ' || char(9) || char(10) || char(13) "
+        arch_filter = " AND is_architectural = 1" if architectural_only else ""
         rows = self.conn.execute(
             "SELECT node_id, source_text FROM repo_nodes "  # noqa: S608 — internal whitespace-trim query, _ws is a hardcoded SQLite expression
             f"WHERE source_text IS NOT NULL AND length(trim(source_text, {_ws})) > 0"
+            + arch_filter
         ).fetchall()
 
-        total = 0
+        batches: list[tuple[int, list[str], list[str]]] = []
         for i in range(0, len(rows), batch_size):
             batch = rows[i : i + batch_size]
-            texts = [r["source_text"] for r in batch]
-            node_ids = [r["node_id"] for r in batch]
+            batches.append(
+                (i, [r["node_id"] for r in batch], [r["source_text"] for r in batch])
+            )
 
+        total = 0
+
+        def _embed_one(idx: int, node_ids: list[str], texts: list[str]):
             try:
                 vectors = embedding_fn(texts)
             except Exception as exc:
                 logger.warning(
                     "populate_embeddings: batch %d–%d failed: %s",
-                    i,
-                    i + len(batch),
-                    exc,
+                    idx, idx + len(node_ids), exc,
                 )
-                continue
+                return None
+            return list(zip(node_ids, vectors, strict=True))
 
-            pairs = list(zip(node_ids, vectors, strict=True))
-            self.upsert_embeddings_batch(pairs)
-            total += len(pairs)
+        if max_workers > 1 and len(batches) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [
+                    pool.submit(_embed_one, idx, nids, texts)
+                    for idx, nids, texts in batches
+                ]
+                for fut in as_completed(futures):
+                    pairs = fut.result()
+                    if pairs:
+                        # sqlite writes are not thread-safe — guarded by GIL
+                        # and our connection runs in a single process; the
+                        # write here is ok because executemany serialises.
+                        self.upsert_embeddings_batch(pairs)
+                        total += len(pairs)
+        else:
+            for idx, nids, texts in batches:
+                pairs = _embed_one(idx, nids, texts)
+                if pairs:
+                    self.upsert_embeddings_batch(pairs)
+                    total += len(pairs)
 
         self.conn.commit()
-        logger.info("populate_embeddings: %d/%d nodes embedded", total, len(rows))
+        logger.info(
+            "populate_embeddings: %d/%d nodes embedded "
+            "(arch_only=%s, workers=%d)",
+            total, len(rows), architectural_only, max_workers,
+        )
         return total
 
     def search_vec(
@@ -1202,6 +1301,15 @@ class UnifiedWikiDB:
             d["relationship_type"] = d.pop("rel_type", "")
             G.add_edge(src, tgt, **d)
 
+        # Attach lookup indexes so GraphQueryService / content expander
+        # can do O(1) symbol resolution on the rehydrated graph instead of
+        # falling back to FTS-only / full graph scans.
+        try:
+            from .code_graph.graph_builder import attach_graph_indexes
+            attach_graph_indexes(G)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("to_networkx: failed to attach graph indexes: %s", exc)
+
         logger.info(
             "to_networkx: reconstructed %d nodes, %d edges",
             G.number_of_nodes(),
@@ -1330,8 +1438,10 @@ class UnifiedWikiDB:
         architectural_only: bool = True,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
-        """Find nodes by symbol_name, optionally bounded to a cluster."""
-        conditions = ["symbol_name = ?"]
+        """Find nodes by symbol_name (case-insensitive), optionally bounded to a cluster."""
+        # P6 (§11.9): case-insensitive lookup so callers don't need to know the
+        # exact casing (`EliteAClient` vs `EliteaClient` etc.).
+        conditions = ["LOWER(symbol_name) = LOWER(?)"]
         params: list[Any] = [name]
 
         if macro_cluster is not None:
@@ -1492,3 +1602,183 @@ class UnifiedWikiDB:
             node_ids,
         ).fetchone()
         return row[0] if row else None
+
+    # ══════════════════════════════════════════════════════════════════
+    # POST-PASS HYGIENE / OBSERVABILITY (§11.7, §11.8)
+    # ══════════════════════════════════════════════════════════════════
+
+    def demote_local_constants(self) -> int:
+        """Demote constants whose every reference is in their defining file.
+
+        See §11.8.  Constants with **zero** incoming reference edges are kept
+        architectural (could be unused public API).  Returns the number of
+        rows actually demoted.
+        """
+        cursor = self.conn.execute(
+            """
+            UPDATE repo_nodes
+               SET is_architectural = 0
+             WHERE symbol_type = 'constant'
+               AND is_architectural = 1
+               AND node_id IN (
+                   SELECT n.node_id
+                     FROM repo_nodes n
+                     JOIN repo_edges e ON e.target_id = n.node_id
+                     JOIN repo_nodes src ON e.source_id = src.node_id
+                    WHERE n.symbol_type = 'constant'
+                      AND n.is_architectural = 1
+                    GROUP BY n.node_id
+                   HAVING COUNT(DISTINCT src.rel_path) = 1
+                      AND MAX(src.rel_path) = n.rel_path
+               )
+            """
+        )
+        self.conn.commit()
+        return cursor.rowcount or 0
+
+    def demote_vendored_code(self) -> int:
+        """Demote nodes living under vendored / third-party paths (§11.12, P7).
+
+        Path-based and conservative: matches obvious vendor locations and
+        bundled test frameworks (gtest / gmock / googletest / googlemock).
+        """
+        cursor = self.conn.execute(
+            """
+            UPDATE repo_nodes
+               SET is_architectural = 0
+             WHERE is_architectural = 1
+               AND (
+                    rel_path LIKE 'third_party/%'
+                 OR rel_path LIKE 'third-party/%'
+                 OR rel_path LIKE 'vendor/%'
+                 OR rel_path LIKE 'vendored/%'
+                 OR rel_path LIKE 'external/%'
+                 OR rel_path LIKE 'extern/%'
+                 OR rel_path LIKE 'deps/%'
+                 OR rel_path LIKE '%/third_party/%'
+                 OR rel_path LIKE '%/third-party/%'
+                 OR rel_path LIKE '%/vendor/%'
+                 OR rel_path LIKE '%/vendored/%'
+                 OR rel_path LIKE '%/external/%'
+                 OR rel_path LIKE '%/gtest/%'
+                 OR rel_path LIKE '%/gmock/%'
+                 OR rel_path LIKE '%/googletest/%'
+                 OR rel_path LIKE '%/googlemock/%'
+               )
+            """
+        )
+        self.conn.commit()
+        return cursor.rowcount or 0
+
+    def promote_class_members(self) -> int:
+        """Synthesize ``member_uses`` edges (§11.4, P1).
+
+        See protocol docstring for the rule.  Implementation strategy:
+        we compute the (C, T, evidence) tuples in a single SELECT, then
+        re-use ``upsert_edges_batch`` so the new rows go through the
+        same column / confidence pipeline as parsed edges.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT
+                C.node_id    AS source_id,
+                T.node_id    AS target_id,
+                C.rel_path   AS source_file,
+                T.rel_path   AS target_file,
+                C.language   AS language,
+                COUNT(*)     AS evidence
+              FROM repo_nodes C
+              JOIN repo_edges d
+                ON d.source_id = C.node_id
+               AND d.rel_type  = 'defines'
+              JOIN repo_nodes M
+                ON M.node_id      = d.target_id
+               AND M.symbol_type IN ('method','field','property','constructor')
+              JOIN repo_edges r
+                ON r.source_id = M.node_id
+               AND r.rel_type IN ('references','calls','creates','instantiates')
+              JOIN repo_nodes T
+                ON T.node_id  = r.target_id
+               AND T.rel_path != C.rel_path
+             WHERE C.symbol_type IN ('class','struct','interface','trait')
+               AND C.is_architectural = 1
+               AND T.node_id != C.node_id
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM repo_edges existing
+                    WHERE existing.source_id = C.node_id
+                      AND existing.target_id = T.node_id
+                      AND existing.rel_type != 'defines'
+               )
+             GROUP BY C.node_id, T.node_id
+            """
+        ).fetchall()
+
+        if not rows:
+            return 0
+
+        new_edges: list[dict[str, Any]] = []
+        for r in rows:
+            new_edges.append(
+                {
+                    "source_id": r["source_id"],
+                    "target_id": r["target_id"],
+                    "rel_type": "member_uses",
+                    "edge_class": "structural",
+                    "confidence": "INFERRED",
+                    "weight": float(r["evidence"]),
+                    "source_file": r["source_file"] or "",
+                    "target_file": r["target_file"] or "",
+                    "language": r["language"] or "",
+                    "created_by": "augmentation:11.4",
+                }
+            )
+        self.upsert_edges_batch(new_edges)
+        self.conn.commit()
+        return len(new_edges)
+
+    def compute_god_nodes(self, top_n: int = 20) -> dict[str, Any]:
+        """Return top-N over-connected symbols and files (§11.7 / B2).
+
+        Pure analytics; no behaviour change.
+        """
+        # Top symbols by total degree (in + out)
+        sym_rows = self.conn.execute(
+            """
+            SELECT n.node_id      AS symbol_id,
+                   n.symbol_name  AS name,
+                   n.symbol_type  AS symbol_type,
+                   n.rel_path     AS rel_path,
+                   ( (SELECT COUNT(*) FROM repo_edges e1 WHERE e1.source_id = n.node_id)
+                   + (SELECT COUNT(*) FROM repo_edges e2 WHERE e2.target_id = n.node_id)
+                   ) AS degree
+              FROM repo_nodes n
+             WHERE n.is_architectural = 1
+             ORDER BY degree DESC
+             LIMIT ?
+            """,
+            (top_n,),
+        ).fetchall()
+
+        # Top files by external edges (file-level cross-edges)
+        file_rows = self.conn.execute(
+            """
+            SELECT n.rel_path                                 AS rel_path,
+                   SUM(CASE WHEN n.is_architectural = 1 THEN 1 ELSE 0 END) AS internal_arch,
+                   COUNT(e.id)                                AS external_edges
+              FROM repo_nodes n
+              LEFT JOIN repo_edges e ON e.source_id = n.node_id
+              LEFT JOIN repo_nodes tgt ON e.target_id = tgt.node_id
+                AND tgt.rel_path != n.rel_path
+             WHERE tgt.rel_path IS NOT NULL
+             GROUP BY n.rel_path
+             ORDER BY external_edges DESC
+             LIMIT ?
+            """,
+            (top_n,),
+        ).fetchall()
+
+        return {
+            "by_symbol_type": [dict(r) for r in sym_rows],
+            "by_file": [dict(r) for r in file_rows],
+        }
