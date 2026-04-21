@@ -103,6 +103,26 @@ class StorageQueryService:
         self.graph = None
 
     # ------------------------------------------------------------------
+    # Node accessor — parity with ``GraphQueryService.graph.nodes.get``
+    # ------------------------------------------------------------------
+
+    def get_node(self, node_id: str) -> dict[str, Any] | None:
+        """Return the raw node attribute dict for ``node_id``.
+
+        Mirrors ``GraphQueryService``'s NetworkX-backed
+        ``service.graph.nodes.get(node_id)`` so callers (e.g. the Code Map
+        ``_build_call_tree_from_sources`` helper) can fetch ``rel_path``,
+        ``symbol_name``, ``symbol_type``, ``line_start`` etc. from a
+        storage-backed wiki without relying on a rehydrated NX graph.
+        """
+        if not node_id:
+            return None
+        try:
+            return self.storage.get_node(node_id)
+        except Exception:  # pragma: no cover — defensive against backend errors
+            return None
+
+    # ------------------------------------------------------------------
     # Symbol resolution
     # ------------------------------------------------------------------
 

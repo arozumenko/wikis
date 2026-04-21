@@ -377,8 +377,11 @@ def _load_cached_artifacts(
         # treat single- and multi-wiki components uniformly.
         try:
             from app.core.code_graph.storage_query_service import StorageQueryService
+            from app.core.storage.text_index import StorageTextIndex
 
-            components.query_service = StorageQueryService(db)
+            components.query_service = StorageQueryService(
+                db, text_index=StorageTextIndex(db)
+            )
         except Exception as e:  # pragma: no cover — defensive
             logger.warning("Failed to build StorageQueryService for %s: %s", cache_key, e)
 

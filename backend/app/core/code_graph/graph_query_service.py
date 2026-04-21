@@ -98,6 +98,17 @@ class GraphQueryService:
         self._suffix_index: dict[str, list[str]] = getattr(graph, "_suffix_index", defaultdict(list))
 
     # ------------------------------------------------------------------
+    # Node accessor — parity with ``StorageQueryService.get_node``
+    # ------------------------------------------------------------------
+
+    def get_node(self, node_id: str) -> dict[str, Any] | None:
+        """Return the raw node attribute dict for ``node_id`` or ``None``."""
+        if not node_id or self.graph is None:
+            return None
+        data = self.graph.nodes.get(node_id)
+        return dict(data) if data is not None else None
+
+    # ------------------------------------------------------------------
     # Symbol Resolution — O(1) with FTS5 fallback
     # ------------------------------------------------------------------
 
