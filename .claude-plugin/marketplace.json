@@ -1,0 +1,15 @@
+{
+  "name": "wikis",
+  "owner": {
+    "name": "Artem Rozumenko",
+    "url": "https://github.com/arozumenko"
+  },
+  "plugins": [
+    {
+      "name": "wikis",
+      "source": "./",
+      "description": "Browse, query, and generate AI-powered code wikis from any agent.",
+      "version": "0.1.0"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "name": "wikis",
+  "version": "0.1.0",
+  "description": "AI-powered code wiki skill for Claude Code, Cursor, Windsurf, and GitHub Copilot. Installable via Claude plugin marketplace or npx for direct install into IDE skill directories.",
+  "type": "module",
+  "bin": {
+    "init": "./bin/init.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arozumenko/wikis.git"
+  },
+  "author": "Artem Rozumenko",
+  "license": "Apache-2.0",
+  "keywords": [
+    "wikis",
+    "documentation",
+    "codebase",
+    "architecture",
+    "skills",
+    "agents",
+    "claude",
+    "cursor",
+    "windsurf",
+    "copilot",
+    "ai-documentation"
+  ]
+}

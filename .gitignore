@@ -42,6 +42,9 @@ data/
 .claude/paste-cache
 .claude/plans
 .claude/image-cache
+.claude/tasks
+
+.octobots/memory
 
 # Playwright
 .playwright-mcp/

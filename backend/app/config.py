@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     storage_path: str = "./data/artifacts"
     cache_dir: str = "./data/cache"
 
+    # Concurrency
+    llm_max_concurrency: int = 4  # max parallel LLM calls during wiki generation (lower for Ollama)
+
     # Provider-specific
     ollama_base_url: str = "http://localhost:11434"
     ollama_num_ctx: int = 32768  # context window for Ollama models
@@ -67,7 +70,7 @@ class Settings(BaseSettings):
 
     # Ask engine
     ask_similarity_threshold: float = 0.75  # EmbeddingsFilter threshold for agentic tools (0.0 = disabled)
-    ask_cache_max_wikis: int = 5
+    ask_cache_max_wikis: int = 10
     ask_cache_ttl_seconds: int = 3600
 
     # Research engine

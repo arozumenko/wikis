@@ -117,3 +117,4 @@ class QARecord(Base):
         Index("ix_qa_wiki_status", "wiki_id", "status"),
         Index("ix_qa_wiki_cache", "wiki_id", "is_cache_hit"),
     )
+

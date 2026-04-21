@@ -147,6 +147,7 @@ async def build_engine_components(
                     "repo_url": record.repo_url,
                     "branch": record.branch,
                     "commit_hash": record.commit_hash,
+                    "description": record.description,
                 }
     except Exception:
         wiki_meta = None
@@ -175,6 +176,13 @@ async def build_engine_components(
     repo_identifier = _extract_repo_identifier(repo_url, branch)
 
     await asyncio.to_thread(_load_cached_artifacts, components, settings.cache_dir, wiki_id, repo_identifier, settings)
+
+    # Inject user-provided wiki description into repo_analysis
+    wiki_description = wiki_meta.get("description") if wiki_meta else None
+    if wiki_description:
+        if components.repo_analysis is None:
+            components.repo_analysis = {}
+        components.repo_analysis["description"] = wiki_description
 
     # Ask/Research run storage-native: no NX rehydration.  A tiny empty graph
     # is kept only for legacy callers that still check ``number_of_nodes()``.

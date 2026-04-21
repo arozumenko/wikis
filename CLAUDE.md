@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |---------|------|-----------|------|
 | Web App | 3000 | `web/` | Next.js 15 + Better-Auth + React 18 SPA |
 | Backend | 8000 | `backend/` | FastAPI + Python 3.11 |
-| MCP Server | 8080 | `backend/mcp_server/` | stdio transport |
+| MCP Server | :8000/mcp | `backend/mcp_server/` | streamable HTTP (embedded); stdio (standalone CLI) |
 
 ## Development Commands
 
@@ -111,9 +111,9 @@ Browser → Next.js Web App (:3000)
   - `hooks/` — useAuth, useThemeMode, useCopyToClipboard
   - `App.tsx` — BrowserRouter + theme provider + AuthGuard
 - `src/lib/` — Better-Auth config, JWT issuance
-- `src/middleware.ts` — Session guard (redirects to /login)
+- `src/middleware.ts` — Session guard + API proxy (rewrites non-SSE `/api/v1/*` → backend; SSE paths handled by App Router route handlers at `src/app/api/v1/`)
 - `prisma/` — SQLite schema + migrations
-- `next.config.ts` — Backend API rewrites (no CORS needed, same-origin)
+- `next.config.ts` — Package transpilation and MUI import optimization (no rewrite config here)
 
 ### Backend Structure (`backend/app/`)
 - `main.py` — FastAPI app factory + lifespan hooks
@@ -143,8 +143,8 @@ Add providers in `backend/app/services/llm_factory.py`. LangChain interfaces (`B
 
 ### Frontend API Client
 - `web/src/spa/api/` — Generated TypeScript API client (from `npm run generate:types`)
-- Next.js rewrites proxy `/api/v1/*` → backend (same-origin, no CORS)
-- SSE stream at `/api/v1/invocations/{id}/stream` for wiki generation progress
+- `src/middleware.ts` proxies non-SSE `/api/v1/*` → backend (same-origin, no CORS)
+- SSE endpoints (`/api/v1/ask`, `/api/v1/research`, `/api/v1/invocations/{id}/stream`) bypass middleware and go through `src/app/api/v1/` route handlers that add no-buffer headers
 
 ## Code Conventions
 

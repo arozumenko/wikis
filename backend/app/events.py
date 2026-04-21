@@ -232,6 +232,7 @@ def thinking_step(
     call_id: str | None = None,
     input: str | None = None,
     output: str | None = None,
+    output_full: str | None = None,
     output_preview: str | None = None,
     output_length: int | None = None,
 ) -> MCPEvent:
@@ -255,6 +256,8 @@ def thinking_step(
         params["input"] = input
     if output is not None:
         params["output"] = output
+    if output_full is not None:
+        params["outputFull"] = output_full
     if output_preview is not None:
         params["outputPreview"] = output_preview
     if output_length is not None:

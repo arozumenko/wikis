@@ -38,6 +38,8 @@ def get_wiki_management(request: Request) -> WikiManagementService:
 
 async def get_db_session(request: Request) -> AsyncSession:
     """Yield an AsyncSession from the app-level session factory."""
+    from app.db import get_session_factory
+
     session_factory = request.app.state.session_factory
     async with session_factory() as session:
         async with session.begin():
@@ -59,3 +61,4 @@ def get_import_service(request: Request) -> ImportService:
 
 def get_wiki_index_cache(request: Request) -> WikiPageIndexCache:
     return request.app.state.wiki_index_cache
+

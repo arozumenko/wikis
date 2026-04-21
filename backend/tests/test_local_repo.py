@@ -99,10 +99,17 @@ class TestExtractGitMetadata:
 
     def test_git_repo(self, tmp_path):
         subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
-        subprocess.run(["git", "commit", "--allow-empty", "-m", "init"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=test@test.com", "-c", "user.name=Test",
+             "commit", "--allow-empty", "-m", "init"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
         info = extract_git_metadata(tmp_path)
         assert info.is_git is True
-        assert info.branch is not None
+        # branch is the current branch name or "HEAD" in detached-HEAD state;
+        # either way it must be a non-empty string when a commit exists.
+        assert isinstance(info.branch, str) and info.branch != ""
 
 
 class TestMakeLocalWikiId:

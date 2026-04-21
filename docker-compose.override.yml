@@ -1,0 +1,21 @@
+# Local dev override — mounts backend and web source code into containers
+# so changes take effect without rebuilding images.
+# Applied automatically by `docker compose up`.
+services:
+  backend:
+    volumes:
+      - ./data:/app/data
+      - ./backend/app:/app/app
+      - ./backend/mcp_server:/app/mcp_server
+
+  app:
+    volumes:
+      - ./web/src:/app/src
+      - ./web/public:/app/public
+    command: >
+      sh -c "cd /app &&
+        ./scripts/prisma-prepare.sh &&
+        npx prisma generate &&
+        npx prisma migrate deploy 2>/dev/null || true &&
+        npx prisma db seed 2>/dev/null || true &&
+        npm run dev"

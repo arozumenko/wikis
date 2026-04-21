@@ -92,6 +92,7 @@ async def create_tables(engine: AsyncEngine) -> None:
 
     # Wiki page FTS — backend-specific. PG: tsvector + GIN index. SQLite: FTS5 vtable + triggers.
     await _ensure_wiki_page_fts(engine)
+
     logger.info("Database tables ensured")
 
 

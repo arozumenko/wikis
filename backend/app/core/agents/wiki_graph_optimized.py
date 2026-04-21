@@ -1135,7 +1135,7 @@ class OptimizedWikiGenerationAgent:
         # Execute workflow with user message (standard LangGraph pattern)
         try:
             runnable_config = {
-                "max_concurrency": 4,
+                "max_concurrency": self.max_concurrent_pages,
                 "recursion_limit": 5000,
                 "configurable": {
                     "thread_id": uuid.uuid4(),

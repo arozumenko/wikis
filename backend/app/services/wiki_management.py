@@ -103,7 +103,7 @@ class WikiManagementService:
         wiki_id: str,
         pages: dict[str, str],
     ) -> int:
-        """Index wiki pages for full-text search (PG tsvector / SQLite FTS5).
+        """Index wiki pages into PostgreSQL for full-text search.
 
         Replaces any existing pages for *wiki_id* (idempotent on re-generation).
 
@@ -118,6 +118,7 @@ class WikiManagementService:
 
         async with self.session_factory() as session:
             async with session.begin():
+                # Clear existing pages for this wiki (idempotent re-index).
                 await session.execute(
                     delete(WikiPageRecord).where(WikiPageRecord.wiki_id == wiki_id)
                 )
@@ -142,19 +143,20 @@ class WikiManagementService:
         return count
 
     async def ensure_pages_indexed(self, wiki_id: str) -> None:
-        """Lazy backfill: index pages from artifact storage if not yet in DB.
+        """Lazy backfill: index pages from artifact storage if not yet in PostgreSQL.
 
         Called before search to ensure old wikis (generated before the FTS
-        migration) have their pages indexed. Idempotent — returns immediately
-        when at least one row exists in ``wiki_page`` for this wiki.
+        migration) have their pages indexed.  Checks for at least one row
+        in ``wiki_page`` — if present, returns immediately.
         """
         async with self.session_factory() as session:
             result = await session.execute(
                 select(WikiPageRecord.id).where(WikiPageRecord.wiki_id == wiki_id).limit(1)
             )
             if result.scalar_one_or_none() is not None:
-                return
+                return  # already indexed
 
+        # Read pages from artifact storage and index them.
         try:
             artifacts = await self.storage.list_artifacts("wiki_artifacts", prefix=wiki_id)
         except Exception:
@@ -170,7 +172,7 @@ class WikiManagementService:
             try:
                 raw = await self.storage.download("wiki_artifacts", artifact_key)
                 content = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-                page_id = artifact_key.rsplit("/", 1)[-1][:-3]
+                page_id = artifact_key.rsplit("/", 1)[-1][:-3]  # filename without .md
                 pages[page_id] = content
             except Exception:
                 logger.warning("Lazy backfill: failed to read %s", artifact_key)
@@ -193,10 +195,9 @@ class WikiManagementService:
         user_id: str,
         description: str | None,
     ) -> WikiRecord | None:
-        """Update the user-provided description for a wiki. Owner-only.
+        """Update the user-provided description for a wiki. Only the owner may do this.
 
-        Returns the updated WikiRecord, or None when not found / caller is not
-        the owner.
+        Returns the updated WikiRecord, or None if not found / caller is not the owner.
         """
         async with self.session_factory() as session:
             async with session.begin():
@@ -208,6 +209,7 @@ class WikiManagementService:
                     return None
                 record.description = description
                 record.updated_at = datetime.now()
+                # Refresh so returned object has the new values detached from session
                 await session.flush()
                 await session.refresh(record)
 
@@ -333,9 +335,7 @@ class WikiManagementService:
         if cache_dir and record.repo_url:
             import asyncio
 
-            await asyncio.to_thread(
-                _cleanup_cache_files, cache_dir, record.repo_url, record.branch or "main"
-            )
+            await asyncio.to_thread(_cleanup_cache_files, cache_dir, record.repo_url, record.branch or "main")
 
         # Remove indexed pages and metadata record
         async with self.session_factory() as session:
@@ -369,6 +369,46 @@ class WikiManagementService:
             error=record.error,
             description=record.description,
         )
+
+
+def _derive_cache_key(cache_dir: str, repo_url: str, branch: str) -> str | None:
+    """Read cache_index.json and return the cache_key for this repo+branch, or None.
+
+    The cache key is the opaque string stored in cache_index.json that maps a
+    repo+branch identifier to its set of on-disk FAISS/BM25/graph cache files.
+
+    Args:
+        cache_dir: Directory that contains ``cache_index.json``.
+        repo_url: Full URL of the repository (``https://github.com/org/repo``).
+        branch: Branch name (e.g. ``"main"``).
+
+    Returns:
+        The cache key string, or ``None`` if not found.
+    """
+    import json
+    from pathlib import Path
+
+    url = repo_url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    parts = url.split("/")
+
+    owner_repo = f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else url
+    repo_identifier = f"{owner_repo}:{branch}"
+
+    index_file = Path(cache_dir) / "cache_index.json"
+    if not index_file.exists():
+        return None
+
+    try:
+        with open(index_file) as f:
+            index = json.load(f)
+    except Exception:
+        return None
+
+    resolved = index.get("refs", {}).get(repo_identifier, repo_identifier)
+    cache_key = index.get(resolved) or index.get(repo_identifier)
+    return cache_key or None
 
 
 def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
@@ -427,6 +467,7 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
     # Find and delete vectorstore files
     cache_key = index.get(resolved) or index.get(repo_identifier)
     pg_repo_ids: set[str] = set()  # collect repo_ids for postgres schema cleanup
+    dirty = False
     if cache_key:
         pg_repo_ids.add(cache_key)
         for ext in (".faiss", ".docs.pkl", ".wiki.db", ".fts5.db", "_analysis.json"):
@@ -450,7 +491,7 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
                 except Exception as e:
                     logger.warning("Failed to delete %s: %s", f, e)
 
-    # Find and delete unified DB files (+ WAL/SHM sidecars)
+    # Find and delete unified DB files tracked under "unified_db" (+ WAL/SHM sidecars)
     udb_section = index.get("unified_db", {})
     for k, v in list(udb_section.items()):
         if k.startswith(resolved) or k.startswith(repo_identifier):
@@ -467,7 +508,6 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
             dirty = True
 
     # Find and delete graph files
-    dirty = False
     graphs = index.get("graphs", {})
     for k, v in list(graphs.items()):
         if k.startswith(resolved) or k.startswith(repo_identifier):
@@ -499,7 +539,7 @@ def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:
             logger.info("Updated cache_index.json after cleanup for %s", repo_identifier)
         except Exception as e:
             logger.warning("Failed to update cache_index.json: %s", e)
-
+    
     # Drop PostgreSQL schemas (no-op when backend is SQLite)
     for rid in pg_repo_ids:
         try:

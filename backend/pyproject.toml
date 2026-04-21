@@ -101,6 +101,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S", "B017"]  # disable security checks + allow broad exception asserts in tests
+"backend/tests/*" = ["S", "B017"]  # same rule matched when ruff runs from repo root
 "app/core/*" = [
     "E402",   # import-not-at-top (conditional imports in core)
     "E741",   # ambiguous-variable-name (single-letter vars in algorithms)

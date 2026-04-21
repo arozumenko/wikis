@@ -1,0 +1,23 @@
+{
+  "name": "wikis",
+  "version": "0.1.0",
+  "description": "Browse, query, and generate AI-powered code wikis. Provides the 'wikis' skill for listing wikis, reading wiki pages, asking Q&A questions, running deep research, and generating new wikis from repository URLs. Requires a running Wikis instance pointed to by WIKIS_URL.",
+  "author": {
+    "name": "Artem Rozumenko",
+    "url": "https://github.com/arozumenko"
+  },
+  "repository": "https://github.com/arozumenko/wikis",
+  "license": "Apache-2.0",
+  "keywords": [
+    "wikis",
+    "documentation",
+    "codebase",
+    "architecture",
+    "qa",
+    "research",
+    "skills",
+    "claude",
+    "cursor",
+    "copilot"
+  ]
+}

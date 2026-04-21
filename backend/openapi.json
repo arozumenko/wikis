@@ -807,6 +807,11 @@
             ],
             "default": null,
             "title": "Embedding Model"
+          },
+          "visibility": {
+            "default": "personal",
+            "title": "Visibility",
+            "type": "string"
           }
         },
         "required": [
@@ -1037,6 +1042,17 @@
             },
             "title": "Research Steps",
             "type": "array"
+          },
+          "code_map": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CodeMapData"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Map"
           }
         },
         "required": [
@@ -1210,6 +1226,58 @@
             ],
             "default": null,
             "title": "Error"
+          },
+          "indexed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Indexed At"
+          },
+          "commit_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Commit Hash"
+          },
+          "owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Owner Id"
+          },
+          "visibility": {
+            "default": "personal",
+            "title": "Visibility",
+            "type": "string"
+          },
+          "is_owner": {
+            "default": false,
+            "title": "Is Owner",
+            "type": "boolean"
+          },
+          "requires_token": {
+            "default": false,
+            "title": "Requires Token",
+            "type": "boolean"
           }
         },
         "required": [
@@ -1360,6 +1428,155 @@
         ],
         "title": "ErrorEvent",
         "type": "object"
+      },
+      "CodeMapSymbol": {
+        "type": "object",
+        "title": "CodeMapSymbol",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "symbol_type": {
+            "type": "string",
+            "title": "Symbol Type",
+            "default": ""
+          },
+          "file_path": {
+            "type": "string",
+            "title": "File Path",
+            "default": ""
+          },
+          "line_start": {
+            "anyOf": [
+              { "type": "integer" },
+              { "type": "null" }
+            ],
+            "title": "Line Start"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "relationships": {
+            "type": "array",
+            "items": { "type": "string" },
+            "title": "Relationships",
+            "default": []
+          }
+        }
+      },
+      "CodeMapSection": {
+        "type": "object",
+        "title": "CodeMapSection",
+        "required": [
+          "id",
+          "title"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "file_path": {
+            "type": "string",
+            "title": "File Path",
+            "default": ""
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "symbols": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeMapSymbol"
+            },
+            "title": "Symbols",
+            "default": []
+          }
+        }
+      },
+      "CodeMapData": {
+        "type": "object",
+        "title": "CodeMapData",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "title": "Summary",
+            "default": ""
+          },
+          "call_stacks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CallStack"
+            },
+            "title": "Call Stacks",
+            "default": []
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeMapSection"
+            },
+            "title": "Sections",
+            "default": []
+          }
+        }
+      },
+      "CallStackStep": {
+        "type": "object",
+        "title": "CallStackStep",
+        "required": ["symbol"],
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "file_path": {
+            "type": "string",
+            "title": "File Path",
+            "default": ""
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          }
+        }
+      },
+      "CallStack": {
+        "type": "object",
+        "title": "CallStack",
+        "required": ["title"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CallStackStep"
+            },
+            "title": "Steps",
+            "default": []
+          }
+        }
       }
     }
   }

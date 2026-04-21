@@ -55,6 +55,16 @@ if ! docker compose version &>/dev/null; then
   exit 1
 fi
 
+if ! docker info &>/dev/null; then
+  err "Docker daemon is not running."
+  case "$(uname -s)" in
+    Darwin) err "Start Docker Desktop: open -a Docker" ;;
+    Linux)  err "Start the daemon: sudo systemctl start docker" ;;
+    *)      err "Please start the Docker daemon before running this installer." ;;
+  esac
+  exit 1
+fi
+
 ok "All prerequisites found"
 
 # ── Create install directory ──────────────────────────────────────
@@ -113,6 +123,22 @@ if lsof -i :"$API_PORT" &>/dev/null; then
 fi
 
 ok "Ports: web=$WEB_PORT, api=$API_PORT"
+
+# ── Public URL ────────────────────────────────────────────────────
+header "🌍 Public URL"
+echo ""
+echo "  The URL users will open in their browser."
+echo "  Examples: http://localhost:${WEB_PORT}, http://192.168.1.50:${WEB_PORT}, https://wikis.example.com"
+echo ""
+prompt "Public URL [http://localhost:${WEB_PORT}]: " PUBLIC_URL
+PUBLIC_URL="${PUBLIC_URL:-http://localhost:${WEB_PORT}}"
+# Strip trailing slash
+PUBLIC_URL="${PUBLIC_URL%/}"
+# Extract scheme and host (without port) for constructing other URLs
+PUBLIC_SCHEME="${PUBLIC_URL%%://*}"
+PUBLIC_HOST_PORT="${PUBLIC_URL#*://}"
+PUBLIC_HOST="${PUBLIC_HOST_PORT%%:*}"
+ok "Public URL: $PUBLIC_URL"
 
 # ── LLM Provider ───────────────────────────────────────────────────
 header "🤖 LLM Provider Configuration"
@@ -222,6 +248,18 @@ case "${provider_choice:-7}" in
     ;;
 esac
 
+# ── LLM Concurrency ──────────────────────────────────────────────
+if [ -n "$LLM_PROVIDER" ]; then
+  if [ "$LLM_PROVIDER" = "ollama" ]; then
+    DEFAULT_CONCURRENCY=2
+  else
+    DEFAULT_CONCURRENCY=4
+  fi
+  echo ""
+  prompt "Max parallel LLM requests [${DEFAULT_CONCURRENCY}]: " LLM_MAX_CONCURRENCY
+  LLM_MAX_CONCURRENCY="${LLM_MAX_CONCURRENCY:-$DEFAULT_CONCURRENCY}"
+fi
+
 # ── Generate JWT keys ──────────────────────────────────────────────
 header "🔐 Generating authentication keys..."
 
@@ -265,6 +303,10 @@ EMBEDDING_MODEL=${EMBEDDING_MODEL}
 ENVFILE
 
 # Conditional provider-specific vars
+if [ -n "$LLM_MAX_CONCURRENCY" ]; then
+  echo "LLM_MAX_CONCURRENCY=${LLM_MAX_CONCURRENCY}" >> .env
+fi
+
 if [ -n "$LLM_API_BASE" ]; then
   echo "LLM_API_BASE=${LLM_API_BASE}" >> .env
 fi
@@ -287,7 +329,8 @@ STORAGE_PATH=/app/data/artifacts
 CACHE_DIR=/app/data/cache
 
 # Auth
-BETTER_AUTH_URL=http://localhost:${WEB_PORT}
+BETTER_AUTH_URL=${PUBLIC_URL}
+FRONTEND_URL=${PUBLIC_URL}
 AUTH_SECRET=${AUTH_SECRET}
 # Uncomment to enable OAuth:
 # GITHUB_CLIENT_ID=
@@ -301,7 +344,7 @@ JWT_PUBLIC_KEY="${JWT_PUBLIC_KEY}"
 
 # Internal
 BACKEND_URL=http://backend:8000
-WIKIS_BACKEND_URL=http://localhost:${API_PORT}
+WIKIS_BACKEND_URL=${PUBLIC_SCHEME}://${PUBLIC_HOST}:${API_PORT}
 LOG_LEVEL=INFO
 NODE_ENV=production
 ENVFILE
@@ -313,9 +356,16 @@ ok "Configuration written to .env"
 header "🚀 Starting Wikis..."
 
 if ! docker compose pull; then
-  warn "Failed to pull images. Will try to start with cached images..."
+  warn "Failed to pull one or more images. This may fail if no cached images exist."
+  prompt "   Continue with cached images? [y/N] " pull_continue
+  if [[ ! "$pull_continue" =~ ^[Yy]$ ]]; then
+    echo "Aborted. Check your internet connection and try again."; exit 1
+  fi
 fi
-docker compose up -d
+if ! docker compose up -d; then
+  err "Failed to start services. Run 'docker compose up' in $INSTALL_DIR for details."
+  exit 1
+fi
 
 info "Waiting for services to be healthy..."
 attempt=0
@@ -340,8 +390,8 @@ echo -e "${GREEN}${BOLD}══════════════════�
 echo -e "${GREEN}${BOLD}  Wikis is ready!${NC}"
 echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════${NC}"
 echo ""
-echo -e "  ${BOLD}App:${NC}       http://localhost:${WEB_PORT}"
-echo -e "  ${BOLD}API:${NC}       http://localhost:${API_PORT}/docs"
+echo -e "  ${BOLD}App:${NC}       ${PUBLIC_URL}"
+echo -e "  ${BOLD}API docs:${NC}  ${PUBLIC_SCHEME}://${PUBLIC_HOST}:${API_PORT}/docs"
 echo -e "  ${BOLD}Login:${NC}     admin@wikis.dev / changeme123"
 echo ""
 echo -e "  ${YELLOW}Change the default password in Settings > Account after first login.${NC}"

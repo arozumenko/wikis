@@ -1,0 +1,135 @@
+---
+title: "Agent Skill"
+description: "Install the Wikis skill into Claude Code, Cursor, Windsurf, or GitHub Copilot — no browser needed."
+---
+
+The Wikis **agent skill** lets any AI coding agent browse wikis, ask codebase questions, run deep research, and generate new wikis directly from the terminal — no browser required. It ships with the Wikis repository and installs in seconds.
+
+## Three install methods
+
+<Tabs>
+  <Tab title="Claude Code plugin (recommended)">
+    The fastest way if you're inside Claude Code. The plugin system auto-discovers the `skills/wikis/` directory and wires everything up automatically:
+
+    ```
+    /plugin marketplace add arozumenko/wikis
+    /plugin install wikis@wikis
+    ```
+
+    Then set your `WIKIS_URL` environment variable and the skill is ready to use in any project.
+  </Tab>
+  <Tab title="npx (any IDE)">
+    Works with Claude Code, Cursor, Windsurf, and GitHub Copilot. Run this in your project root:
+
+    ```bash
+    npx github:arozumenko/wikis init
+    ```
+
+    The installer auto-detects which IDE directories exist (`.claude/`, `.cursor/`, `.windsurf/`, `.github/`) and copies the skill into each one.
+
+    **Options:**
+
+    ```bash
+    # Install to all detected IDEs (no prompts)
+    npx github:arozumenko/wikis init --all
+
+    # Install to Claude Code only
+    npx github:arozumenko/wikis init --target claude
+
+    # Overwrite an existing install
+    npx github:arozumenko/wikis init --all --update
+    ```
+
+    | Target | IDE directory | Installed path |
+    |--------|---------------|----------------|
+    | Claude Code | `.claude/` | `.claude/skills/wikis/` |
+    | Cursor | `.cursor/` | `.cursor/skills/wikis/` |
+    | Windsurf | `.windsurf/` | `.windsurf/skills/wikis/` |
+    | GitHub Copilot | `.github/` | `.github/skills/wikis/` |
+  </Tab>
+  <Tab title="agentskills.io / Vercel CLI">
+    If you use the [Vercel agent skills CLI](https://github.com/vercel-labs/skills) or any tool that follows the [agentskills.io](https://agentskills.io) spec:
+
+    ```bash
+    npx skills add https://github.com/arozumenko/wikis
+    ```
+
+    The skill at `skills/wikis/SKILL.md` is fully spec-compliant and works with any compatible client.
+  </Tab>
+</Tabs>
+
+## Configuration
+
+After installation, set these environment variables before starting your IDE:
+
+```bash
+# Required — URL of your Wikis instance
+export WIKIS_URL=http://localhost:3000
+
+# Optional — only needed if authentication is enabled
+export WIKIS_TOKEN=<your-jwt-token>
+```
+
+<Note>
+  Replace `http://localhost:3000` with your actual Wikis instance URL if it is hosted remotely.
+</Note>
+
+## What the skill can do
+
+Once installed, your agent can invoke the following operations by running the scripts in `skills/wikis/scripts/`:
+
+| Operation | Script | API endpoint |
+|-----------|--------|-------------|
+| List all wikis | `list-wikis.mjs` | `GET /api/v1/wikis` |
+| Read wiki or page | `get-wiki.mjs <wiki_id> [page_id]` | `GET /api/v1/wikis/{id}` |
+| Ask a question | `ask-wiki.mjs <wiki_id> "<question>"` | `POST /api/v1/ask` |
+| Deep research | `research-wiki.mjs <wiki_id> "<question>"` | `POST /api/v1/research` |
+| Generate a wiki | `generate-wiki.mjs <repo_url> [branch]` | `POST /api/v1/generate` |
+
+Scripts require **Node.js 18+** and use the native `fetch` API — no extra dependencies.
+
+## Example agent workflow
+
+```
+User: Explain how wiki generation works in arozumenko/wikis.
+
+Agent: [runs list-wikis.mjs]
+       → finds wiki_id: abc123 for arozumenko/wikis
+
+       [runs get-wiki.mjs abc123]
+       → reads table of contents, finds "wiki-generation-pipeline" page
+
+       [runs get-wiki.mjs abc123 wiki-generation-pipeline]
+       → reads full page Markdown
+
+       [runs research-wiki.mjs abc123 "explain the wiki generation pipeline in detail"]
+       → multi-step research synthesises answer from multiple pages
+
+       Here's how it works: the pipeline starts by cloning the repo...
+```
+
+## Comparison with MCP integration
+
+The agent skill and [MCP integration](/guide/mcp-integration) both give your AI tools access to Wikis — they complement each other:
+
+| | Agent skill | MCP integration |
+|-|-------------|-----------------|
+| **Transport** | Node.js scripts via CLI | HTTP (Model Context Protocol) |
+| **Best for** | Agents that run terminal commands | Editors with native MCP support |
+| **Auth** | `WIKIS_TOKEN` env var | API key in MCP config |
+| **Generates wikis** | ✓ | — |
+| **Works without a browser** | ✓ | ✓ |
+| **Claude Code** | ✓ plugin or npx | ✓ `.mcp.json` |
+| **Cursor / Windsurf** | ✓ npx | ✓ settings JSON |
+| **GitHub Copilot** | ✓ npx | — |
+
+For most Claude Code users, the **plugin install** method is the easiest starting point. Use MCP when you want tighter editor integration (inline tool calls, no explicit script invocation).
+
+## Troubleshooting
+
+| Error | Likely cause | Fix |
+|-------|-------------|-----|
+| `Error: WIKIS_URL environment variable is not set` | `WIKIS_URL` not exported | Run `export WIKIS_URL=http://localhost:3000` |
+| `GET /api/v1/wikis failed: 401` | Missing or expired token | Set `WIKIS_TOKEN` with a valid JWT |
+| `GET /api/v1/wikis failed: ECONNREFUSED` | Wikis not running | Start the instance with `docker compose up` |
+| Skill not loading in agent | Install path wrong | Re-run `npx github:arozumenko/wikis init --update` |

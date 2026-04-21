@@ -1,0 +1,155 @@
+---
+title: "Obsidian Integration"
+description: "Open any generated wiki directly as an Obsidian vault — wikilinks, frontmatter, callouts, and source graphs included."
+---
+
+Wikis generates documentation in **Obsidian-compatible Markdown**. Every wiki is structured so you can open it as an [Obsidian](https://obsidian.md) vault and immediately get working wikilinks, metadata panels, callout blocks, and a graph view that connects docs to source files — no conversion or plugins required.
+
+## What Obsidian compatibility means
+
+[Obsidian](https://obsidian.md) is a local-first knowledge base that uses a superset of Markdown: wikilinks, YAML frontmatter, callout blocks, and transclusions. Wikis uses the same format natively, so a generated wiki **is** an Obsidian vault — not an export that needs to be converted.
+
+This means you can:
+- Keep a wiki checked into your repo alongside the code it documents
+- Open the wiki folder in Obsidian and use graph view, backlinks, tags, and search immediately
+- Edit pages in Obsidian and commit changes back — the Markdown stays valid
+
+## Opening a wiki in Obsidian
+
+1. Locate the wiki directory on the server (or download the wiki artifact)
+2. In Obsidian, choose **Open folder as vault** and select the wiki directory
+3. Obsidian will detect the wikilinks, frontmatter, and callout syntax automatically
+
+<Note>
+  No Obsidian plugins are required. All Wikis-specific syntax uses Obsidian's core feature set.
+</Note>
+
+## YAML frontmatter — Properties panel
+
+Every generated page begins with a YAML frontmatter block containing structured metadata:
+
+```markdown
+---
+title: Authentication Service
+tags: [auth, jwt, backend]
+type: module
+source_files:
+  - backend/app/auth.py
+  - backend/app/core/jwks.py
+symbols:
+  - validate_token
+  - JWTValidator
+---
+```
+
+Inside the wiki viewer, this renders as a collapsible **Properties** panel at the top of each page. In Obsidian, the same data appears in the built-in Properties panel and is fully searchable and filterable.
+
+| Field | Description |
+|-------|-------------|
+| `title` | Page title (used for wikilink resolution) |
+| `tags` | Topical tags — architectural layer, domain, feature area |
+| `type` | Page type: `module`, `architecture`, `api`, `guide`, `overview` |
+| `source_files` | Repo paths of source files this page documents |
+| `symbols` | Key functions, classes, or types covered on this page |
+
+## Wikilinks
+
+Inter-page links use Obsidian wikilink syntax instead of relative Markdown paths:
+
+```markdown
+The [[Authentication Service]] validates every incoming request.
+See also [[JWT Token Flow|token lifecycle diagram]].
+```
+
+- `[[Page Title]]` — links to the page whose `title` frontmatter matches
+- `[[Page Title|Display Text]]` — link with custom anchor text
+
+Source code references are turned into wikilinks too:
+
+```markdown
+The core logic lives in [[source/backend/app/auth.py|auth.py]].
+```
+
+In the wiki viewer, wikilinks navigate within the viewer. In Obsidian, they work as native bidirectional links and appear in graph view.
+
+## Callout blocks
+
+The LLM uses Obsidian callout syntax for highlighted notes, warnings, and examples throughout pages:
+
+```markdown
+> [!tip] Performance tip
+> Use the cached JWKS endpoint rather than fetching the public key on every request.
+
+> [!warning]
+> Tokens are not stored permanently — regeneration is required if the secret rotates.
+```
+
+Six callout types are supported:
+
+| Type | Colour | Use |
+|------|--------|-----|
+| `[!abstract]` | Blue | Summaries, overviews |
+| `[!info]` | Cyan | Informational notes |
+| `[!tip]` | Green | Recommendations |
+| `[!warning]` | Orange | Cautions, edge cases |
+| `[!example]` | Purple | Code examples, walkthroughs |
+| `[!danger]` | Red | Breaking changes, destructive operations |
+
+Both the wiki viewer and Obsidian render callouts with colour-coded borders, background tints, and emoji labels.
+
+## Section overview pages (_index)
+
+Each documentation section has an auto-generated `_index.md` page — a **map of content** (MOC) that links to every page within the section:
+
+```markdown
+---
+title: Authentication
+type: overview
+---
+
+# Authentication
+
+Overview of all authentication-related documentation.
+
+- [[JWT Token Flow]]
+- [[JWKS Endpoint]]
+- [[Session Management]]
+- [[Access Control]]
+```
+
+In the sidebar, clicking a **section header** navigates to its `_index` page. The chevron icon to the right of the header independently toggles the section open or collapsed without navigating away.
+
+In Obsidian, `_index` pages serve as natural entry points in graph view and as hub notes for the MOC pattern.
+
+## Source file stubs
+
+The wiki includes stub notes under a `source/` directory that mirror the repository's file tree:
+
+```
+source/
+  backend/
+    app/
+      auth.py.md
+      main.py.md
+  web/
+    src/
+      spa/
+        App.tsx.md
+```
+
+Each stub note links back to the wiki pages that document that file. This means:
+- Obsidian's graph view shows edges from source files to documentation pages
+- Backlinks in Obsidian reveal every wiki page that references a given file
+- You can navigate from code to docs and back within Obsidian
+
+## Related pages footer
+
+Each wiki page ends with a **Related Pages** section listing sibling pages in the same section as wikilinks. This creates the dense link graph that makes Obsidian's graph view and backlinks useful.
+
+```markdown
+## Related Pages
+
+- [[JWT Token Flow]]
+- [[JWKS Endpoint]]
+- [[Session Management]]
+```

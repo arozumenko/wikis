@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import pytest
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
 from app.models.db_models import Base
 from app.services.wiki_management import WikiManagementService
 from app.storage.local import LocalArtifactStorage
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -219,3 +218,39 @@ class TestGetWiki:
     async def test_get_nonexistent_returns_none(self, service):
         record = await service.get_wiki("nope", user_id="user-1")
         assert record is None
+
+
+# ---------------------------------------------------------------------------
+# update description
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateDescription:
+    async def test_owner_can_set_description(self, service):
+        await service.register_wiki("w1", "https://github.com/a/b", "main", "Wiki", 1, owner_id="user-1")
+        record = await service.update_description("w1", user_id="user-1", description="A useful wiki")
+        assert record is not None
+        assert record.description == "A useful wiki"
+
+    async def test_description_persists(self, service):
+        await service.register_wiki("w1", "https://github.com/a/b", "main", "Wiki", 1, owner_id="user-1")
+        await service.update_description("w1", user_id="user-1", description="Persisted description")
+        fetched = await service.get_wiki_record("w1")
+        assert fetched is not None
+        assert fetched.description == "Persisted description"
+
+    async def test_non_owner_returns_none(self, service):
+        await service.register_wiki("w1", "https://github.com/a/b", "main", "Wiki", 1, owner_id="user-1")
+        result = await service.update_description("w1", user_id="user-2", description="Hacked")
+        assert result is None
+
+    async def test_unknown_wiki_returns_none(self, service):
+        result = await service.update_description("does-not-exist", user_id="user-1", description="Anything")
+        assert result is None
+
+    async def test_description_can_be_cleared_with_none(self, service):
+        await service.register_wiki("w1", "https://github.com/a/b", "main", "Wiki", 1, owner_id="user-1")
+        await service.update_description("w1", user_id="user-1", description="Some text")
+        record = await service.update_description("w1", user_id="user-1", description=None)
+        assert record is not None
+        assert record.description is None
