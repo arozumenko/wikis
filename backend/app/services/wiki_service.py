@@ -258,7 +258,14 @@ class WikiService:
 
             # Resolve generation options (request overrides → config defaults)
             planner_type = request.planner_type if request.planner_type is not None else self.settings.planner_type
-            exclude_tests = request.exclude_tests if request.exclude_tests is not None else self.settings.cluster_exclude_tests
+            # exclude_tests only applies to the cluster planner; agent planner ignores it.
+            if planner_type == "cluster":
+                exclude_tests = (
+                    request.exclude_tests if request.exclude_tests is not None
+                    else self.settings.cluster_exclude_tests
+                )
+            else:
+                exclude_tests = False
 
             # generate_wiki is sync/CPU-bound — run in thread
             result = await asyncio.to_thread(

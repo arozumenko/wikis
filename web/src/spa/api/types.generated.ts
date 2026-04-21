@@ -311,6 +311,19 @@ export interface components {
              */
             embedding_model: string | null;
             /**
+             * Planner Type
+             * @description Structure planner override (optional, falls back to server config).
+             * @default null
+             * @enum {string|null}
+             */
+            planner_type: "agent" | "cluster" | null;
+            /**
+             * Exclude Tests
+             * @description Soft-skip test nodes during clustering (cluster planner only).
+             * @default null
+             */
+            exclude_tests: boolean | null;
+            /**
              * Visibility
              * @default personal
              */
