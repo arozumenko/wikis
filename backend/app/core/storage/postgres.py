@@ -938,6 +938,14 @@ class PostgresWikiStorage:
             batches.append((i, [nid for nid, _ in batch], [t for _, t in batch]))
 
         total = 0
+        n_batches = len(batches)
+        log_every = max(10, n_batches // 20) if n_batches else 1
+        t_start = time.time()
+        logger.info(
+            "populate_embeddings: starting — %d nodes in %d batches "
+            "(batch_size=%d, workers=%d)",
+            len(embeddable), n_batches, batch_size, max_workers,
+        )
 
         def _embed_one(idx: int, node_ids: list[str], texts: list[str]):
             try:
@@ -950,6 +958,7 @@ class PostgresWikiStorage:
                 return None
             return list(zip(node_ids, vectors, strict=True))
 
+        completed_batches = 0
         if max_workers > 1 and len(batches) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -962,12 +971,30 @@ class PostgresWikiStorage:
                     if pairs:
                         self.upsert_embeddings_batch(pairs)
                         total += len(pairs)
+                    completed_batches += 1
+                    if completed_batches % log_every == 0:
+                        elapsed = time.time() - t_start
+                        rate = total / elapsed if elapsed > 0 else 0.0
+                        logger.info(
+                            "populate_embeddings: %d/%d batches (%d nodes, "
+                            "%.1f nodes/s)",
+                            completed_batches, n_batches, total, rate,
+                        )
         else:
             for idx, nids, texts in batches:
                 pairs = _embed_one(idx, nids, texts)
                 if pairs:
                     self.upsert_embeddings_batch(pairs)
                     total += len(pairs)
+                completed_batches += 1
+                if completed_batches % log_every == 0:
+                    elapsed = time.time() - t_start
+                    rate = total / elapsed if elapsed > 0 else 0.0
+                    logger.info(
+                        "populate_embeddings: %d/%d batches (%d nodes, "
+                        "%.1f nodes/s)",
+                        completed_batches, n_batches, total, rate,
+                    )
 
         logger.info(
             "populate_embeddings: %d/%d nodes embedded "

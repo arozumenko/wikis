@@ -2195,6 +2195,12 @@ class EnhancedUnifiedGraphBuilder:
         # Process files sequentially
         for file_path, result in parse_results.items():
             processed_files += 1
+            # Periodic progress so very large repos don't appear stalled.
+            if processed_files % 500 == 0 or processed_files == total_files:
+                logger.info(
+                    "Symbol chunks: processed %d/%d files (%d kept so far)",
+                    processed_files, total_files, architectural_symbols_kept,
+                )
             is_doc_file = getattr(result, 'parse_level', 'comprehensive') == 'documentation'
             
             # SEPARATE_DOC_INDEX: Skip ALL code files - they go to graph only
@@ -2400,6 +2406,13 @@ class EnhancedUnifiedGraphBuilder:
 
         for file_path, result in parse_results.items():
             processed_files += 1
+            # Periodic progress so very large repos don't appear stalled
+            # while the chunk generator is materialised by the caller.
+            if processed_files % 500 == 0 or processed_files == total_files:
+                logger.info(
+                    "Streaming chunks: processed %d/%d files (%d symbols emitted so far)",
+                    processed_files, total_files, architectural_symbols_kept,
+                )
             is_doc_file = getattr(result, 'parse_level', 'comprehensive') == 'documentation'
 
             # SEPARATE_DOC_INDEX: Skip ALL code files - they go to graph only

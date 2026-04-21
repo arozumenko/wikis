@@ -495,10 +495,12 @@ class FilesystemRepositoryIndexer:
         udb = open_storage(repo_id=cache_key, db_path=db_path)
         try:
             # Phase 1a — Populate graph (nodes + edges)
+            self._emit_progress(0.21, "Importing graph into unified DB...")
             udb.from_networkx(self.relationship_graph)
 
             # Phase 1b — Populate vector embeddings (repo_vec table)
             if _embed_batch_fn:
+                self._emit_progress(0.22, "Embedding code symbols...")
                 try:
                     # Default 256: ``text-embedding-3-large`` accepts up
                     # to 2048 inputs / 300k tokens per request, and code
@@ -515,6 +517,7 @@ class FilesystemRepositoryIndexer:
                 logger.info("No embeddings model available — repo_vec will be empty")
 
             # Phase 2 — Edge weighting, hub detection, orphan resolution
+            self._emit_progress(0.23, "Weighting edges & detecting hubs...")
             try:
                 from .graph_topology import run_phase2
 
@@ -534,6 +537,7 @@ class FilesystemRepositoryIndexer:
                 phase2_stats = None
 
             # Phase 3 — Hierarchical Leiden clustering
+            self._emit_progress(0.24, "Clustering graph (Leiden)...")
             try:
                 from .graph_clustering import run_phase3
 
