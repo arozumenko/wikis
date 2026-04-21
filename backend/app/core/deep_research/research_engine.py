@@ -13,6 +13,7 @@ Events are captured via LangGraph's native astream with stream_mode=["messages",
 """
 
 import logging
+import os
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -155,17 +156,31 @@ class DeepResearchEngine:
         model = self.llm_client or self._build_model()
 
         fts_index = getattr(self.graph_manager, "fts_index", None) if self.graph_manager else None
-        custom_tools = create_codebase_tools(
-            retriever_stack=self.retriever_stack,
-            graph_manager=self.graph_manager,
-            code_graph=self.code_graph,
-            repo_analysis=self.repo_analysis,
-            event_callback=None,
-            graph_text_index=fts_index,
-            similarity_threshold=self.config.similarity_threshold,
-            repo_path=self.repo_path,
-            query_service=self.query_service,
-        )
+        # Force progressive disclosure tools (search_symbols / get_relationships /
+        # get_code / search_docs / query_graph) — mirrors AskEngine. Without
+        # this override, ``research_tools.create_codebase_tools`` falls back to
+        # the legacy bulk tools when ``WIKIS_PROGRESSIVE_TOOLS`` is unset.
+        # Filesystem tools (read_source_file / list_repo_files) are appended
+        # automatically when ``repo_path`` is on disk and are unaffected.
+        _orig_progressive = os.environ.get("WIKIS_PROGRESSIVE_TOOLS", "")
+        os.environ["WIKIS_PROGRESSIVE_TOOLS"] = "1"
+        try:
+            custom_tools = create_codebase_tools(
+                retriever_stack=self.retriever_stack,
+                graph_manager=self.graph_manager,
+                code_graph=self.code_graph,
+                repo_analysis=self.repo_analysis,
+                event_callback=None,
+                graph_text_index=fts_index,
+                similarity_threshold=self.config.similarity_threshold,
+                repo_path=self.repo_path,
+                query_service=self.query_service,
+            )
+        finally:
+            if _orig_progressive:
+                os.environ["WIKIS_PROGRESSIVE_TOOLS"] = _orig_progressive
+            else:
+                os.environ.pop("WIKIS_PROGRESSIVE_TOOLS", None)
 
         _profile = getattr(model, "profile", None)
         if isinstance(_profile, dict) and isinstance(_profile.get("max_input_tokens"), int):
