@@ -10,7 +10,12 @@ from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
-HEALTH_CHECK_TTL_SECONDS = 60
+# How long a successful provider-health snapshot stays trusted before we
+# bother re-pinging the LLM and embedding endpoints.  Docker-compose pings
+# /health every 30s; with the previous 60s TTL every other probe burned a
+# real LLM + embeddings round-trip and re-emitted the startup INFO logs,
+# flooding the indexing logs and consuming API quota for no reason.
+HEALTH_CHECK_TTL_SECONDS = 600
 
 
 @dataclass
@@ -62,19 +67,44 @@ def validate_credentials(settings: Settings) -> str | None:
     return None
 
 
-async def check_providers(settings: Settings) -> ProviderHealth:
-    """Test LLM and embedding connectivity. Never raises — logs warnings."""
+async def check_providers(
+    settings: Settings,
+    previous: ProviderHealth | None = None,
+) -> ProviderHealth:
+    """Test LLM and embedding connectivity. Never raises — logs warnings.
+
+    Pass ``previous`` for periodic re-checks so unchanged status only logs at
+    DEBUG level (avoids flooding logs with the same startup banner every minute).
+    """
     health = ProviderHealth()
 
     if not settings.health_check_on_startup:
         logger.info("Health check disabled (HEALTH_CHECK_ON_STARTUP=false)")
         return health
 
+    def _log_status(component: str, new_status: str, prev_status: str | None) -> None:
+        """INFO on first check or status change; DEBUG when status is unchanged."""
+        ok = new_status == "ok"
+        changed = prev_status != new_status
+        if ok:
+            msg = f"{component} health check passed ({settings.llm_provider}/{settings.llm_model})"
+            if prev_status is None or changed:
+                logger.info(msg)
+            else:
+                logger.debug(msg)
+        else:
+            # Failures always log at WARNING regardless of repetition
+            logger.warning(f"{component} health check failed ({settings.llm_provider}): {new_status}")
+
+    prev_llm = previous.llm if previous else None
+    prev_emb = previous.embeddings if previous else None
+
     # Validate LLM credentials before attempting network calls
     cred_error = validate_credentials(settings)
     if cred_error:
         msg = f"LLM provider {settings.llm_provider} configured but credentials missing: {cred_error}"
-        logger.error(msg)
+        if prev_llm != f"unreachable: {cred_error}":
+            logger.error(msg)
         health.llm = f"unreachable: {cred_error}"
     else:
         # Test LLM only when credentials are valid
@@ -84,10 +114,10 @@ async def check_providers(settings: Settings) -> ProviderHealth:
             llm = create_llm(settings)
             await llm.ainvoke("Say OK")
             health.llm = "ok"
-            logger.info(f"LLM health check passed ({settings.llm_provider}/{settings.llm_model})")
+            _log_status("LLM", health.llm, prev_llm)
         except Exception as e:
             health.llm = f"unreachable: {e}"
-            logger.warning(f"LLM health check failed ({settings.llm_provider}): {e}")
+            _log_status("LLM", health.llm, prev_llm)
 
     # Test embeddings independently — they may use a different provider/key
     try:
@@ -96,9 +126,9 @@ async def check_providers(settings: Settings) -> ProviderHealth:
         emb = create_embeddings(settings)
         await emb.aembed_query("test")
         health.embeddings = "ok"
-        logger.info(f"Embedding health check passed ({settings.llm_provider})")
+        _log_status("Embedding", health.embeddings, prev_emb)
     except Exception as e:
         health.embeddings = f"unreachable: {e}"
-        logger.warning(f"Embedding health check failed: {e}")
+        _log_status("Embedding", health.embeddings, prev_emb)
 
     return health
