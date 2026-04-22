@@ -132,9 +132,23 @@ class _ConnCompat:
         with self._engine.begin() as conn:
             conn.execute(text(f"SET search_path TO {self._schema}, public"))
             result = conn.execute(text(adapted_sql), named_params)
+            # DML statements (UPDATE/INSERT/DELETE without RETURNING) produce a
+            # Result with ``returns_rows == False``.  SQLAlchemy auto-closes
+            # those, so calling ``.fetchall()`` raises "This result object does
+            # not return rows.  It has been closed automatically."
+            if not result.returns_rows:
+                return _CompatResultSet([])
             keys = tuple(result.keys())
             rows = [_CompatRow(keys, tuple(r)) for r in result.fetchall()]
             return _CompatResultSet(rows)
+
+    def commit(self) -> None:
+        """No-op: every :meth:`execute` already commits via ``engine.begin()``.
+
+        Kept for API parity with :class:`sqlite3.Connection` so legacy
+        callers (``persist_clusters`` etc.) work unchanged.
+        """
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -914,7 +928,7 @@ class PostgresWikiStorage:
             # Fetch all nodes; use source_text with fallback to
             # docstring / symbol_name so that nodes with empty
             # source_text still get an embedding vector.
-            arch_filter = " WHERE is_architectural = TRUE" if architectural_only else ""
+            arch_filter = " WHERE is_architectural = 1" if architectural_only else ""
             rows = conn.execute(
                 text(
                     f"SELECT node_id, source_text, docstring, symbol_name "
@@ -1720,7 +1734,7 @@ class PostgresWikiStorage:
                            JOIN {self._edges} e   ON e.target_id = n.node_id
                            JOIN {self._nodes} src ON e.source_id = src.node_id
                           WHERE n.symbol_type = 'constant'
-                            AND n.is_architectural = TRUE
+                            AND n.is_architectural = 1
                           GROUP BY n.node_id, n.rel_path
                          HAVING COUNT(DISTINCT src.rel_path) = 1
                             AND MAX(src.rel_path) = n.rel_path
@@ -1741,8 +1755,8 @@ class PostgresWikiStorage:
                 text(
                     f"""
                     UPDATE {self._nodes}
-                       SET is_architectural = FALSE
-                     WHERE is_architectural = TRUE
+                       SET is_architectural = 0
+                     WHERE is_architectural = 1
                        AND (
                             rel_path LIKE 'third_party/%%'
                          OR rel_path LIKE 'third-party/%%'
@@ -1808,7 +1822,7 @@ class PostgresWikiStorage:
                         ON T.node_id  = r.target_id
                        AND T.rel_path != C.rel_path
                      WHERE C.symbol_type IN ('class','struct','interface','trait')
-                       AND C.is_architectural = TRUE
+                       AND C.is_architectural = 1
                        AND T.node_id != C.node_id
                        AND NOT EXISTS (
                            SELECT 1
@@ -1838,7 +1852,7 @@ class PostgresWikiStorage:
                            + (SELECT COUNT(*) FROM {self._edges} e2 WHERE e2.target_id = n.node_id)
                            ) AS degree
                       FROM {self._nodes} n
-                     WHERE n.is_architectural = TRUE
+                     WHERE n.is_architectural = 1
                      ORDER BY degree DESC
                      LIMIT :lim
                     """
@@ -1850,7 +1864,7 @@ class PostgresWikiStorage:
                 text(
                     f"""
                     SELECT n.rel_path                                              AS rel_path,
-                           SUM(CASE WHEN n.is_architectural THEN 1 ELSE 0 END)     AS internal_arch,
+                           SUM(CASE WHEN n.is_architectural = 1 THEN 1 ELSE 0 END) AS internal_arch,
                            COUNT(e.id)                                             AS external_edges
                       FROM {self._nodes} n
                       LEFT JOIN {self._edges} e   ON e.source_id = n.node_id

@@ -1597,7 +1597,7 @@ class OptimizedWikiGenerationAgent:
                 "[CLUSTER_EXPANSION] Budget exceeded (%d/%d) — truncating",
                 total_tokens, CONTEXT_TOKEN_BUDGET,
             )
-            truncated = self._ranked_truncation(
+            truncated, _metrics = self._ranked_truncation(
                 docs, page_spec, CONTEXT_TOKEN_BUDGET,
             )
             return self._format_simple_context(truncated, page_spec)

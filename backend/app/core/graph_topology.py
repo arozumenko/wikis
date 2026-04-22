@@ -505,13 +505,23 @@ def resolve_orphans(
 
         # Process in batches — single API call per batch.  When
         # ``embed_max_workers > 1``, batches are dispatched concurrently
-        # via a thread pool and applied in completion order.  Only the
-        # embedding API call runs in worker threads — sqlite/vec writes
-        # remain on the caller thread.
+        # via a thread pool and results are consumed as they complete
+        # (streaming — never materialised into a single list).  This
+        # keeps memory flat and lets vec-search begin as soon as the
+        # first batch is embedded.
         batch_specs = [
             vec_candidates[i:i + embed_batch_size]
             for i in range(0, len(vec_candidates), embed_batch_size)
         ]
+        n_batches = len(batch_specs)
+        n_candidates = len(vec_candidates)
+
+        logger.info(
+            "[ORPHAN] Pass 2 starting: %d candidates, %d batches "
+            "(batch_size=%d, workers=%d, vec_prefix_depth=%d)",
+            n_candidates, n_batches, embed_batch_size, embed_max_workers,
+            vec_prefix_depth,
+        )
 
         def _embed_batch(batch):
             texts = [t for _, t, _ in batch]
@@ -519,24 +529,18 @@ def resolve_orphans(
                 return batch, embed_batch_fn(texts)
             return batch, [embedding_fn(t) for t in texts]
 
-        if embed_max_workers > 1 and len(batch_specs) > 1:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=embed_max_workers) as pool:
-                futures = [pool.submit(_embed_batch, b) for b in batch_specs]
-                completed = (f.result() for f in as_completed(futures))
-                batch_iter = list(completed)
-        else:
-            batch_iter = [_embed_batch(b) for b in batch_specs]
+        # Heartbeat: log at most every ~10s so huge repos look alive.
+        _last_log = _time.monotonic()
+        _log_interval = 10.0
 
-        for batch, embeddings in batch_iter:
+        def _process_result(batch, embeddings, idx: int) -> None:
+            nonlocal _last_log
             for (nid, _text, rel_path), emb in zip(batch, embeddings):
                 if nid in resolved:
                     continue
 
                 prefixes = _expanding_prefixes(rel_path)
                 if vec_prefix_depth > 0:
-                    # Keep the most-local prefixes plus the global "" fallback
-                    # to bound per-orphan vec queries on big repos.
                     capped: List[str] = prefixes[: max(1, vec_prefix_depth - 1)]
                     if "" not in capped:
                         capped.append("")
@@ -558,8 +562,7 @@ def resolve_orphans(
                         for hit in vec_hits:
                             _add_edge(
                                 db, G,
-                                source=nid,
-                                target=hit["node_id"],
+                                source=nid, target=hit["node_id"],
                                 rel_type="semantic_link",
                                 edge_class="semantic",
                                 created_by="vec_semantic",
@@ -568,12 +571,34 @@ def resolve_orphans(
                             )
                             stats["semantic"] += 1
                         resolved.add(nid)
-                        break  # Stop expanding prefix chain
+                        break
+
+            now = _time.monotonic()
+            if now - _last_log >= _log_interval or idx == n_batches:
+                logger.info(
+                    "[ORPHAN] Pass 2 progress: batch %d/%d, %d edges, "
+                    "%d/%d resolved, elapsed %.1fs",
+                    idx, n_batches, stats["semantic"],
+                    len(resolved), n_candidates, now - t2,
+                )
+                _last_log = now
+
+        if embed_max_workers > 1 and n_batches > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=embed_max_workers) as pool:
+                futures = [pool.submit(_embed_batch, b) for b in batch_specs]
+                for i, fut in enumerate(as_completed(futures), start=1):
+                    batch, embeddings = fut.result()
+                    _process_result(batch, embeddings, i)
+        else:
+            for i, spec in enumerate(batch_specs, start=1):
+                batch, embeddings = _embed_batch(spec)
+                _process_result(batch, embeddings, i)
 
         t3 = _time.monotonic()
         logger.info(
             "[ORPHAN] Pass 2 (semantic vector): %d edges from %d candidates in %.1fs",
-            stats["semantic"], len(vec_candidates), t3 - t2,
+            stats["semantic"], n_candidates, t3 - t2,
         )
 
     # ── Pass 3: Directory proximity fallback ─────────────────
