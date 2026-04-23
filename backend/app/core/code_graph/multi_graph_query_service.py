@@ -38,6 +38,76 @@ class MultiGraphQueryService:
         self.graph = _MergedGraphView(
             {wid: svc.graph for wid, svc in services.items()}
         )
+        # ``storage`` is intentionally None on the multi-wiki facade.  Callers
+        # must use :py:meth:`get_node` / :py:meth:`get_nodes_by_path_prefix`
+        # instead of touching a single underlying store.
+        self.storage = None
+
+    # ------------------------------------------------------------------
+    # Node Accessor — parity with GraphQueryService / StorageQueryService
+    # ------------------------------------------------------------------
+
+    def get_node(self, node_id: str) -> dict[str, Any] | None:
+        """Return the raw node attribute dict for ``node_id`` across all wikis.
+
+        Tries each constituent service's ``get_node`` (covers both
+        ``GraphQueryService`` — NX-backed — and ``StorageQueryService``
+        — Postgres/SQLite-backed).  Returns the first dict found.
+
+        This is the cross-wiki replacement for the legacy
+        ``code_graph.nodes.get(node_id)`` pattern that only ever consulted
+        the primary wiki's NetworkX graph.
+        """
+        if not node_id:
+            return None
+        for _wiki_id, svc in self._services.items():
+            getter = getattr(svc, "get_node", None)
+            if getter is None:
+                continue
+            try:
+                data = getter(node_id)
+            except Exception:  # pragma: no cover — defensive
+                continue
+            if data is not None:
+                return data
+        return None
+
+    def get_nodes_by_path_prefix(
+        self,
+        path_prefix: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Fan out a path-prefix lookup across every wiki's storage.
+
+        ``StorageQueryService.storage`` exposes
+        ``get_nodes_by_path_prefix`` for storage-backed wikis.  Older NX-only
+        services don't, so we silently skip them.  Results are deduplicated
+        by ``node_id`` and capped at ``limit`` total rows.
+        """
+        if not path_prefix:
+            return []
+        seen_ids: set[str] = set()
+        rows: list[dict[str, Any]] = []
+        for _wiki_id, svc in self._services.items():
+            store = getattr(svc, "storage", None)
+            if store is None:
+                continue
+            getter = getattr(store, "get_nodes_by_path_prefix", None)
+            if getter is None:
+                continue
+            try:
+                wiki_rows = getter(path_prefix, limit=limit)
+            except Exception:  # pragma: no cover — defensive
+                continue
+            for row in wiki_rows or []:
+                nid = row.get("node_id")
+                if not nid or nid in seen_ids:
+                    continue
+                seen_ids.add(nid)
+                rows.append(row)
+                if len(rows) >= limit:
+                    return rows
+        return rows
 
     # ------------------------------------------------------------------
     # Symbol Resolution
@@ -230,25 +300,29 @@ class _MergedGraphView:
 
     ``_build_call_tree_from_sources`` accesses ``gqs.graph.nodes.get(node_id)``
     to read node attributes.  This view delegates that lookup to the first graph
-    that contains the node_id.
+    that contains the node_id.  Storage-backed services expose
+    ``svc.graph is None`` and are silently skipped here — callers that need
+    cross-backend node attributes should use ``MultiGraphQueryService.get_node``.
     """
 
     def __init__(self, graphs: dict[str, Any]) -> None:
-        self._graphs = graphs
-        self.nodes = _MergedNodesView(graphs)
+        self._graphs = {wid: g for wid, g in graphs.items() if g is not None}
+        self.nodes = _MergedNodesView(self._graphs)
 
     def __contains__(self, node_id: str) -> bool:
         return any(node_id in g for g in self._graphs.values())
 
 
 class _MergedNodesView:
-    """Proxy for graph.nodes that searches all graphs."""
+    """Proxy for graph.nodes that searches all NX-backed graphs."""
 
     def __init__(self, graphs: dict[str, Any]) -> None:
         self._graphs = graphs
 
     def get(self, node_id: str, default: dict | None = None) -> dict | None:
         for graph in self._graphs.values():
+            if graph is None:
+                continue
             data = graph.nodes.get(node_id)
             if data is not None:
                 return data

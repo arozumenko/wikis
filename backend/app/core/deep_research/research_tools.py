@@ -743,15 +743,22 @@ def create_codebase_tools(
                     path_prefix=path_prefix,
                 )
                 for r in svc_results:
-                    # Extract one-line doc (first sentence of docstring)
+                    # Extract one-line doc (first sentence of docstring).
+                    # Use ``query_service.get_node`` so the lookup works for
+                    # nodes from any wiki in a project, not just the primary
+                    # wiki's in-memory NX graph.
                     one_line = ""
-                    if r.node_id and r.node_id in code_graph:
-                        doc = (code_graph.nodes.get(r.node_id, {}) or {}).get("docstring", "") or ""
-                        if doc:
-                            first_line = doc.strip().split("\n")[0].strip()
-                            if len(first_line) > 80:
-                                first_line = first_line[:77] + "..."
-                            one_line = first_line
+                    node_data: dict = {}
+                    if r.node_id and hasattr(query_service, "get_node"):
+                        node_data = query_service.get_node(r.node_id) or {}
+                    if not node_data and r.node_id and code_graph is not None and r.node_id in code_graph:
+                        node_data = code_graph.nodes.get(r.node_id, {}) or {}
+                    doc = node_data.get("docstring", "") or ""
+                    if doc:
+                        first_line = doc.strip().split("\n")[0].strip()
+                        if len(first_line) > 80:
+                            first_line = first_line[:77] + "..."
+                        one_line = first_line
 
                     results.append(
                         {
@@ -813,6 +820,7 @@ def create_codebase_tools(
         graph: Any,
         fts_index: Any,
         emit_fn: Callable,
+        qs: Any = None,
     ) -> str | None:
         """Discover implicit string-based references for orphan container symbols.
 
@@ -821,48 +829,93 @@ def create_codebase_tools(
         literals in framework or RPC code (e.g. ``Event.on_startup``
         dispatched via ``emit("on_startup")``).
 
-        Extracts child method/function names via ``defines`` edges and
-        runs FTS5 text search for each name.  Returns a formatted result
-        string if any hits are found, otherwise ``None``.
+        Resolves child method names via the abstract query service
+        (cross-wiki + storage-backend safe), and runs FTS5 text search
+        for each name.  Falls back to direct ``code_graph`` traversal
+        only when ``qs`` is unavailable (legacy single-wiki path).
+        Returns a formatted result string if any hits are found,
+        otherwise ``None``.
         """
-        if graph is None or fts_index is None:
+        if fts_index is None:
             return None
         if not (hasattr(fts_index, "search") and hasattr(fts_index, "is_open")):
             return None
         if not fts_index.is_open:
             return None
 
-        node_data = graph.nodes.get(node_id, {})
+        # --- Resolve container node attributes ---
+        # Prefer query_service.get_node so we transparently support
+        # storage-backed wikis and cross-wiki node ownership.
+        node_data: dict = {}
+        if qs is not None and hasattr(qs, "get_node"):
+            node_data = qs.get_node(node_id) or {}
+        if not node_data and graph is not None:
+            try:
+                node_data = graph.nodes.get(node_id, {}) or {}
+            except Exception:
+                node_data = {}
+        if not node_data:
+            return None
+
         sym_type = (node_data.get("symbol_type") or "").lower()
         if sym_type not in CONTAINER_SYMBOL_TYPES:
             return None
 
         sym_name = node_data.get("symbol_name", "") or node_data.get("name", "")
 
-        # Collect child method/function names via 'defines' edges
+        # --- Collect child method/function names via 'defines' edges ---
         method_names: list[str] = []
-        for succ in graph.successors(node_id):
-            # Check all edges between node_id → succ for a 'defines' relationship
-            edge_data = graph.get_edge_data(node_id, succ)
-            if edge_data is None:
-                continue
-            # MultiDiGraph returns {0: {...}, 1: {...}}, DiGraph returns {...}
-            edges = (
-                edge_data.values()
-                if isinstance(edge_data, dict) and all(isinstance(v, dict) for v in edge_data.values())
-                else [edge_data]
-            )
-            is_defines = any(e.get("relationship_type", "").lower() == "defines" for e in edges)
-            if not is_defines:
-                continue
+        if qs is not None and hasattr(qs, "get_relationships"):
+            try:
+                rels = qs.get_relationships(
+                    node_id,
+                    direction="outgoing",
+                    max_depth=1,
+                    max_results=200,
+                )
+            except Exception:
+                rels = []
+            for r in rels or []:
+                if (getattr(r, "relationship_type", "") or "").lower() != "defines":
+                    continue
+                tgt_type = (getattr(r, "target_type", "") or "").lower()
+                if tgt_type not in ("method", "function"):
+                    continue
+                name = getattr(r, "target_name", "") or ""
+                if name and not name.startswith("__") and "::" not in name:
+                    method_names.append(name)
+                elif name:
+                    # target_name may be a fully-qualified node_id; take the
+                    # last segment as the bare method name for FTS.
+                    last = name.rsplit("::", 1)[-1]
+                    if last and not last.startswith("__"):
+                        method_names.append(last)
 
-            succ_data = graph.nodes.get(succ, {})
-            succ_type = (succ_data.get("symbol_type") or "").lower()
-            if succ_type not in ("method", "function"):
-                continue
-            name = succ_data.get("symbol_name", "") or succ_data.get("name", "")
-            if name and not name.startswith("__"):
-                method_names.append(name)
+        if not method_names and graph is not None:
+            # Legacy single-wiki path: walk the in-memory NX graph directly.
+            try:
+                successors_iter = list(graph.successors(node_id))
+            except Exception:
+                successors_iter = []
+            for succ in successors_iter:
+                edge_data = graph.get_edge_data(node_id, succ)
+                if edge_data is None:
+                    continue
+                edges = (
+                    edge_data.values()
+                    if isinstance(edge_data, dict) and all(isinstance(v, dict) for v in edge_data.values())
+                    else [edge_data]
+                )
+                is_defines = any(e.get("relationship_type", "").lower() == "defines" for e in edges)
+                if not is_defines:
+                    continue
+                succ_data = graph.nodes.get(succ, {})
+                succ_type = (succ_data.get("symbol_type") or "").lower()
+                if succ_type not in ("method", "function"):
+                    continue
+                name = succ_data.get("symbol_name", "") or succ_data.get("name", "")
+                if name and not name.startswith("__"):
+                    method_names.append(name)
 
         if not method_names:
             return None
@@ -988,6 +1041,7 @@ def create_codebase_tools(
                     code_graph,
                     graph_text_index,
                     emit,
+                    qs=query_service,
                 )
                 if orphan_hits:
                     return orphan_hits
@@ -1018,6 +1072,7 @@ def create_codebase_tools(
                     code_graph,
                     graph_text_index,
                     emit,
+                    qs=query_service,
                 )
                 if orphan_hits:
                     lines.append("")
@@ -1042,19 +1097,32 @@ def create_codebase_tools(
         """
         emit({"type": "tool_start", "tool": "get_code", "input": symbol_name, "timestamp": datetime.now().isoformat()})
 
-        if code_graph is None:
+        # Multi-wiki and storage-backed wikis route everything through
+        # ``query_service`` — it is the only abstraction that knows how to
+        # resolve a node and read its attributes across every wiki in the
+        # project.  ``code_graph`` is only ever the *primary* wiki's NX
+        # graph (or None for storage-backed primaries), so reading node
+        # attributes from it directly silently drops cross-wiki nodes.
+        if query_service is None and code_graph is None:
             return "Code graph not available"
 
         try:
             node_id = None
             if query_service:
                 node_id = query_service.resolve_symbol(symbol_name)
-            if not node_id:
+            if not node_id and code_graph is not None:
                 node_id = _find_graph_node(code_graph, symbol_name)
             if not node_id:
                 return f"Symbol '{symbol_name}' not found. Check the exact name from search_symbols."
 
-            data = code_graph.nodes.get(node_id, {})
+            # Prefer ``query_service.get_node`` (cross-wiki / storage-aware);
+            # only fall back to the in-memory ``code_graph`` when no service
+            # is wired (legacy single-wiki NX-only path).
+            data: dict = {}
+            if query_service is not None and hasattr(query_service, "get_node"):
+                data = query_service.get_node(node_id) or {}
+            if not data and code_graph is not None:
+                data = code_graph.nodes.get(node_id, {}) or {}
             if not data:
                 return f"No data for node '{node_id}'"
 

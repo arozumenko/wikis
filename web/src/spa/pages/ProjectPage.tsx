@@ -325,6 +325,11 @@ export function ProjectPage() {
   // Shared SSE event handler for thinking_step events (identical to WikiViewerPage)
   const handleThinkingStep = useCallback((event: Record<string, unknown>) => {
     const stepKind = (event.step_type ?? event.stepType) as string | undefined;
+    const callId =
+      (event.tool_call_id as string | undefined) ??
+      (event.toolCallId as string | undefined) ??
+      (event.call_id as string | undefined) ??
+      (event.callId as string | undefined);
     updateLastTurn((prev) => {
       if (stepKind === 'tool_call') {
         const record: ToolCallRecord = {
@@ -334,14 +339,36 @@ export function ProjectPage() {
           timestamp: event.timestamp as string,
           endTimestamp: null,
           done: false,
+          tool_call_id: callId,
         };
         return { ...prev, toolCalls: [...prev.toolCalls, record] };
       }
       if (stepKind === 'tool_result') {
         let updated = false;
-        const toolCalls = [...prev.toolCalls]
-          .reverse()
-          .map((tc) => {
+        // Prefer matching by tool_call_id — robust against parallel /
+        // out-of-order tool completions. Fall back to legacy "first
+        // not-done with same tool_name" only when neither side carries
+        // an id (older events).
+        const matchById = callId
+          ? prev.toolCalls.findIndex((tc) => !tc.done && tc.tool_call_id === callId)
+          : -1;
+        const toolCalls = prev.toolCalls.map((tc, idx) => {
+          if (matchById >= 0) {
+            if (idx !== matchById) return tc;
+          } else {
+            if (updated || tc.done || tc.tool_name !== (event.tool as string)) return tc;
+          }
+          updated = true;
+          return {
+            ...tc,
+            tool_output: ((event.output ?? event.output_preview ?? event.outputPreview) as string) ?? '',
+            endTimestamp: event.timestamp as string,
+            done: true,
+          };
+        });
+        // Fallback to reverse-order match for legacy events where id is missing.
+        if (!updated && matchById < 0) {
+          const reversed = [...prev.toolCalls].reverse().map((tc) => {
             if (!updated && !tc.done && tc.tool_name === (event.tool as string)) {
               updated = true;
               return {
@@ -352,8 +379,9 @@ export function ProjectPage() {
               };
             }
             return tc;
-          })
-          .reverse();
+          });
+          return { ...prev, toolCalls: reversed.reverse() };
+        }
         return { ...prev, toolCalls };
       }
       return prev;
