@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +18,15 @@ class Settings(BaseSettings):
     llm_api_base: str | None = None
     llm_model: str = "gpt-4o-mini"  # HIGH tier (page generation, analysis)
     llm_model_low: str | None = None  # LOW tier (quality check, enhancement) — falls back to llm_model
+
+    @field_validator("llm_model_low", mode="before")
+    @classmethod
+    def _strip_model_low(cls, v: str | None) -> str | None:
+        """Docker .env files don't support inline comments — strip them."""
+        if v is None:
+            return None
+        v = v.split("#")[0].strip()
+        return v or None
 
     # Embeddings
     embedding_provider: str | None = None  # defaults to llm_provider; set to "openai" when using anthropic LLM
@@ -70,6 +79,10 @@ class Settings(BaseSettings):
     # Database (shared with web app's Prisma; empty = default SQLite)
     database_url: str = ""
 
+    # Wiki storage backend (graph + FTS + vectors)
+    wiki_storage_backend: str = "sqlite"  # sqlite | postgres
+    wiki_storage_dsn: str = ""  # PostgreSQL DSN for wiki storage (when backend=postgres)
+
     # Wiki page index cache
     wiki_index_cache_max_wikis: int = 50
 
@@ -78,6 +91,16 @@ class Settings(BaseSettings):
     qa_cache_similarity_threshold: float = 0.92
     qa_cache_max_age_seconds: int = 86400  # 24 hours
     qa_cache_max_wikis: int = 50  # LRU eviction threshold for in-memory FAISS indexes
+
+    # Structure planner
+    planner_type: str = "agent"  # agent | cluster
+    cluster_hub_z_threshold: float = 3.0
+    cluster_exclude_tests: bool = True
+
+    # Graph topology enrichment (Phase 2)
+    graph_enrichment_enabled: bool = True
+    hub_z_threshold: float = 3.0
+    vec_distance_threshold: float = 0.15
 
     # App
     log_level: str = "INFO"

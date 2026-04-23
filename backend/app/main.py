@@ -133,7 +133,10 @@ def create_app() -> FastAPI:
 
         provider_health = getattr(request.app.state, "provider_health", None)
         if provider_health is not None and provider_health.stale:
-            provider_health = await check_providers(settings)
+            provider_health = await check_providers(
+                request.app.state.settings,
+                previous=provider_health,
+            )
             request.app.state.provider_health = provider_health
 
         if provider_health is not None and not provider_health.healthy:

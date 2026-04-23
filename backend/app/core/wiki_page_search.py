@@ -153,16 +153,64 @@ class WikiPageSearchAdapter:
         query: str,
         top_k: int,
     ) -> list[tuple[str, float]]:
-        """SQLite fallback — LIKE matching, no ranking."""
-        like_pattern = f"%{query}%"
-        result = await session.execute(
-            text(
-                "SELECT page_title, 1.0 AS rank "
-                "FROM wiki_page "
-                "WHERE wiki_id = :wiki_id "
-                "  AND (page_title LIKE :q OR content LIKE :q OR description LIKE :q) "
-                "LIMIT :top_k"
-            ),
-            {"q": like_pattern, "wiki_id": self._wiki_id, "top_k": top_k},
-        )
-        return [(row[0], float(row[1])) for row in result.fetchall()]
+        """SQLite full-text search via the FTS5 ``wiki_page_fts`` virtual table.
+
+        Uses ``bm25(wiki_page_fts, 10.0, 5.0, 1.0)`` so weights mirror the
+        PostgreSQL A/B/C scaling (title > description > content). bm25 returns
+        negative values where lower means better; we negate so callers get
+        higher-is-better scores compatible with the PG ts_rank path.
+
+        Falls back to LIKE matching if the FTS5 vtable is missing (e.g. legacy
+        databases that pre-date the migration in :func:`app.db._ensure_wiki_page_fts`).
+        """
+        match_expr = _build_fts5_match(query)
+        if not match_expr:
+            return []
+
+        try:
+            result = await session.execute(
+                text(
+                    "SELECT wp.page_title, "
+                    "       -bm25(wiki_page_fts, 10.0, 5.0, 1.0) AS rank "
+                    "FROM wiki_page_fts "
+                    "JOIN wiki_page wp ON wp.rowid = wiki_page_fts.rowid "
+                    "WHERE wiki_page_fts MATCH :match "
+                    "  AND wp.wiki_id = :wiki_id "
+                    "ORDER BY rank DESC "
+                    "LIMIT :top_k"
+                ),
+                {"match": match_expr, "wiki_id": self._wiki_id, "top_k": top_k},
+            )
+            return [(row[0], float(row[1])) for row in result.fetchall()]
+        except Exception as e:
+            # FTS5 vtable missing or malformed query — fall back to LIKE.
+            logger.debug(
+                "WikiPageSearchAdapter: FTS5 search failed (%s) — falling back to LIKE",
+                e,
+            )
+            like_pattern = f"%{query}%"
+            result = await session.execute(
+                text(
+                    "SELECT page_title, 1.0 AS rank "
+                    "FROM wiki_page "
+                    "WHERE wiki_id = :wiki_id "
+                    "  AND (page_title LIKE :q OR content LIKE :q OR description LIKE :q) "
+                    "LIMIT :top_k"
+                ),
+                {"q": like_pattern, "wiki_id": self._wiki_id, "top_k": top_k},
+            )
+            return [(row[0], float(row[1])) for row in result.fetchall()]
+
+
+def _build_fts5_match(query: str) -> str:
+    """Convert free-text query into a safe FTS5 MATCH expression.
+
+    Each whitespace-separated token is wrapped in double quotes to escape any
+    FTS5 syntax characters, then joined with OR so partial matches still rank.
+    Returns the empty string when no usable tokens remain.
+    """
+    tokens = [t for t in query.replace('"', " ").split() if t]
+    if not tokens:
+        return ""
+    quoted = [f'"{t}"' for t in tokens]
+    return " OR ".join(quoted)

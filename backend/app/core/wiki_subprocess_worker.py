@@ -149,12 +149,35 @@ def _build_llm_and_embeddings(llm_settings: dict[str, Any], embedding_model: Any
         embeddings_base_url = api_base
 
     embedding_model_name = embedding_model if embedding_model else "text-embedding-3-large"
+    # Embeddings get a longer timeout and slightly more retries than chat —
+    # large repos may issue hundreds of batch calls and a single transient
+    # provider hiccup should not abort the whole indexing run.
+    try:
+        embed_timeout = float(os.getenv("WIKI_EMBED_REQUEST_TIMEOUT", "60"))
+    except ValueError:
+        embed_timeout = 60.0
+    try:
+        embed_max_retries = max(max_retries, int(os.getenv("WIKI_EMBED_MAX_RETRIES", "5")))
+    except ValueError:
+        embed_max_retries = max(max_retries, 5)
+    # ``chunk_size`` controls how LangChain splits the input list inside
+    # ``embed_documents`` *before* hitting the HTTP API.  We keep it in
+    # sync with ``WIKI_EMBED_BATCH_SIZE`` so values above LangChain's
+    # default of 1000 actually result in larger HTTP batches instead of
+    # being silently re-split client-side.  OpenAI's embeddings endpoint
+    # accepts up to 2048 inputs / ~300k tokens per request.
+    try:
+        embed_chunk_size = max(1, int(os.getenv("WIKI_EMBED_BATCH_SIZE", "256")))
+    except ValueError:
+        embed_chunk_size = 256
     embeddings = OpenAIEmbeddings(
         model=embedding_model_name,
         api_key=api_key,
         base_url=embeddings_base_url,
         organization=organization,
-        max_retries=max_retries,
+        max_retries=embed_max_retries,
+        request_timeout=embed_timeout,
+        chunk_size=embed_chunk_size,
     )
 
     return llm, embeddings, embedding_model_name
@@ -263,14 +286,9 @@ def main(argv=None) -> int:
         _print(f"[worker] Starting wiki generation: {query}")
         result = wrapper.generate_wiki(query=query)
 
-        # Save repository analysis for Ask tool if wiki generation succeeded
+        # Post-process manifest metadata if wiki generation succeeded.
         if result and result.get("success"):
             try:
-                from plugin_implementation.repository_analysis_store import RepositoryAnalysisStore
-
-                cache_dir = os.path.join(base_path, "cache")
-                analysis_store = RepositoryAnalysisStore(cache_dir)
-
                 # Use actual branch from clone result (handles master vs main, etc.)
                 actual_branch = result.get("branch") or active_branch
                 if actual_branch != active_branch:
@@ -292,40 +310,10 @@ def main(argv=None) -> int:
 
                 wiki_version_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
 
-                analysis_key_override = f"{repo_identifier}@{wiki_version_id}"
-
                 if repo_context:
-                    # Backward compatible: keep the legacy analysis record (newest wins).
-                    analysis_store.save_analysis(
-                        repo_identifier=repo_identifier,
-                        analysis=repo_context,  # Just the LLM analysis text
-                        commit_hash=commit_hash,
-                        metadata={
-                            "branch": active_branch,
-                            "indexing_method": indexing_method,
-                            "commit_hash": commit_hash,
-                            "provider_type": provider_type,
-                        },
-                    )
-
-                    # Versioned analysis record: addressed by analysis_key_override, so UI can select.
-                    analysis_store.save_analysis(
-                        repo_identifier=repo_identifier,
-                        analysis=repo_context,
-                        commit_hash=commit_hash,
-                        metadata={
-                            "branch": active_branch,
-                            "indexing_method": indexing_method,
-                            "commit_hash": commit_hash,
-                            "wiki_version_id": wiki_version_id,
-                        },
-                        analysis_key_override=analysis_key_override,
-                    )
-                    _print(
-                        f"[worker] Saved repository analysis for Ask tool ({len(repo_context)} chars) as {repo_identifier}"
-                    )
+                    _print(f"[worker] Repository analysis available in unified DB ({len(repo_context)} chars)")
                 else:
-                    _print("[worker] Warning: No repository_context in result, skipping analysis save")
+                    _print("[worker] Warning: No repository_context in result")
 
                 # Emit a manifest artifact listing the exact wiki pages for this run.
                 # Context7-style: all artifacts are prefixed with wiki_id folder
@@ -400,7 +388,6 @@ def main(argv=None) -> int:
                     "repository": repository,
                     "branch": active_branch,
                     "commit_hash": commit_hash,
-                    "analysis_key": analysis_key_override,
                     "pages": pages,
                     "provider_type": provider_type,
                 }
@@ -458,7 +445,6 @@ def main(argv=None) -> int:
                     # Also surface metadata at the top-level result for debugging and registry.
                     result["wiki_version_id"] = wiki_version_id
                     result["wiki_id"] = wiki_id
-                    result["analysis_key"] = analysis_key_override
                     result["canonical_repo_identifier"] = repo_identifier
                     result["branch"] = active_branch
                     result["commit_hash"] = commit_hash
@@ -468,7 +454,7 @@ def main(argv=None) -> int:
                 except Exception as mf_err:
                     _print(f"[worker] Warning: Failed to append wiki manifest artifact: {mf_err}")
             except Exception as save_err:
-                _print(f"[worker] Warning: Failed to save repository analysis: {save_err}")
+                _print(f"[worker] Warning: Failed to build wiki manifest metadata: {save_err}")
 
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(result, f)

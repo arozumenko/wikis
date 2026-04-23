@@ -75,6 +75,83 @@ const thinScrollbar = {
   },
 } as const;
 
+interface ThinkingStepShape {
+  step_type?: 'tool_call' | 'tool_result';
+  stepType?: 'tool_call' | 'tool_result';
+  tool: string;
+  tool_call_id?: string;
+  toolCallId?: string;
+  call_id?: string;
+  callId?: string;
+  input?: string;
+  output?: string;
+  output_preview?: string;
+  outputPreview?: string;
+  timestamp: string;
+}
+
+/**
+ * Merge a single thinking_step event (tool_call or tool_result) into a list
+ * of `ToolCallRecord`s.
+ *
+ * `tool_result` is matched to its originating `tool_call` by `tool_call_id`
+ * first, falling back to "first not-done with same tool_name" only when no
+ * id is present on either side. This prevents the off-by-one display bug
+ * where parallel/out-of-order tool completions land on the wrong card.
+ */
+function mergeThinkingStep(
+  prev: ToolCallRecord[],
+  e: ThinkingStepShape,
+): ToolCallRecord[] {
+  const stepKind = e.step_type ?? e.stepType;
+  const callId = e.tool_call_id ?? e.toolCallId ?? e.call_id ?? e.callId;
+  if (stepKind === 'tool_call') {
+    const record: ToolCallRecord = {
+      tool_name: e.tool,
+      tool_input: e.input ?? '',
+      tool_output: null,
+      timestamp: e.timestamp,
+      endTimestamp: null,
+      done: false,
+      tool_call_id: callId,
+    };
+    return [...prev, record];
+  }
+  if (stepKind === 'tool_result') {
+    const matchById = callId
+      ? prev.findIndex((tc) => !tc.done && tc.tool_call_id === callId)
+      : -1;
+    if (matchById >= 0) {
+      return prev.map((tc, idx) =>
+        idx === matchById
+          ? {
+              ...tc,
+              tool_output: e.output ?? e.output_preview ?? e.outputPreview ?? '',
+              endTimestamp: e.timestamp,
+              done: true,
+            }
+          : tc,
+      );
+    }
+    // Legacy fallback: first not-done with same tool_name (reverse order).
+    let updated = false;
+    const reversed = [...prev].reverse().map((tc) => {
+      if (!updated && !tc.done && tc.tool_name === e.tool) {
+        updated = true;
+        return {
+          ...tc,
+          tool_output: e.output ?? e.output_preview ?? e.outputPreview ?? '',
+          endTimestamp: e.timestamp,
+          done: true,
+        };
+      }
+      return tc;
+    });
+    return reversed.reverse();
+  }
+  return prev;
+}
+
 export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
   const { wikiId } = useParams<{ wikiId: string }>();
   const [wiki, setWiki] = useState<WikiDetail | null>(null);
@@ -324,40 +401,10 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           (event) => {
             if (event.type === 'thinking_step') {
               const e = event;
-              const stepKind = e.step_type ?? e.stepType;
-              updateLastTurn((prev) => {
-                if (stepKind === 'tool_call') {
-                  const record: ToolCallRecord = {
-                    tool_name: e.tool,
-                    tool_input: e.input ?? '',
-                    tool_output: null,
-                    timestamp: e.timestamp,
-                    endTimestamp: null,
-                    done: false,
-                  };
-                  return { ...prev, toolCalls: [...prev.toolCalls, record] };
-                }
-                if (stepKind === 'tool_result') {
-                  let updated = false;
-                  const toolCalls = [...prev.toolCalls]
-                    .reverse()
-                    .map((tc) => {
-                      if (!updated && !tc.done && tc.tool_name === e.tool) {
-                        updated = true;
-                        return {
-                          ...tc,
-                          tool_output: e.output ?? e.output_preview ?? e.outputPreview ?? '',
-                          endTimestamp: e.timestamp,
-                          done: true,
-                        };
-                      }
-                      return tc;
-                    })
-                    .reverse();
-                  return { ...prev, toolCalls };
-                }
-                return prev;
-              });
+              updateLastTurn((prev) => ({
+                ...prev,
+                toolCalls: mergeThinkingStep(prev.toolCalls, e),
+              }));
             } else if (event.type === 'answer_chunk') {
               updateLastTurn((prev) => ({ ...prev, answer: (prev.answer ?? '') + event.chunk }));
             } else if (event.type === 'code_map_ready') {
@@ -417,40 +464,10 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           (event) => {
             if (event.type === 'thinking_step') {
               const e = event;
-              const stepKind = e.step_type ?? e.stepType;
-              updateLastTurn((prev) => {
-                if (stepKind === 'tool_call') {
-                  const record: ToolCallRecord = {
-                    tool_name: e.tool,
-                    tool_input: e.input ?? '',
-                    tool_output: null,
-                    timestamp: e.timestamp,
-                    endTimestamp: null,
-                    done: false,
-                  };
-                  return { ...prev, toolCalls: [...prev.toolCalls, record] };
-                }
-                if (stepKind === 'tool_result') {
-                  let updated = false;
-                  const toolCalls = [...prev.toolCalls]
-                    .reverse()
-                    .map((tc) => {
-                      if (!updated && !tc.done && tc.tool_name === e.tool) {
-                        updated = true;
-                        return {
-                          ...tc,
-                          tool_output: e.output ?? e.output_preview ?? e.outputPreview ?? '',
-                          endTimestamp: e.timestamp,
-                          done: true,
-                        };
-                      }
-                      return tc;
-                    })
-                    .reverse();
-                  return { ...prev, toolCalls };
-                }
-                return prev;
-              });
+              updateLastTurn((prev) => ({
+                ...prev,
+                toolCalls: mergeThinkingStep(prev.toolCalls, e),
+              }));
             } else if (event.type === 'answer_chunk') {
               updateLastTurn((prev) => ({ ...prev, answer: (prev.answer ?? '') + event.chunk }));
             } else if (event.type === 'ask_complete') {

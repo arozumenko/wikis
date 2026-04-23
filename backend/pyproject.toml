@@ -24,17 +24,26 @@ dependencies = [
     "openai>=1.55.0",
     "anthropic>=0.57.0",
     # Search & indexing
-    "faiss-cpu>=1.7.0",
     "sentence-transformers>=2.2.0",
     "rank_bm25",
     # Code parsing
     "tree-sitter-language-pack==0.9.1",
+    # Graph clustering
+    "networkx>=3.0",
+    "igraph>=0.11.0",
+    "leidenalg>=0.10.0",
     # Git
     "pygithub==2.3.0",
     # Database
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.29.0",
+    "psycopg2-binary>=2.9.0",
     "aiosqlite>=0.20.0",
+    "pysqlite3>=0.5.0",
+    "sqlite-vec>=0.1.9",
+    "faiss-cpu>=1.7.0",
+    # PostgreSQL vector extension (optional — only needed for postgres wiki storage)
+    "pgvector>=0.3.0",
     # Auth
     "python-jose[cryptography]>=3.3.0",
     "httpx>=0.27.0",

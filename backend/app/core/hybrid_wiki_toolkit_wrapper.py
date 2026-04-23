@@ -17,7 +17,6 @@ from .agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
 from .filesystem_indexer import FilesystemRepositoryIndexer
 from .github_client import StandaloneGitHubClient
 from .repo_providers import GitCloneConfig, LocalPathConfig
-from .retrievers import WikiRetrieverStack
 
 logger = logging.getLogger(__name__)
 
@@ -137,12 +136,24 @@ class HybridWikiToolkitWrapper:
         if self.indexer is None:
             self._initialize_filesystem_indexer()
 
-            # Initialize retriever stack
-            self.retriever_stack = WikiRetrieverStack(
-                vectorstore_manager=self.indexer.vectorstore_manager,
-                relationship_graph=self.indexer.relationship_graph,
-                llm_client=self.llm,
-            )
+            # Initialize retriever from unified DB
+            db_path = getattr(self.indexer, "_unified_db_path", None)
+            if db_path:
+                from .storage import open_storage, repo_id_from_path
+                from .unified_retriever import UnifiedRetriever
+
+                _repo_id = repo_id_from_path(db_path)
+                db = open_storage(repo_id=_repo_id, db_path=db_path, readonly=True)
+                embedding_fn = None
+                if self.embeddings and hasattr(self.embeddings, "embed_query"):
+                    embedding_fn = self.embeddings.embed_query
+                self.retriever_stack = UnifiedRetriever(
+                    db=db,
+                    embedding_fn=embedding_fn,
+                    embeddings=self.embeddings,
+                )
+            else:
+                logger.warning("No unified DB path available — retriever will be limited")
 
     def _initialize_filesystem_indexer(self):
         """Initialize filesystem-based indexer with multi-provider support"""
@@ -188,6 +199,8 @@ class HybridWikiToolkitWrapper:
         include_research: bool = True,
         include_diagrams: bool = True,
         output_format: str = "json",
+        planner_type: str = "agent",
+        exclude_tests: bool = False,
     ):
         """Generate comprehensive wiki from repository analysis with hybrid processing"""
         try:
@@ -234,6 +247,8 @@ class HybridWikiToolkitWrapper:
                     "fts_index",
                     None,
                 ),
+                planner_type=planner_type,
+                exclude_tests=exclude_tests,
             )
 
             # Generate wiki with user message using standard LangGraph pattern
@@ -288,6 +303,25 @@ class HybridWikiToolkitWrapper:
                 if self.indexer and hasattr(self.indexer, "_last_commit_hash"):
                     commit_hash = self.indexer._last_commit_hash
 
+                # Persist repository analysis into the unified DB so the Ask
+                # path can read it without a standalone _analysis.json file.
+                repo_context = wiki_result.get("repository_context")
+                if repo_context:
+                    db_path = getattr(self.indexer, "_unified_db_path", None)
+                    if db_path:
+                        try:
+                            from .storage import open_storage, repo_id_from_path
+
+                            _repo_id = repo_id_from_path(db_path)
+                            udb = open_storage(repo_id=_repo_id, db_path=db_path)
+                            try:
+                                udb.set_meta("repository_analysis", repo_context)
+                            finally:
+                                udb.close()
+                            logger.info("Stored repository analysis in unified DB (%d chars)", len(repo_context))
+                        except Exception as exc:
+                            logger.warning("Failed to store analysis in unified DB: %s", exc)
+
                 return {
                     "success": True,
                     "result": result_message,
@@ -296,7 +330,7 @@ class HybridWikiToolkitWrapper:
                     "errors": workflow_errors,
                     "failed_pages": failed_pages,
                     # Pass through repository_context for Ask tool
-                    "repository_context": wiki_result.get("repository_context"),
+                    "repository_context": repo_context,
                     # Pass commit hash for cache key consistency
                     "commit_hash": commit_hash,
                     # Pass actual branch from clone (handles master vs main, etc.)

@@ -138,6 +138,31 @@ class WikiStructurePlannerEngine:
             max_tokens=4096,  # Reduced for speed - tool-based output needs less tokens
         )
 
+    @staticmethod
+    def _unwrap_chat_model(model: Any) -> BaseChatModel:
+        """Unwrap RunnableRetry / RunnableBinding wrappers around a chat model.
+
+        deepagents' ``resolve_model()`` puts the model in a dict key (i.e.
+        hashes it), and ``RunnableRetry`` / ``RunnableBinding`` are not
+        hashable, so the planner crashes with
+        ``TypeError: unhashable type: 'RunnableRetry'``.
+
+        We follow the ``.bound`` chain (used by both ``RunnableBinding`` and
+        ``RunnableRetry``) until we reach a real ``BaseChatModel``.  Falls
+        back to the original object if no inner chat model is found, so any
+        future wrapper types still surface a clear deepagents error rather
+        than being silently broken.
+        """
+        current = model
+        for _ in range(8):  # arbitrary safety cap; nesting is normally 1
+            if isinstance(current, BaseChatModel):
+                return current
+            inner = getattr(current, "bound", None)
+            if inner is None or inner is current:
+                break
+            current = inner
+        return current
+
     def _create_agent(self, collector):
         """
         Create the DeepAgents agent with FilesystemMiddleware + output tools.
@@ -166,23 +191,27 @@ class WikiStructurePlannerEngine:
         # Get base model (either passed or built)
         base_model = self.llm_client or self._build_model()
 
-        # Bind max_tokens for speed - tool-based output needs less tokens
-        # parallel_tool_calls=True allows the model to call multiple tools at once
-        # (e.g. query_graph for 5 modules in one round-trip instead of 5 sequential calls)
-        model = base_model.bind(max_tokens=4096, parallel_tool_calls=True)
+        # NOTE: Do NOT call base_model.bind() here — RunnableBinding is not a
+        # BaseChatModel, so deepagents' resolve_model() cannot hash it.
+        # deepagents handles tool calling configuration internally.
+        #
+        # Same problem applies if the caller passes an LLM wrapped in
+        # ``.with_retry()`` (RunnableRetry) or any other RunnableBinding —
+        # deepagents' ``resolve_model()`` tries to hash the model and crashes
+        # with ``unhashable type: 'RunnableRetry'``.  Unwrap to the inner
+        # BaseChatModel here; retry semantics are still applied by the rest
+        # of the wiki-generation pipeline that uses ``self.llm_client``
+        # directly.
+        model = self._unwrap_chat_model(base_model)
 
-        # Create a backend factory that returns FilesystemBackend with virtual_mode=True
-        # This sandboxes all file operations to repo_root
-        repo_root = self.repo_root
-
-        def backend_factory(runtime, root_dir=repo_root):
-            _ = runtime  # runtime intentionally unused
-            try:
-                # virtual_mode=True ensures paths are sandboxed to root_dir
-                return FilesystemBackend(root_dir=root_dir, virtual_mode=True)
-            except TypeError:
-                # Fallback for older versions without virtual_mode
-                return FilesystemBackend(root_dir=root_dir)
+        # Build the FilesystemBackend directly (deepagents 0.5.0+ accepts a
+        # backend instance; the factory pattern is deprecated). virtual_mode=True
+        # sandboxes all file operations to repo_root.
+        try:
+            fs_backend = FilesystemBackend(root_dir=self.repo_root, virtual_mode=True)
+        except TypeError:
+            # Fallback for older deepagents without virtual_mode
+            fs_backend = FilesystemBackend(root_dir=self.repo_root)
 
         # Compute repo-aware symbol cap for the prompt
         from ..agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
@@ -214,7 +243,7 @@ class WikiStructurePlannerEngine:
             model=model,
             tools=output_tools,  # Output tools; FilesystemMiddleware adds fs tools
             system_prompt=system_prompt,
-            backend=backend_factory,
+            backend=fs_backend,
             middleware=custom_middleware,
         )
 
@@ -276,7 +305,7 @@ class WikiStructurePlannerEngine:
                         collector.register_discovered_dirs(dirs)
                         logger.debug(f"[STRUCTURE_PLANNER][COVERAGE] Registered dirs from ls: {dirs[:10]}")
 
-    def plan_structure(self, repo_name: str = "", stream_callback: callable | None = None) -> dict[str, Any]:
+    def plan_structure(self, repo_name: str = "", stream_callback: "callable | None" = None) -> dict[str, Any]:
         """
         Generate a wiki structure plan for the repository.
 
@@ -772,7 +801,7 @@ class WikiStructurePlannerEngine:
         self,
         repo_name: str = "",
         repository_files: list[str] | None = None,
-        stream_callback: callable | None = None,
+        stream_callback: "callable | None" = None,
     ) -> dict[str, Any]:
         """Generate a wiki structure using the graph-first deterministic approach.
 

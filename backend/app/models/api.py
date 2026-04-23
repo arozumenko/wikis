@@ -27,6 +27,10 @@ class GenerateWikiRequest(BaseModel):
     # LLM overrides (optional, falls back to server config)
     llm_model: str | None = None
     embedding_model: str | None = None
+    # Structure planner override (optional, falls back to server config)
+    planner_type: Literal["agent", "cluster"] | None = None
+    # Test exclusion (optional; only honoured when planner_type == "cluster").
+    exclude_tests: bool | None = None
 
     @model_validator(mode="after")
     def _validate_local_path(self) -> GenerateWikiRequest:

@@ -154,110 +154,37 @@ class WikiService:
         return invocation
 
     async def _run_generation(self, invocation: Invocation, request: GenerateWikiRequest) -> None:
-        """Background task: clone → index → generate → store artifacts."""
+        """Background task: clone → index → generate → store artifacts.
+
+        Heavy work (clone / parse / embed / LangGraph page generation) runs in
+        an isolated Python subprocess via :meth:`_run_wiki_subprocess` so the
+        API's event loop stays responsive on large repositories.  This
+        function only orchestrates: spawn, stream progress events, then
+        upload the resulting pages and artifacts.
+        """
         try:
-            from app.core.hybrid_wiki_toolkit_wrapper import HybridWikiToolkitWrapper
             from app.core.repo_providers.factory import RepoProviderFactory
-            from app.services.llm_factory import create_embeddings, create_llm
 
-            await self._emit_progress(invocation, "configuring", 0.05, "Configuring LLM and embeddings")
+            await self._emit_progress(invocation, "configuring", 0.05, "Preparing wiki generation")
 
-            # Build LLM and embeddings
-            llm_overrides = {}
-            if request.llm_model:
-                llm_overrides["model"] = request.llm_model
-            llm = create_llm(self.settings, tier="high", **llm_overrides)
-            llm_low = create_llm(self.settings, tier="low")
-
-            emb_overrides = {}
-            if request.embedding_model:
-                emb_overrides["model"] = request.embedding_model
-            embeddings = create_embeddings(self.settings, **emb_overrides)
-
-            # Build clone config from URL
-            clone_config = RepoProviderFactory.from_url(
-                url=request.repo_url,
-                token=request.access_token,
-                branch=request.branch,
-            )
+            # Resolve generation options (request overrides → config defaults).
+            planner_type = request.planner_type if request.planner_type is not None else self.settings.planner_type
+            # exclude_tests only applies to the cluster planner; agent planner ignores it.
+            if planner_type == "cluster":
+                exclude_tests = (
+                    request.exclude_tests if request.exclude_tests is not None
+                    else self.settings.cluster_exclude_tests
+                )
+            else:
+                exclude_tests = False
 
             await self._emit_progress(invocation, "indexing", 0.1, "Cloning repository and building index")
 
-            # Progress callback for indexing phases
-            def progress_callback(phase: str, progress: float, message: str) -> None:
-                """Sync callback — uses thread-safe emit_sync."""
-                try:
-                    invocation.emit_sync(
-                        events.progress(invocation.id, int(progress * 100), 100, message, phase=phase),
-                    )
-                    invocation.current_phase = phase
-                    invocation.progress = progress
-                    invocation.message = message
-                except Exception:  # noqa: S110
-                    pass  # never break generation for progress reporting
-
-            # Create toolkit and generate
-            toolkit = HybridWikiToolkitWrapper(
-                clone_config=clone_config,
-                llm=llm,
-                embeddings=embeddings,
-                cache_dir=self.settings.cache_dir,
-                force_rebuild_index=request.force_rebuild_index,
-                llm_low=llm_low,
-                progress_callback=progress_callback,
-                max_concurrent_pages=self.settings.llm_max_concurrency,
-            )
-
-            # Token pre-estimation after toolkit init
-            try:
-                from app.services.context_limits import get_context_limit
-
-                _model_name = request.llm_model or self.settings.llm_model or ""
-                estimated = 0
-                # Use toolkit's token counter if available (tiktoken-based)
-                if hasattr(toolkit, "estimate_index_tokens"):
-                    estimated = toolkit.estimate_index_tokens()
-                # Fallback: estimate from index summary char count
-                if not estimated and hasattr(toolkit, "indexer") and toolkit.indexer:
-                    summary = toolkit.get_index_summary() if hasattr(toolkit, "get_index_summary") else {}
-                    total_chars = summary.get("total_chars", 0) if isinstance(summary, dict) else 0
-                    estimated = total_chars // 4
-                if estimated > 0:
-                    invocation.estimated_tokens = estimated
-                    invocation.model_context_limit = get_context_limit(_model_name)
-                    ratio = (
-                        invocation.estimated_tokens / invocation.model_context_limit
-                        if invocation.model_context_limit
-                        else 0
-                    )
-                    if ratio > 0.8:
-                        await invocation.emit(
-                            events.progress(
-                                invocation.id,
-                                20,
-                                100,
-                                (
-                                    f"Large repo: ~{invocation.estimated_tokens:,} estimated tokens "
-                                    f"vs {invocation.model_context_limit:,} context limit "
-                                    f"({ratio:.1f}x). Generation will use ranked truncation."
-                                ),
-                                phase="warning",
-                            )
-                        )
-                        logger.warning(
-                            f"Context pressure ratio {ratio:.2f}x for {request.repo_url} (model={_model_name})"
-                        )
-            except Exception as e:
-                logger.debug(f"Token estimation skipped: {e}")
-
-            await self._emit_progress(invocation, "generating", 0.3, "Generating wiki content")
-
-            # generate_wiki is sync/CPU-bound — run in thread
-            result = await asyncio.to_thread(
-                toolkit.generate_wiki,
-                query=request.wiki_title or "Generate comprehensive wiki",
-                include_research=request.include_research,
-                include_diagrams=request.include_diagrams,
+            result = await self._run_wiki_subprocess(
+                invocation=invocation,
+                request=request,
+                planner_type=planner_type,
+                exclude_tests=exclude_tests,
             )
 
             if result is None or not isinstance(result, dict) or not result.get("success"):
@@ -417,6 +344,128 @@ class WikiService:
         for inv_id in expired:
             del self._invocations[inv_id]
             self._tasks.pop(inv_id, None)
+
+    async def _run_wiki_subprocess(
+        self,
+        invocation: Invocation,
+        request: GenerateWikiRequest,
+        planner_type: str,
+        exclude_tests: bool,
+    ) -> dict:
+        """Run wiki generation in an isolated Python subprocess.
+
+        Offloads the entire heavy pipeline (clone → parse → embed → LangGraph
+        page generation) out of the uvicorn process so the event loop stays
+        responsive regardless of repo size.  Progress events are streamed
+        back line-by-line via the subprocess's stdout.
+        """
+        import base64
+        import json
+        import os
+        import sys
+        import tempfile
+
+        payload = {
+            "invocation_id": invocation.id,
+            "repo_url": request.repo_url,
+            "branch": request.branch,
+            "access_token": request.access_token,
+            "wiki_title": request.wiki_title,
+            "include_research": request.include_research,
+            "include_diagrams": request.include_diagrams,
+            "force_rebuild_index": request.force_rebuild_index,
+            "llm_model": request.llm_model,
+            "embedding_model": request.embedding_model,
+            "planner_type": planner_type,
+            "exclude_tests": exclude_tests,
+        }
+
+        with tempfile.TemporaryDirectory(prefix="wiki-run-") as tmp:
+            input_path = os.path.join(tmp, "input.json")
+            output_path = os.path.join(tmp, "output.json")
+            with open(input_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-u",  # unbuffered stdout — lines reach us promptly
+                "-m",
+                "app.core.wiki_runner",
+                "--input",
+                input_path,
+                "--output",
+                output_path,
+                stdout=asyncio.subprocess.PIPE,
+                # stderr inherits the parent's fd so logging lands in docker logs.
+            )
+
+            async def _pump_stdout() -> None:
+                assert proc.stdout is not None
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        return
+                    try:
+                        ev = json.loads(line.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError:
+                        # Stray non-JSON line — ignore, it'll show up in docker logs via stderr.
+                        continue
+                    kind = ev.get("t")
+                    if kind == "progress":
+                        await self._emit_progress(
+                            invocation,
+                            ev.get("phase") or "",
+                            float(ev.get("progress") or 0.0),
+                            ev.get("message") or "",
+                        )
+                    elif kind == "token_estimate":
+                        invocation.estimated_tokens = ev.get("estimated_tokens")
+                        invocation.model_context_limit = ev.get("model_context_limit")
+                        if invocation.estimated_tokens and invocation.model_context_limit:
+                            ratio = invocation.estimated_tokens / invocation.model_context_limit
+                            if ratio > 0.8:
+                                await invocation.emit(
+                                    events.progress(
+                                        invocation.id,
+                                        int(invocation.progress * 100) or 20,
+                                        100,
+                                        (
+                                            f"Large repo: ~{invocation.estimated_tokens:,} estimated tokens "
+                                            f"vs {invocation.model_context_limit:,} context limit "
+                                            f"({ratio:.1f}x). Generation will use ranked truncation."
+                                        ),
+                                        phase="warning",
+                                    )
+                                )
+                                logger.warning(
+                                    "Context pressure ratio %.2fx for %s", ratio, request.repo_url,
+                                )
+
+            try:
+                await asyncio.gather(_pump_stdout(), proc.wait())
+            except asyncio.CancelledError:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                raise
+
+            try:
+                with open(output_path, encoding="utf-8") as f:
+                    result = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Wiki runner produced no result file (exit={proc.returncode}): {exc}"
+                ) from exc
+
+            # Decode base64-wrapped artifact bytes back to ``bytes``.
+            for art in result.get("artifacts") or []:
+                if art.pop("_b64", False) and isinstance(art.get("data"), str):
+                    art["data"] = base64.b64decode(art["data"])
+
+            return result
 
     @staticmethod
     async def _emit_progress(invocation: Invocation, phase: str, progress: float, message: str) -> None:

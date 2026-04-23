@@ -74,6 +74,7 @@ class PageSpec(BaseModel):
     target_folders: list[str] = Field(default_factory=list)  # Folders in repo this page references
     key_files: list[str] = Field(default_factory=list)  # Specific files this page will reference
     retrieval_query: str = Field(default="")  # Fallback query for vector store retrieval (documentation files)
+    metadata: dict[str, Any] = Field(default_factory=dict)  # Planner-specific metadata (cluster ids, node lists)
 
 
 class SectionSpec(BaseModel):
@@ -159,6 +160,11 @@ class WikiState(DictAccessMixin, BaseModel):
     page_budget: int | None = None  # Adaptive page budget (min 5, max 55)
     page_budget_justification: str | None = None  # Reasoning from LLM for budget
     budget_compression_recommendation: str | None = None  # If compression / consolidation recommended
+
+    # Generation options (from API request / config defaults)
+    planner_type: str = "agent"  # agent | cluster
+    exclude_tests: bool = False  # soft-skip test nodes during clustering
+    unified_db: Any | None = None  # UnifiedWikiDB instance (set by agent)
 
     # Wiki structure planning (LLM-driven)
     wiki_structure_spec: WikiStructureSpec | None = None

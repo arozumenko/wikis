@@ -16,9 +16,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
+                  "additionalProperties": true,
                   "type": "object",
                   "title": "Response Health Health Get"
                 }
@@ -71,6 +69,16 @@
               }
             }
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -79,7 +87,7 @@
                 }
               }
             },
-            "description": "Unprocessable Content"
+            "description": "Unprocessable Entity"
           }
         }
       }
@@ -421,6 +429,470 @@
         }
       }
     },
+    "/api/v1/wikis/{wiki_id}": {
+      "get": {
+        "summary": "Get Wiki",
+        "description": "Get wiki detail with pages and their content.",
+        "operationId": "get_wiki_api_v1_wikis__wiki_id__get",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Wiki Api V1 Wikis  Wiki Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Wiki",
+        "operationId": "delete_wiki_api_v1_wikis__wiki_id__delete",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteWikiResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/{wiki_id}/search": {
+      "get": {
+        "summary": "Search Wiki",
+        "description": "Full-text search over wiki pages with graph-expansion re-ranking.",
+        "operationId": "search_wiki_api_v1_wikis__wiki_id__search_get",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Q"
+            }
+          },
+          {
+            "name": "hop_depth",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 5,
+              "minimum": 1,
+              "default": 1,
+              "title": "Hop Depth"
+            }
+          },
+          {
+            "name": "top_k",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 10,
+              "title": "Top K"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiSearchResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/{wiki_id}/pages": {
+      "get": {
+        "summary": "List Wiki Pages",
+        "description": "List all pages in a wiki with their titles and descriptions.",
+        "operationId": "list_wiki_pages_api_v1_wikis__wiki_id__pages_get",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiPageListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/{wiki_id}/pages/{page_title}/neighbors": {
+      "get": {
+        "summary": "Get Page Neighbors",
+        "description": "Return the wikilink graph neighborhood for a single wiki page.",
+        "operationId": "get_page_neighbors_api_v1_wikis__wiki_id__pages__page_title__neighbors_get",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "page_title",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Page Title"
+            }
+          },
+          {
+            "name": "hop_depth",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 5,
+              "minimum": 1,
+              "default": 1,
+              "title": "Hop Depth"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PageNeighborsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/{wiki_id}/pages/{page_title}": {
+      "get": {
+        "summary": "Get Wiki Page By Title",
+        "description": "Return the full content of a single wiki page identified by its title.",
+        "operationId": "get_wiki_page_by_title_api_v1_wikis__wiki_id__pages__page_title__get",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "page_title",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Page Title"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiPageResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/{wiki_id}/pages/{page_id}": {
+      "get": {
+        "summary": "Get Wiki Page",
+        "description": "Get a single wiki page content. page_id can be section/page format.",
+        "operationId": "get_wiki_page_api_v1_wikis__wiki_id__pages__page_id__get",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "page_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Page Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Wiki Page Api V1 Wikis  Wiki Id  Pages  Page Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/wikis/{wiki_id}/resume": {
       "post": {
         "summary": "Resume Wiki",
@@ -476,10 +948,11 @@
         }
       }
     },
-    "/api/v1/wikis/{wiki_id}/refresh": {
-      "post": {
-        "summary": "Refresh Wiki",
-        "operationId": "refresh_wiki_api_v1_wikis__wiki_id__refresh_post",
+    "/api/v1/wikis/{wiki_id}/qa": {
+      "get": {
+        "summary": "List Qa",
+        "description": "Paginated Q&A history for a wiki.",
+        "operationId": "list_qa_api_v1_wikis__wiki_id__qa_get",
         "parameters": [
           {
             "name": "wiki_id",
@@ -488,6 +961,51 @@
             "schema": {
               "type": "string",
               "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "pending",
+                    "validated",
+                    "rejected",
+                    "enriched",
+                    "stale"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
             }
           },
           {
@@ -508,12 +1026,12 @@
           }
         ],
         "responses": {
-          "202": {
+          "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenerateWikiResponse"
+                  "$ref": "#/components/schemas/QAListResponse"
                 }
               }
             }
@@ -531,10 +1049,11 @@
         }
       }
     },
-    "/api/v1/wikis/{wiki_id}": {
-      "delete": {
-        "summary": "Delete Wiki",
-        "operationId": "delete_wiki_api_v1_wikis__wiki_id__delete",
+    "/api/v1/wikis/{wiki_id}/qa/stats": {
+      "get": {
+        "summary": "Qa Stats",
+        "description": "QA statistics for a wiki.",
+        "operationId": "qa_stats_api_v1_wikis__wiki_id__qa_stats_get",
         "parameters": [
           {
             "name": "wiki_id",
@@ -568,7 +1087,1003 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DeleteWikiResponse"
+                  "$ref": "#/components/schemas/QAStatsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/{wiki_id}/refresh": {
+      "post": {
+        "summary": "Refresh Wiki",
+        "operationId": "refresh_wiki_api_v1_wikis__wiki_id__refresh_post",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshWikiRequest",
+                "default": {}
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerateWikiResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/{wiki_id}/visibility": {
+      "patch": {
+        "summary": "Update Wiki Visibility",
+        "description": "Change a wiki's visibility between 'personal' and 'shared'.",
+        "operationId": "update_wiki_visibility_api_v1_wikis__wiki_id__visibility_patch",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWikiVisibilityRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiSummary"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/{wiki_id}/description": {
+      "patch": {
+        "summary": "Update Wiki Description",
+        "description": "Update the user-provided description for a wiki.",
+        "operationId": "update_wiki_description_api_v1_wikis__wiki_id__description_patch",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWikiDescriptionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Update Wiki Description Api V1 Wikis  Wiki Id  Description Patch"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/{wiki_id}/export": {
+      "get": {
+        "summary": "Export Wiki",
+        "description": "Export a wiki as a downloadable ZIP archive.\n\nSupports two formats:\n- ``obsidian`` \u2014 Obsidian vault layout with YAML frontmatter\n- ``wikis`` \u2014 Wikis-to-Wikis bundle for re-importing into another instance",
+        "operationId": "export_wiki_api_v1_wikis__wiki_id__export_get",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Export format: 'obsidian' or 'wikis'",
+              "default": "obsidian",
+              "title": "Format"
+            },
+            "description": "Export format: 'obsidian' or 'wikis'"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "application/zip": {}
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/import": {
+      "post": {
+        "summary": "Import Wiki",
+        "description": "Import a wiki from a ``.wikiexport`` bundle produced by the wikis export.",
+        "operationId": "import_wiki_api_v1_wikis_import_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_import_wiki_api_v1_wikis_import_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiSummary"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          }
+        }
+      }
+    },
+    "/api/v1/projects": {
+      "post": {
+        "summary": "Create Project",
+        "operationId": "create_project_api_v1_projects_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List Projects",
+        "operationId": "list_projects_api_v1_projects_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{project_id}": {
+      "get": {
+        "summary": "Get Project",
+        "operationId": "get_project_api_v1_projects__project_id__get",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update Project",
+        "operationId": "update_project_api_v1_projects__project_id__patch",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectUpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Project",
+        "operationId": "delete_project_api_v1_projects__project_id__delete",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{project_id}/wikis": {
+      "post": {
+        "summary": "Add Wiki To Project",
+        "operationId": "add_wiki_to_project_api_v1_projects__project_id__wikis_post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectAddWikiRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List Project Wikis",
+        "operationId": "list_project_wikis_api_v1_projects__project_id__wikis_get",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{project_id}/wikis/{wiki_id}": {
+      "delete": {
+        "summary": "Remove Wiki From Project",
+        "operationId": "remove_wiki_from_project_api_v1_projects__project_id__wikis__wiki_id__delete",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{project_id}/search": {
+      "get": {
+        "summary": "Search Project",
+        "description": "Full-text search over all wiki pages in a project with graph-expansion re-ranking.",
+        "operationId": "search_project_api_v1_projects__project_id__search_get",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Q"
+            }
+          },
+          {
+            "name": "hop_depth",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 5,
+              "minimum": 1,
+              "default": 1,
+              "title": "Hop Depth"
+            }
+          },
+          {
+            "name": "top_k",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 10,
+              "title": "Top K"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectSearchResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{project_id}/map": {
+      "post": {
+        "summary": "Project Codemap",
+        "description": "Build a code-map for all wikis in a project.\n\nProxies to the codemap pipeline with ``project_id`` set and\n``research_type=codemap``.",
+        "operationId": "project_codemap_api_v1_projects__project_id__map_post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "accept",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "application/json",
+              "title": "Accept"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/_ProjectCodeMapRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResearchResponse"
                 }
               }
             }
@@ -611,8 +2126,28 @@
         "description": "Request to ask a question about a wiki.",
         "properties": {
           "wiki_id": {
-            "title": "Wiki Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Wiki Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
           },
           "question": {
             "title": "Question",
@@ -632,7 +2167,6 @@
           }
         },
         "required": [
-          "wiki_id",
           "question"
         ],
         "title": "AskRequest",
@@ -651,12 +2185,81 @@
             },
             "title": "Sources",
             "type": "array"
+          },
+          "tool_steps": {
+            "default": 0,
+            "title": "Tool Steps",
+            "type": "integer"
+          },
+          "qa_id": {
+            "default": "",
+            "title": "Qa Id",
+            "type": "string"
           }
         },
         "required": [
           "answer"
         ],
         "title": "AskResponse",
+        "type": "object"
+      },
+      "Body_import_wiki_api_v1_wikis_import_post": {
+        "properties": {
+          "bundle": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "Bundle"
+          }
+        },
+        "type": "object",
+        "required": [
+          "bundle"
+        ],
+        "title": "Body_import_wiki_api_v1_wikis_import_post"
+      },
+      "CallStack": {
+        "description": "A named call-flow chain, e.g. 'Frontend Auth' or 'MCP Auth'.",
+        "properties": {
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/$defs/CallStackStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "CallStack",
+        "type": "object"
+      },
+      "CallStackStep": {
+        "description": "One step in a call stack chain.",
+        "properties": {
+          "symbol": {
+            "title": "Symbol",
+            "type": "string"
+          },
+          "file_path": {
+            "default": "",
+            "title": "File Path",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol"
+        ],
+        "title": "CallStackStep",
         "type": "object"
       },
       "ChatMessage": {
@@ -678,6 +2281,121 @@
         "title": "ChatMessage",
         "type": "object"
       },
+      "CodeMapData": {
+        "description": "Hierarchical call-tree for the code-map right panel.",
+        "properties": {
+          "summary": {
+            "default": "",
+            "title": "Summary",
+            "type": "string"
+          },
+          "call_stacks": {
+            "items": {
+              "$ref": "#/$defs/CallStack"
+            },
+            "title": "Call Stacks",
+            "type": "array"
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/$defs/CodeMapSection"
+            },
+            "title": "Sections",
+            "type": "array"
+          }
+        },
+        "title": "CodeMapData",
+        "type": "object"
+      },
+      "CodeMapSection": {
+        "description": "A top-level section in the call-tree (usually one source file).",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "file_path": {
+            "default": "",
+            "title": "File Path",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "symbols": {
+            "items": {
+              "$ref": "#/$defs/CodeMapSymbol"
+            },
+            "title": "Symbols",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "title"
+        ],
+        "title": "CodeMapSection",
+        "type": "object"
+      },
+      "CodeMapSymbol": {
+        "description": "A single symbol (function / class / variable) shown as a leaf in the tree.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "symbol_type": {
+            "default": "",
+            "title": "Symbol Type",
+            "type": "string"
+          },
+          "file_path": {
+            "default": "",
+            "title": "File Path",
+            "type": "string"
+          },
+          "line_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Line Start"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "relationships": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Relationships",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "CodeMapSymbol",
+        "type": "object"
+      },
       "DeleteWikiResponse": {
         "description": "Response after deleting a wiki.",
         "properties": {
@@ -688,6 +2406,18 @@
           "wiki_id": {
             "title": "Wiki Id",
             "type": "string"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Message"
           }
         },
         "required": [
@@ -784,6 +2514,11 @@
             "title": "Force Rebuild Index",
             "type": "boolean"
           },
+          "visibility": {
+            "default": "personal",
+            "title": "Visibility",
+            "type": "string"
+          },
           "llm_model": {
             "anyOf": [
               {
@@ -808,10 +2543,33 @@
             "default": null,
             "title": "Embedding Model"
           },
-          "visibility": {
-            "default": "personal",
-            "title": "Visibility",
-            "type": "string"
+          "planner_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "agent",
+                  "cluster"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Planner Type"
+          },
+          "exclude_tests": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Exclude Tests"
           }
         },
         "required": [
@@ -897,6 +2655,21 @@
           "wiki_id": {
             "type": "string",
             "title": "Wiki Id"
+          },
+          "repo_url": {
+            "type": "string",
+            "title": "Repo Url",
+            "default": ""
+          },
+          "branch": {
+            "type": "string",
+            "title": "Branch",
+            "default": ""
+          },
+          "owner_id": {
+            "type": "string",
+            "title": "Owner Id",
+            "default": ""
           },
           "status": {
             "type": "string",
@@ -993,12 +2766,501 @@
         "title": "Invocation",
         "description": "Tracks the state of a background wiki generation job."
       },
+      "PageListItem": {
+        "properties": {
+          "page_title": {
+            "type": "string",
+            "title": "Page Title"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "section": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section"
+          }
+        },
+        "type": "object",
+        "required": [
+          "page_title",
+          "description"
+        ],
+        "title": "PageListItem",
+        "description": "A brief description of a single wiki page, used in list responses."
+      },
+      "PageNeighbor": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "rel": {
+            "type": "string",
+            "enum": [
+              "links_to",
+              "linked_from"
+            ],
+            "title": "Rel"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "rel"
+        ],
+        "title": "PageNeighbor",
+        "description": "A neighboring wiki page with its relationship direction."
+      },
+      "PageNeighborsResponse": {
+        "properties": {
+          "wiki_id": {
+            "type": "string",
+            "title": "Wiki Id"
+          },
+          "page_title": {
+            "type": "string",
+            "title": "Page Title"
+          },
+          "links_to": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Links To"
+          },
+          "linked_from": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Linked From"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wiki_id",
+          "page_title",
+          "links_to",
+          "linked_from"
+        ],
+        "title": "PageNeighborsResponse",
+        "description": "Response containing the neighbor graph for a single wiki page."
+      },
+      "ProjectAddWikiRequest": {
+        "properties": {
+          "wiki_id": {
+            "type": "string",
+            "title": "Wiki Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wiki_id"
+        ],
+        "title": "ProjectAddWikiRequest",
+        "description": "Request to add a wiki to a project."
+      },
+      "ProjectCreateRequest": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "personal",
+              "shared"
+            ],
+            "title": "Visibility",
+            "default": "personal"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "ProjectCreateRequest",
+        "description": "Request to create a new project."
+      },
+      "ProjectListResponse": {
+        "properties": {
+          "projects": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectResponse"
+            },
+            "type": "array",
+            "title": "Projects"
+          }
+        },
+        "type": "object",
+        "required": [
+          "projects"
+        ],
+        "title": "ProjectListResponse",
+        "description": "Response listing all projects."
+      },
+      "ProjectResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "visibility": {
+            "type": "string",
+            "title": "Visibility"
+          },
+          "owner_id": {
+            "type": "string",
+            "title": "Owner Id"
+          },
+          "is_owner": {
+            "type": "boolean",
+            "title": "Is Owner",
+            "default": false
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "wiki_count": {
+            "type": "integer",
+            "title": "Wiki Count",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "visibility",
+          "owner_id",
+          "created_at"
+        ],
+        "title": "ProjectResponse",
+        "description": "Response for a single project."
+      },
+      "ProjectSearchResponse": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/SearchResultItem"
+            },
+            "type": "array",
+            "title": "Results"
+          },
+          "wiki_summary": {
+            "items": {
+              "$ref": "#/components/schemas/WikiSummaryItem"
+            },
+            "type": "array",
+            "title": "Wiki Summary"
+          }
+        },
+        "type": "object",
+        "required": [
+          "query",
+          "results",
+          "wiki_summary"
+        ],
+        "title": "ProjectSearchResponse",
+        "description": "Response for a search scoped to all wikis in a project."
+      },
+      "ProjectUpdateRequest": {
+        "properties": {
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "visibility": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "personal",
+                  "shared"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visibility"
+          }
+        },
+        "type": "object",
+        "title": "ProjectUpdateRequest",
+        "description": "Request to update an existing project."
+      },
+      "QAListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/QARecordResponse"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Total"
+          },
+          "limit": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Offset"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "limit",
+          "offset"
+        ],
+        "title": "QAListResponse",
+        "description": "Paginated QA list response."
+      },
+      "QARecordResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "wiki_id": {
+            "type": "string",
+            "title": "Wiki Id"
+          },
+          "question": {
+            "type": "string",
+            "title": "Question"
+          },
+          "answer": {
+            "type": "string",
+            "title": "Answer"
+          },
+          "sources_json": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sources Json"
+          },
+          "tool_steps": {
+            "type": "integer",
+            "title": "Tool Steps",
+            "default": 0
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "fast",
+              "deep"
+            ],
+            "title": "Mode",
+            "default": "fast"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "validated",
+              "rejected",
+              "enriched",
+              "stale"
+            ],
+            "title": "Status",
+            "default": "pending"
+          },
+          "is_cache_hit": {
+            "type": "boolean",
+            "title": "Is Cache Hit",
+            "default": false
+          },
+          "has_context": {
+            "type": "boolean",
+            "title": "Has Context",
+            "default": false
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "wiki_id",
+          "question",
+          "answer"
+        ],
+        "title": "QARecordResponse",
+        "description": "Single QA record in API responses."
+      },
+      "QAStatsResponse": {
+        "properties": {
+          "total_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Total Count"
+          },
+          "cache_hit_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cache Hit Count"
+          },
+          "validated_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Validated Count"
+          },
+          "rejected_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Rejected Count"
+          },
+          "hit_rate": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Hit Rate"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total_count",
+          "cache_hit_count",
+          "validated_count",
+          "rejected_count",
+          "hit_rate"
+        ],
+        "title": "QAStatsResponse",
+        "description": "QA statistics response."
+      },
+      "RefreshWikiRequest": {
+        "properties": {
+          "access_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Access Token"
+          }
+        },
+        "type": "object",
+        "title": "RefreshWikiRequest",
+        "description": "Request body for wiki refresh \u2014 allows passing an access token for private repos."
+      },
       "ResearchRequest": {
         "description": "Request to perform deep research on a wiki.",
         "properties": {
           "wiki_id": {
-            "title": "Wiki Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Wiki Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
           },
           "question": {
             "title": "Question",
@@ -1009,14 +3271,15 @@
             "title": "Research Type",
             "type": "string"
           },
-          "enable_subagents": {
-            "default": true,
-            "title": "Enable Subagents",
-            "type": "boolean"
+          "chat_history": {
+            "items": {
+              "$ref": "#/components/schemas/ChatMessage"
+            },
+            "title": "Chat History",
+            "type": "array"
           }
         },
         "required": [
-          "wiki_id",
           "question"
         ],
         "title": "ResearchRequest",
@@ -1052,7 +3315,7 @@
                 "type": "null"
               }
             ],
-            "title": "Code Map"
+            "default": null
           }
         },
         "required": [
@@ -1060,6 +3323,48 @@
         ],
         "title": "ResearchResponse",
         "type": "object"
+      },
+      "SearchResultItem": {
+        "properties": {
+          "wiki_id": {
+            "type": "string",
+            "title": "Wiki Id"
+          },
+          "wiki_name": {
+            "type": "string",
+            "title": "Wiki Name"
+          },
+          "page_title": {
+            "type": "string",
+            "title": "Page Title"
+          },
+          "snippet": {
+            "type": "string",
+            "title": "Snippet"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          },
+          "neighbors": {
+            "items": {
+              "$ref": "#/components/schemas/PageNeighbor"
+            },
+            "type": "array",
+            "title": "Neighbors"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wiki_id",
+          "wiki_name",
+          "page_title",
+          "snippet",
+          "score",
+          "neighbors"
+        ],
+        "title": "SearchResultItem",
+        "description": "A single search result item from a wiki page."
       },
       "SourceReference": {
         "description": "A reference to a source code location.",
@@ -1103,6 +3408,66 @@
             ],
             "default": null,
             "title": "Snippet"
+          },
+          "symbol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Symbol"
+          },
+          "symbol_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Symbol Type"
+          },
+          "relevance_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Relevance Score"
+          },
+          "wiki_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Wiki Id"
+          },
+          "wiki_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Wiki Title"
           }
         },
         "required": [
@@ -1110,6 +3475,38 @@
         ],
         "title": "SourceReference",
         "type": "object"
+      },
+      "UpdateWikiDescriptionRequest": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "title": "UpdateWikiDescriptionRequest",
+        "description": "Request to update the description of a wiki."
+      },
+      "UpdateWikiVisibilityRequest": {
+        "properties": {
+          "visibility": {
+            "type": "string",
+            "title": "Visibility"
+          }
+        },
+        "type": "object",
+        "required": [
+          "visibility"
+        ],
+        "title": "UpdateWikiVisibilityRequest",
+        "description": "Request to update the visibility of a wiki."
       },
       "ValidationError": {
         "properties": {
@@ -1164,6 +3561,90 @@
         },
         "title": "WikiListResponse",
         "type": "object"
+      },
+      "WikiPageListResponse": {
+        "properties": {
+          "wiki_id": {
+            "type": "string",
+            "title": "Wiki Id"
+          },
+          "pages": {
+            "items": {
+              "$ref": "#/components/schemas/PageListItem"
+            },
+            "type": "array",
+            "title": "Pages"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wiki_id",
+          "pages"
+        ],
+        "title": "WikiPageListResponse",
+        "description": "Response listing all pages in a wiki."
+      },
+      "WikiPageResponse": {
+        "properties": {
+          "wiki_id": {
+            "type": "string",
+            "title": "Wiki Id"
+          },
+          "page_title": {
+            "type": "string",
+            "title": "Page Title"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          },
+          "sections": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sections"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wiki_id",
+          "page_title",
+          "content",
+          "sections"
+        ],
+        "title": "WikiPageResponse",
+        "description": "Response containing full content of a single wiki page."
+      },
+      "WikiSearchResponse": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/SearchResultItem"
+            },
+            "type": "array",
+            "title": "Results"
+          },
+          "wiki_summary": {
+            "items": {
+              "$ref": "#/components/schemas/WikiSummaryItem"
+            },
+            "type": "array",
+            "title": "Wiki Summary"
+          }
+        },
+        "type": "object",
+        "required": [
+          "query",
+          "results",
+          "wiki_summary"
+        ],
+        "title": "WikiSearchResponse",
+        "description": "Response for a search scoped to a single wiki."
       },
       "WikiSummary": {
         "description": "Summary of a generated wiki.",
@@ -1278,6 +3759,18 @@
             "default": false,
             "title": "Requires Token",
             "type": "boolean"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Description"
           }
         },
         "required": [
@@ -1290,6 +3783,49 @@
         ],
         "title": "WikiSummary",
         "type": "object"
+      },
+      "WikiSummaryItem": {
+        "properties": {
+          "wiki_id": {
+            "type": "string",
+            "title": "Wiki Id"
+          },
+          "wiki_name": {
+            "type": "string",
+            "title": "Wiki Name"
+          },
+          "match_count": {
+            "type": "integer",
+            "title": "Match Count"
+          },
+          "relevance": {
+            "type": "number",
+            "title": "Relevance"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wiki_id",
+          "wiki_name",
+          "match_count",
+          "relevance"
+        ],
+        "title": "WikiSummaryItem",
+        "description": "Per-wiki aggregate summary within a search response."
+      },
+      "_ProjectCodeMapRequest": {
+        "properties": {
+          "question": {
+            "type": "string",
+            "title": "Question"
+          }
+        },
+        "type": "object",
+        "required": [
+          "question"
+        ],
+        "title": "_ProjectCodeMapRequest",
+        "description": "Request body for the project code-map endpoint."
       },
       "SSEEvent": {
         "description": "Generic SSE event wrapper.",
@@ -1421,6 +3957,45 @@
             "default": false,
             "title": "Recoverable",
             "type": "boolean"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Type"
+          },
+          "model_limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Limit"
+          },
+          "suggested_actions": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Suggested Actions"
           }
         },
         "required": [
@@ -1428,155 +4003,6 @@
         ],
         "title": "ErrorEvent",
         "type": "object"
-      },
-      "CodeMapSymbol": {
-        "type": "object",
-        "title": "CodeMapSymbol",
-        "required": [
-          "id",
-          "name"
-        ],
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id"
-          },
-          "name": {
-            "type": "string",
-            "title": "Name"
-          },
-          "symbol_type": {
-            "type": "string",
-            "title": "Symbol Type",
-            "default": ""
-          },
-          "file_path": {
-            "type": "string",
-            "title": "File Path",
-            "default": ""
-          },
-          "line_start": {
-            "anyOf": [
-              { "type": "integer" },
-              { "type": "null" }
-            ],
-            "title": "Line Start"
-          },
-          "description": {
-            "type": "string",
-            "title": "Description",
-            "default": ""
-          },
-          "relationships": {
-            "type": "array",
-            "items": { "type": "string" },
-            "title": "Relationships",
-            "default": []
-          }
-        }
-      },
-      "CodeMapSection": {
-        "type": "object",
-        "title": "CodeMapSection",
-        "required": [
-          "id",
-          "title"
-        ],
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id"
-          },
-          "title": {
-            "type": "string",
-            "title": "Title"
-          },
-          "file_path": {
-            "type": "string",
-            "title": "File Path",
-            "default": ""
-          },
-          "description": {
-            "type": "string",
-            "title": "Description",
-            "default": ""
-          },
-          "symbols": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CodeMapSymbol"
-            },
-            "title": "Symbols",
-            "default": []
-          }
-        }
-      },
-      "CodeMapData": {
-        "type": "object",
-        "title": "CodeMapData",
-        "properties": {
-          "summary": {
-            "type": "string",
-            "title": "Summary",
-            "default": ""
-          },
-          "call_stacks": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CallStack"
-            },
-            "title": "Call Stacks",
-            "default": []
-          },
-          "sections": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CodeMapSection"
-            },
-            "title": "Sections",
-            "default": []
-          }
-        }
-      },
-      "CallStackStep": {
-        "type": "object",
-        "title": "CallStackStep",
-        "required": ["symbol"],
-        "properties": {
-          "symbol": {
-            "type": "string",
-            "title": "Symbol"
-          },
-          "file_path": {
-            "type": "string",
-            "title": "File Path",
-            "default": ""
-          },
-          "description": {
-            "type": "string",
-            "title": "Description",
-            "default": ""
-          }
-        }
-      },
-      "CallStack": {
-        "type": "object",
-        "title": "CallStack",
-        "required": ["title"],
-        "properties": {
-          "title": {
-            "type": "string",
-            "title": "Title"
-          },
-          "steps": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CallStackStep"
-            },
-            "title": "Steps",
-            "default": []
-          }
-        }
       }
     }
   }

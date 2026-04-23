@@ -113,10 +113,19 @@ async def build_multi_wiki_components(
     # Build a MultiGraphQueryService so all tools search across every wiki
     from app.core.code_graph.graph_query_service import GraphQueryService
     from app.core.code_graph.multi_graph_query_service import MultiGraphQueryService
+    from app.core.code_graph.storage_query_service import StorageQueryService
+    from app.core.storage.text_index import StorageTextIndex
 
     individual_services = {}
     for wid, comp in loaded.items():
-        if comp.code_graph is not None:
+        # Prefer storage-native service; fall back to NX graph when only that exists.
+        if comp.query_service is not None:
+            individual_services[wid] = comp.query_service
+        elif comp.storage is not None:
+            individual_services[wid] = StorageQueryService(
+                comp.storage, text_index=StorageTextIndex(comp.storage)
+            )
+        elif comp.code_graph is not None:
             fts = comp.graph_manager.fts_index if comp.graph_manager else None
             individual_services[wid] = GraphQueryService(comp.code_graph, fts_index=fts)
 

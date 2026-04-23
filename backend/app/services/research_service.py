@@ -37,7 +37,11 @@ _INTERESTING_REL_TYPES = frozenset({
 # Symbol types to exclude (file-level containers add no tree value)
 _EXCLUDE_SYMBOL_TYPES = frozenset({"file", "module", "package", "directory"})
 
-_MAX_NEIGHBORS_PER_SEED = 15
+# Multi-hop traversal: depth 2 lets us see callee-of-callee chains
+# (e.g. ``format_to → vformat_to → format_handler``) without exploding the
+# tree.  ``_MAX_NEIGHBORS_PER_SEED`` is bumped to absorb the extra hop.
+_CALL_TREE_MAX_DEPTH = 2
+_MAX_NEIGHBORS_PER_SEED = 30
 _MAX_SECTIONS = 8
 _MAX_SYMBOLS_PER_SECTION = 8
 
@@ -98,32 +102,74 @@ def _build_call_tree_from_sources(
 
     # --- Resolve ask sources to graph seeds ---
     seed_node_ids: list[str] = []
+    storage = getattr(gqs, "storage", None)  # available on StorageQueryService
     for src in sources:
         node_id: str | None = None
-        # Try resolving by symbol name first (most precise)
+        # Try resolving by symbol name first (most precise).  When the symbol
+        # is qualified (e.g. ``fmt::format_to`` or ``Pkg.Mod.func``), also
+        # retry with the simple trailing name — many graphs index symbols
+        # under the unqualified name with the qualifier living in
+        # ``parent_symbol``.
         if src.symbol:
-            node_id = gqs.resolve_symbol(src.symbol, file_path=src.file_path or "")
-        # Fall back to searching by file path for any symbol in that file
-        if not node_id and src.file_path:
-            file_hits = gqs.search(
-                os.path.basename(src.file_path),
-                k=5,
-                exclude_types=_EXCLUDE_SYMBOL_TYPES,
+            node_id = gqs.resolve_symbol(
+                src.symbol, file_path=src.file_path or ""
             )
-            for hit in file_hits:
-                hit_fp = hit.rel_path or hit.file_path
-                if hit_fp and src.file_path in hit_fp:
-                    node_id = hit.node_id
-                    break
+            if not node_id:
+                simple = src.symbol.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
+                if simple and simple != src.symbol:
+                    node_id = gqs.resolve_symbol(
+                        simple, file_path=src.file_path or ""
+                    )
+
+        # Fall back to picking any architectural symbol declared in the same
+        # file.  Prefer a direct path-prefix lookup against storage (matches
+        # paths exactly); fall back to FTS basename search for legacy
+        # NetworkX-only graphs.
+        if not node_id and src.file_path:
+            file_hits: list = []
+            if storage is not None:
+                try:
+                    rows = storage.get_nodes_by_path_prefix(
+                        src.file_path, limit=20,
+                    )
+                    for row in rows:
+                        stype = (row.get("symbol_type") or "").lower()
+                        if stype in _EXCLUDE_SYMBOL_TYPES:
+                            continue
+                        nid = row.get("node_id")
+                        if nid:
+                            node_id = nid
+                            break
+                except Exception:
+                    logger.debug(
+                        "Codemap: path-prefix lookup failed for %s",
+                        src.file_path,
+                        exc_info=True,
+                    )
+            if not node_id:
+                file_hits = gqs.search(
+                    os.path.basename(src.file_path),
+                    k=5,
+                    exclude_types=_EXCLUDE_SYMBOL_TYPES,
+                )
+                for hit in file_hits:
+                    hit_fp = hit.rel_path or hit.file_path
+                    if hit_fp and src.file_path in hit_fp:
+                        node_id = hit.node_id
+                        break
         if node_id and node_id not in seed_node_ids:
             seed_node_ids.append(node_id)
 
+    logger.info(
+        "Codemap: resolved %d/%d ask sources to graph seeds",
+        len(seed_node_ids), len(sources),
+    )
     if not seed_node_ids:
         return None
 
     # --- Expand each seed via graph traversal (1-hop, call-flow edges only) ---
     for node_id in seed_node_ids:
-        data = gqs.graph.nodes.get(node_id, {})
+        data = gqs.get_node(node_id) or {}
         name = data.get("symbol_name", "") or data.get("name", "")
         sym_type = (data.get("symbol_type") or "").lower()
         if sym_type in _EXCLUDE_SYMBOL_TYPES:
@@ -134,7 +180,7 @@ def _build_call_tree_from_sources(
         _ensure_sym(node_id, name, sym_type, fp, line)
 
         rels = gqs.get_relationships(
-            node_id, direction="both", max_depth=1,
+            node_id, direction="both", max_depth=_CALL_TREE_MAX_DEPTH,
             max_results=_MAX_NEIGHBORS_PER_SEED,
         )
         for rel in rels:
@@ -149,8 +195,8 @@ def _build_call_tree_from_sources(
                 continue
 
             # Skip file/module/package containers and generic symbols
-            src_data = gqs.graph.nodes.get(src_raw, {})
-            tgt_data = gqs.graph.nodes.get(tgt_raw, {})
+            src_data = gqs.get_node(src_raw) or {}
+            tgt_data = gqs.get_node(tgt_raw) or {}
             src_type = (src_data.get("symbol_type") or "").lower()
             tgt_type = (tgt_data.get("symbol_type") or "").lower()
             if src_type in _EXCLUDE_SYMBOL_TYPES or tgt_type in _EXCLUDE_SYMBOL_TYPES:
@@ -188,7 +234,19 @@ def _build_call_tree_from_sources(
                     rels_list.append(rel_str)
 
     if not file_symbols:
+        logger.info(
+            "Codemap: traversal yielded no symbols from %d seed(s) — "
+            "all neighbors filtered as generic/excluded",
+            len(seed_node_ids),
+        )
         return None
+
+    logger.info(
+        "Codemap: built call tree with %d symbols across %d files from %d seeds",
+        sum(len(s) for s in file_symbols.values()),
+        len(file_symbols),
+        len(seed_node_ids),
+    )
 
     # --- Order files by graph connectivity (files sharing edges cluster together) ---
     # Build a file adjacency graph: files that have symbols calling each other stay close
@@ -662,13 +720,31 @@ class ResearchService:
                 logger.info("Codemap: merged %d sections from %d wikis",
                             len(all_sections), len(components.query_service.per_wiki_services()))
         else:
-            # Single-wiki path
-            fts_index = components.graph_manager.fts_index if components.graph_manager else None
-            gqs: Union[GraphQueryService, MultiGraphQueryService] = GraphQueryService(components.code_graph, fts_index)
-            try:
-                code_map = _build_call_tree_from_sources(ask_sources, gqs)
-            except Exception:
-                logger.exception("Failed to build call tree from ask sources")
+            # Single-wiki path: prefer the storage-native ``query_service`` built
+            # by ``build_engine_components`` so call-tree seeding works for
+            # storage-backed wikis (UnifiedDB / Postgres).  Only fall back to a
+            # rehydrated NX ``GraphQueryService`` when no service was wired and
+            # an in-memory ``code_graph`` is available.
+            gqs: Union[GraphQueryService, MultiGraphQueryService] | None = (
+                components.query_service
+            )
+            if gqs is None and components.code_graph is not None:
+                fts_index = (
+                    components.graph_manager.fts_index
+                    if components.graph_manager
+                    else None
+                )
+                gqs = GraphQueryService(components.code_graph, fts_index)
+            if gqs is None:
+                logger.warning(
+                    "Codemap: no query_service or code_graph available — "
+                    "skipping build_call_tree",
+                )
+            else:
+                try:
+                    code_map = _build_call_tree_from_sources(ask_sources, gqs)
+                except Exception:
+                    logger.exception("Failed to build call tree from ask sources")
 
         node_count = sum(len(s.symbols) for s in code_map.sections) if code_map else 0
         yield {"event_type": "thinking_step", "data": {

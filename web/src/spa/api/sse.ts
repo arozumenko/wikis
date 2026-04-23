@@ -72,6 +72,13 @@ export interface ToolCallRecord {
   timestamp: string;
   endTimestamp: string | null;
   done: boolean;
+  /**
+   * LangGraph / MCP tool call identifier. Carried through so the UI can match
+   * `tool_result` events to the originating `tool_call` record by id rather
+   * than by tool name + insertion order — this prevents off-by-one display
+   * when the agent runs tool calls in parallel or returns them out of order.
+   */
+  tool_call_id?: string;
 }
 
 export type SSEEventData =

@@ -183,14 +183,9 @@ def run_wiki_generation(input_data: dict[str, Any]) -> dict[str, Any]:
 
     result = wrapper.generate_wiki(query=query)
 
-    # Match subprocess worker post-processing: repository analysis + manifest artifact
+    # Match subprocess worker post-processing for manifest metadata.
     if result and result.get("success"):
         try:
-            from plugin_implementation.repository_analysis_store import RepositoryAnalysisStore
-
-            cache_dir = os.path.join(base_path, "cache")
-            analysis_store = RepositoryAnalysisStore(cache_dir)
-
             # Use actual branch from clone result (handles master vs main, etc.)
             actual_branch = result.get("branch") or active_branch
             if actual_branch != active_branch:
@@ -209,40 +204,10 @@ def run_wiki_generation(input_data: dict[str, Any]) -> dict[str, Any]:
 
             wiki_version_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
 
-            analysis_key_override = f"{repo_identifier}@{wiki_version_id}"
-
             if repo_context:
-                analysis_store.save_analysis(
-                    repo_identifier=repo_identifier,
-                    analysis=repo_context,
-                    commit_hash=commit_hash,
-                    metadata={
-                        "branch": active_branch,
-                        "indexing_method": indexing_method,
-                        "commit_hash": commit_hash,
-                        "provider_type": provider_type,
-                    },
-                )
-
-                analysis_store.save_analysis(
-                    repo_identifier=repo_identifier,
-                    analysis=repo_context,
-                    commit_hash=commit_hash,
-                    metadata={
-                        "branch": active_branch,
-                        "indexing_method": indexing_method,
-                        "commit_hash": commit_hash,
-                        "wiki_version_id": wiki_version_id,
-                    },
-                    analysis_key_override=analysis_key_override,
-                )
-                log.info(
-                    "Saved repository analysis for Ask tool (%s chars) as %s",
-                    len(repo_context),
-                    repo_identifier,
-                )
+                log.info("Repository analysis available in unified DB (%s chars)", len(repo_context))
             else:
-                log.warning("No repository_context in result, skipping analysis save")
+                log.warning("No repository_context in result")
 
             # Context7-style: all artifacts are prefixed with wiki_id folder
             from plugin_implementation.registry_manager import normalize_wiki_id
@@ -313,7 +278,6 @@ def run_wiki_generation(input_data: dict[str, Any]) -> dict[str, Any]:
                 "repository": repository,
                 "branch": active_branch,
                 "commit_hash": commit_hash,
-                "analysis_key": analysis_key_override,
                 "pages": pages,
                 "provider_type": provider_type,
             }
@@ -369,7 +333,6 @@ def run_wiki_generation(input_data: dict[str, Any]) -> dict[str, Any]:
                 # Surface metadata at the top-level result for invoke.py registry
                 result["wiki_version_id"] = wiki_version_id
                 result["wiki_id"] = wiki_id
-                result["analysis_key"] = analysis_key_override
                 result["canonical_repo_identifier"] = repo_identifier
                 result["branch"] = active_branch
                 result["commit_hash"] = commit_hash
@@ -379,7 +342,7 @@ def run_wiki_generation(input_data: dict[str, Any]) -> dict[str, Any]:
             except Exception as mf_err:
                 log.warning("Failed to append wiki manifest artifact: %s", mf_err)
         except Exception as save_err:
-            log.warning("Failed to save repository analysis: %s", save_err)
+            log.warning("Failed to build wiki manifest metadata: %s", save_err)
 
     end_time = datetime.now(UTC)
     duration = (end_time - start_time).total_seconds()

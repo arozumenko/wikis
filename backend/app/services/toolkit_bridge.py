@@ -1,7 +1,7 @@
-"""Toolkit bridge — builds engine components from cached index artifacts.
+"""Toolkit bridge — builds engine components from cached unified wiki DB.
 
 Shared by AskService and ResearchService. Uses cache_index.json to find
-the correct vectorstore/graph for a specific wiki's repository.
+the correct .wiki.db for a specific wiki's repository.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -26,13 +27,15 @@ logger = logging.getLogger(__name__)
 class EngineComponents:
     """Components needed by AskEngine and DeepResearchEngine."""
 
-    retriever_stack: Any = None  # WikiRetrieverStack
+    retriever_stack: Any = None  # UnifiedRetriever
     graph_manager: Any = None  # GraphManager
-    code_graph: Any = None  # NetworkX DiGraph
+    code_graph: Any = None  # NetworkX DiGraph (legacy; None when storage is loaded directly)
+    storage: Any = None  # WikiStorageProtocol (UnifiedWikiDB / PostgresWikiStorage)
     repo_analysis: dict | None = None
     llm: Any = None  # BaseChatModel
     repo_path: str | None = None  # Path to cloned repo (if still on disk)
-    query_service: Any = None  # GraphQueryService or MultiGraphQueryService (projects)
+    unified_db_path: str | None = None  # Path to .wiki.db
+    query_service: Any = None  # GraphQueryService / StorageQueryService / MultiGraphQueryService
 
 
 class ComponentCache:
@@ -118,9 +121,11 @@ async def build_engine_components(
     settings: Settings,
     tier: str = "high",
 ) -> EngineComponents:
-    """Build engine components from cached index artifacts.
+    """Build engine components from cached unified wiki DB.
 
-    Uses cache_index.json to find the correct FAISS/graph for this wiki's repo.
+    Locates the ``.wiki.db`` file for this wiki's repo via cache_index.json,
+    creates an ``UnifiedRetriever`` for retrieval, and reconstructs the NX
+    code graph from the DB if needed.
 
     Raises FileNotFoundError if wiki doesn't exist.
     """
@@ -179,12 +184,12 @@ async def build_engine_components(
             components.repo_analysis = {}
         components.repo_analysis["description"] = wiki_description
 
-    # Ensure code_graph exists (empty graph for small repos without one)
+    # Ask/Research run storage-native: no NX rehydration.  A tiny empty graph
+    # is kept only for legacy callers that still check ``number_of_nodes()``.
     if components.code_graph is None:
         import networkx as nx
 
         components.code_graph = nx.DiGraph()
-        logger.info(f"Created empty code graph for {wiki_id} (small repo)")
 
     # Try to locate the cloned repo on disk for direct file access
     if wiki_meta:
@@ -206,10 +211,12 @@ def _find_repo_clone(
 ) -> str | None:
     """Find the cloned repo directory on disk.
 
-    Uses the same path convention as LocalRepositoryManager:
-      {cache_dir}/{owner_repo}_{branch}_{commit_short}
+    LocalRepositoryManager (used by FilesystemIndexer) clones into the
+    ``repositories/`` subdirectory of the cache:
+      {cache_dir}/repositories/{owner_repo}_{branch}_{commit_short}
 
-    Returns the path if it exists, else None.
+    Older deployments may have placed clones directly under ``cache_dir``,
+    so we check both layouts. Returns the path if it exists, else None.
     """
     import os
 
@@ -222,21 +229,27 @@ def _find_repo_clone(
     else:
         safe_name = url.replace("/", "_")
 
+    # Search both the canonical "repositories/" subdir and the legacy
+    # cache_dir root.
+    search_roots = [os.path.join(cache_dir, "repositories"), cache_dir]
+
     # Exact match with commit hash
     if commit_hash:
-        candidate = os.path.join(cache_dir, f"{safe_name}_{branch}_{commit_hash[:8]}")
-        if os.path.isdir(candidate):
-            logger.info("Found repo clone at %s", candidate)
-            return candidate
+        for root in search_roots:
+            candidate = os.path.join(root, f"{safe_name}_{branch}_{commit_hash[:8]}")
+            if os.path.isdir(candidate):
+                logger.info("Found repo clone at %s", candidate)
+                return candidate
 
     # Fallback: glob for any clone matching owner_repo_branch_*
     import glob as glob_mod
 
-    pattern = os.path.join(cache_dir, f"{safe_name}_{branch}_*")
-    matches = sorted(glob_mod.glob(pattern), key=os.path.getmtime, reverse=True)
-    if matches and os.path.isdir(matches[0]):
-        logger.info("Found repo clone (glob fallback) at %s", matches[0])
-        return matches[0]
+    for root in search_roots:
+        pattern = os.path.join(root, f"{safe_name}_{branch}_*")
+        matches = sorted(glob_mod.glob(pattern), key=os.path.getmtime, reverse=True)
+        if matches and os.path.isdir(matches[0]):
+            logger.info("Found repo clone (glob fallback) at %s", matches[0])
+            return matches[0]
 
     logger.info("No repo clone found for %s branch=%s", repo_url, branch)
     return None
@@ -263,14 +276,18 @@ def _load_cached_artifacts(
     repo_identifier: str,
     settings: Any = None,
 ) -> None:
-    """Load vectorstore and graph using cache_index.json to find correct files."""
+    """Load unified wiki DB and create UnifiedRetriever for Ask/Research.
+
+    Looks up cache_index.json to find the correct ``.wiki.db`` file, then
+    creates an ``UnifiedRetriever``.
+    Also reconstructs the NX code graph from the DB for graph-based tools.
+    """
     cache_path = Path(cache_dir)
     index_file = cache_path / "cache_index.json"
 
     cache_key = None
-    graph_key = None
 
-    # Load cache index to find correct keys
+    # Load cache index to find unified DB key
     if index_file.exists():
         try:
             with open(index_file) as f:
@@ -279,92 +296,111 @@ def _load_cached_artifacts(
             # Resolve ref: owner/repo:branch → owner/repo:branch:commit
             resolved = index.get("refs", {}).get(repo_identifier, repo_identifier)
 
-            # Find vectorstore cache key
-            cache_key = index.get(resolved) or index.get(repo_identifier)
+            # Find unified DB cache key
+            udb_section = index.get("unified_db", {})
+            cache_key = udb_section.get(resolved) or udb_section.get(repo_identifier)
 
-            # Find graph cache key
-            graphs = index.get("graphs", {})
-            graph_key = graphs.get(f"{resolved}:combined") or graphs.get(f"{repo_identifier}:combined")
-            # Try without :combined suffix
-            if not graph_key:
-                for k, v in graphs.items():
-                    if k.startswith(resolved) or k.startswith(repo_identifier):
-                        graph_key = v
+            # Fallback: try all entries that match prefix
+            if not cache_key:
+                for k, v in udb_section.items():
+                    if k.startswith(repo_identifier) or repo_identifier.startswith(k.rsplit(":", 1)[0]):
+                        cache_key = v
                         break
 
             logger.info(
-                f"Cache index lookup: repo={repo_identifier} resolved={resolved} "
-                f"vectorstore={cache_key} graph={graph_key}"
+                "Cache index lookup: repo=%s resolved=%s unified_db=%s",
+                repo_identifier,
+                resolved,
+                cache_key,
             )
         except Exception as e:
             logger.warning(f"Failed to read cache_index.json: {e}")
 
-    # Load graph
-    if graph_key:
-        try:
-            import gzip
-            import pickle
+    # If no cache_index entry, try glob for .wiki.db files
+    if not cache_key:
+        import glob as glob_mod
 
-            import networkx as nx
+        wiki_dbs = glob_mod.glob(str(cache_path / "*.wiki.db"))
+        if wiki_dbs:
+            # Use the most recent one
+            wiki_dbs.sort(key=os.path.getmtime, reverse=True)
+            from app.core.storage import repo_id_from_path
+            cache_key = repo_id_from_path(wiki_dbs[0])
+            logger.info("Found .wiki.db via glob fallback: %s", wiki_dbs[0])
 
-            from app.core.graph_manager import GraphManager
+    if not cache_key:
+        logger.warning(f"No unified DB found for {repo_identifier} — ask/research may fail")
+        return
 
-            gm = GraphManager(cache_dir=cache_dir)
-            graph_file = cache_path / f"{graph_key}.code_graph.gz"
-            if graph_file.exists():
-                with gzip.open(graph_file, "rb") as f:
-                    graph = pickle.load(f)  # noqa: S301 — pickle used for graph cache, data is self-generated
-                if isinstance(graph, nx.DiGraph):
-                    components.code_graph = graph
-                    gm.graph = graph
-                    components.graph_manager = gm
-                    logger.info(f"Loaded graph {graph_key} ({graph.number_of_nodes()} nodes)")
-        except Exception as e:
-            logger.warning(f"Failed to load graph {graph_key}: {e}")
+    # Open unified DB and create retriever
+    db_path = cache_path / f"{cache_key}.wiki.db"
 
-    # Load vectorstore using _load_from_cache with correct file paths
-    # Use same embeddings as generation to match FAISS dimensions
-    if cache_key:
-        try:
-            from app.core.vectorstore import VectorStoreManager
-            from app.services.llm_factory import create_embeddings
-
-            embeddings = create_embeddings(settings)
-            vsm = VectorStoreManager(cache_dir=cache_dir, embeddings=embeddings)
-            cache_file = cache_path / f"{cache_key}.faiss"
-            docs_file = cache_path / f"{cache_key}.docs.pkl"
-            if cache_file.exists():
-                vectorstore, documents = vsm._load_from_cache(cache_file, docs_file)
-                vsm.vectorstore = vectorstore
-                vsm.documents = documents
-                logger.info(
-                    f"Loaded vectorstore {cache_key} ({vectorstore.index.ntotal} vectors, {len(documents)} docs)"
-                )
-
-                from app.core.retrievers import WikiRetrieverStack
-
-                components.retriever_stack = WikiRetrieverStack(
-                    vectorstore_manager=vsm,
-                    relationship_graph=components.code_graph,
-                )
-            else:
-                logger.warning(f"FAISS file not found: {cache_file}")
-        except Exception as e:
-            logger.warning(f"Failed to load vectorstore {cache_key}: {e}")
-
-    # Load repository analysis
     try:
-        from app.core.repository_analysis_store import RepositoryAnalysisStore
+        from app.core.storage import is_postgres_backend, open_storage
+        from app.core.unified_retriever import UnifiedRetriever
 
-        store = RepositoryAnalysisStore(cache_dir=cache_dir)
-        analysis = store.get_analysis_for_prompt(repo_identifier)
-        if analysis:
-            components.repo_analysis = {"summary": analysis}
-            logger.info(f"Loaded repository analysis for {repo_identifier}")
+        if is_postgres_backend():
+            db = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
         else:
-            logger.debug(f"No repository analysis found for {repo_identifier}")
-    except Exception as e:
-        logger.warning(f"Failed to load repository analysis for {repo_identifier}: {e}")
+            if not db_path.exists():
+                logger.warning(f"Unified DB file not found: {db_path}")
+                return
+            db = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
 
-    if not cache_key and not graph_key:
-        logger.warning(f"No cache entries found for {repo_identifier} — ask/research may fail")
+        components.unified_db_path = str(db_path)
+
+        # Create embedding function for hybrid search
+        embedding_fn = None
+        embeddings = None
+        if settings:
+            try:
+                from app.services.llm_factory import create_embeddings
+
+                embeddings = create_embeddings(settings)
+                if hasattr(embeddings, "embed_query"):
+                    embedding_fn = embeddings.embed_query
+            except Exception as e:
+                logger.warning(f"Failed to create embeddings for Ask retriever: {e}")
+
+        components.retriever_stack = UnifiedRetriever(
+            db=db,
+            embedding_fn=embedding_fn,
+            embeddings=embeddings,
+        )
+
+        # Expose the storage handle directly — ask/research tools use
+        # ``StorageQueryService`` + ``StorageTextIndex`` instead of a
+        # rehydrated NX graph.
+        components.storage = db
+
+        # Build a storage-native query service so research/ask tools can
+        # treat single- and multi-wiki components uniformly.
+        try:
+            from app.core.code_graph.storage_query_service import StorageQueryService
+            from app.core.storage.text_index import StorageTextIndex
+
+            components.query_service = StorageQueryService(
+                db, text_index=StorageTextIndex(db)
+            )
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning("Failed to build StorageQueryService for %s: %s", cache_key, e)
+
+        # Load repository analysis from unified DB (Ask tool context)
+        raw_analysis = db.get_meta("repository_analysis")
+        if raw_analysis:
+            try:
+                components.repo_analysis = json.loads(raw_analysis)
+            except (json.JSONDecodeError, TypeError):
+                # Analysis may be plain text rather than JSON
+                components.repo_analysis = {"summary": raw_analysis}
+
+        stats = db.stats()
+        logger.info(
+            "Loaded unified DB %s (%d nodes, %d edges, %.1f MB)",
+            cache_key,
+            stats["node_count"],
+            stats["edge_count"],
+            stats["db_size_mb"],
+        )
+    except Exception as e:
+        logger.warning(f"Failed to load unified DB {cache_key}: {e}")

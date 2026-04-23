@@ -346,6 +346,12 @@ class TestBuildCallTreeFromSources:
         gqs.resolve_symbol = MagicMock(side_effect=_resolve_symbol)
         gqs.search = MagicMock(return_value=[])
         gqs.get_relationships = MagicMock(return_value=relationships or [])
+        # Real GraphQueryService.get_node returns the node attr dict (or None).
+        # Wire the mock to mirror that contract so production code reads real
+        # strings instead of auto-generated MagicMock attributes.
+        gqs.get_node = MagicMock(
+            side_effect=lambda node_id: nodes.get(node_id),
+        )
         return gqs
 
     def test_empty_sources_returns_none(self):
@@ -800,6 +806,10 @@ class TestBuildCallTreeRelationships:
         gqs.resolve_symbol = MagicMock(side_effect=_resolve)
         gqs.search = MagicMock(return_value=[])
         gqs.get_relationships = MagicMock(return_value=relationships)
+        # Real GraphQueryService.get_node returns the node attr dict (or None).
+        gqs.get_node = MagicMock(
+            side_effect=lambda node_id: nodes.get(node_id),
+        )
         return gqs
 
     def test_relationship_edge_added(self):

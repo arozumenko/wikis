@@ -42,21 +42,14 @@ from ..document_compressor import DocumentCompressor
 from ..document_ranker import DocumentRanker
 from ..prompts.wiki_prompts_enhanced import (
     ENHANCED_CONTENT_GENERATION_PROMPT_V3_TONE_ADJUSTED,
-    ENHANCED_CONTENT_GENERATION_PROMPT_V3_WITH_CONTINUATION,
     ENHANCED_REPO_ANALYSIS_PROMPT,
-    ENHANCED_RETRY_CONTENT_PROMPT,
     ENHANCED_WIKI_STRUCTURE_PROMPT,
-    QUALITY_ASSESSMENT_PROMPT,
     STRUCTURED_REPO_ANALYSIS_PROMPT,
     TARGET_AUDIENCES,
 )
-from ..retrievers import WikiRetrieverStack
 from ..state.wiki_state import (
-    EnhancementState,
     PageGenerationState,
     PageSpec,
-    QualityAssessment,
-    QualityAssessmentState,
     RepositoryAnalysis,
     SectionSpec,
     TargetAudience,
@@ -66,14 +59,8 @@ from ..state.wiki_state import (
     WikiStyle,
 )
 from ..token_counter import CONTEXT_TOKEN_BUDGET, get_token_counter
-from .agentic_doc_generator_v2 import AgenticDocGeneratorV2
 
 logger = logging.getLogger(__name__)
-
-# Legacy: Agentic mode threshold no longer used.
-# All over-budget pages now use ranked truncation → simple mode.
-# Kept for backward compatibility.
-AGENTIC_MODE_THRESHOLD = 999_999  # Effectively disabled
 
 # Toggle to skip repository_context in page generation (test mode for token savings)
 SKIP_REPO_CONTEXT_FOR_PAGES = os.getenv("WIKIS_SKIP_REPO_CONTEXT_FOR_PAGES", "0") == "1"
@@ -134,7 +121,7 @@ class OptimizedWikiGenerationAgent:
     def __init__(
         self,
         indexer,  # Accept any indexer (filesystem-based expected)
-        retriever_stack: WikiRetrieverStack,
+        retriever_stack: Any,  # UnifiedRetriever
         llm: BaseLanguageModel,
         repository_url: str,
         branch: str = "main",
@@ -161,13 +148,16 @@ class OptimizedWikiGenerationAgent:
         llm_low: BaseLanguageModel | None = None,
         # Progress callback — (phase, progress, message) for SSE streaming
         progress_callback: Any | None = None,
+        # Structure planner options
+        planner_type: str = "agent",
+        exclude_tests: bool = False,
     ):
 
         # Validate all required components
         if not indexer:
             raise ValueError("Indexer is required")
         if not retriever_stack:
-            raise ValueError("WikiRetrieverStack is required")
+            raise ValueError("Retriever stack is required")
         if not llm:
             raise ValueError("BaseLanguageModel is required")
         if not repository_url:
@@ -198,6 +188,8 @@ class OptimizedWikiGenerationAgent:
         self.enable_structure_analysis = enable_structure_analysis
         self.graph_text_index = graph_text_index  # FTS5 index for O(log N) symbol lookup
         self.progress_callback = progress_callback
+        self.planner_type = planner_type
+        self.exclude_tests = exclude_tests
         self._pages_generated = 0
         self._total_pages = 0
         self._progress_lock = __import__("threading").Lock()
@@ -208,6 +200,10 @@ class OptimizedWikiGenerationAgent:
         logger.info(f"  - Indexer: {type(indexer).__name__}")
         logger.info(f"  - Retriever: {type(retriever_stack).__name__}")
         logger.info(f"  - LLM: {type(llm).__name__}")
+
+        # Cluster expansion state (lazy-opened)
+        self._cluster_db = None       # UnifiedWikiDB instance (opened on first use)
+        self._cluster_db_path = None  # Cached path for the unified DB file
 
         # Build code_graph
         self.graph = self._build_graph()
@@ -377,6 +373,25 @@ class OptimizedWikiGenerationAgent:
                     self.progress_callback("planning", 0.28, "Planning wiki structure with LLM...")
                 except Exception:
                     pass
+
+            # ── Cluster planner path ──────────────────────────────────
+            planner_type = state.get("planner_type", self.planner_type)
+            exclude_tests = state.get("exclude_tests", self.exclude_tests)
+
+            if planner_type == "cluster":
+                try:
+                    result = self._generate_wiki_structure_cluster(
+                        state=state, config=config, exclude_tests=exclude_tests,
+                    )
+                    if result is not None:
+                        return result
+                    # None means fallback to existing planners
+                    logger.warning("Cluster planner returned no result, falling back to agent planner")
+                except Exception as cluster_err:
+                    logger.warning(
+                        "Cluster planner failed, falling back to agent planner: %s",
+                        cluster_err,
+                    )
 
             repository_files = self._get_repository_file_paths()
             use_deepagents = self._should_use_deepagents_structure_planner(
@@ -808,26 +823,8 @@ class OptimizedWikiGenerationAgent:
                     f"I am on phase page_generation\nRetrieved context for: {page_spec.page_name}\nReasoning: Curated symbol + file set narrows LLM focus while preserving completeness.\nNext: Generate draft content then sanitize diagrams."
                 )
 
-            # Route to appropriate generation method based on context mode
-            # After ranked truncation, all pages go through simple mode (V3_TONE_ADJUSTED)
-            if relevant_content.get("mode") == "agentic":
-                # LEGACY AGENTIC MODE — should no longer be triggered (threshold set to 999K)
-                # Kept as extreme fallback just in case
-                logger.warning(
-                    f"[PAGE_GEN] Unexpected agentic mode for '{page_spec.page_name}' — "
-                    f"this should not happen with ranked truncation"
-                )
-                generated_content = self._generate_agentic(page_spec, relevant_content, repo_context, config)
-            elif "tier1_content" in relevant_content:
-                # LEGACY HIERARCHICAL MODE — should no longer be triggered
-                logger.warning(
-                    f"[PAGE_GEN] Unexpected hierarchical mode for '{page_spec.page_name}' — "
-                    f"this should not happen with ranked truncation"
-                )
-                generated_content = self._generate_with_continuation(page_spec, relevant_content, repo_context, config)
-            else:
-                # SIMPLE MODE — all pages go here after ranked truncation
-                generated_content = self._generate_simple(page_spec, relevant_content, repo_context, config)
+            # Generate page content (all pages use simple mode after ranked truncation)
+            generated_content = self._generate_simple(page_spec, relevant_content, repo_context, config)
 
             # Post-process: sanitize Mermaid diagrams (Phase 1 heuristic sanitizer)
             try:
@@ -917,205 +914,6 @@ class OptimizedWikiGenerationAgent:
                 "errors": [f"Page generation failed for {display_page_id}: {e}"],
             }
 
-    def dispatch_quality_assessment(self, state: WikiState) -> list[Send]:
-        """Dispatch parallel quality assessment tasks using Send pattern"""
-
-        wiki_pages = state.get("wiki_pages", [])
-
-        # Get only completed pages for quality assessment
-        completed_pages = [
-            page for page in wiki_pages if page.status == "completed" and not hasattr(page, "quality_assessment")
-        ]
-
-        if not completed_pages:
-            logger.info("📊 No pages to assess, proceeding to enhancement dispatch")
-            return self.dispatch_enhancement(state)
-
-        # Create assessment tasks using Send pattern
-        sends = []
-        for page in completed_pages:
-            sends.append(
-                Send(
-                    "assess_page_quality",
-                    {"page_id": page.page_id, "page_content": page.content, "page_title": page.title},
-                )
-            )
-
-        logger.info(f"📊 Dispatching {len(sends)} quality assessment tasks")
-        if self.progress_callback:
-            try:
-                self.progress_callback("quality", 0.85, f"Assessing quality of {len(sends)} pages...")
-            except Exception:
-                pass
-        return sends
-
-    def dispatch_enhancement(self, state: WikiState) -> list[Send]:
-        """Dispatch parallel enhancement tasks for pages that failed quality gates"""
-
-        quality_assessments = state.get("quality_assessments", [])
-
-        # Find pages that failed quality assessment and need enhancement
-        failed_assessments = []
-        for qa in quality_assessments:
-            assessment = qa.get("assessment")
-            if assessment and not assessment.passes_quality_gate:
-                # Check retry limits
-                retry_counts = state.get("retry_counts", {})
-                if retry_counts.get(qa["page_id"], 0) < self.max_retries:
-                    failed_assessments.append(qa)
-
-        if not failed_assessments:
-            logger.info("🎯 No pages need enhancement, proceeding to finalization")
-            if self.progress_callback:
-                try:
-                    self.progress_callback("enhancing", 0.90, "All pages passed quality gates — skipping enhancement")
-                except Exception:
-                    pass
-            return [Send("finalize_wiki", state)]
-
-        # Create enhancement tasks using Send pattern
-        sends = []
-        for qa in failed_assessments:
-            # Find the corresponding page content
-            wiki_pages = state.get("wiki_pages", [])
-            page = next((p for p in wiki_pages if p.page_id == qa["page_id"]), None)
-
-            if page:
-                sends.append(
-                    Send(
-                        "enhance_page_content",
-                        {
-                            "page_id": qa["page_id"],
-                            "page_content": page.content,
-                            "page_title": page.title,
-                            "quality_assessment": qa["assessment"],
-                            "repository_context": state["repository_context"],
-                        },
-                    )
-                )
-
-        logger.info(f"🔧 Dispatching {len(sends)} enhancement tasks")
-        if self.progress_callback:
-            try:
-                self.progress_callback("enhancing", 0.88, f"Enhancing {len(sends)} pages...")
-            except Exception:
-                pass
-        return sends
-
-    async def assess_page_quality(self, state: QualityAssessmentState, config: RunnableConfig) -> dict[str, Any]:
-        """Assess quality of a single page"""
-
-        page_id = state["page_id"]
-        content = state["page_content"]
-        page_title = state["page_title"]
-
-        logger.info(f"📋 Assessing quality of page: {page_title}")
-        if self.progress_callback:
-            try:
-                self.progress_callback("quality", 0.86, f"Assessing quality: {page_title}")
-            except Exception:
-                pass
-
-        try:
-            assessment = await self._assess_page_quality(page_id, content)
-
-            return {"quality_assessments": [{"page_id": page_id, "assessment": assessment}]}
-
-        except Exception as e:
-            logger.error(f"Quality assessment failed for {page_id}: {e}")
-
-            # Return default assessment
-            default_assessment = QualityAssessment(
-                scores={"overall": 0.5},
-                overall_score=0.5,
-                strengths=[],
-                weaknesses=[f"Assessment failed: {e}"],
-                improvement_suggestions=[],
-                passes_quality_gate=False,
-                confidence_level=0.0,
-            )
-
-            return {"quality_assessments": [{"page_id": page_id, "assessment": default_assessment}]}
-
-    async def enhance_page_content(self, state: EnhancementState, config: RunnableConfig) -> dict[str, Any]:
-        """Enhance content for a single page that failed quality gates"""
-
-        page_id = state["page_id"]
-        content = state["page_content"]
-        page_title = state["page_title"]
-        quality_assessment = state["quality_assessment"]
-        state["repository_context"]
-
-        logger.info(f"🔧 Enhancing content for page: {page_title}")
-        if self.progress_callback:
-            try:
-                self.progress_callback("enhancing", 0.88, f"Enhancing: {page_title}")
-            except Exception:
-                pass
-
-        try:
-            # Create enhancement prompt using existing page content and assessment
-            enhancement_prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", "You are a technical writer improving content based on quality feedback."),
-                    ("human", ENHANCED_RETRY_CONTENT_PROMPT),
-                ]
-            )
-
-            response = await self.llm_low.ainvoke(
-                enhancement_prompt.format_messages(
-                    original_content=content,
-                    repo_name=self.repository_url,
-                    section_title=page_title,
-                    audience=self.target_audience.value
-                    if hasattr(self.target_audience, "value")
-                    else str(self.target_audience),
-                    enhancement_focus="Quality improvements based on assessment feedback",
-                    validation_feedback=json.dumps(
-                        quality_assessment.model_dump()
-                        if hasattr(quality_assessment, "model_dump")
-                        else (quality_assessment.dict() if hasattr(quality_assessment, "dict") else {}),
-                        indent=2,
-                    ),
-                    quality_issues="\\n".join(quality_assessment.weaknesses),
-                    improvement_requirements="\\n".join(quality_assessment.improvement_suggestions),
-                ),
-                config=config,
-            )
-
-            enhanced_content = response.content
-
-            return {
-                "enhanced_pages": [
-                    WikiPage(
-                        page_id=page_id,
-                        title=page_title,
-                        content=enhanced_content,
-                        status="enhanced",
-                        retry_count=0,
-                        generated_at=datetime.now(),
-                    )
-                ],
-                "messages": [f"Enhanced content for {page_title}"],
-            }
-
-        except Exception as e:
-            logger.error(f"Content enhancement failed for {page_id}: {e}")
-
-            return {
-                "enhanced_pages": [
-                    WikiPage(
-                        page_id=page_id,
-                        title=page_title,
-                        content=content,  # Keep original content
-                        status="enhancement_failed",
-                        retry_count=0,
-                        generated_at=datetime.now(),
-                    )
-                ],
-                "errors": [f"Enhancement failed for {page_title}: {e}"],
-            }
-
     def finalize_wiki(self, state: WikiState, config: RunnableConfig) -> dict[str, Any]:
         """Finalize wiki generation and prepare for export"""
 
@@ -1129,31 +927,10 @@ class OptimizedWikiGenerationAgent:
             this.module.invocation_thinking("Finalizing wiki & aggregating pages")
 
         try:
-            # Consolidate all pages from different phases
+            # Consolidate all pages
             wiki_pages = state.get("wiki_pages", [])
-            enhanced_pages = state.get("enhanced_pages", [])
-            quality_assessments = state.get("quality_assessments", [])
 
-            # Create lookup for enhanced pages
-            enhanced_lookup = {page.page_id: page for page in enhanced_pages}
-
-            # Create lookup for quality assessments
-            assessment_lookup = {qa["page_id"]: qa["assessment"] for qa in quality_assessments}
-
-            # Merge pages with enhancements and assessments
-            final_pages = []
-            for page in wiki_pages:
-                # Use enhanced version if available
-                if page.page_id in enhanced_lookup:
-                    final_page = enhanced_lookup[page.page_id]
-                else:
-                    final_page = page
-
-                # Add quality assessment if available
-                if page.page_id in assessment_lookup:
-                    final_page.quality_assessment = assessment_lookup[page.page_id]
-
-                final_pages.append(final_page)
+            final_pages = list(wiki_pages)
 
             # Calculate final statistics
             wiki_structure = state.get("wiki_structure_spec")
@@ -1168,27 +945,12 @@ class OptimizedWikiGenerationAgent:
             total_pages = len(final_pages)
             total_diagrams = sum(page.content.count("```mermaid") for page in final_pages)
 
-            # Calculate average quality from pages with assessments
-            pages_with_quality = [
-                page for page in final_pages if hasattr(page, "quality_assessment") and page.quality_assessment
-            ]
-            avg_quality = (
-                sum(page.quality_assessment.overall_score for page in pages_with_quality) / len(pages_with_quality)
-                if pages_with_quality
-                else 0.0
-            )
-
-            # Count enhanced pages
-            enhanced_count = len([page for page in final_pages if page.status == "enhanced"])
-
             # Create generation summary
             generation_summary = {
                 "wiki_title": wiki_structure.wiki_title,
                 "total_sections": len(wiki_structure.sections),
                 "total_pages": total_pages,
                 "total_diagrams": total_diagrams,
-                "enhanced_pages": enhanced_count,
-                "average_quality_score": avg_quality,
                 "generation_timestamp": datetime.now().isoformat(),
                 "execution_time": time.time() - state.get("start_time", time.time()),
             }
@@ -1198,7 +960,7 @@ class OptimizedWikiGenerationAgent:
                 "generation_summary": generation_summary,
                 "current_phase": "finalization_complete",
                 "messages": [
-                    f"Wiki finalized: {total_pages} pages, {enhanced_count} enhanced, {total_diagrams} diagrams"
+                    f"Wiki finalized: {total_pages} pages, {total_diagrams} diagrams"
                 ],
             }
 
@@ -1298,8 +1060,6 @@ class OptimizedWikiGenerationAgent:
         builder.add_node("analyze_repository", self.analyze_repository)
         builder.add_node("generate_wiki_structure", self.generate_wiki_structure)
         builder.add_node("generate_page_content", self.generate_page_content)
-        # builder.add_node("assess_page_quality", self.assess_page_quality)
-        # builder.add_node("enhance_page_content", self.enhance_page_content)
         builder.add_node("finalize_wiki", self.finalize_wiki)
         builder.add_node("export_wiki", self.export_wiki)
 
@@ -1307,27 +1067,12 @@ class OptimizedWikiGenerationAgent:
         builder.add_edge(START, "analyze_repository")
         builder.add_edge("analyze_repository", "generate_wiki_structure")
 
-        # Phase 1: Page Generation (map)
+        # Page Generation (map)
         builder.add_conditional_edges(
             "generate_wiki_structure", self.dispatch_page_generation, ["generate_page_content"]
         )
 
-        # Phase 2: Quality Assessment (map)
-        # builder.add_conditional_edges(
-        #     "generate_page_content",
-        #     self.dispatch_quality_assessment,
-        #     ["assess_page_quality", "enhance_page_content", "finalize_wiki"]
-        # )
-        #
-        # # Phase 3: Enhancement (map)
-        # builder.add_conditional_edges(
-        #     "assess_page_quality",
-        #     self.dispatch_enhancement,
-        #     ["enhance_page_content", "finalize_wiki"]
-        # )
-
-        # Final steps (Reduce)
-        # builder.add_edge("enhance_page_content", "finalize_wiki")
+        # Reduce → finalize → export
         builder.add_edge("generate_page_content", "finalize_wiki")
         builder.add_edge("finalize_wiki", "export_wiki")
         builder.add_edge("export_wiki", END)
@@ -1345,10 +1090,23 @@ class OptimizedWikiGenerationAgent:
     def generate_wiki(self, user_message: str) -> dict[str, Any]:
         """Generate wiki using optimized LangGraph workflow with user message"""
 
+        code_graph = (
+            getattr(self.retriever_stack, "relationship_graph", None)
+            or getattr(self.indexer, "relationship_graph", None)
+        )
+        if code_graph is not None and code_graph.number_of_nodes() > 0:
+            try:
+                self._ensure_unified_db(code_graph)
+            except Exception as exc:
+                logger.warning("[UNIFIED_DB] Failed to prepare unified DB before workflow: %s", exc)
+
         # Initialize state with clean phase-based structure (only workflow data, no config)
         initial_state: WikiState = {
             "start_time": time.time(),
             "current_phase": "initialization",
+            # Generation options
+            "planner_type": self.planner_type,
+            "exclude_tests": self.exclude_tests,
             # Repository analysis results (state data)
             "repository_analysis": None,
             "repository_context": None,
@@ -1363,14 +1121,8 @@ class OptimizedWikiGenerationAgent:
             # Wiki structure results (state data)
             "wiki_structure_spec": None,
             "structure_planning_complete": False,
-            # Phase 1: Content Generation (operator.add accumulation)
+            # Content Generation (operator.add accumulation)
             "wiki_pages": [],
-            # Phase 2: Quality Assessment (operator.add accumulation)
-            "quality_assessments": [],
-            # Phase 3: Enhancement (operator.add accumulation)
-            "enhanced_pages": [],
-            # Retry tracking (state data)
-            "retry_counts": {},
             # Final results (state data)
             "generation_summary": None,
             "artifacts": [],
@@ -1396,20 +1148,6 @@ class OptimizedWikiGenerationAgent:
             # Convert WikiPage objects to expected format for response
             wiki_pages = final_state.get("wiki_pages", [])
             generated_pages = {page.page_id: page.content for page in wiki_pages}
-
-            # Convert quality assessments to dict format
-            quality_assessments = {}
-            for page in wiki_pages:
-                if hasattr(page, "quality_assessment") and page.quality_assessment:
-                    # Convert QualityAssessment to dict if it's a Pydantic model
-                    qa_obj = page.quality_assessment
-                    if qa_obj is not None:
-                        if hasattr(qa_obj, "model_dump"):
-                            quality_assessments[page.page_id] = qa_obj.model_dump()
-                        elif hasattr(qa_obj, "dict"):
-                            quality_assessments[page.page_id] = qa_obj.dict()
-                        else:
-                            quality_assessments[page.page_id] = qa_obj
 
             # Convert WikiStructureSpec to dict format for JSON serialization
             wiki_structure = final_state.get("wiki_structure_spec")
@@ -1442,7 +1180,7 @@ class OptimizedWikiGenerationAgent:
                     "status": page.status,
                 }
                 for page in wiki_pages
-                if getattr(page, "status", None) and str(page.status).lower() in {"failed", "enhancement_failed"}
+                if getattr(page, "status", None) and str(page.status).lower() == "failed"
             ]
 
             return {
@@ -1450,7 +1188,6 @@ class OptimizedWikiGenerationAgent:
                 "wiki_structure": wiki_structure_dict,
                 "generated_pages": generated_pages,
                 "generation_summary": final_state.get("generation_summary", {}),
-                "quality_assessments": quality_assessments,
                 "artifacts": final_state.get("artifacts", []),
                 "execution_time": time.time() - initial_state["start_time"],
                 "errors": workflow_errors,
@@ -1619,6 +1356,458 @@ class OptimizedWikiGenerationAgent:
                 return True
 
         return False
+
+    def _generate_wiki_structure_cluster(
+        self,
+        state: WikiState,
+        config: RunnableConfig,
+        exclude_tests: bool = False,
+    ) -> dict[str, Any] | None:
+        """Generate wiki structure using the cluster-based planner.
+
+        Returns the standard structure dict on success, or ``None`` to signal
+        that the caller should fall back to the agent-based planner.
+        """
+        from ..graph_clustering import run_phase3
+        from ..wiki_structure_planner.cluster_planner import ClusterStructurePlanner
+
+        code_graph = (
+            getattr(self.retriever_stack, "relationship_graph", None)
+            or getattr(self.indexer, "relationship_graph", None)
+        )
+        if code_graph is None or code_graph.number_of_nodes() == 0:
+            logger.warning("Cluster planner: no code graph available — falling back")
+            return None
+
+        # ── Populate unified DB from code graph (for expansion & topology) ──
+        self._ensure_unified_db(code_graph)
+
+        if self._cluster_db is None:
+            logger.warning("Cluster planner: no unified DB available — falling back")
+            return None
+
+        # ── Ensure code_graph has Phase 2 enrichment ──────────────────
+        # When the indexer pre-built the DB, Phase 2 (orphan resolution,
+        # doc edges, component bridging, edge weighting) was applied to
+        # the indexer's copy of the graph and persisted to the DB.
+        # However, the in-memory code_graph we hold here is the *raw*
+        # graph from the retriever stack — it has none of those
+        # enrichments.  Leiden clustering on the un-enriched graph
+        # produces fragmented/disconnected results because ~55% of
+        # symbol nodes are orphans and all edges have weight=1.0.
+        #
+        # Fix: reconstruct the graph from the DB (which has the full
+        # enriched edge set with calibrated weights) and use THAT for
+        # clustering.
+        clustering_graph = code_graph  # default: use as-is
+        if not code_graph.graph.get("phase2_enriched"):
+            try:
+                phase2_done = self._cluster_db.get_meta("phase2_completed")
+                if phase2_done:
+                    enriched_g = self._cluster_db.to_networkx()
+                    if enriched_g.number_of_nodes() > 0:
+                        logger.info(
+                            "[CLUSTER] Using Phase 2-enriched graph from DB: "
+                            "%d nodes, %d edges (raw graph had %d edges)",
+                            enriched_g.number_of_nodes(),
+                            enriched_g.number_of_edges(),
+                            code_graph.number_of_edges(),
+                        )
+                        clustering_graph = enriched_g
+                    else:
+                        logger.warning(
+                            "[CLUSTER] DB to_networkx() returned empty graph — "
+                            "using raw code_graph"
+                        )
+                else:
+                    logger.debug(
+                        "[CLUSTER] Phase 2 not completed in DB — "
+                        "using raw code_graph for clustering"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[CLUSTER] Failed to load enriched graph from DB: %s — "
+                    "using raw code_graph",
+                    exc,
+                )
+
+        if self.progress_callback:
+            try:
+                self.progress_callback("planning", 0.29, "Running graph clustering...")
+            except Exception:
+                pass
+
+        # ── Run Phase 3: clustering persists directly to DB ──
+        try:
+            from ..feature_flags import FeatureFlags
+
+            # planner_type="cluster" means all Leiden features are ON.
+            # exclude_tests comes from the UI toggle.
+            flags = FeatureFlags(
+                hierarchical_leiden=True,
+                capability_validation=True,
+                smart_expansion=True,
+                coverage_ledger=True,
+                language_hints=True,
+                exclude_tests=exclude_tests,
+            )
+            phase3_stats = run_phase3(
+                db=self._cluster_db,
+                G=clustering_graph,
+                feature_flags=flags,
+            )
+            logger.info("[CLUSTER] Phase 3 complete: %s", phase3_stats)
+        except Exception as exc:
+            logger.warning("Cluster planner: Phase 3 failed: %s — falling back", exc)
+            return None
+
+        # Verify clustering produced results
+        all_clusters = self._cluster_db.get_all_clusters()
+        if not all_clusters:
+            logger.warning("Cluster planner: clustering produced 0 sections — falling back")
+            return None
+
+        if self.progress_callback:
+            try:
+                n_sections = len(all_clusters)
+                n_pages = sum(len(micros) for micros in all_clusters.values())
+                self.progress_callback(
+                    "planning", 0.32,
+                    f"Detected {n_sections} sections, {n_pages} pages — naming with LLM...",
+                )
+            except Exception:
+                pass
+
+        planner = ClusterStructurePlanner(
+            db=self._cluster_db,
+            llm=self.llm_low,
+            wiki_title=None,  # Auto-derive from repo metadata
+        )
+
+        response = planner.plan_structure()
+        total_pages = sum(len(s.pages) for s in response.sections)
+
+        logger.info(
+            "ClusterStructurePlanner: %d sections, %d pages",
+            len(response.sections),
+            total_pages,
+        )
+
+        if self.progress_callback:
+            try:
+                section_names = ", ".join(s.title for s in response.sections[:5])
+                suffix = f"... and {len(response.sections) - 5} more" if len(response.sections) > 5 else ""
+                self.progress_callback(
+                    "planning", 0.38,
+                    f"Structure planned — {len(response.sections)} sections, {total_pages} pages: {section_names}{suffix}",
+                )
+            except Exception:
+                pass
+
+        if this and getattr(this, "module", None):
+            this.module.invocation_thinking(
+                f"I am on phase structure_planning\n"
+                f"Structure designed: {len(response.sections)} sections / {total_pages} pages (cluster planner)\n"
+                f"Reasoning: Deterministic clustering from code graph with LLM naming.\n"
+                f"Next: Parallelize page drafting with focused context windows."
+            )
+
+        return {
+            "wiki_structure_spec": response,
+            "structure_planning_complete": True,
+            "current_phase": "structure_complete",
+        }
+
+    # ── Cluster-bounded page expansion ──────────────────────────────
+
+    def _try_cluster_expansion(
+        self, page_spec: PageSpec,
+    ) -> dict[str, Any] | None:
+        """Attempt cluster-bounded expansion for a page.
+
+        Returns the formatted context dict (same shape as
+        ``_format_simple_context``) when the page was produced by the
+        cluster planner.  Returns ``None`` to signal the caller should
+        fall through to the legacy graph-based path.
+        """
+        rationale = getattr(page_spec, "rationale", "") or ""
+        if "graph clustering" not in rationale:
+            return None
+
+        metadata = getattr(page_spec, "metadata", None) or {}
+        macro_id = metadata.get("section_id")
+        micro_id = metadata.get("page_id")
+        cluster_node_ids = metadata.get("cluster_node_ids")
+
+        if macro_id is None:
+            macro_id = self._extract_macro_id(rationale)
+
+        db = self._open_cluster_db()
+        if db is None:
+            logger.warning(
+                "[CLUSTER_EXPANSION] No unified DB available — "
+                "falling back to legacy expansion"
+            )
+            return None
+
+        target_symbols = getattr(page_spec, "target_symbols", []) or []
+        if not target_symbols:
+            return None
+
+        try:
+            from ..cluster_expansion import expand_for_page
+
+            docs = expand_for_page(
+                db=db,
+                page_symbols=target_symbols,
+                macro_id=macro_id,
+                micro_id=micro_id,
+                cluster_node_ids=cluster_node_ids,
+                token_budget=CONTEXT_TOKEN_BUDGET,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[CLUSTER_EXPANSION] Failed for page '%s': %s — "
+                "falling back to legacy",
+                page_spec.page_name, exc,
+            )
+            return None
+
+        if not docs:
+            logger.info(
+                "[CLUSTER_EXPANSION] No docs for page '%s' — "
+                "falling back to legacy",
+                page_spec.page_name,
+            )
+            return None
+
+        token_counter = get_token_counter()
+        total_tokens = token_counter.count_documents(docs)
+
+        if total_tokens <= CONTEXT_TOKEN_BUDGET:
+            logger.info(
+                "CLUSTER EXPANSION: %d docs for '%s' "
+                "(%d/%d tokens, macro=%s)",
+                len(docs), page_spec.page_name,
+                total_tokens, CONTEXT_TOKEN_BUDGET, macro_id,
+            )
+            return self._format_simple_context(docs, page_spec)
+        else:
+            logger.info(
+                "[CLUSTER_EXPANSION] Budget exceeded (%d/%d) — truncating",
+                total_tokens, CONTEXT_TOKEN_BUDGET,
+            )
+            truncated, _metrics = self._ranked_truncation(
+                docs, page_spec, CONTEXT_TOKEN_BUDGET,
+            )
+            return self._format_simple_context(truncated, page_spec)
+
+    def _ensure_unified_db(self, code_graph) -> None:
+        """Locate / open the unified DB that was written during indexing.
+
+        The indexer writes a ``{cache_key}.wiki.db`` to the cache directory
+        with graph, embeddings, Phase 2 topology, and Phase 3 clustering
+        already populated.  This method simply opens it.
+
+        Falls back to creating one in-memory from the code graph if the
+        pre-built DB cannot be found (e.g. unit tests, local dev).
+        """
+        if self._cluster_db is not None:
+            return
+
+        from ..storage import open_storage, repo_id_from_path
+
+        # Try to find the pre-built DB from the indexer
+        db_path = self._find_unified_db()
+        if db_path:
+            try:
+                repo_id = repo_id_from_path(db_path) if db_path else None
+                db = open_storage(repo_id=repo_id, db_path=db_path)
+                self._cluster_db = db
+                self._cluster_db_path = db_path
+                from ..storage.text_index import StorageTextIndex
+
+                self.graph_text_index = StorageTextIndex(db)
+                stats = db.stats()
+                backend_name = type(db).__name__
+                logger.info(
+                    "[UNIFIED_DB] Opened storage: %s (repo_id=%s, %d nodes)",
+                    backend_name,
+                    repo_id,
+                    stats["node_count"],
+                )
+                return
+            except Exception as exc:
+                logger.warning("[UNIFIED_DB] Failed to open pre-built DB: %s — will create", exc)
+
+        # Fallback: create from the NX graph (tests / local dev without indexer)
+        import tempfile
+
+        source_dir = (
+            getattr(self.indexer, "source_dir", None)
+            or getattr(self.indexer, "repo_path", None)
+        )
+        if source_dir:
+            wikis_dir = os.path.join(source_dir, ".wikis")
+            os.makedirs(wikis_dir, exist_ok=True)
+            db_path = os.path.join(wikis_dir, "unified_wiki.db")
+        else:
+            tmp = tempfile.mkdtemp(prefix="wikis_udb_")
+            db_path = os.path.join(tmp, "unified_wiki.db")
+
+        try:
+            repo_id = repo_id_from_path(db_path)
+            db = open_storage(repo_id=repo_id, db_path=db_path)
+            db.from_networkx(code_graph)
+            self._cluster_db = db
+            self._cluster_db_path = db_path
+            from ..storage.text_index import StorageTextIndex
+
+            self.graph_text_index = StorageTextIndex(db)
+            logger.info(
+                "[UNIFIED_DB] Created from code graph: %d nodes, %d edges → %s",
+                code_graph.number_of_nodes(),
+                code_graph.number_of_edges(),
+                db_path,
+            )
+
+            # Phase 2 enrichment
+            from ..config import get_settings as _get_settings
+
+            _settings = _get_settings()
+            if _settings.graph_enrichment_enabled:
+                try:
+                    from ..graph_topology import run_phase2
+
+                    p2 = run_phase2(
+                        db=db,
+                        G=code_graph,
+                        z_threshold=_settings.hub_z_threshold,
+                        vec_distance_threshold=_settings.vec_distance_threshold,
+                    )
+                    logger.info(
+                        "[UNIFIED_DB] Phase 2 enrichment: %d hubs, %d edges persisted",
+                        p2.get("hubs", {}).get("count", 0),
+                        p2.get("persisted_edges", 0),
+                    )
+                except Exception as p2_exc:
+                    logger.warning("[UNIFIED_DB] Phase 2 enrichment failed: %s", p2_exc)
+
+        except Exception as exc:
+            logger.warning("[UNIFIED_DB] Failed to populate: %s", exc)
+
+    def _open_cluster_db(self):
+        """Open (or return cached) unified DB for cluster expansion."""
+        if self._cluster_db is not None:
+            return self._cluster_db
+
+        db_path = self._cluster_db_path or self._find_unified_db()
+        if not db_path:
+            return None
+
+        try:
+            from ..storage import open_storage, repo_id_from_path
+
+            repo_id = repo_id_from_path(db_path)
+            self._cluster_db = open_storage(repo_id=repo_id, db_path=db_path)
+            self._cluster_db_path = db_path
+            logger.info("[CLUSTER_EXPANSION] Opened unified DB: %s", db_path)
+            return self._cluster_db
+        except Exception as exc:
+            logger.warning("[CLUSTER_EXPANSION] Failed to open DB: %s", exc)
+            return None
+
+    def _close_cluster_db(self) -> None:
+        """Close the cached unified DB connection if open."""
+        if self._cluster_db is not None:
+            try:
+                self._cluster_db.close()
+            except Exception:
+                pass
+            self._cluster_db = None
+
+    def _find_unified_db(self) -> str | None:
+        """Locate the unified wiki DB file (or cache key for postgres).
+
+        Checks:
+        1. Indexer's ``_unified_db_path`` attribute (set during indexing)
+        2. ``{cache_dir}/*.wiki.db`` via cache_index.json
+        3. Legacy ``{source_dir}/.wikis/unified_wiki.db`` location
+
+        For postgres backend, we still return a db_path-like string
+        so the caller can extract the repo_id/cache_key from it.
+        """
+        from ..storage import is_postgres_backend
+
+        _pg = is_postgres_backend()
+
+        # 1. Direct path from indexer
+        indexer_db = getattr(self.indexer, "_unified_db_path", None)
+        if indexer_db:
+            if _pg or os.path.isfile(indexer_db):
+                return indexer_db
+
+        # 2. Look in cache directory via cache_index.json
+        cache_dir = None
+        graph_mgr = getattr(self.indexer, "graph_manager", None)
+        if graph_mgr:
+            cache_dir = str(getattr(graph_mgr, "cache_dir", None) or "")
+        if not cache_dir:
+            from ..config import get_settings as _get_settings
+            try:
+                _settings = _get_settings()
+                cache_dir = _settings.cache_dir
+            except Exception:
+                pass
+
+        if cache_dir:
+            import json
+            index_file = os.path.join(cache_dir, "cache_index.json")
+            if os.path.isfile(index_file):
+                try:
+                    with open(index_file) as f:
+                        index = json.load(f)
+                    udb_section = index.get("unified_db", {})
+                    for _repo_id, cache_key in udb_section.items():
+                        db_path = os.path.join(cache_dir, f"{cache_key}.wiki.db")
+                        if _pg or os.path.isfile(db_path):
+                            return db_path
+                except Exception:
+                    pass
+
+            if not _pg:
+                # Glob fallback (SQLite only)
+                import glob as _glob
+                wiki_dbs = _glob.glob(os.path.join(cache_dir, "*.wiki.db"))
+                if wiki_dbs:
+                    wiki_dbs.sort(key=os.path.getmtime, reverse=True)
+                    return wiki_dbs[0]
+
+        if not _pg:
+            # 3. Legacy location in source dir (SQLite only)
+            source_dir = getattr(self.indexer, "source_dir", None) or getattr(self.indexer, "repo_path", None)
+            if source_dir:
+                candidates = [
+                    os.path.join(source_dir, ".wikis", "unified_wiki.db"),
+                    os.path.join(source_dir, "unified_wiki.db"),
+                ]
+                for path in candidates:
+                    if os.path.isfile(path):
+                        return path
+
+        return None
+
+    @staticmethod
+    def _extract_macro_id(rationale: str) -> int | None:
+        """Extract macro cluster ID from a page's rationale string."""
+        import re as _re
+        m = _re.search(r"macro[_\s]*(?:id|cluster)[:\s=]*(\d+)", rationale, _re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        m = _re.search(r"section[_\s]*(?:id)[:\s=]*(\d+)", rationale, _re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        return None
 
     def _build_repo_profile(self, repository_files: list[str]) -> dict[str, Any]:
         """Build a lean repository profile for structure planning.
@@ -3893,6 +4082,14 @@ class OptimizedWikiGenerationAgent:
         simple mode while still surfacing the docs the planner explicitly chose.
         """
 
+        # ── Cluster-expansion fast path ─────────────────────────────────
+        # When the cluster planner produced this page, we can retrieve
+        # content directly from the unified DB with cluster-bounded
+        # expansion — no NX graph needed.
+        cluster_docs = self._try_cluster_expansion(page_spec)
+        if cluster_docs is not None:
+            return cluster_docs
+
         # GRAPH-FIRST RETRIEVAL: Use target_symbols for precise code lookup if available
         target_symbols = getattr(page_spec, "target_symbols", []) or []
         target_docs = getattr(page_spec, "target_docs", []) or []
@@ -4103,43 +4300,6 @@ class OptimizedWikiGenerationAgent:
                 "code_files": 0,
                 "retrieval_failed": True,
             }
-
-    async def _assess_page_quality(self, page_id: str, content: str) -> QualityAssessment:
-        """Assess quality of a generated page using LLM"""
-
-        try:
-            quality_prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", "You are a technical documentation quality assessor."),
-                    ("human", QUALITY_ASSESSMENT_PROMPT),
-                ]
-            )
-
-            section_name, page_name = page_id.split("/", 1) if "/" in page_id else ("Main", page_id)
-            target_audience = TARGET_AUDIENCES.get(self.target_audience.value, "Mixed audience")
-
-            response = await self.llm.ainvoke(
-                quality_prompt.format_messages(
-                    content=content, page_name=page_name, section_name=section_name, target_audience=target_audience
-                )
-            )
-
-            # Parse assessment response
-            assessment_data = self._parse_llm_json_response(response.content)
-            return QualityAssessment(**assessment_data)
-
-        except Exception as e:
-            logger.error(f"Quality assessment failed for {page_id}: {e}")
-            # Return default assessment
-            return QualityAssessment(
-                scores={"overall": 0.6},
-                overall_score=0.6,
-                strengths=[],
-                weaknesses=[f"Assessment error: {e}"],
-                improvement_suggestions=[],
-                passes_quality_gate=False,
-                confidence_level=0.0,
-            )
 
     def _dispatch_progress(self, event_type: str, data: dict[str, Any]):
         """Dispatch progress event if tracking is enabled"""
@@ -5368,398 +5528,6 @@ class OptimizedWikiGenerationAgent:
 
         return response.content
 
-    def _generate_agentic(
-        self, page_spec: PageSpec, relevant_content: dict[str, Any], repo_context: str, config: RunnableConfig
-    ) -> str:
-        """
-        Generate content using agentic section-based approach with context swapping.
-
-        Uses V2 generator with:
-        1. LLM Planning Phase: Generates semantic page structure with symbol assignments
-        2. Tool Calling Generation: Iterates through planned sections with context swapping
-
-        Used when context is too large even for hierarchical mode (>80K tokens).
-        """
-        target_audience = TARGET_AUDIENCES.get(self.target_audience.value, "Mixed audience")
-
-        expanded_docs = relevant_content.get("expanded_docs", [])
-        total_tokens = relevant_content.get("total_tokens", 0)
-
-        logger.info(
-            f"📝 Generating content for '{page_spec.page_name}' in AGENTIC V2 MODE "
-            f"- {len(expanded_docs)} documents ({total_tokens:,} tokens) via planning + tool calling"
-        )
-
-        # Initialize the V2 agentic generator (planning + tool calling)
-        generator = AgenticDocGeneratorV2(
-            llm=self.llm,
-            expanded_docs=expanded_docs,
-            page_spec=page_spec,
-            repo_context=repo_context,
-            repository_url=self.repository_url,
-            wiki_style=self.wiki_style.value,
-            target_audience=target_audience,
-            graph=self.retriever_stack.relationship_graph
-            if hasattr(self.retriever_stack, "relationship_graph")
-            else None,
-            retriever_stack=self.retriever_stack,
-        )
-
-        if os.getenv("WIKIS_AGENTIC_DROP_EXPANDED_DOCS", "0") == "1":
-            relevant_content.pop("expanded_docs", None)
-            expanded_docs = []
-
-        # Run agentic generation with planning
-        generated_content = generator.generate(config)
-
-        logger.info(
-            f"✅ Agentic V2 generation complete for '{page_spec.page_name}': "
-            f"{len(generator.planned_sections)} planned sections, {len(generated_content)} chars"
-        )
-
-        return generated_content
-
-        return generated_content
-
-    def _generate_with_continuation(
-        self, page_spec: PageSpec, relevant_content: dict[str, Any], repo_context: str, config: RunnableConfig
-    ) -> str:
-        """
-        Generate content for hierarchical mode (context exceeds token budget) with continuation pattern.
-
-        Uses message history to maintain conversation state across iterations,
-        allowing LLM to continue from where it stopped.
-        """
-        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
-        target_audience = TARGET_AUDIENCES.get(self.target_audience.value, "Mixed audience")
-
-        max_iterations = 3
-
-        # Extract tier content
-        tier1_content = relevant_content["tier1_content"]
-        tier2_content = relevant_content["tier2_content"]
-        tier3_content = relevant_content["tier3_content"]
-
-        # Documents available for fetching
-        all_expanded_docs = relevant_content.get("all_expanded_docs", [])
-
-        logger.info(
-            f"📝 Generating content for '{page_spec.page_name}' in HIERARCHICAL MODE (V3_WITH_CONTINUATION) "
-            f"with {len(all_expanded_docs)} documents available for continuation"
-        )
-
-        # Toggle: skip repository_context for token savings test
-        effective_repo_context = "" if SKIP_REPO_CONTEXT_FOR_PAGES else repo_context
-        if SKIP_REPO_CONTEXT_FOR_PAGES:
-            logger.info(
-                f"⚡ SKIP_REPO_CONTEXT_FOR_PAGES=1: Omitting {len(repo_context):,} char repository_context (hierarchical)"
-            )
-
-        # Build initial message history
-        messages = [
-            SystemMessage(
-                content="You are an expert technical writer creating comprehensive, enterprise-grade documentation."
-            ),
-            HumanMessage(
-                content=ENHANCED_CONTENT_GENERATION_PROMPT_V3_WITH_CONTINUATION.format(
-                    section_name=page_spec.page_name.split("/")[0] if "/" in page_spec.page_name else "Main",
-                    page_name=page_spec.page_name,
-                    page_description=page_spec.description,
-                    content_focus=page_spec.content_focus,
-                    repository_url=self.repository_url,
-                    wiki_style=self.wiki_style.value,
-                    repository_context=effective_repo_context,
-                    tier1_content=tier1_content,
-                    tier2_content=tier2_content,
-                    tier3_content=tier3_content,
-                    related_files="\\n".join(relevant_content["files"]),
-                    target_audience=target_audience,
-                )
-            ),
-        ]
-
-        accumulated_content = ""
-
-        for iteration in range(max_iterations):
-            logger.info(f"🔄 Iteration {iteration + 1}/{max_iterations} for '{page_spec.page_name}'")
-
-            # Generate content with current message history
-            response = self.llm.invoke(messages, config=config)
-            generated_content = response.content
-
-            # Check for NEED_CONTEXT requests
-            need_context_requests = self._parse_need_context_requests(generated_content)
-
-            if not need_context_requests:
-                # No continuation needed, we're done
-                logger.info(f"✅ Content generation complete for '{page_spec.page_name}' (no continuation needed)")
-
-                # Accumulate final content
-                accumulated_content += generated_content
-                return self._strip_need_context_markers(accumulated_content)
-
-            # LLM requested more context
-            logger.info(f"🔍 LLM requested {len(need_context_requests)} continuation(s) for '{page_spec.page_name}'")
-
-            # Aggregate all requested items
-            all_requested_items = []
-            for idx, request in enumerate(need_context_requests):
-                reason = request.get("reason", "No reason provided")
-                items = request.get("items", [])
-                all_requested_items.extend(items)
-                logger.info(f"   Request {idx + 1}: {reason}\\n   Items: {', '.join(items)}")
-
-            # Fetch requested items with token limit (40K)
-            fetched_docs, fetch_stats = self._fetch_requested_items(
-                all_requested_items, all_expanded_docs, token_limit=40000
-            )
-
-            if not fetched_docs:
-                # Couldn't fetch anything, return what we have
-                logger.warning(
-                    f"⚠️ Could not fetch any requested items for '{page_spec.page_name}', returning current content"
-                )
-                accumulated_content += generated_content
-                return self._strip_need_context_markers(accumulated_content)
-
-            # Log fetch results
-            fetched_symbols = [doc.metadata.get("symbol_name", "Unknown") for doc in fetched_docs]
-            logger.info(
-                f"📦 Fetched {fetch_stats['fetched_count']}/{len(all_requested_items)} items "
-                f"({fetch_stats['total_tokens']} tokens) for '{page_spec.page_name}'"
-            )
-            logger.info(f"   Successfully fetched: {', '.join(fetched_symbols)}")
-
-            if fetch_stats.get("not_fetched"):
-                logger.warning(
-                    f"⚠️ Could not fetch {len(fetch_stats['not_fetched'])} items: "
-                    f"{', '.join(fetch_stats['not_fetched'][:10])}"
-                    f"{'...' if len(fetch_stats['not_fetched']) > 10 else ''}"
-                )
-
-            # Strip NEED_CONTEXT markers from current response
-            stripped_content = self._strip_need_context_markers(generated_content)
-            accumulated_content += stripped_content
-
-            # Add LLM's response (without NEED_CONTEXT markers) to message history
-            messages.append(AIMessage(content=stripped_content))
-
-            # Format fetched documents
-            fetched_content = self._format_fetched_documents(fetched_docs)
-
-            # Create continuation prompt with iteration awareness
-            remaining_iterations = max_iterations - iteration - 1
-            current_iteration = iteration + 2  # +2 because iteration is 0-indexed and we're about to start next
-
-            if remaining_iterations == 0:
-                # Final iteration - tell LLM to complete without further requests
-                iteration_status = (
-                    f"\n\n⚠️ **FINAL ITERATION ({current_iteration} of {max_iterations})** - "
-                    f"Complete the documentation now. Any NEED_CONTEXT requests will be ignored. "
-                    f"Use the context you have to finish the document."
-                )
-            else:
-                iteration_status = (
-                    f"\n\n📊 **Iteration {current_iteration} of {max_iterations}** - "
-                    f"{remaining_iterations} continuation(s) remaining. "
-                    f"Request all needed items in one batch if possible."
-                )
-
-            continuation_message = f"""Based on your request, here is the additional context:
-
-{fetched_content}
-
-Please continue writing the documentation from where you stopped, incorporating this additional information. Maintain the same tone and structure.{iteration_status}"""
-
-            messages.append(HumanMessage(content=continuation_message))
-
-            logger.info(
-                f"📝 Continuing generation with {len(fetched_docs)} additional documents (iteration {current_iteration}/{max_iterations})"
-            )
-
-            # If this is the last iteration, log it
-            if iteration == max_iterations - 1:
-                logger.info(
-                    f"🏁 Reached max iterations ({max_iterations}) for '{page_spec.page_name}', "
-                    f"will finalize after this iteration"
-                )
-
-        # Return accumulated content
-        return accumulated_content
-
-    def _parse_need_context_requests(self, content: str) -> list[dict[str, Any]]:
-        """Parse NEED_CONTEXT JSON requests from LLM response"""
-
-        requests = []
-
-        # Find all NEED_CONTEXT markers
-        pattern = r"NEED_CONTEXT:\s*"
-        matches = list(re.finditer(pattern, content, re.DOTALL))
-
-        for match in matches:
-            start_pos = match.end()
-
-            # Extract JSON object starting from this position
-            # Count braces to find matching closing brace
-            json_str = ""
-            brace_count = 0
-            in_string = False
-            escape_next = False
-            found_json = False
-
-            for i in range(start_pos, len(content)):
-                char = content[i]
-                json_str += char
-
-                if escape_next:
-                    escape_next = False
-                    continue
-
-                if char == "\\":
-                    escape_next = True
-                    continue
-
-                if char == '"' and not in_string:
-                    in_string = True
-                elif char == '"' and in_string:
-                    in_string = False
-                elif char == "{" and not in_string:
-                    brace_count += 1
-                elif char == "}" and not in_string:
-                    brace_count -= 1
-                    if brace_count == 0:
-                        # Found complete JSON object
-                        found_json = True
-                        break
-
-            if not found_json:
-                logger.warning(f"Could not find complete JSON object after NEED_CONTEXT at position {start_pos}")
-                continue
-
-            # Try to parse the extracted JSON
-            try:
-                parsed = json.loads(json_str)
-                if "items" in parsed and isinstance(parsed["items"], list):
-                    requests.append(parsed)
-                    logger.debug(f"Successfully parsed NEED_CONTEXT request with {len(parsed['items'])} items")
-                else:
-                    logger.warning(f"Invalid NEED_CONTEXT format (missing 'items' array): {json_str[:100]}...")
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse NEED_CONTEXT JSON: {json_str[:100]}... - {e}")
-
-        return requests
-
-    def _fetch_requested_items(
-        self, items: list[str], all_docs: list[Any], token_limit: int = 40000
-    ) -> tuple[list[Any], dict[str, Any]]:
-        """Fetch requested documents by symbol name, respecting token limits"""
-
-        fetched_docs = []
-        total_tokens = 0
-        not_fetched = []
-        token_counter = get_token_counter()
-
-        for item in items:
-            # Find document with matching symbol_name in metadata
-            found = False
-            for doc in all_docs:
-                metadata = getattr(doc, "metadata", {})
-                symbol_name = metadata.get("symbol_name", "")
-
-                # Match exact symbol name or class.method pattern
-                if symbol_name == item or symbol_name.endswith(f".{item}"):
-                    # Count tokens accurately using tiktoken
-                    doc_tokens = token_counter.count_document(doc)
-
-                    if total_tokens + doc_tokens > token_limit:
-                        not_fetched.append(item)
-                        logger.debug(f"Token limit reached, skipping '{item}'")
-                        break
-
-                    fetched_docs.append(doc)
-                    total_tokens += doc_tokens
-                    found = True
-                    break
-
-            if not found and item not in not_fetched:
-                not_fetched.append(item)
-                logger.debug(f"Could not find document for '{item}'")
-
-        stats = {"fetched_count": len(fetched_docs), "total_tokens": total_tokens, "not_fetched": not_fetched}
-
-        return fetched_docs, stats
-
-    def _format_fetched_documents(self, docs: list[Any]) -> str:
-        """Format fetched documents into readable content with line references"""
-        sections = []
-
-        for doc in docs:
-            metadata = getattr(doc, "metadata", {})
-            content = getattr(doc, "page_content", "")
-
-            symbol_name = metadata.get("symbol_name", "Unknown")
-            source_file = metadata.get("source", "Unknown")
-            start_line = metadata.get("start_line", 0)
-            end_line = metadata.get("end_line", 0)
-
-            sections.append(f"#### {symbol_name}")
-            if start_line and end_line:
-                sections.append(f"**Source**: `{source_file}` L{start_line}-L{end_line}")
-            else:
-                sections.append(f"**Source**: `{source_file}`")
-            sections.append(f"\\n{content}\\n")
-
-        return "\\n\\n".join(sections)
-
-    def _strip_need_context_markers(self, content: str) -> str:
-        """Remove NEED_CONTEXT markers from final content"""
-
-        # Use same robust approach as parsing
-        pattern = r"NEED_CONTEXT:\s*"
-        matches = list(re.finditer(pattern, content, re.DOTALL))
-
-        # Process matches in reverse order to maintain string positions
-        for match in reversed(matches):
-            start_pos = match.start()
-            json_end_pos = match.end()
-
-            # Find the closing brace of the JSON object
-            brace_count = 0
-            in_string = False
-            escape_next = False
-
-            for i in range(match.end(), len(content)):
-                char = content[i]
-
-                if escape_next:
-                    escape_next = False
-                    continue
-
-                if char == "\\":
-                    escape_next = True
-                    continue
-
-                if char == '"' and not in_string:
-                    in_string = True
-                elif char == '"' and in_string:
-                    in_string = False
-                elif char == "{" and not in_string:
-                    brace_count += 1
-                elif char == "}" and not in_string:
-                    brace_count -= 1
-                    if brace_count == 0:
-                        json_end_pos = i + 1
-                        break
-
-            # Remove the entire NEED_CONTEXT block
-            content = content[:start_pos] + content[json_end_pos:]
-
-        # Clean up extra whitespace
-        content = re.sub(r"\n{3,}", "\n\n", content)
-
-        return content.strip()
-
     def _extract_relationship_hints(
         self, symbol_name: str, file_path: str, graph, tier_map: dict[str, int] = None
     ) -> str:
@@ -5812,7 +5580,7 @@ Please continue writing the documentation from where you stopped, incorporating 
 
     def _find_node_in_graph(self, symbol_name: str, file_path: str, graph) -> str | None:
         """Find node ID using O(1) index if available, fallback to search"""
-        # Try O(1) index first (from content_expander)
+        # Try O(1) index first
         if hasattr(graph, "_node_index") and graph._node_index:
             language = self._infer_language_from_path(file_path)
             key = (symbol_name, file_path, language)
