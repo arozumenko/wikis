@@ -20,6 +20,19 @@ def _settings():
     return Settings(llm_api_key=SecretStr("test-key"))
 
 
+def _make_cached_unified_db(tmp_path, db_name: str, repository_analysis: str | None = None):
+    from app.core.unified_db import UnifiedWikiDB
+
+    db_path = tmp_path / f"{db_name}.wiki.db"
+    db = UnifiedWikiDB(str(db_path), embedding_dim=4)
+    try:
+        if repository_analysis is not None:
+            db.set_meta("repository_analysis", repository_analysis)
+    finally:
+        db.close()
+    return db_path
+
+
 class TestBuildEngineComponents:
     @pytest.mark.asyncio
     async def test_wiki_not_found_raises(self, tmp_path):
@@ -150,19 +163,11 @@ class TestComponentCache:
 
 class TestLoadCachedArtifactsRepoAnalysis:
     def test_populates_repo_analysis_when_analysis_exists(self, tmp_path):
-        """_load_cached_artifacts sets components.repo_analysis when analysis is stored."""
-        from app.core.repository_analysis_store import RepositoryAnalysisStore
-
-        repo_identifier = "owner/repo:main"
-        store = RepositoryAnalysisStore(cache_dir=str(tmp_path))
-        store.save_analysis(
-            repo_identifier=repo_identifier,
-            analysis="This repo does important things.",
-            commit_hash=None,
-        )
+        """_load_cached_artifacts sets components.repo_analysis from unified DB metadata."""
+        _make_cached_unified_db(tmp_path, "repo-analysis", "This repo does important things.")
 
         components = EngineComponents()
-        _load_cached_artifacts(components, str(tmp_path), "wiki-123", repo_identifier)
+        _load_cached_artifacts(components, str(tmp_path), "wiki-123", "owner/repo:main")
 
         assert components.repo_analysis is not None
         assert "summary" in components.repo_analysis
@@ -176,13 +181,13 @@ class TestLoadCachedArtifactsRepoAnalysis:
         assert components.repo_analysis is None
 
     def test_store_exception_does_not_propagate(self, tmp_path):
-        """If RepositoryAnalysisStore.get_analysis_for_prompt raises, _load_cached_artifacts swallows it."""
+        """If unified DB metadata loading raises, _load_cached_artifacts swallows it."""
+        _make_cached_unified_db(tmp_path, "broken-db")
         components = EngineComponents()
+        mock_db = MagicMock()
+        mock_db.get_meta.side_effect = RuntimeError("disk failure")
 
-        with patch(
-            "app.core.repository_analysis_store.RepositoryAnalysisStore.get_analysis_for_prompt",
-            side_effect=RuntimeError("disk failure"),
-        ):
+        with patch("app.core.storage.open_storage", return_value=mock_db):
             # Must not raise
             _load_cached_artifacts(components, str(tmp_path), "wiki-789", "owner/repo:main")
 
