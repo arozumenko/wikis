@@ -36,6 +36,14 @@ def request_obj():
     return GenerateWikiRequest(repo_url="https://github.com/test/repo")
 
 
+def _mock_generation_result(generated_pages=None, artifacts=None, success=True):
+    return {
+        "success": success,
+        "generated_pages": generated_pages or {},
+        "artifacts": artifacts or [],
+    }
+
+
 class TestWikiServiceUnit:
     def test_make_wiki_id_deterministic(self):
         id1 = WikiService._make_wiki_id("https://github.com/a/b", "main")
@@ -76,11 +84,11 @@ class TestWikiServiceUnit:
 
     @pytest.mark.asyncio
     async def test_generation_failure_sets_status(self, service, request_obj):
-        """If _run_generation raises, invocation should be marked failed."""
+        """If subprocess generation raises, invocation should be marked failed."""
         invocation = Invocation(id="test-id", wiki_id="test-wiki", status="generating")
         service._invocations["test-id"] = invocation
 
-        with patch("app.services.llm_factory.create_llm", side_effect=ValueError("bad key")):
+        with patch.object(service, "_run_wiki_subprocess", new_callable=AsyncMock, side_effect=ValueError("bad key")):
             await service._run_generation(invocation, request_obj)
 
         assert invocation.status == "failed"
@@ -96,24 +104,19 @@ class TestRunGeneration:
 
     @pytest.mark.asyncio
     async def test_successful_generation_stores_artifacts(self, service, request_obj, invocation):
-        mock_toolkit = MagicMock()
-        mock_toolkit.generate_wiki.return_value = {
-            "success": True,
-            "generated_pages": {
-                "getting-started": "# Getting Started\nWelcome.",
-                "architecture": "# Architecture\nMicroservices.",
-            },
-            "artifacts": [
-                {"name": "index.json", "data": b"{}"},
-            ],
-        }
         service._invocations[invocation.id] = invocation
 
-        with (
-            patch("app.services.llm_factory.create_llm", return_value=MagicMock()),
-            patch("app.services.llm_factory.create_embeddings", return_value=MagicMock()),
-            patch("app.core.repo_providers.factory.RepoProviderFactory.from_url", return_value=MagicMock()),
-            patch("app.core.hybrid_wiki_toolkit_wrapper.HybridWikiToolkitWrapper", return_value=mock_toolkit),
+        with patch.object(
+            service,
+            "_run_wiki_subprocess",
+            new_callable=AsyncMock,
+            return_value=_mock_generation_result(
+                generated_pages={
+                    "getting-started": "# Getting Started\nWelcome.",
+                    "architecture": "# Architecture\nMicroservices.",
+                },
+                artifacts=[{"name": "index.json", "data": b"{}"}],
+            ),
         ):
             await service._run_generation(invocation, request_obj)
 
@@ -129,54 +132,43 @@ class TestRunGeneration:
     @pytest.mark.asyncio
     async def test_llm_model_override_passed(self, service, invocation):
         req = GenerateWikiRequest(repo_url="https://github.com/t/r", llm_model="gpt-4o")
-        mock_toolkit = MagicMock()
-        mock_toolkit.generate_wiki.return_value = {"success": True, "artifacts": []}
         service._invocations[invocation.id] = invocation
 
-        with (
-            patch("app.services.llm_factory.create_llm", return_value=MagicMock()) as mock_llm,
-            patch("app.services.llm_factory.create_embeddings", return_value=MagicMock()),
-            patch("app.core.repo_providers.factory.RepoProviderFactory.from_url", return_value=MagicMock()),
-            patch("app.core.hybrid_wiki_toolkit_wrapper.HybridWikiToolkitWrapper", return_value=mock_toolkit),
-        ):
+        with patch.object(
+            service,
+            "_run_wiki_subprocess",
+            new_callable=AsyncMock,
+            return_value=_mock_generation_result(),
+        ) as mock_run:
             await service._run_generation(invocation, req)
 
-        # create_llm called twice: tier="high" (with model override) and tier="low"
-        assert mock_llm.call_count == 2
-        high_call = mock_llm.call_args_list[0]
-        assert high_call[1].get("model") == "gpt-4o"
+        run_kwargs = mock_run.await_args.kwargs
+        assert run_kwargs["request"].llm_model == "gpt-4o"
+        assert run_kwargs["planner_type"] == "agent"
+        assert run_kwargs["exclude_tests"] is False
 
     @pytest.mark.asyncio
     async def test_embedding_model_override_passed(self, service, invocation):
         req = GenerateWikiRequest(repo_url="https://github.com/t/r", embedding_model="text-embedding-ada-002")
-        mock_toolkit = MagicMock()
-        mock_toolkit.generate_wiki.return_value = {"success": True, "artifacts": []}
         service._invocations[invocation.id] = invocation
 
-        with (
-            patch("app.services.llm_factory.create_llm", return_value=MagicMock()),
-            patch("app.services.llm_factory.create_embeddings", return_value=MagicMock()) as mock_emb,
-            patch("app.core.repo_providers.factory.RepoProviderFactory.from_url", return_value=MagicMock()),
-            patch("app.core.hybrid_wiki_toolkit_wrapper.HybridWikiToolkitWrapper", return_value=mock_toolkit),
-        ):
+        with patch.object(
+            service,
+            "_run_wiki_subprocess",
+            new_callable=AsyncMock,
+            return_value=_mock_generation_result(),
+        ) as mock_run:
             await service._run_generation(invocation, req)
 
-        mock_emb.assert_called_once()
-        call_kwargs = mock_emb.call_args
-        assert call_kwargs[1].get("model") == "text-embedding-ada-002"
+        run_kwargs = mock_run.await_args.kwargs
+        assert run_kwargs["request"].embedding_model == "text-embedding-ada-002"
+        assert run_kwargs["planner_type"] == "agent"
 
     @pytest.mark.asyncio
     async def test_non_dict_result_sets_failed(self, service, request_obj, invocation):
-        mock_toolkit = MagicMock()
-        mock_toolkit.generate_wiki.return_value = "not a dict"
         service._invocations[invocation.id] = invocation
 
-        with (
-            patch("app.services.llm_factory.create_llm", return_value=MagicMock()),
-            patch("app.services.llm_factory.create_embeddings", return_value=MagicMock()),
-            patch("app.core.repo_providers.factory.RepoProviderFactory.from_url", return_value=MagicMock()),
-            patch("app.core.hybrid_wiki_toolkit_wrapper.HybridWikiToolkitWrapper", return_value=mock_toolkit),
-        ):
+        with patch.object(service, "_run_wiki_subprocess", new_callable=AsyncMock, return_value="not a dict"):
             await service._run_generation(invocation, request_obj)
 
         assert invocation.status == "failed"
@@ -186,7 +178,7 @@ class TestRunGeneration:
     async def test_cancellation_sets_cancelled_status(self, service, request_obj, invocation):
         service._invocations[invocation.id] = invocation
 
-        with patch("app.services.llm_factory.create_llm", side_effect=asyncio.CancelledError()):
+        with patch.object(service, "_run_wiki_subprocess", new_callable=AsyncMock, side_effect=asyncio.CancelledError()):
             await service._run_generation(invocation, request_obj)
 
         assert invocation.status == "cancelled"
@@ -196,14 +188,12 @@ class TestRunGeneration:
     async def test_task_removed_from_tasks_dict_on_completion(self, service, request_obj, invocation):
         service._invocations[invocation.id] = invocation
         service._tasks[invocation.id] = MagicMock()
-        mock_toolkit = MagicMock()
-        mock_toolkit.generate_wiki.return_value = {"success": True, "artifacts": []}
 
-        with (
-            patch("app.services.llm_factory.create_llm", return_value=MagicMock()),
-            patch("app.services.llm_factory.create_embeddings", return_value=MagicMock()),
-            patch("app.core.repo_providers.factory.RepoProviderFactory.from_url", return_value=MagicMock()),
-            patch("app.core.hybrid_wiki_toolkit_wrapper.HybridWikiToolkitWrapper", return_value=mock_toolkit),
+        with patch.object(
+            service,
+            "_run_wiki_subprocess",
+            new_callable=AsyncMock,
+            return_value=_mock_generation_result(),
         ):
             await service._run_generation(invocation, request_obj)
 
@@ -214,7 +204,7 @@ class TestRunGeneration:
         service._invocations[invocation.id] = invocation
         service._tasks[invocation.id] = MagicMock()
 
-        with patch("app.services.llm_factory.create_llm", side_effect=ValueError("boom")):
+        with patch.object(service, "_run_wiki_subprocess", new_callable=AsyncMock, side_effect=ValueError("boom")):
             await service._run_generation(invocation, request_obj)
 
         assert invocation.id not in service._tasks

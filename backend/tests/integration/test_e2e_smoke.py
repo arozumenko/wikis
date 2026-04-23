@@ -9,7 +9,7 @@ Run with: pytest tests/integration/test_e2e_smoke.py -v
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -33,6 +33,7 @@ async def e2e_client(tmp_path, monkeypatch):
     """Full app client with mocked generation backend."""
     monkeypatch.setenv("AUTH_ENABLED", "false")
     monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("HEALTH_CHECK_ON_STARTUP", "false")
 
     session_factory = await _make_session_factory()
     app = create_app()
@@ -52,10 +53,15 @@ async def e2e_client(tmp_path, monkeypatch):
             yield c, app
 
 
-def _mock_toolkit():
-    """Create a mock toolkit that returns realistic generate_wiki results."""
-    toolkit = MagicMock()
-    toolkit.generate_wiki.return_value = {
+def _mock_generation_result():
+    """Create a realistic wiki-generation result payload.
+
+    The production generate path now runs through
+    ``WikiService._run_wiki_subprocess()``. The smoke test should mock that
+    seam directly so it still exercises the real HTTP route, background task,
+    invocation tracking, page storage, wiki registration, and delete flow.
+    """
+    return {
         "success": True,
         "generated_pages": {
             "getting-started": "# Getting Started\nWelcome to the project.",
@@ -66,49 +72,57 @@ def _mock_toolkit():
         "execution_time": 45.2,
         "errors": [],
     }
-    return toolkit
 
 
 class TestE2ESmokeFlow:
     """Full flow: generate → poll → list → ask → research → delete."""
 
     @pytest.mark.asyncio
-    @patch("app.core.hybrid_wiki_toolkit_wrapper.HybridWikiToolkitWrapper", return_value=_mock_toolkit())
-    @patch("app.core.repo_providers.factory.RepoProviderFactory.from_url", return_value=MagicMock())
-    @patch("app.services.llm_factory.create_embeddings", return_value=MagicMock())
-    @patch("app.services.llm_factory.create_llm", return_value=MagicMock())
-    async def test_full_e2e_flow(self, mock_llm, mock_emb, mock_repo, mock_toolkit_cls, e2e_client):
+    async def test_full_e2e_flow(self, e2e_client):
         c, app = e2e_client
 
-        # === Step 1: Generate wiki ===
-        resp = await c.post(
-            "/api/v1/generate",
-            json={
-                "repo_url": "https://github.com/test/smoke-repo",
-                "branch": "main",
-                "wiki_title": "Smoke Test Wiki",
-            },
-        )
-        assert resp.status_code == 202, f"Generate failed: {resp.text}"
-        gen_data = resp.json()
-        wiki_id = gen_data["wiki_id"]
-        assert wiki_id
-        assert "invocations/" in gen_data["message"]
+        with patch.object(
+            app.state.wiki_service,
+            "_run_wiki_subprocess",
+            new_callable=AsyncMock,
+            return_value=_mock_generation_result(),
+        ) as mock_run:
+            # === Step 1: Generate wiki ===
+            resp = await c.post(
+                "/api/v1/generate",
+                json={
+                    "repo_url": "https://github.com/test/smoke-repo",
+                    "branch": "main",
+                    "wiki_title": "Smoke Test Wiki",
+                },
+            )
+            assert resp.status_code == 202, f"Generate failed: {resp.text}"
+            gen_data = resp.json()
+            wiki_id = gen_data["wiki_id"]
+            assert wiki_id
+            assert "invocations/" in gen_data["message"]
 
-        # Extract invocation ID from message
-        inv_id = gen_data["message"].split("invocations/")[-1]
+            # Extract invocation ID from message
+            inv_id = gen_data["message"].split("invocations/")[-1]
 
-        # === Step 2: Poll invocation until complete ===
-        for _ in range(50):  # max 5 seconds
-            resp = await c.get(f"/api/v1/invocations/{inv_id}")
-            assert resp.status_code == 200
-            inv_data = resp.json()
-            if inv_data["status"] in ("complete", "failed"):
-                break
-            await asyncio.sleep(0.1)
+            # === Step 2: Poll invocation until complete ===
+            for _ in range(50):  # max 5 seconds
+                resp = await c.get(f"/api/v1/invocations/{inv_id}")
+                assert resp.status_code == 200
+                inv_data = resp.json()
+                if inv_data["status"] in ("complete", "failed"):
+                    break
+                await asyncio.sleep(0.1)
 
-        assert inv_data["status"] == "complete", f"Generation failed: {inv_data}"
-        assert inv_data["progress"] == 1.0
+            assert inv_data["status"] == "complete", f"Generation failed: {inv_data}"
+            assert inv_data["progress"] == 1.0
+
+            # Verify the real execution seam was used.
+            assert mock_run.await_count == 1
+            run_kwargs = mock_run.await_args.kwargs
+            assert run_kwargs["request"].repo_url == "https://github.com/test/smoke-repo"
+            assert run_kwargs["invocation"].id == inv_id
+            assert run_kwargs["invocation"].wiki_id == wiki_id
 
         # === Step 3: List wikis — should contain our wiki ===
         resp = await c.get("/api/v1/wikis")
