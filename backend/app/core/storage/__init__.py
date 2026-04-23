@@ -20,10 +20,13 @@ Usage::
 
 from .factory import create_storage, drop_storage, is_postgres_backend, open_storage, repo_id_from_path
 from .protocol import WikiStorageProtocol
+from .sqlite import SqliteWikiStorage, UnifiedWikiDB
 from .text_index import StorageTextIndex
 
 __all__ = [
     "StorageTextIndex",
+    "SqliteWikiStorage",
+    "UnifiedWikiDB",
     "WikiStorageProtocol",
     "create_storage",
     "drop_storage",

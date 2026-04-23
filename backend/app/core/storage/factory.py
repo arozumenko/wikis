@@ -69,9 +69,9 @@ def create_storage(
         if db_path is None:
             raise ValueError("db_path is required for SQLite backend")
 
-        from ..unified_db import UnifiedWikiDB
+        from .sqlite import SqliteWikiStorage
 
-        return UnifiedWikiDB(
+        return SqliteWikiStorage(
             db_path=db_path,
             embedding_dim=embedding_dim,
             readonly=readonly,

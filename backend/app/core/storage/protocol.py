@@ -5,7 +5,8 @@ This Protocol captures every public method that consumers (UnifiedRetriever,
 cluster_expansion, filesystem_indexer, wiki_graph_optimized, toolkit_bridge,
 ask_engine, research_engine, etc.) need from the storage layer.
 
-Both ``SqliteWikiStorage`` (wrapping the existing UnifiedWikiDB) and
+Both ``SqliteWikiStorage`` (the SQLite implementation, with
+``UnifiedWikiDB`` kept as a compatibility alias) and
 ``PostgresWikiStorage`` conform to this protocol.
 
 Design principles:
