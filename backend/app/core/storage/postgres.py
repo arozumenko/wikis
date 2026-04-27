@@ -44,6 +44,7 @@ from sqlalchemy import (
     select,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
@@ -232,6 +233,10 @@ def _define_tables(
         Column("micro_cluster", Integer),
         Column("is_hub", Integer, server_default="0"),
         Column("hub_assignment", Text),
+        # Phase 6 (graph-quality roadmap) — list of API-surface objects
+        # (REST/gRPC/GraphQL/FFI/BDD/CLI) extracted from the symbol's
+        # source_text. NULL when nothing detected.
+        Column("api_surface", JSONB),
         # tsvector column for FTS
         Column("fts_vector", Text),  # Will be cast to tsvector in DDL
         schema=schema,
@@ -445,6 +450,15 @@ class PostgresWikiStorage:
                         ALTER TABLE {schema}.repo_edges
                             ADD COLUMN provenance JSONB DEFAULT NULL;
                     END IF;
+                    -- Phase 6 (graph-quality roadmap): api_surface column.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_nodes'
+                          AND column_name = 'api_surface'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_nodes
+                            ADD COLUMN api_surface JSONB DEFAULT NULL;
+                    END IF;
                 END $$;
             """))
         indexes = [
@@ -591,6 +605,13 @@ class PostgresWikiStorage:
         if isinstance(params, (list, tuple)):
             params = json.dumps(params)
 
+        # Phase 6 — api_surface persisted as JSONB. Empty list → NULL.
+        api_surface = n.get("api_surface")
+        if isinstance(api_surface, (list, tuple)):
+            api_surface = json.dumps(list(api_surface)) if api_surface else None
+        elif isinstance(api_surface, dict):
+            api_surface = json.dumps(api_surface)
+
         _s = self._strip_nul
         return {
             "node_id": _s(n["node_id"]),
@@ -616,6 +637,7 @@ class PostgresWikiStorage:
             "micro_cluster": n.get("micro_cluster"),
             "is_hub": n.get("is_hub", 0),
             "hub_assignment": _s(n.get("hub_assignment")),
+            "api_surface": api_surface,
         }
 
     # ==================================================================
@@ -635,7 +657,12 @@ class PostgresWikiStorage:
         # Use PostgreSQL UPSERT (INSERT ... ON CONFLICT ... DO UPDATE)
         cols = list(rows[0].keys())
         col_list = ", ".join(cols)
-        val_placeholders = ", ".join(f":{c}" for c in cols)
+        # api_surface is JSONB; explicit cast keeps SQLAlchemy able to
+        # bind a Python str/None like the provenance column does.
+        val_placeholders = ", ".join(
+            f"CAST(:{c} AS JSONB)" if c == "api_surface" else f":{c}"
+            for c in cols
+        )
         update_set = ", ".join(
             f"{c} = EXCLUDED.{c}" for c in cols if c != "node_id"
         )
@@ -1398,6 +1425,7 @@ class PostgresWikiStorage:
             "signature": signature,
             "parameters": parameters,
             "return_type": return_type,
+            "api_surface": data.get("api_surface"),
         }
 
     def _nx_edge_to_dict(self, u: str, v: str, key: int, data: dict) -> dict[str, Any]:

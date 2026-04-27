@@ -156,6 +156,12 @@ CREATE TABLE IF NOT EXISTS repo_nodes (
     is_hub          INTEGER DEFAULT 0,
     hub_assignment  TEXT DEFAULT NULL,
 
+    -- Phase 6 (graph-quality roadmap) — JSON list of API surface
+    -- objects (REST/gRPC/GraphQL/FFI/BDD/CLI) extracted from this
+    -- symbol's source_text. NULL when no surface detected. Used by
+    -- the cross-language linker (L1) and federated query expansion.
+    api_surface     TEXT DEFAULT NULL,
+
     -- Timestamps
     indexed_at      TEXT DEFAULT (datetime('now'))
 );
@@ -429,6 +435,16 @@ class UnifiedWikiDB:
             self.conn.commit()
             self._backfill_is_test()
 
+        # Phase 6 (graph-quality roadmap): API surface JSON column.
+        if "api_surface" not in cols:
+            logger.info(
+                "Migrating schema: adding api_surface column to repo_nodes (Phase 6)"
+            )
+            cur.execute(
+                "ALTER TABLE repo_nodes ADD COLUMN api_surface TEXT DEFAULT NULL"
+            )
+            self.conn.commit()
+
         # §11.6 / B1: edge confidence column. ALTER TABLE in sqlite cannot
         # add a CHECK constraint after the fact, but the default + the
         # application-side discipline (only INFERRED/EXTRACTED/AMBIGUOUS
@@ -511,14 +527,16 @@ class UnifiedWikiDB:
             symbol_name, symbol_type, parent_symbol, analysis_level,
             source_text, docstring, signature, parameters, return_type,
             is_architectural, is_doc, is_test, chunk_type,
-            macro_cluster, micro_cluster, is_hub, hub_assignment
+            macro_cluster, micro_cluster, is_hub, hub_assignment,
+            api_surface
         ) VALUES (
             :node_id, :rel_path, :file_name, :language,
             :start_line, :end_line,
             :symbol_name, :symbol_type, :parent_symbol, :analysis_level,
             :source_text, :docstring, :signature, :parameters, :return_type,
             :is_architectural, :is_doc, :is_test, :chunk_type,
-            :macro_cluster, :micro_cluster, :is_hub, :hub_assignment
+            :macro_cluster, :micro_cluster, :is_hub, :hub_assignment,
+            :api_surface
         )
         """
 
@@ -550,6 +568,16 @@ class UnifiedWikiDB:
             if isinstance(params, (list, tuple)):
                 params = json.dumps(params)
 
+            # Phase 6: api_surface may arrive as list[dict] from
+            # extract_api_surfaces_for_graph; serialize to JSON for
+            # storage. Empty lists collapse to NULL so the column stays
+            # cheap.
+            api_surface = n.get("api_surface")
+            if isinstance(api_surface, (list, tuple)):
+                api_surface = json.dumps(list(api_surface)) if api_surface else None
+            elif isinstance(api_surface, dict):
+                api_surface = json.dumps(api_surface)
+
             rows.append(
                 {
                     "node_id": n["node_id"],
@@ -575,6 +603,7 @@ class UnifiedWikiDB:
                     "micro_cluster": n.get("micro_cluster"),
                     "is_hub": n.get("is_hub", 0),
                     "hub_assignment": n.get("hub_assignment"),
+                    "api_surface": api_surface,
                 }
             )
 
@@ -1320,6 +1349,7 @@ class UnifiedWikiDB:
             "signature": signature,
             "parameters": parameters,
             "return_type": return_type,
+            "api_surface": data.get("api_surface"),
         }
 
     def _nx_edge_to_dict(self, u: str, v: str, key: int, data: dict) -> dict[str, Any]:

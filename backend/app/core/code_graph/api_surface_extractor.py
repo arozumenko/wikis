@@ -408,3 +408,45 @@ def extract_api_surfaces(
         seen.add(key)
         unique.append(s)
     return unique
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 1c orchestrator
+# ──────────────────────────────────────────────────────────────────────
+
+
+def extract_api_surfaces_for_graph(
+    g: "Any",  # nx.MultiDiGraph — annotation lazy to avoid import cost
+    *,
+    parser_metadata_by_node: Optional[Dict[str, dict]] = None,
+) -> Dict[str, List[APISurface]]:
+    """Walk *g* and attach API-surface metadata to every node.
+
+    Side effects: each node whose ``source_text`` exposes any surface
+    gets its ``api_surface`` attribute set to the list of ``APISurface``
+    dicts. Nodes without surfaces are left untouched (no key written).
+
+    Returns a mapping ``{node_id: [APISurface, ...]}`` containing
+    only the nodes for which at least one surface was detected. The
+    return value is what :func:`run_cross_language_linker` expects as
+    ``surfaces_by_node`` for its L1 pass.
+
+    Pure with respect to edges and to nodes that produce no surfaces.
+    """
+    parser_metadata_by_node = parser_metadata_by_node or {}
+    out: Dict[str, List[APISurface]] = {}
+    for node_id, data in g.nodes(data=True):
+        try:
+            surfaces = extract_api_surfaces(
+                data, parser_metadata=parser_metadata_by_node.get(str(node_id))
+            )
+        except Exception:  # pragma: no cover — defensive; matchers are regex-only
+            continue
+        if not surfaces:
+            continue
+        # Mutate the in-memory node attrs so the SQLite/Postgres
+        # serialisers persist the surfaces via the ``api_surface``
+        # column.
+        data["api_surface"] = surfaces
+        out[str(node_id)] = surfaces
+    return out

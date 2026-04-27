@@ -115,3 +115,48 @@ class TestDispatcher:
         text = "@app.get('/x')\n@app.get('/x')\ndef f(): ..."
         s = extract_api_surfaces(_node(text))
         assert len(s) == 1
+
+
+class TestExtractApiSurfacesForGraph:
+    """PR-12: Phase 1c orchestrator that walks the graph and persists
+    api_surface attributes on each node."""
+
+    def test_attaches_surfaces_and_returns_mapping(self):
+        import networkx as nx
+
+        from app.core.code_graph.api_surface_extractor import (
+            extract_api_surfaces_for_graph,
+        )
+
+        g = nx.MultiDiGraph()
+        g.add_node(
+            "rest_node",
+            source_text="@app.post('/api/users')\ndef create_user(): ...",
+            language="python",
+            symbol_name="create_user",
+        )
+        g.add_node(
+            "plain_node",
+            source_text="x = 1",
+            language="python",
+            symbol_name="x",
+        )
+
+        out = extract_api_surfaces_for_graph(g)
+
+        assert "rest_node" in out
+        assert "plain_node" not in out
+        assert any(s["kind"] == "rest" for s in out["rest_node"])
+        # Mutation: surfaces attached to node attrs for downstream
+        # serialisation by sqlite/postgres _nx_node_to_dict.
+        assert g.nodes["rest_node"]["api_surface"] == out["rest_node"]
+        assert "api_surface" not in g.nodes["plain_node"]
+
+    def test_empty_graph_returns_empty_mapping(self):
+        import networkx as nx
+
+        from app.core.code_graph.api_surface_extractor import (
+            extract_api_surfaces_for_graph,
+        )
+
+        assert extract_api_surfaces_for_graph(nx.MultiDiGraph()) == {}
