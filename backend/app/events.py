@@ -304,3 +304,99 @@ def page_complete(progress_token: str, page_id: str, page_title: str) -> MCPEven
         },
         event_alias="page_complete",
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 — Project-level lifecycle events
+# ---------------------------------------------------------------------------
+
+PHASE_PROJECT_RELATEDNESS = "project_relatedness"
+PHASE_CROSS_REPO_LINKER = "cross_repo_linker"
+PHASE_PROJECT_CLUSTERING = "project_clustering"
+
+
+def project_relatedness_progress(
+    progress_token: str,
+    progress: int,
+    total: int,
+    message: str,
+    *,
+    project_id: str | None = None,
+) -> MCPEvent:
+    """Project-pair relatedness scoring progress.
+
+    Emitted by the Phase 8 cross-repo pipeline once it lands. Wraps a
+    standard ``notifications/progress`` so existing SSE clients keep
+    working unchanged; consumers that care about the lifecycle stage
+    can branch on the ``_phase`` parameter.
+    """
+    params: dict[str, Any] = {
+        "progressToken": progress_token,
+        "progress": progress,
+        "total": total,
+        "message": message,
+        "_phase": PHASE_PROJECT_RELATEDNESS,
+    }
+    if project_id:
+        params["_projectId"] = project_id
+    return MCPEvent(
+        "notifications/progress",
+        params,
+        event_alias="project_relatedness_progress",
+    )
+
+
+def cross_repo_linker_progress(
+    progress_token: str,
+    progress: int,
+    total: int,
+    message: str,
+    *,
+    project_id: str | None = None,
+    pair: tuple[str, str] | None = None,
+) -> MCPEvent:
+    """Cross-repo linker progress (per wiki pair)."""
+    params: dict[str, Any] = {
+        "progressToken": progress_token,
+        "progress": progress,
+        "total": total,
+        "message": message,
+        "_phase": PHASE_CROSS_REPO_LINKER,
+    }
+    if project_id:
+        params["_projectId"] = project_id
+    if pair and len(pair) == 2:
+        params["_pair"] = list(pair)
+    return MCPEvent(
+        "notifications/progress",
+        params,
+        event_alias="cross_repo_linker_progress",
+    )
+
+
+def project_clustering_progress(
+    progress_token: str,
+    progress: int,
+    total: int,
+    message: str,
+    *,
+    project_id: str | None = None,
+    community_count: int | None = None,
+) -> MCPEvent:
+    """Project-level Leiden clustering progress."""
+    params: dict[str, Any] = {
+        "progressToken": progress_token,
+        "progress": progress,
+        "total": total,
+        "message": message,
+        "_phase": PHASE_PROJECT_CLUSTERING,
+    }
+    if project_id:
+        params["_projectId"] = project_id
+    if community_count is not None:
+        params["_communityCount"] = int(community_count)
+    return MCPEvent(
+        "notifications/progress",
+        params,
+        event_alias="project_clustering_progress",
+    )
