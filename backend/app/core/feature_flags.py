@@ -207,6 +207,28 @@ class FeatureFlags:
     #: is gated off.
     api_surface_extraction: bool = True
 
+    # ── Phase 7 — Project graph storage + Federated query/retriever ──
+
+    #: Persist project-level nodes/edges/relatedness via
+    #: :class:`ProjectStorageProtocol`. When ``False`` the in-memory
+    #: implementation acts as a no-op and ``MultiGraphQueryService``
+    #: stays the active facade. Default off.
+    project_graph: bool = False
+
+    #: Use :class:`FederatedQueryService` instead of
+    #: :class:`MultiGraphQueryService`. Drop-in compatible — same surface
+    #: plus ``cross_repo_edges`` and ``relatedness``. Default off.
+    federated_query: bool = False
+
+    #: Use :class:`FederatedRetrieverStack` (1-hop expansion along
+    #: ``edge_class="cross_repo"`` with cross-repo dampening) instead
+    #: of :class:`MultiWikiRetrieverStack`. Default off.
+    federated_retriever: bool = False
+
+    #: SQLite-only path to the project graph DB. Empty string falls
+    #: back to ``<storage_root>/<project_id>/project.db``.
+    project_graph_db_path: str = ""
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -240,4 +262,8 @@ def get_feature_flags() -> FeatureFlags:
         cross_language_linking=_env_bool("WIKI_CROSS_LANGUAGE_LINKING", False),
         test_linker=_env_bool("WIKI_TEST_LINKER", False),
         api_surface_extraction=_env_bool("WIKI_API_SURFACE_EXTRACTION", True),
+        project_graph=_env_bool("WIKI_PROJECT_GRAPH", False),
+        federated_query=_env_bool("WIKI_FEDERATED_QUERY", False),
+        federated_retriever=_env_bool("WIKI_FEDERATED_RETRIEVER", False),
+        project_graph_db_path=os.environ.get("WIKI_PROJECT_GRAPH_DB_PATH", "").strip(),
     )
