@@ -116,6 +116,21 @@ class FeatureFlags:
     #: ``min_fts_query_len`` characters.
     fts_stopword_gate: bool = True
 
+    # ── Phase 2 — IDF gating + tiered lexical + REST disambig ─────────
+
+    #: Replace flat Pass-1 lexical lookup with the T1–T4 tiered cascade
+    #: (same-dir → parent-dir → local-FTS → global). Default off until
+    #: Phase 3 lands the cascade reorder; flip via env.
+    orphan_lexical_tiered: bool = False
+
+    #: Apply the IDF gate to lexical Pass 1 (drops common names like
+    #: ``User`` / ``API`` from ever issuing T3/T4 queries).
+    orphan_lexical_idf_gate: bool = True
+
+    #: Detect REST endpoint classes (generic name + REST decorator/base)
+    #: and rewrite their FTS query to ``"<file_stem> <symbol_name>"``.
+    orphan_rest_disambig: bool = True
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -133,4 +148,7 @@ def get_feature_flags() -> FeatureFlags:
         edge_dedup=_env_bool("WIKI_EDGE_DEDUP", True),
         fts_min_score_norm=_env_float("WIKI_FTS_MIN_SCORE_NORM", 0.15),
         fts_stopword_gate=_env_bool("WIKI_FTS_STOPWORD_GATE", True),
+        orphan_lexical_tiered=_env_bool("WIKI_ORPHAN_LEXICAL_TIERED", False),
+        orphan_lexical_idf_gate=_env_bool("WIKI_ORPHAN_LEXICAL_IDF_GATE", True),
+        orphan_rest_disambig=_env_bool("WIKI_ORPHAN_REST_DISAMBIG", True),
     )

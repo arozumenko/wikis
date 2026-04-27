@@ -432,7 +432,46 @@ def resolve_orphans(
     resolved: Set[str] = set()
 
     # ── Pass 1: FTS5 lexical match ───────────────────────────
-    for node_id in orphans:
+    # Phase 2 (graph-quality roadmap): when ``orphan_lexical_tiered`` is
+    # on, delegate to the tiered T1–T4 cascade with IDF gating + REST
+    # disambiguation. The legacy flat-FTS path remains the default.
+    from .feature_flags import get_feature_flags as _flags
+    _f = _flags()
+    if _f.orphan_lexical_tiered:
+        from .graph_lexical_v2 import resolve_orphans_lexical_tiered as _tiered
+        for node_id in orphans:
+            try:
+                hits = _tiered(
+                    db, G, node_id,
+                    fts_limit=max(fts_limit, 8),
+                    max_lexical_edges=max_lexical_edges,
+                    flags=_f,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("tiered lexical resolve failed for %s: %s", node_id, exc)
+                continue
+            if not hits:
+                continue
+            for hit in hits:
+                _add_edge(
+                    db, G,
+                    source=node_id,
+                    target=hit["node_id"],
+                    rel_type="lexical_link",
+                    edge_class="lexical",
+                    created_by="fts5_lexical_v2",
+                    skip_db=True,
+                    provenance={
+                        "source": "fts_lexical_tiered",
+                        "tier": hit.get("_tier"),
+                        "query": hit.get("_query"),
+                        "score_norm": hit.get("score_norm"),
+                    },
+                )
+                stats["lexical"] += 1
+            resolved.add(node_id)
+    else:
+     for node_id in orphans:
         node = db.get_node(node_id) if db is not None else None
 
         # Get symbol_name from DB first, fall back to graph attributes
@@ -461,8 +500,7 @@ def resolve_orphans(
 
         # Phase 1: drop hits below the configured score-norm threshold so
         # weak BM25 matches do not become edges.
-        from .feature_flags import get_feature_flags as _flags
-        min_norm = _flags().fts_min_score_norm
+        min_norm = _f.fts_min_score_norm
         if min_norm > 0:
             fts_hits = [
                 h for h in fts_hits
