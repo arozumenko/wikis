@@ -163,8 +163,57 @@ class WikiStorageProtocol(Protocol):
     ) -> list[dict[str, Any]]:
         """BM25-ranked text search with optional filtering.
 
-        Returns list of dicts with node metadata + ``fts_rank`` score.
+        Returns list of dicts with node metadata + ``fts_rank`` score
+        (backend-native, sign differs between SQLite and PostgreSQL) and
+        ``score_norm`` ∈ [0, 1] (higher is better, comparable across
+        backends).
         Implementations use FTS5 (SQLite) or tsvector/tsquery (PostgreSQL).
+        """
+        ...
+
+    def count_fts_matches(self, query: str, *, exact_match: bool = False) -> int:
+        """Return the total number of FTS matches for *query*.
+
+        Used by the IDF-based gate in lexical orphan resolution
+        (Phase 2 of the graph-quality roadmap). When ``exact_match`` is
+        True, the query is treated as a phrase (FTS5 phrase quoting /
+        ``phraseto_tsquery``).
+        """
+        ...
+
+    def search_fts_by_column(
+        self,
+        query: str,
+        column: str,
+        *,
+        limit: int = 20,
+        path_prefix: str | None = None,
+        symbol_types: list[str] | None = None,
+        exact_match: bool = False,
+    ) -> list[dict[str, Any]]:
+        """FTS search restricted to a single indexed text column.
+
+        Supported columns: ``symbol_name``, ``signature``, ``docstring``,
+        ``source_text``. Returns dicts with the same shape as
+        :meth:`search_fts`.
+        """
+        ...
+
+    def search_fts_with_path(
+        self,
+        query: str,
+        path_prefix: str,
+        *,
+        symbol_types: list[str] | None = None,
+        exact_match: bool = False,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """FTS search restricted to a non-empty path prefix.
+
+        Convenience wrapper around :meth:`search_fts` that enforces the
+        ``path_prefix`` parameter (raises ``ValueError`` if empty). Used
+        by Pass 2 (hybrid) of the orphan-resolution cascade so that hits
+        stay local to the orphan's directory.
         """
         ...
 
@@ -200,6 +249,33 @@ class WikiStorageProtocol(Protocol):
         cluster_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """KNN vector search. Returns dicts with ``vec_distance``."""
+        ...
+
+    def get_embedding_by_id(self, node_id: str) -> list[float] | None:
+        """Fetch the stored embedding for a node, or ``None`` when absent.
+
+        Required by Phase 3 / Phase 4 of the graph-quality roadmap so
+        passes can reuse Phase 1b embeddings instead of re-embedding the
+        same text.
+        """
+        ...
+
+    def batch_similarity_search(
+        self,
+        embeddings: list[tuple[str, list[float]]],
+        *,
+        k: int = 5,
+        path_prefix: str | None = None,
+        distance_threshold: float = 0.15,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Run KNN per ``(query_id, embedding)`` pair, return ``{query_id: hits}``.
+
+        PostgreSQL uses a single ``LATERAL`` query (true server-side
+        batch). SQLite has no batch KNN — the implementation loops
+        in-process, optionally with a thread pool gated by
+        :attr:`FeatureFlags.vec_batch_concurrency`. Hits with
+        ``vec_distance >= distance_threshold`` are filtered out.
+        """
         ...
 
     # ==================================================================

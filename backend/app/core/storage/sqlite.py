@@ -78,6 +78,29 @@ def _serialize_float32_vec(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
+def _deserialize_float32_vec(blob: bytes) -> list[float]:
+    """Deserialize a sqlite-vec blob into a list of floats."""
+    if not blob:
+        return []
+    count = len(blob) // 4
+    return list(struct.unpack(f"{count}f", blob))
+
+
+def _attach_score_norm_sqlite(row: dict[str, Any]) -> dict[str, Any]:
+    """Add ``score_norm`` ∈ (0, 1] derived from a SQLite BM25 ``fts_rank``.
+
+    SQLite FTS5 ``bm25()`` returns negative scores (more negative = better
+    match). Phase 0 of the graph-quality roadmap normalizes this to a
+    bounded positive value so callers can compare scores across backends.
+    """
+    rank = row.get("fts_rank")
+    if rank is None:
+        row["score_norm"] = 0.0
+    else:
+        row["score_norm"] = 1.0 / (1.0 + abs(float(rank)))
+    return row
+
+
 def _can_load_extensions() -> bool:
     """Check if the active sqlite3 driver supports loading extensions."""
     try:
@@ -756,7 +779,10 @@ class UnifiedWikiDB:
     ) -> list[dict[str, Any]]:
         """BM25-ranked text search with optional path/cluster/type filtering.
 
-        Returns list of dicts with node metadata + ``fts_rank`` score.
+        Returns list of dicts with node metadata, ``fts_rank`` (raw BM25,
+        more-negative = better) and ``score_norm`` ∈ (0, 1] computed as
+        ``1 / (1 + abs(fts_rank))`` so callers can compare scores across
+        backends (Phase 0 of the graph-quality roadmap).
         """
         if not query or not query.strip():
             return []
@@ -796,7 +822,7 @@ class UnifiedWikiDB:
 
         try:
             rows = self.conn.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
+            return [_attach_score_norm_sqlite(dict(r)) for r in rows]
         except sqlite3.OperationalError as exc:
             # FTS5 query syntax errors — fall back to prefix search
             logger.debug("FTS5 query failed (%s), trying prefix match", exc)
@@ -804,7 +830,7 @@ class UnifiedWikiDB:
             params[0] = safe_query
             try:
                 rows = self.conn.execute(sql, params).fetchall()
-                return [dict(r) for r in rows]
+                return [_attach_score_norm_sqlite(dict(r)) for r in rows]
             except sqlite3.OperationalError:
                 return []
 
@@ -1545,16 +1571,151 @@ class UnifiedWikiDB:
 
         try:
             rows = self.conn.execute(
-                "SELECT n.* FROM repo_fts f "  # noqa: S608
+                "SELECT n.*, bm25(repo_fts, 10.0, 4.0, 2.0, 1.0) AS fts_rank "  # noqa: S608
+                "FROM repo_fts f "
                 "JOIN repo_nodes n ON f.node_id = n.node_id "
                 f"WHERE repo_fts MATCH ?{where_extra} "
-                "ORDER BY rank LIMIT ?",
+                "ORDER BY fts_rank LIMIT ?",
                 params,
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [_attach_score_norm_sqlite(dict(r)) for r in rows]
         except sqlite3.OperationalError as exc:
             logger.debug("search_fts_by_symbol_name failed for '%s': %s", name, exc)
             return []
+
+    # ------------------------------------------------------------------
+    # Phase 0 — graph-quality roadmap additions
+    # ------------------------------------------------------------------
+
+    def count_fts_matches(self, query: str, *, exact_match: bool = False) -> int:
+        """Return the total number of FTS matches for *query*.
+
+        ``exact_match=True`` quotes the query as a phrase so multi-word
+        names (``"refresh wiki"``) match the literal sequence only.
+        """
+        if not query or not query.strip():
+            return 0
+        safe = query.replace('"', '""')
+        if exact_match:
+            safe = f'"{safe}"'
+        try:
+            row = self.conn.execute(
+                "SELECT count(*) AS c FROM repo_fts WHERE repo_fts MATCH ?",
+                (safe,),
+            ).fetchone()
+            return int(row["c"]) if row else 0
+        except sqlite3.OperationalError as exc:
+            logger.debug("count_fts_matches failed for '%s': %s", query, exc)
+            return 0
+
+    def search_fts_by_column(
+        self,
+        query: str,
+        column: str,
+        *,
+        limit: int = 20,
+        path_prefix: str | None = None,
+        symbol_types: list[str] | None = None,
+        exact_match: bool = False,
+    ) -> list[dict[str, Any]]:
+        """FTS search restricted to one of the four indexed text columns."""
+        allowed = {"symbol_name", "signature", "docstring", "source_text"}
+        if column not in allowed:
+            raise ValueError(
+                f"search_fts_by_column: column must be one of {sorted(allowed)}",
+            )
+        if not query or not query.strip():
+            return []
+        safe_query = query.replace('"', '""')
+        if exact_match:
+            safe_query = f'"{safe_query}"'
+        scoped_query = f"{column}:{safe_query}"
+        return self.search_fts5(
+            scoped_query,
+            path_prefix=path_prefix,
+            symbol_types=symbol_types,
+            limit=limit,
+        )
+
+    def search_fts_with_path(
+        self,
+        query: str,
+        path_prefix: str,
+        *,
+        symbol_types: list[str] | None = None,
+        exact_match: bool = False,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """FTS search that requires a non-empty ``path_prefix``."""
+        if not path_prefix or not path_prefix.strip():
+            raise ValueError("search_fts_with_path requires a non-empty path_prefix")
+        if not query or not query.strip():
+            return []
+        safe_query = query.replace('"', '""')
+        if exact_match:
+            safe_query = f'"{safe_query}"'
+        return self.search_fts5(
+            safe_query,
+            path_prefix=path_prefix,
+            symbol_types=symbol_types,
+            limit=limit,
+        )
+
+    def get_embedding_by_id(self, node_id: str) -> list[float] | None:
+        """Fetch a stored embedding by node ID, or ``None`` when absent."""
+        if not self._vec_available or not node_id:
+            return None
+        try:
+            row = self.conn.execute(
+                "SELECT embedding FROM repo_vec WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            logger.debug("get_embedding_by_id failed for '%s': %s", node_id, exc)
+            return None
+        if not row or row["embedding"] is None:
+            return None
+        return _deserialize_float32_vec(row["embedding"])
+
+    def batch_similarity_search(
+        self,
+        embeddings: list[tuple[str, list[float]]],
+        *,
+        k: int = 5,
+        path_prefix: str | None = None,
+        distance_threshold: float = 0.15,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Per-query KNN; sqlite-vec has no native batch KNN so this loops.
+
+        Concurrency is controlled by
+        :attr:`FeatureFlags.vec_batch_concurrency`.
+        """
+        if not embeddings or not self._vec_available:
+            return {}
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        from ..feature_flags import get_feature_flags
+
+        max_workers = max(1, get_feature_flags().vec_batch_concurrency)
+        out: dict[str, list[dict[str, Any]]] = {}
+
+        def _one(item: tuple[str, list[float]]) -> tuple[str, list[dict[str, Any]]]:
+            qid, emb = item
+            hits = self.search_vec(emb, k=k, path_prefix=path_prefix)
+            kept = [h for h in hits if float(h.get("vec_distance", 1.0)) < distance_threshold]
+            return qid, kept
+
+        if max_workers == 1 or len(embeddings) == 1:
+            for item in embeddings:
+                qid, hits = _one(item)
+                out[qid] = hits
+            return out
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for qid, hits in pool.map(_one, embeddings):
+                out[qid] = hits
+        return out
 
     def get_edge_targets(self, source_id: str) -> list[dict[str, Any]]:
         """Lightweight outgoing edges: [{target_id, rel_type, weight}]."""
