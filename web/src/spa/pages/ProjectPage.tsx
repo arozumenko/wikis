@@ -54,6 +54,7 @@ import { listWikis } from '../api/wiki';
 import type { components } from '../api/types.generated';
 
 const CodeMapTree = lazy(() => import('../components/CodeMapTree'));
+import { RecomputeWidget } from '../components/RecomputeWidget';
 
 type WikiSummary = components['schemas']['WikiSummary'];
 type SourceReference = components['schemas']['SourceReference'];
@@ -709,6 +710,8 @@ export function ProjectPage() {
           </Typography>
         )}
       </Box>
+
+      {projectId && <RecomputeWidget projectId={projectId} isOwner={isOwner} />}
 
       {/* Wiki grid */}
       {wikis.length === 0 && !isOwner ? (
