@@ -254,6 +254,9 @@ def _define_tables(
         Column("language", Text, server_default=""),
         Column("annotations", Text, server_default=""),
         Column("created_by", Text, server_default="ast"),
+        # Phase 1 (graph-quality roadmap) — JSON blob describing the
+        # synthetic edge's source. NULL for parser-derived AST edges.
+        Column("provenance", Text),
         schema=schema,
     )
 
@@ -432,6 +435,15 @@ class PostgresWikiStorage:
                         ALTER TABLE {schema}.repo_edges
                             ADD CONSTRAINT repo_edges_confidence_chk
                             CHECK (confidence IN ('EXTRACTED','INFERRED','AMBIGUOUS'));
+                    END IF;
+                    -- Phase 1 (graph-quality roadmap): provenance column.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_edges'
+                          AND column_name = 'provenance'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_edges
+                            ADD COLUMN provenance JSONB DEFAULT NULL;
                     END IF;
                 END $$;
             """))
@@ -746,6 +758,11 @@ class PostgresWikiStorage:
             annotations = e.get("annotations", "")
             if isinstance(annotations, dict):
                 annotations = json.dumps(annotations)
+            provenance = e.get("provenance")
+            if isinstance(provenance, dict):
+                provenance = json.dumps(provenance)
+            elif provenance is not None and not isinstance(provenance, str):
+                provenance = json.dumps(provenance)
             rows.append({
                 "source_id": _s(e["source_id"]),
                 "target_id": _s(e["target_id"]),
@@ -760,11 +777,16 @@ class PostgresWikiStorage:
                 "language": _s(e.get("language", "")),
                 "annotations": _s(annotations),
                 "created_by": _s(e.get("created_by", "ast")),
+                "provenance": provenance,
             })
 
         cols = [c for c in rows[0].keys() if c != "id"]
         col_list = ", ".join(cols)
-        val_placeholders = ", ".join(f":{c}" for c in cols)
+        # provenance is JSONB; explicit cast lets SQLAlchemy bind a Python str/None.
+        val_placeholders = ", ".join(
+            f"CAST(:{c} AS JSONB)" if c == "provenance" else f":{c}"
+            for c in cols
+        )
 
         sql = text(f"INSERT INTO {schema}.repo_edges ({col_list}) VALUES ({val_placeholders})")
 

@@ -451,8 +451,24 @@ def resolve_orphans(
         if not symbol_name or len(symbol_name) < 2:
             continue
 
+        # Phase 1 (graph-quality roadmap): skip generic / short queries
+        # so utility tokens like "init" / "config" do not spray edges.
+        if _is_low_value_lexical_query(symbol_name):
+            continue
+
         fts_hits = db.search_fts5(query=symbol_name, limit=fts_limit)
         fts_hits = [h for h in fts_hits if h.get("node_id", "") != node_id]
+
+        # Phase 1: drop hits below the configured score-norm threshold so
+        # weak BM25 matches do not become edges.
+        from .feature_flags import get_feature_flags as _flags
+        min_norm = _flags().fts_min_score_norm
+        if min_norm > 0:
+            fts_hits = [
+                h for h in fts_hits
+                if h.get("score_norm") is None
+                or float(h.get("score_norm", 0.0)) >= min_norm
+            ]
 
         if fts_hits:
             for hit in fts_hits[:max_lexical_edges]:
@@ -464,6 +480,11 @@ def resolve_orphans(
                     edge_class="lexical",
                     created_by="fts5_lexical",
                     skip_db=True,
+                    provenance={
+                        "source": "fts_lexical",
+                        "query": symbol_name,
+                        "score_norm": hit.get("score_norm"),
+                    },
                 )
                 stats["lexical"] += 1
             resolved.add(node_id)
@@ -636,14 +657,30 @@ def _add_edge(
     raw_similarity: Optional[float] = None,
     *,
     skip_db: bool = False,
-) -> None:
+    provenance: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Add a synthetic edge to both the in-memory graph AND the DB.
 
     When *skip_db* is True the edge is added only to the in-memory graph.
     Use this inside ``resolve_orphans`` / ``inject_doc_edges`` /
     ``bridge_disconnected_components`` because ``persist_weights_to_db``
     rewrites **all** edges to the DB at the end of Phase 2 anyway.
+
+    When ``WIKI_EDGE_DEDUP`` is on (default), duplicate
+    ``(source, target, rel_type)`` triples are skipped and the function
+    returns ``False``. Returns ``True`` when an edge was actually added.
+
+    ``provenance`` is an optional dict (e.g. ``{"source": "fts_lexical",
+    "query": "AuthService", "score": 0.42}``) that is stored both as the
+    in-memory edge attribute and (when persisted) in the
+    ``repo_edges.provenance`` column.
     """
+    from .feature_flags import get_feature_flags
+
+    flags = get_feature_flags()
+    if flags.edge_dedup and _has_typed_edge(G, source, target, rel_type):
+        return False
+
     attrs: Dict[str, Any] = {
         "relationship_type": rel_type,
         "edge_class": edge_class,
@@ -651,11 +688,69 @@ def _add_edge(
     }
     if raw_similarity is not None:
         attrs["raw_similarity"] = raw_similarity
+    if provenance is not None:
+        attrs["provenance"] = provenance
 
     G.add_edge(source, target, **attrs)
 
     if not skip_db and db is not None:
         db.upsert_edge(source, target, rel_type, **attrs)
+    return True
+
+
+def _has_typed_edge(
+    G: nx.MultiDiGraph, source: str, target: str, rel_type: str
+) -> bool:
+    """Return True iff an edge with the given ``relationship_type`` exists.
+
+    Used by :func:`_add_edge` (when ``WIKI_EDGE_DEDUP`` is on) and by
+    Phase 2 helpers that need to skip duplicate work without consulting
+    a local ``seen`` set.
+    """
+    if not G.has_edge(source, target):
+        return False
+    return any(
+        d.get("relationship_type") == rel_type
+        for d in G[source][target].values()
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 1 (graph-quality roadmap) — lexical query gating
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: Tokens that are too generic to drive lexical orphan resolution. Mirrors the
+#: set added in the deepwiki_plugin Phase 1 backport.
+_LEXICAL_STOPWORDS: frozenset[str] = frozenset({
+    "init", "main", "test", "tests", "setup", "config", "utils", "helper",
+    "helpers", "common", "base", "abstract", "interface", "impl", "data",
+    "model", "service", "factory", "manager", "handler", "controller",
+    "view", "router", "routes", "api", "lib", "src", "app", "core",
+})
+
+#: Minimum query length (after stripping) for an FTS lookup to be issued.
+_MIN_FTS_QUERY_LEN: int = 4
+
+
+def _is_low_value_lexical_query(query: str) -> bool:
+    """Return True when *query* should be skipped by Phase 2 lexical lookups.
+
+    A query is low-value when, after stripping, it is shorter than
+    :data:`_MIN_FTS_QUERY_LEN` *or* its lowercase form is a member of
+    :data:`_LEXICAL_STOPWORDS`. The check is gated by
+    :attr:`FeatureFlags.fts_stopword_gate` so callers can disable it for
+    debugging.
+    """
+    from .feature_flags import get_feature_flags
+
+    if not get_feature_flags().fts_stopword_gate:
+        return False
+    if not query:
+        return True
+    cleaned = query.strip()
+    if len(cleaned) < _MIN_FTS_QUERY_LEN:
+        return True
+    return cleaned.lower() in _LEXICAL_STOPWORDS
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1155,6 +1250,17 @@ def run_phase2(
     """
     results: Dict[str, Any] = {}
 
+    # Phase 1 (graph-quality roadmap) — observability snapshots.
+    from .feature_flags import get_feature_flags as _flags
+    from .graph_topology_diagnostics import Phase2Stats, explain_connectivity
+
+    flags = _flags()
+    observe = flags.phase2_observability
+    stats_v2: Optional[Phase2Stats] = Phase2Stats() if observe else None
+
+    if observe:
+        stats_v2.components_before_orphan = nx.number_weakly_connected_components(G)
+
     # Step 1: Orphan resolution — inject semantic/lexical edges FIRST
     # so that weighting and hub detection see the COMPLETE edge set.
     results["orphan_resolution"] = resolve_orphans(
@@ -1163,16 +1269,27 @@ def run_phase2(
         embed_batch_fn=embed_batch_fn,
         vec_distance_threshold=vec_distance_threshold,
     )
+    if observe:
+        stats_v2.components_after_orphan = nx.number_weakly_connected_components(G)
+        stats_v2.orphan_resolution = results["orphan_resolution"]
 
     # Step 2: Doc edge injection (hyperlink + proximity)
     results["doc_edges"] = inject_doc_edges(db, G)
+    if observe:
+        stats_v2.components_after_doc = nx.number_weakly_connected_components(G)
+        stats_v2.doc_edges = results["doc_edges"]
 
     # Step 3: Bridge disconnected components — BEFORE weighting so
     # bridge edges receive proper weights in step 4.
     results["bridging"] = bridge_disconnected_components(db, G)
+    if observe:
+        stats_v2.components_after_bridge = nx.number_weakly_connected_components(G)
+        stats_v2.bridging = results["bridging"]
 
     # Step 4: Edge weighting — on ALL edges (structural + semantic + lexical + doc + bridge)
     results["weighting"] = apply_edge_weights(G)
+    if observe:
+        stats_v2.weighting = results["weighting"]
 
     # Step 5: Hub detection — on complete degree distribution
     hubs = detect_hubs(G, z_threshold=z_threshold)
@@ -1181,6 +1298,8 @@ def run_phase2(
         "count": len(hubs),
         "node_ids": sorted(hubs)[:20],  # Cap at 20 for readability
     }
+    if observe:
+        stats_v2.hubs = results["hubs"]
 
     # Step 6: Persist weights
     results["persisted_edges"] = persist_weights_to_db(db, G)
@@ -1189,6 +1308,12 @@ def run_phase2(
     if db is not None:
         db.set_meta("phase2_completed", True)
         db.set_meta("phase2_stats", results)
+        if observe and stats_v2 is not None:
+            # Populate edge breakdowns now that all edges exist.
+            edge_view = explain_connectivity(db, G)
+            stats_v2.edges_by_class = edge_view.edges_by_class
+            stats_v2.edges_by_provenance = edge_view.edges_by_provenance
+            db.set_meta("phase2_stats_v2", stats_v2.as_dict())
 
     logger.info(
         "Phase 2 complete: %d orphans resolved, %d doc edges injected, "

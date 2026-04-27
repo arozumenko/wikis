@@ -205,6 +205,11 @@ CREATE TABLE IF NOT EXISTS repo_edges (
     -- Provenance
     created_by      TEXT DEFAULT 'ast',
 
+    -- Phase 1 (graph-quality roadmap) — JSON blob describing the synthetic
+    -- edge's source (e.g. {"source": "fts_lexical", "query": "AuthService"}).
+    -- NULL for parser-derived AST edges.
+    provenance      TEXT DEFAULT NULL,
+
     FOREIGN KEY (source_id) REFERENCES repo_nodes(node_id),
     FOREIGN KEY (target_id) REFERENCES repo_nodes(node_id)
 );
@@ -440,6 +445,15 @@ class UnifiedWikiDB:
                 )
                 self.conn.commit()
 
+            if "provenance" not in edge_cols:
+                logger.info(
+                    "Migrating schema: adding provenance column to repo_edges (Phase 1)"
+                )
+                cur.execute(
+                    "ALTER TABLE repo_edges ADD COLUMN provenance TEXT DEFAULT NULL"
+                )
+                self.conn.commit()
+
     def _backfill_is_test(self) -> None:
         """Set is_test=1 for existing rows whose rel_path matches test patterns."""
         rows = self.conn.execute(
@@ -659,12 +673,14 @@ class UnifiedWikiDB:
             source_id, target_id, rel_type, edge_class, analysis_level,
             confidence,
             weight, raw_similarity,
-            source_file, target_file, language, annotations, created_by
+            source_file, target_file, language, annotations, created_by,
+            provenance
         ) VALUES (
             :source_id, :target_id, :rel_type, :edge_class, :analysis_level,
             :confidence,
             :weight, :raw_similarity,
-            :source_file, :target_file, :language, :annotations, :created_by
+            :source_file, :target_file, :language, :annotations, :created_by,
+            :provenance
         )
         """
 
@@ -673,6 +689,12 @@ class UnifiedWikiDB:
             annotations = e.get("annotations", "")
             if isinstance(annotations, dict):
                 annotations = json.dumps(annotations)
+
+            provenance = e.get("provenance")
+            if isinstance(provenance, dict):
+                provenance = json.dumps(provenance)
+            elif provenance is not None and not isinstance(provenance, str):
+                provenance = json.dumps(provenance)
 
             rows.append(
                 {
@@ -689,6 +711,7 @@ class UnifiedWikiDB:
                     "language": e.get("language", ""),
                     "annotations": annotations,
                     "created_by": e.get("created_by", "ast"),
+                    "provenance": provenance,
                 }
             )
 

@@ -98,6 +98,24 @@ class FeatureFlags:
     #: native batch KNN; the implementation loops per embedding).
     vec_batch_concurrency: int = 4
 
+    # ── Phase 1 — Phase-2 observability + safe quick wins ─────────────
+
+    #: Capture and persist :class:`Phase2Stats` to ``repo_meta`` under
+    #: ``phase2_stats_v2`` (cheap; default on).
+    phase2_observability: bool = True
+
+    #: Skip duplicate ``(source, target, rel_type)`` edges when injecting
+    #: synthetic edges in Phase 2 helpers.
+    edge_dedup: bool = True
+
+    #: Drop FTS hits whose ``score_norm`` is below this threshold during
+    #: Phase 2 lexical lookups.
+    fts_min_score_norm: float = 0.15
+
+    #: Refuse to issue FTS lookups for stop-word-only queries below
+    #: ``min_fts_query_len`` characters.
+    fts_stopword_gate: bool = True
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -111,4 +129,8 @@ def get_feature_flags() -> FeatureFlags:
         pg_ts_rank_cap=_env_float("WIKI_TS_RANK_CAP", 1.0),
         pg_ts_rank_normalize=_env_bool("WIKI_PG_TS_RANK_NORM", True),
         vec_batch_concurrency=_env_int("WIKI_VEC_BATCH_CONCURRENCY", 4),
+        phase2_observability=_env_bool("WIKI_PHASE2_OBSERVABILITY", True),
+        edge_dedup=_env_bool("WIKI_EDGE_DEDUP", True),
+        fts_min_score_norm=_env_float("WIKI_FTS_MIN_SCORE_NORM", 0.15),
+        fts_stopword_gate=_env_bool("WIKI_FTS_STOPWORD_GATE", True),
     )
