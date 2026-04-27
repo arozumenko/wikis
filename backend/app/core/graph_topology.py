@@ -100,6 +100,7 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
         "directory", "lexical", "semantic", "doc", "bridge",
         "cross_language",   # Phase 6 — cross-language linker
         "test_link",        # Phase 6 — test linker
+        "cross_repo",       # Phase 8 — cross-repo linker
     })
     structural_in: Dict[str, int] = {}
     for _u, v, data in G.edges(data=True):

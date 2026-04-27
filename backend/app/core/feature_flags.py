@@ -229,6 +229,32 @@ class FeatureFlags:
     #: back to ``<storage_root>/<project_id>/project.db``.
     project_graph_db_path: str = ""
 
+    # ── Phase 8 — Cross-repo linker + relatedness gating + project Leiden
+
+    #: Run :mod:`cross_repo_linker` after per-wiki indexing to populate
+    #: ``project_edges`` with ``edge_class="cross_repo"`` rows. Default
+    #: off until Phase 7 storage backends ship.
+    cross_repo_linking: bool = False
+
+    #: Run Leiden over the project graph to assign
+    #: ``project_nodes.macro_cluster``. Default off.
+    project_clustering: bool = False
+
+    #: Maximum number of wikis considered when scoring a project's
+    #: pairwise relatedness matrix. Hard cap to keep the O(n²) loop
+    #: bounded.
+    project_max_wikis: int = 50
+
+    #: Score multiplier applied to cross-repo edges in the federated
+    #: retriever and the linker output. Mirrors
+    #: :class:`FederatedRetrieverStack`'s default.
+    cross_repo_dampening: float = 0.7
+
+    #: Minimum relatedness score required for a wiki pair to be linked
+    #: by :mod:`cross_repo_linker`. Pairs below this threshold are
+    #: dropped before the L0–L2 cascade runs.
+    relatedness_threshold: float = 0.15
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -266,4 +292,9 @@ def get_feature_flags() -> FeatureFlags:
         federated_query=_env_bool("WIKI_FEDERATED_QUERY", False),
         federated_retriever=_env_bool("WIKI_FEDERATED_RETRIEVER", False),
         project_graph_db_path=os.environ.get("WIKI_PROJECT_GRAPH_DB_PATH", "").strip(),
+        cross_repo_linking=_env_bool("WIKI_CROSS_REPO_LINKING", False),
+        project_clustering=_env_bool("WIKI_PROJECT_CLUSTERING", False),
+        project_max_wikis=_env_int("WIKI_PROJECT_MAX_WIKIS", 50),
+        cross_repo_dampening=_env_float("WIKI_CROSS_REPO_DAMPENING", 0.7),
+        relatedness_threshold=_env_float("WIKI_RELATEDNESS_THRESHOLD", 0.15),
     )
