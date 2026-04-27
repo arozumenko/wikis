@@ -131,6 +131,17 @@ class FeatureFlags:
     #: and rewrite their FTS query to ``"<file_stem> <symbol_name>"``.
     orphan_rest_disambig: bool = True
 
+    # ── Phase 3 — cascade reorder + explicit-ref Pass 1 + embedding reuse
+
+    #: Enable the 4-pass v2 orphan cascade (explicit-refs → hybrid →
+    #: tiered lexical → directory). Default off until Phase 4 hybrid
+    #: lands and the integration tests stabilise.
+    orphan_cascade_v2: bool = False
+
+    #: Pre-fetch persisted embeddings for orphans before Pass 2 (vec)
+    #: so we never re-embed already-stored vectors. Cheap + safe.
+    orphan_reuse_embeddings: bool = True
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -151,4 +162,6 @@ def get_feature_flags() -> FeatureFlags:
         orphan_lexical_tiered=_env_bool("WIKI_ORPHAN_LEXICAL_TIERED", False),
         orphan_lexical_idf_gate=_env_bool("WIKI_ORPHAN_LEXICAL_IDF_GATE", True),
         orphan_rest_disambig=_env_bool("WIKI_ORPHAN_REST_DISAMBIG", True),
+        orphan_cascade_v2=_env_bool("WIKI_ORPHAN_CASCADE_V2", False),
+        orphan_reuse_embeddings=_env_bool("WIKI_ORPHAN_REUSE_EMBEDDINGS", True),
     )
