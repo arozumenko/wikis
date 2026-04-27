@@ -121,7 +121,7 @@ class FeatureFlags:
     #: Replace flat Pass-1 lexical lookup with the T1–T4 tiered cascade
     #: (same-dir → parent-dir → local-FTS → global). Default off until
     #: Phase 3 lands the cascade reorder; flip via env.
-    orphan_lexical_tiered: bool = False
+    orphan_lexical_tiered: bool = True
 
     #: Apply the IDF gate to lexical Pass 1 (drops common names like
     #: ``User`` / ``API`` from ever issuing T3/T4 queries).
@@ -136,7 +136,7 @@ class FeatureFlags:
     #: Enable the 4-pass v2 orphan cascade (explicit-refs → hybrid →
     #: tiered lexical → directory). Default off until Phase 4 hybrid
     #: lands and the integration tests stabilise.
-    orphan_cascade_v2: bool = False
+    orphan_cascade_v2: bool = True
 
     #: Pre-fetch persisted embeddings for orphans before Pass 2 (vec)
     #: so we never re-embed already-stored vectors. Cheap + safe.
@@ -146,7 +146,7 @@ class FeatureFlags:
 
     #: Replace pure-vector Pass 2 with the FTS+Vec hybrid using RRF
     #: fusion. Default off until cascade-v2 is ready to flip.
-    orphan_hybrid_search: bool = False
+    orphan_hybrid_search: bool = True
 
     #: RRF constant ``k`` — larger flattens the contribution of
     #: top-ranked items. TREC standard = 60.
@@ -193,12 +193,12 @@ class FeatureFlags:
     #: → L2 hybrid RRF → L3 containment) and inject ``cross_language``
     #: edges into the graph during Phase 1c. Default off until the
     #: per-language matchers stabilise.
-    cross_language_linking: bool = False
+    cross_language_linking: bool = True
 
     #: Run the test↔code linker (same-stem heuristic, shared decorator,
     #: test-framework imports) and inject ``test_link`` edges. Default
     #: off; cheap, but its weight floor affects clustering.
-    test_linker: bool = False
+    test_linker: bool = True
 
     #: Extract API surfaces (REST / gRPC / GraphQL / FFI / BDD / CLI)
     #: from parser output during Phase 1c and persist them on the
@@ -213,17 +213,17 @@ class FeatureFlags:
     #: :class:`ProjectStorageProtocol`. When ``False`` the in-memory
     #: implementation acts as a no-op and ``MultiGraphQueryService``
     #: stays the active facade. Default off.
-    project_graph: bool = False
+    project_graph: bool = True
 
     #: Use :class:`FederatedQueryService` instead of
     #: :class:`MultiGraphQueryService`. Drop-in compatible — same surface
     #: plus ``cross_repo_edges`` and ``relatedness``. Default off.
-    federated_query: bool = False
+    federated_query: bool = True
 
     #: Use :class:`FederatedRetrieverStack` (1-hop expansion along
     #: ``edge_class="cross_repo"`` with cross-repo dampening) instead
     #: of :class:`MultiWikiRetrieverStack`. Default off.
-    federated_retriever: bool = False
+    federated_retriever: bool = True
 
     #: SQLite-only path to the project graph DB. Empty string falls
     #: back to ``<storage_root>/<project_id>/project.db``.
@@ -234,11 +234,11 @@ class FeatureFlags:
     #: Run :mod:`cross_repo_linker` after per-wiki indexing to populate
     #: ``project_edges`` with ``edge_class="cross_repo"`` rows. Default
     #: off until Phase 7 storage backends ship.
-    cross_repo_linking: bool = False
+    cross_repo_linking: bool = True
 
     #: Run Leiden over the project graph to assign
     #: ``project_nodes.macro_cluster``. Default off.
-    project_clustering: bool = False
+    project_clustering: bool = True
 
     #: Maximum number of wikis considered when scoring a project's
     #: pairwise relatedness matrix. Hard cap to keep the O(n²) loop
@@ -272,12 +272,12 @@ def get_feature_flags() -> FeatureFlags:
         edge_dedup=_env_bool("WIKI_EDGE_DEDUP", True),
         fts_min_score_norm=_env_float("WIKI_FTS_MIN_SCORE_NORM", 0.15),
         fts_stopword_gate=_env_bool("WIKI_FTS_STOPWORD_GATE", True),
-        orphan_lexical_tiered=_env_bool("WIKI_ORPHAN_LEXICAL_TIERED", False),
+        orphan_lexical_tiered=_env_bool("WIKI_ORPHAN_LEXICAL_TIERED", True),
         orphan_lexical_idf_gate=_env_bool("WIKI_ORPHAN_LEXICAL_IDF_GATE", True),
         orphan_rest_disambig=_env_bool("WIKI_ORPHAN_REST_DISAMBIG", True),
-        orphan_cascade_v2=_env_bool("WIKI_ORPHAN_CASCADE_V2", False),
+        orphan_cascade_v2=_env_bool("WIKI_ORPHAN_CASCADE_V2", True),
         orphan_reuse_embeddings=_env_bool("WIKI_ORPHAN_REUSE_EMBEDDINGS", True),
-        orphan_hybrid_search=_env_bool("WIKI_ORPHAN_HYBRID_SEARCH", False),
+        orphan_hybrid_search=_env_bool("WIKI_ORPHAN_HYBRID_SEARCH", True),
         orphan_rrf_k=_env_int("WIKI_ORPHAN_RRF_K", 60),
         orphan_rrf_threshold=_env_float("WIKI_ORPHAN_RRF_THRESHOLD", 0.02),
         orphan_hybrid_top_n=_env_int("WIKI_ORPHAN_HYBRID_TOP_N", 20),
@@ -285,15 +285,15 @@ def get_feature_flags() -> FeatureFlags:
         orphan_hybrid_strategy=os.environ.get("WIKI_ORPHAN_HYBRID_STRATEGY", "rrf").strip() or "rrf",
         node_id_style=(os.environ.get("WIKI_NODE_ID_STYLE", "stem").strip().lower() or "stem"),
         qualified_name_index=_env_bool("WIKI_QUALIFIED_NAME_INDEX", True),
-        cross_language_linking=_env_bool("WIKI_CROSS_LANGUAGE_LINKING", False),
-        test_linker=_env_bool("WIKI_TEST_LINKER", False),
+        cross_language_linking=_env_bool("WIKI_CROSS_LANGUAGE_LINKING", True),
+        test_linker=_env_bool("WIKI_TEST_LINKER", True),
         api_surface_extraction=_env_bool("WIKI_API_SURFACE_EXTRACTION", True),
-        project_graph=_env_bool("WIKI_PROJECT_GRAPH", False),
-        federated_query=_env_bool("WIKI_FEDERATED_QUERY", False),
-        federated_retriever=_env_bool("WIKI_FEDERATED_RETRIEVER", False),
+        project_graph=_env_bool("WIKI_PROJECT_GRAPH", True),
+        federated_query=_env_bool("WIKI_FEDERATED_QUERY", True),
+        federated_retriever=_env_bool("WIKI_FEDERATED_RETRIEVER", True),
         project_graph_db_path=os.environ.get("WIKI_PROJECT_GRAPH_DB_PATH", "").strip(),
-        cross_repo_linking=_env_bool("WIKI_CROSS_REPO_LINKING", False),
-        project_clustering=_env_bool("WIKI_PROJECT_CLUSTERING", False),
+        cross_repo_linking=_env_bool("WIKI_CROSS_REPO_LINKING", True),
+        project_clustering=_env_bool("WIKI_PROJECT_CLUSTERING", True),
         project_max_wikis=_env_int("WIKI_PROJECT_MAX_WIKIS", 50),
         cross_repo_dampening=_env_float("WIKI_CROSS_REPO_DAMPENING", 0.7),
         relatedness_threshold=_env_float("WIKI_RELATEDNESS_THRESHOLD", 0.15),

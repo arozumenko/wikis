@@ -156,7 +156,31 @@ class TestOrphanDetection:
 
 
 class TestFTS5Resolution:
-    """Step 3 — FTS5 lexical orphan resolution."""
+    """Step 3 — FTS5 lexical orphan resolution.
+
+    These tests cover the **legacy** flat-FTS cascade. The v2 cascade
+    (explicit-ref → hybrid → tiered lexical → directory) is exercised
+    in tests/unit/test_graph_topology_v2.py and the cascade module's
+    own unit suites. We pin v2 off here to keep coverage on the
+    legacy path, which is still selectable via WIKI_ORPHAN_CASCADE_V2=0.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _legacy_cascade(self, monkeypatch):
+        from app.core import feature_flags as _ff
+
+        original = _ff.get_feature_flags()
+        from dataclasses import replace
+
+        forced = replace(
+            original,
+            orphan_cascade_v2=False,
+            orphan_lexical_tiered=False,
+            orphan_hybrid_search=False,
+        )
+        monkeypatch.setattr(_ff, "get_feature_flags", lambda: forced)
+        # graph_topology imports get_feature_flags lazily inside
+        # resolve_orphans so the monkeypatch above is enough.
 
     def test_fts5_resolves_orphan(self):
         G = nx.MultiDiGraph()
@@ -215,7 +239,22 @@ class TestFTS5Resolution:
 
 
 class TestSemanticResolution:
-    """Step 4 — semantic vector orphan resolution."""
+    """Step 4 — semantic vector orphan resolution (legacy cascade)."""
+
+    @pytest.fixture(autouse=True)
+    def _legacy_cascade(self, monkeypatch):
+        from app.core import feature_flags as _ff
+
+        original = _ff.get_feature_flags()
+        from dataclasses import replace
+
+        forced = replace(
+            original,
+            orphan_cascade_v2=False,
+            orphan_lexical_tiered=False,
+            orphan_hybrid_search=False,
+        )
+        monkeypatch.setattr(_ff, "get_feature_flags", lambda: forced)
 
     def test_semantic_resolves_orphan(self):
         G = nx.MultiDiGraph()
