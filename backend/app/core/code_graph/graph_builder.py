@@ -34,6 +34,7 @@ from ..parsers.javascript_visitor_parser import JavaScriptVisitorParser
 from ..parsers.python_parser import PythonParser
 from ..parsers.typescript_enhanced_parser import TypeScriptEnhancedParser
 from ..utils.resource_monitor import resource_monitor
+from ..feature_flags import get_feature_flags  # re-exported so tests can patch
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,19 @@ def attach_graph_indexes(graph: "nx.MultiDiGraph") -> None:  # noqa: F821
     graph._suffix_index = defaultdict(list)
     graph._decl_impl_index = defaultdict(list)
     graph._constant_def_index = defaultdict(list)
+
+    # Phase 5 / Action 3B — qualified-name + FQN indexes.
+    # ``_qualified_name_index``: ``"Parent.symbol"`` → list of node_ids
+    #   (multiple, since the same qualified path can exist in many files).
+    # ``_fqn_index``: ``"rel_path::Parent.symbol"`` → single node_id.
+    # Built only when ``WIKI_QUALIFIED_NAME_INDEX`` is enabled (default on);
+    # consumers fall back to the legacy simple-name index otherwise.
+    try:
+        _qni_enabled = bool(get_feature_flags().qualified_name_index)
+    except Exception:  # pragma: no cover - feature flags must always import
+        _qni_enabled = True
+    graph._qualified_name_index = defaultdict(list) if _qni_enabled else {}
+    graph._fqn_index = {} if _qni_enabled else {}
 
     def _symbol_type_of(node_id: str) -> str:
         node_data = graph.nodes.get(node_id, {})
@@ -127,6 +141,31 @@ def attach_graph_indexes(graph: "nx.MultiDiGraph") -> None:  # noqa: F821
                 _maybe_set(graph._full_name_index, full_name, node_id)
 
             graph._name_index[symbol_name].append(node_id)
+
+            # Phase 5 — qualified + FQN indexes (Parent.symbol / rel_path::...).
+            # ``symbol_name`` may already be the qualified form (e.g.,
+            # ``AppConfig.__init__``) when the parser emits dotted names; for
+            # bare leaf names we still want a qualified entry, so use the
+            # symbol's stored ``full_name`` minus the module prefix when
+            # available.
+            if _qni_enabled:
+                qualified = symbol_name
+                full_name = node_data.get('full_name')
+                if not full_name:
+                    symbol_obj = node_data.get('symbol')
+                    full_name = getattr(symbol_obj, 'full_name', None) if symbol_obj else None
+                if full_name:
+                    parts = full_name.split('.')
+                    file_stem = node_data.get('file_name') or ''
+                    if len(parts) >= 2 and file_stem and parts[0] == file_stem:
+                        qualified = '.'.join(parts[1:]) or qualified
+                    else:
+                        qualified = full_name
+                if qualified:
+                    graph._qualified_name_index[qualified].append(node_id)
+                rel_path_attr = node_data.get('rel_path') or file_path
+                if rel_path_attr and qualified:
+                    graph._fqn_index[f"{rel_path_attr}::{qualified}"] = node_id
 
             parts = node_id.split('::', 2)
             suffix = parts[2] if len(parts) == 3 else node_id
@@ -1509,8 +1548,18 @@ class EnhancedUnifiedGraphBuilder:
             # For nested symbols, include parent context: Parent.symbol
             # This disambiguates e.g., AppConfig.__init__ vs DatabaseConfig.__init__
             local_qualified_name = self._get_local_qualified_name(symbol, file_name)
-            node_id = f"{language}::{file_name}::{local_qualified_name}"
-            
+
+            # Phase 5 / Action 3A — rel_path-based node IDs.
+            # Default ``"stem"`` keeps the legacy file-stem scheme (and its
+            # hash-suffix collision branch). ``"rel_path"`` replaces the stem
+            # with a path-safe slug, removing the collision class entirely.
+            _id_style = get_feature_flags().node_id_style
+            if _id_style == "rel_path":
+                _safe_path = (rel_path or file_path or file_name).replace("/", "__").replace(".", "_")
+                node_id = f"{language}::{_safe_path}::{local_qualified_name}"
+            else:
+                node_id = f"{language}::{file_name}::{local_qualified_name}"
+
             # Only skip if this EXACT node already exists (same file + same symbol)
             # Do NOT skip symbols with same name from different files - those are legitimate!
             if graph.has_node(node_id):
@@ -1518,11 +1567,16 @@ class EnhancedUnifiedGraphBuilder:
                 if existing_file == file_path:
                     # True duplicate from same file, skip
                     continue
-                else:
+                elif _id_style != "rel_path":
                     # Different file (e.g., declaration vs implementation)
                     # Create unique node_id by appending file hash
                     file_hash = hash(file_path) & 0xFFFF
                     node_id = f"{node_id}_{file_hash:04x}"
+                else:
+                    # rel_path style is collision-free by construction; a
+                    # repeat indicates a legitimate redeclaration in the
+                    # same file (handled above) or a parser bug — skip.
+                    continue
             
             # Extract line numbers from Range object for flat access
             _range = getattr(symbol, 'range', None)

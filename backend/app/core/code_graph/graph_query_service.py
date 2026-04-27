@@ -96,6 +96,11 @@ class GraphQueryService:
         self._full_name_index: dict[str, str] = getattr(graph, "_full_name_index", {})
         self._name_index: dict[str, list[str]] = getattr(graph, "_name_index", defaultdict(list))
         self._suffix_index: dict[str, list[str]] = getattr(graph, "_suffix_index", defaultdict(list))
+        # Phase 5 — qualified + FQN indexes (may be empty when flag off).
+        self._qualified_name_index: dict[str, list[str]] = getattr(
+            graph, "_qualified_name_index", {}
+        )
+        self._fqn_index: dict[str, str] = getattr(graph, "_fqn_index", {})
 
     # ------------------------------------------------------------------
     # Node accessor — parity with ``StorageQueryService.get_node``
@@ -134,6 +139,22 @@ class GraphQueryService:
         name = symbol_name.strip()
         if not name:
             return None
+
+        # Phase 5 — Strategy 0a: FQN (rel_path::qualified) — strongest signal.
+        if file_path and self._fqn_index:
+            nid = self._fqn_index.get(f"{file_path}::{name}")
+            if nid:
+                return nid
+
+        # Phase 5 — Strategy 0b: qualified-name index (Parent.symbol) when the
+        # caller supplies a dotted/qualified path.  Filtered by file/lang hint
+        # via ``_select_best`` so it cannot regress single-file lookups.
+        if "." in name and self._qualified_name_index:
+            qcandidates = self._qualified_name_index.get(name) or []
+            if qcandidates:
+                picked = self._select_best(qcandidates, file_path, language)
+                if picked:
+                    return picked
 
         # Strategy 1: exact (name, file, lang) key
         if file_path and language:

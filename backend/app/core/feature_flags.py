@@ -167,6 +167,26 @@ class FeatureFlags:
     #: for follow-up tuning work; falls back to RRF until implemented).
     orphan_hybrid_strategy: str = "rrf"
 
+    # ── Phase 5 — Node disambiguation (3A / 3B / 3C) ──────────────────
+
+    #: Node ID generation strategy. ``"stem"`` (legacy) keys nodes by
+    #: ``language::file_stem::local_qualified_name`` and silently
+    #: collides between same-stem files in different directories,
+    #: falling back to a 16-bit file-hash suffix. ``"rel_path"``
+    #: replaces the stem with a path-safe ``rel_path`` slug, which
+    #: removes the collision class entirely (no hash suffix). Default
+    #: ``"stem"`` for one release; flip to ``"rel_path"`` next.
+    #: NOT retroactive — existing wikis stay on the build-time scheme
+    #: until a full rebuild.
+    node_id_style: str = "stem"
+
+    #: Build the qualified-name (``Parent.symbol``) and FQN
+    #: (``rel_path::Parent.symbol``) lookup indexes on top of the
+    #: existing simple-name index. Cheap; default on. Consumed by
+    #: :class:`GraphQueryService.resolve_symbol` and the explicit-ref
+    #: Pass 1 resolver.
+    qualified_name_index: bool = True
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -195,4 +215,6 @@ def get_feature_flags() -> FeatureFlags:
         orphan_hybrid_top_n=_env_int("WIKI_ORPHAN_HYBRID_TOP_N", 20),
         orphan_hybrid_alpha=_env_float("WIKI_ORPHAN_HYBRID_ALPHA", 0.5),
         orphan_hybrid_strategy=os.environ.get("WIKI_ORPHAN_HYBRID_STRATEGY", "rrf").strip() or "rrf",
+        node_id_style=(os.environ.get("WIKI_NODE_ID_STYLE", "stem").strip().lower() or "stem"),
+        qualified_name_index=_env_bool("WIKI_QUALIFIED_NAME_INDEX", True),
     )
