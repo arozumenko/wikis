@@ -40,7 +40,7 @@ from app.storage.base import ArtifactStorage
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["recompute_project"]
+__all__ = ["recompute_project", "mark_projects_for_wiki_stale", "maybe_enqueue_recompute"]
 
 
 EventEmitter = Callable[[Any], Awaitable[None] | None]
@@ -412,3 +412,94 @@ def mark_projects_for_wiki_stale(
             logger.debug(
                 "mark_projects_for_wiki_stale failed for %s", pid, exc_info=True
             )
+
+
+# ----------------------------------------------------------------------
+# PR-15 — read-time staleness check + auto-enqueue
+# ----------------------------------------------------------------------
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse a stored ISO timestamp; tolerate naive / missing values."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+async def maybe_enqueue_recompute(
+    project_id: str,
+    *,
+    user_id: str,
+    storage: ArtifactStorage,
+    settings: Settings,
+    wiki_built_ats: Iterable[datetime] = (),
+    max_age_days: int | None = None,
+) -> tuple[bool, str]:
+    """Check project staleness and fire a background recompute when stale.
+
+    Returns ``(stale, reason)``. The recompute runs as a detached
+    asyncio task so the calling HTTP request can return immediately.
+    Disabled when ``flags.project_graph`` is OFF (returns
+    ``(False, "project_graph_disabled")``).
+    """
+    from app.core.feature_flags import get_feature_flags
+    from app.core.project_lifecycle import (
+        DEFAULT_STALENESS_DAYS,
+        is_project_stale,
+    )
+    from app.core.storage.project_storage import open_project_storage
+
+    flags = get_feature_flags()
+    if not flags.project_graph:
+        return False, "project_graph_disabled"
+
+    try:
+        store = open_project_storage(
+            project_id,
+            cache_dir=getattr(settings, "cache_dir", None),
+            settings=settings,
+        )
+    except Exception:
+        logger.debug("maybe_enqueue: open_project_storage failed", exc_info=True)
+        return False, "storage_unavailable"
+
+    recomputed_at = _parse_iso(store.get_project_meta(project_id, "recomputed_at"))
+    forced_stale = bool(store.get_project_meta(project_id, "stale"))
+    age_window = max_age_days if max_age_days is not None else DEFAULT_STALENESS_DAYS
+
+    stale, reason = is_project_stale(
+        project_recomputed_at=recomputed_at,
+        wiki_built_ats=wiki_built_ats,
+        max_age_days=age_window,
+    )
+    if not stale and forced_stale:
+        stale, reason = True, "marked_stale"
+
+    if not stale:
+        return False, reason
+
+    async def _runner() -> None:
+        try:
+            await recompute_project(
+                project_id,
+                user_id=user_id,
+                storage=storage,
+                settings=settings,
+            )
+        except Exception:
+            logger.warning(
+                "background recompute_project failed for %s", project_id, exc_info=True
+            )
+
+    try:
+        asyncio.create_task(_runner())
+    except RuntimeError:
+        # No running loop (sync test path) — skip background scheduling.
+        logger.debug("maybe_enqueue: no running loop, skipping background recompute")
+
+    return True, reason

@@ -159,3 +159,86 @@ async def test_recompute_happy_path_two_wikis(monkeypatch, tmp_path):
 
     # At least one progress event captured
     assert events, "expected at least one SSE event"
+
+
+# ---------------------------------------------------------------------
+# PR-15 — maybe_enqueue_recompute
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_maybe_enqueue_disabled_when_flag_off(monkeypatch, tmp_path):
+    forced = dataclasses.replace(ff.get_feature_flags(), project_graph=False)
+    monkeypatch.setattr(
+        "app.core.feature_flags.get_feature_flags", lambda: forced
+    )
+    stale, reason = await project_recompute.maybe_enqueue_recompute(
+        "p1", user_id="u1", storage=object(), settings=_settings_stub(tmp_path)
+    )
+    assert stale is False
+    assert reason == "project_graph_disabled"
+
+
+@pytest.mark.asyncio
+async def test_maybe_enqueue_fires_when_never_computed(monkeypatch, tmp_path):
+    forced = dataclasses.replace(ff.get_feature_flags(), project_graph=True)
+    monkeypatch.setattr(
+        "app.core.feature_flags.get_feature_flags", lambda: forced
+    )
+    store = InMemoryProjectStorage()
+    monkeypatch.setattr(
+        "app.core.storage.project_storage.open_project_storage",
+        lambda *_a, **_kw: store,
+    )
+
+    called: list = []
+
+    async def _fake_recompute(*a, **kw):
+        called.append((a, kw))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(project_recompute, "recompute_project", _fake_recompute)
+
+    stale, reason = await project_recompute.maybe_enqueue_recompute(
+        "p1", user_id="u1", storage=object(), settings=_settings_stub(tmp_path)
+    )
+    # Yield to let the background task run.
+    import asyncio as _aio
+    await _aio.sleep(0)
+
+    assert stale is True
+    assert reason == "never_computed"
+    assert called, "background recompute_project should have been scheduled"
+
+
+@pytest.mark.asyncio
+async def test_maybe_enqueue_skips_when_fresh(monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+
+    forced = dataclasses.replace(ff.get_feature_flags(), project_graph=True)
+    monkeypatch.setattr(
+        "app.core.feature_flags.get_feature_flags", lambda: forced
+    )
+    store = InMemoryProjectStorage()
+    store.set_project_meta(
+        "p1", "recomputed_at", datetime.now(timezone.utc).isoformat()
+    )
+    monkeypatch.setattr(
+        "app.core.storage.project_storage.open_project_storage",
+        lambda *_a, **_kw: store,
+    )
+
+    called: list = []
+
+    async def _fake_recompute(*a, **kw):
+        called.append((a, kw))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(project_recompute, "recompute_project", _fake_recompute)
+
+    stale, reason = await project_recompute.maybe_enqueue_recompute(
+        "p1", user_id="u1", storage=object(), settings=_settings_stub(tmp_path)
+    )
+    assert stale is False
+    assert reason == "fresh"
+    assert not called

@@ -1070,6 +1070,7 @@ async def list_projects(
 @router.get("/projects/{project_id}", response_model=ProjectResponse)
 async def get_project(
     project_id: str,
+    request: Request,
     user: CurrentUser = Depends(get_current_user),
     svc: ProjectService = Depends(get_project_service),
 ) -> ProjectResponse:
@@ -1077,6 +1078,23 @@ async def get_project(
     if project is None:
         raise HTTPException(404, f"Project not found: {project_id}")
     count = await svc.get_wiki_count(project_id)
+
+    # PR-15: read-time staleness check; auto-enqueue recompute when stale.
+    try:
+        from app.services.project_recompute import maybe_enqueue_recompute
+
+        wikis = await svc.list_project_wikis(project_id, user_id=user.id) or []
+        built_ats = [w.indexed_at for w in wikis if getattr(w, "indexed_at", None)]
+        await maybe_enqueue_recompute(
+            project_id,
+            user_id=user.id,
+            storage=request.app.state.storage,
+            settings=request.app.state.settings,
+            wiki_built_ats=built_ats,
+        )
+    except Exception:  # noqa: BLE001
+        pass  # never break project reads on a staleness check
+
     return _project_response(project, count, user_id=user.id)
 
 
