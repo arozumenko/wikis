@@ -93,9 +93,14 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
         return {"edges_weighted": 0, "min": 0, "max": 0, "mean": 0}
 
     # Compute in-degree using ONLY structural edges (AST-derived).
-    # Synthetic edges (orphan resolution, doc injection) are excluded
-    # so they don't inflate anchor degrees and crush real edges.
-    _SYNTHETIC_CLASSES = frozenset({"directory", "lexical", "semantic", "doc", "bridge"})
+    # Synthetic edges (orphan resolution, doc injection, cross-language
+    # linker, test linker) are excluded so they don't inflate anchor
+    # degrees and crush real edges.
+    _SYNTHETIC_CLASSES = frozenset({
+        "directory", "lexical", "semantic", "doc", "bridge",
+        "cross_language",   # Phase 6 — cross-language linker
+        "test_link",        # Phase 6 — test linker
+    })
     structural_in: Dict[str, int] = {}
     for _u, v, data in G.edges(data=True):
         if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:

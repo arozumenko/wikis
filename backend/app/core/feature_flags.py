@@ -187,6 +187,26 @@ class FeatureFlags:
     #: Pass 1 resolver.
     qualified_name_index: bool = True
 
+    # ── Phase 6 — Cross-language linker + new edge classes ───────────
+
+    #: Run the 4-level cross-language linker (L0 exact → L1 API surface
+    #: → L2 hybrid RRF → L3 containment) and inject ``cross_language``
+    #: edges into the graph during Phase 1c. Default off until the
+    #: per-language matchers stabilise.
+    cross_language_linking: bool = False
+
+    #: Run the test↔code linker (same-stem heuristic, shared decorator,
+    #: test-framework imports) and inject ``test_link`` edges. Default
+    #: off; cheap, but its weight floor affects clustering.
+    test_linker: bool = False
+
+    #: Extract API surfaces (REST / gRPC / GraphQL / FFI / BDD / CLI)
+    #: from parser output during Phase 1c and persist them on the
+    #: ``repo_nodes.api_surface`` column when present. Cheap; default
+    #: on so the column is populated even when ``cross_language_linking``
+    #: is gated off.
+    api_surface_extraction: bool = True
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -217,4 +237,7 @@ def get_feature_flags() -> FeatureFlags:
         orphan_hybrid_strategy=os.environ.get("WIKI_ORPHAN_HYBRID_STRATEGY", "rrf").strip() or "rrf",
         node_id_style=(os.environ.get("WIKI_NODE_ID_STYLE", "stem").strip().lower() or "stem"),
         qualified_name_index=_env_bool("WIKI_QUALIFIED_NAME_INDEX", True),
+        cross_language_linking=_env_bool("WIKI_CROSS_LANGUAGE_LINKING", False),
+        test_linker=_env_bool("WIKI_TEST_LINKER", False),
+        api_surface_extraction=_env_bool("WIKI_API_SURFACE_EXTRACTION", True),
     )
