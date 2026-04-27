@@ -142,6 +142,31 @@ class FeatureFlags:
     #: so we never re-embed already-stored vectors. Cheap + safe.
     orphan_reuse_embeddings: bool = True
 
+    # ── Phase 4 — hybrid RRF Pass 2 ───────────────────────────────────
+
+    #: Replace pure-vector Pass 2 with the FTS+Vec hybrid using RRF
+    #: fusion. Default off until cascade-v2 is ready to flip.
+    orphan_hybrid_search: bool = False
+
+    #: RRF constant ``k`` — larger flattens the contribution of
+    #: top-ranked items. TREC standard = 60.
+    orphan_rrf_k: int = 60
+
+    #: Minimum fused ``rrf_score`` required for a hit to become an edge.
+    orphan_rrf_threshold: float = 0.02
+
+    #: Per-orphan top-N cap on hybrid hits (caps both per-list FTS/vec
+    #: candidates and the post-fusion result).
+    orphan_hybrid_top_n: int = 20
+
+    #: Reserved for the linear-fusion path (``alpha * vec + (1-alpha)
+    #: * fts``). Only used when ``orphan_hybrid_strategy == "linear"``.
+    orphan_hybrid_alpha: float = 0.5
+
+    #: Fusion strategy: ``"rrf"`` (default) or ``"linear"`` (reserved
+    #: for follow-up tuning work; falls back to RRF until implemented).
+    orphan_hybrid_strategy: str = "rrf"
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -164,4 +189,10 @@ def get_feature_flags() -> FeatureFlags:
         orphan_rest_disambig=_env_bool("WIKI_ORPHAN_REST_DISAMBIG", True),
         orphan_cascade_v2=_env_bool("WIKI_ORPHAN_CASCADE_V2", False),
         orphan_reuse_embeddings=_env_bool("WIKI_ORPHAN_REUSE_EMBEDDINGS", True),
+        orphan_hybrid_search=_env_bool("WIKI_ORPHAN_HYBRID_SEARCH", False),
+        orphan_rrf_k=_env_int("WIKI_ORPHAN_RRF_K", 60),
+        orphan_rrf_threshold=_env_float("WIKI_ORPHAN_RRF_THRESHOLD", 0.02),
+        orphan_hybrid_top_n=_env_int("WIKI_ORPHAN_HYBRID_TOP_N", 20),
+        orphan_hybrid_alpha=_env_float("WIKI_ORPHAN_HYBRID_ALPHA", 0.5),
+        orphan_hybrid_strategy=os.environ.get("WIKI_ORPHAN_HYBRID_STRATEGY", "rrf").strip() or "rrf",
     )
