@@ -1182,6 +1182,66 @@ async def list_project_wikis(
     return WikiListResponse(wikis=summaries)
 
 
+@router.post("/projects/{project_id}/recompute")
+async def recompute_project_route(
+    project_id: str,
+    request: Request,
+    user: CurrentUser = Depends(get_current_user),
+) -> EventSourceResponse:
+    """Stream a project-level recompute (relatedness → cross-repo → leiden).
+
+    Gated server-side by ``flags.project_graph``. Emits SSE progress events
+    matching the wiki-generation widget contract.
+    """
+    import asyncio
+
+    from app.services.project_recompute import recompute_project
+
+    settings = request.app.state.settings
+    storage = request.app.state.storage
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def runner() -> None:
+        try:
+            result = await recompute_project(
+                project_id,
+                user_id=user.id,
+                storage=storage,
+                settings=settings,
+                on_event=queue.put,
+            )
+            await queue.put({"_final": result})
+        except Exception as exc:  # noqa: BLE001
+            await queue.put({"_error": str(exc)})
+        finally:
+            await queue.put(None)
+
+    asyncio.create_task(runner())
+
+    async def event_generator():
+        idx = 0
+        while True:
+            evt = await queue.get()
+            if evt is None:
+                break
+            idx += 1
+            if isinstance(evt, dict) and ("_final" in evt or "_error" in evt):
+                yield ServerSentEvent(
+                    id=str(idx),
+                    event="recompute_complete" if "_final" in evt else "recompute_error",
+                    data=_json.dumps(evt.get("_final") or {"error": evt.get("_error")}),
+                )
+                continue
+            yield ServerSentEvent(
+                id=str(idx),
+                event=getattr(evt, "event", "message"),
+                data=evt.model_dump_json() if hasattr(evt, "model_dump_json") else _json.dumps(evt),
+            )
+
+    return EventSourceResponse(event_generator())
+
+
 @router.get("/projects/{project_id}/search", response_model=ProjectSearchResponse)
 async def search_project(
     project_id: str,
