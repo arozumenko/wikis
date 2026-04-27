@@ -197,13 +197,22 @@ async def _ensure_wiki_page_fts(engine: AsyncEngine) -> None:
             "  VALUES (new.rowid, new.page_title, new.description, new.content); "
             "END"
         ))
-        # Backfill any rows that pre-existed before triggers were installed.
-        await conn.execute(text(
-            "INSERT INTO wiki_page_fts(rowid, page_title, description, content) "
-            "SELECT wp.rowid, wp.page_title, wp.description, wp.content "
-            "FROM wiki_page wp "
-            "WHERE wp.rowid NOT IN (SELECT rowid FROM wiki_page_fts)"
-        ))
+
+    # Backfill / repair the FTS5 index in a separate transaction.  For an
+    # *external content* FTS5 table (``content='wiki_page'``), the canonical
+    # resync pattern is the ``rebuild`` command — idempotent, and a no-op on
+    # an already-consistent index.  We isolate it from the trigger DDL above
+    # so a rare ``rebuild`` failure (corrupt index, FTS5 invariant violation,
+    # disk pressure) does not roll back the trigger setup and force a boot
+    # loop; instead we log and continue with a stale index until the next
+    # startup.  See https://www.sqlite.org/fts5.html#the_rebuild_command
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "INSERT INTO wiki_page_fts(wiki_page_fts) VALUES('rebuild')"
+            ))
+    except Exception as e:
+        logger.error("wiki_page_fts rebuild failed; FTS index may be stale: %s", e)
     logger.info("wiki_page FTS5 vtable + triggers ensured (SQLite)")
 
 
