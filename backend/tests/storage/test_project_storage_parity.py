@@ -1,18 +1,50 @@
-"""Phase 7 — InMemoryProjectStorage parity tests."""
+"""Phase 7 — Project storage parity tests (memory + sqlite + postgres)."""
 
 from __future__ import annotations
+
+import os
 
 import pytest
 
 from app.core.storage.project_storage import (
     InMemoryProjectStorage,
+    PostgresProjectStorage,
     ProjectStorageProtocol,
+    SqliteProjectStorage,
 )
 
 
-@pytest.fixture
-def store() -> InMemoryProjectStorage:
-    return InMemoryProjectStorage()
+def _make_postgres(tmp_path):
+    dsn = os.environ.get("WIKI_TEST_PG_DSN", "")
+    if not dsn:
+        pytest.skip("WIKI_TEST_PG_DSN not set; skipping Postgres parity test")
+    try:
+        return PostgresProjectStorage(dsn, f"parity_{tmp_path.name}")
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"PostgresProjectStorage unavailable: {exc}")
+
+
+@pytest.fixture(params=["memory", "sqlite", "postgres"])
+def store(request, tmp_path):
+    backend = request.param
+    if backend == "memory":
+        yield InMemoryProjectStorage()
+        return
+    if backend == "sqlite":
+        s = SqliteProjectStorage(str(tmp_path / "p.project.db"))
+        try:
+            yield s
+        finally:
+            s.close()
+        return
+    s = _make_postgres(tmp_path)
+    try:
+        yield s
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 class TestProtocol:

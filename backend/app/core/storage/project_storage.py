@@ -25,6 +25,9 @@ from typing import Any, Iterable, Protocol, runtime_checkable
 __all__ = [
     "ProjectStorageProtocol",
     "InMemoryProjectStorage",
+    "SqliteProjectStorage",
+    "PostgresProjectStorage",
+    "open_project_storage",
 ]
 
 
@@ -231,3 +234,584 @@ class InMemoryProjectStorage:
         if store is None:
             return None
         return store.meta.get(key)
+
+
+# ----------------------------------------------------------------------
+# SQLite implementation
+# ----------------------------------------------------------------------
+
+
+import logging  # noqa: E402
+import os  # noqa: E402
+import sqlite3  # noqa: E402
+import re  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
+_SQLITE_DDL = """
+CREATE TABLE IF NOT EXISTS project_nodes (
+    node_id    TEXT PRIMARY KEY,
+    wiki_id    TEXT NOT NULL DEFAULT '',
+    attrs      TEXT DEFAULT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_edges (
+    source_id   TEXT NOT NULL,
+    target_id   TEXT NOT NULL,
+    edge_class  TEXT NOT NULL,
+    weight      REAL DEFAULT 1.0,
+    provenance  TEXT DEFAULT NULL,
+    PRIMARY KEY (source_id, target_id, edge_class)
+);
+CREATE INDEX IF NOT EXISTS idx_project_edges_src
+    ON project_edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_project_edges_class
+    ON project_edges(edge_class);
+
+CREATE TABLE IF NOT EXISTS project_relatedness (
+    wiki_a    TEXT NOT NULL,
+    wiki_b    TEXT NOT NULL,
+    score     REAL DEFAULT 0.0,
+    breakdown TEXT DEFAULT NULL,
+    PRIMARY KEY (wiki_a, wiki_b)
+);
+
+CREATE TABLE IF NOT EXISTS project_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+
+class SqliteProjectStorage:
+    """SQLite-backed :class:`ProjectStorageProtocol` implementation.
+
+    Each project has its own database file (no project_id column —
+    isolation comes from the file path). Designed to be cheap to open
+    multiple times against the same path; the connection is private to
+    the instance.
+    """
+
+    def __init__(self, db_path: str | os.PathLike[str]) -> None:
+        self._db_path = str(db_path)
+        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(_SQLITE_DDL)
+        self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:  # pragma: no cover
+            pass
+
+    # ------------------------------------------------------------------
+    # Nodes
+    # ------------------------------------------------------------------
+    def upsert_project_node(
+        self,
+        project_id: str,
+        node_id: str,
+        wiki_id: str,
+        attrs: dict[str, Any],
+    ) -> None:
+        if not project_id or not node_id:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO project_nodes "
+            "(node_id, wiki_id, attrs) VALUES (?, ?, ?)",
+            (node_id, wiki_id or "", json.dumps(attrs or {})),
+        )
+        self._conn.commit()
+
+    def get_project_nodes(self, project_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT node_id, wiki_id, attrs FROM project_nodes"
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                attrs = json.loads(r["attrs"]) if r["attrs"] else {}
+            except (TypeError, ValueError):
+                attrs = {}
+            out.append({"node_id": r["node_id"], "wiki_id": r["wiki_id"], **attrs})
+        return out
+
+    # ------------------------------------------------------------------
+    # Edges
+    # ------------------------------------------------------------------
+    def upsert_project_edge(
+        self,
+        project_id: str,
+        source_node_id: str,
+        target_node_id: str,
+        edge_class: str,
+        weight: float,
+        provenance: dict[str, Any] | None = None,
+    ) -> None:
+        if not project_id or not source_node_id or not target_node_id:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO project_edges "
+            "(source_id, target_id, edge_class, weight, provenance) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                source_node_id,
+                target_node_id,
+                edge_class or "",
+                float(weight),
+                json.dumps(provenance) if provenance else None,
+            ),
+        )
+        self._conn.commit()
+
+    def get_project_edges(
+        self,
+        project_id: str,
+        *,
+        source_node_id: str | None = None,
+        edge_class: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT source_id, target_id, edge_class, weight, provenance "
+            "FROM project_edges WHERE 1=1"
+        )
+        params: list[Any] = []
+        if source_node_id is not None:
+            sql += " AND source_id = ?"
+            params.append(source_node_id)
+        if edge_class is not None:
+            sql += " AND edge_class = ?"
+            params.append(edge_class)
+        rows = self._conn.execute(sql, params).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                prov = json.loads(r["provenance"]) if r["provenance"] else {}
+            except (TypeError, ValueError):
+                prov = {}
+            out.append(
+                {
+                    "source_node_id": r["source_id"],
+                    "target_node_id": r["target_id"],
+                    "edge_class": r["edge_class"],
+                    "weight": float(r["weight"]),
+                    "provenance": prov,
+                }
+            )
+        return out
+
+    # ------------------------------------------------------------------
+    # Relatedness
+    # ------------------------------------------------------------------
+    def upsert_repo_relatedness(
+        self,
+        project_id: str,
+        wiki_a: str,
+        wiki_b: str,
+        score: float,
+        breakdown: dict[str, Any] | None = None,
+    ) -> None:
+        if not project_id or not wiki_a or not wiki_b or wiki_a == wiki_b:
+            return
+        a, b = _pair_key(wiki_a, wiki_b)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO project_relatedness "
+            "(wiki_a, wiki_b, score, breakdown) VALUES (?, ?, ?, ?)",
+            (a, b, float(score), json.dumps(breakdown) if breakdown else None),
+        )
+        self._conn.commit()
+
+    def get_repo_relatedness(self, project_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT wiki_a, wiki_b, score, breakdown FROM project_relatedness"
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                bd = json.loads(r["breakdown"]) if r["breakdown"] else {}
+            except (TypeError, ValueError):
+                bd = {}
+            out.append(
+                {
+                    "wiki_a": r["wiki_a"],
+                    "wiki_b": r["wiki_b"],
+                    "score": float(r["score"]),
+                    "breakdown": bd,
+                }
+            )
+        return out
+
+    # ------------------------------------------------------------------
+    # Meta
+    # ------------------------------------------------------------------
+    def set_project_meta(self, project_id: str, key: str, value: Any) -> None:
+        if not project_id or not key:
+            return
+        try:
+            payload = json.dumps(value)
+        except (TypeError, ValueError):
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO project_meta (key, value) VALUES (?, ?)",
+            (key, payload),
+        )
+        self._conn.commit()
+
+    def get_project_meta(self, project_id: str, key: str) -> Any:
+        row = self._conn.execute(
+            "SELECT value FROM project_meta WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row["value"])
+        except (TypeError, ValueError):
+            return None
+
+
+# ----------------------------------------------------------------------
+# Postgres implementation
+# ----------------------------------------------------------------------
+
+
+_PROJECT_SCHEMA_RE = re.compile(r"[^a-zA-Z0-9_]+")
+
+
+def _safe_project_schema(project_id: str) -> str:
+    """Return a postgres-safe schema name derived from ``project_id``."""
+    cleaned = _PROJECT_SCHEMA_RE.sub("_", str(project_id)).strip("_").lower()
+    if not cleaned:
+        cleaned = "default"
+    if not cleaned[0].isalpha() and cleaned[0] != "_":
+        cleaned = f"p_{cleaned}"
+    return f"wiki_project_{cleaned}"
+
+
+class PostgresProjectStorage:
+    """PostgreSQL-backed project storage (schema-per-project).
+
+    Mirrors :class:`SqliteProjectStorage` semantics on top of a dedicated
+    schema. Tables are created lazily on first use and are idempotent.
+    """
+
+    def __init__(self, dsn: str, project_id: str) -> None:
+        from sqlalchemy import create_engine, text  # type: ignore
+
+        self._project_id = project_id
+        self._schema = _safe_project_schema(project_id)
+        self._engine = create_engine(dsn, future=True)
+        self._text = text
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        text = self._text
+        schema = self._schema
+        with self._engine.begin() as conn:
+            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+            conn.execute(text(
+                f'CREATE TABLE IF NOT EXISTS "{schema}".project_nodes ('
+                'node_id TEXT PRIMARY KEY, '
+                "wiki_id TEXT NOT NULL DEFAULT '', "
+                'attrs JSONB DEFAULT NULL)'
+            ))
+            conn.execute(text(
+                f'CREATE TABLE IF NOT EXISTS "{schema}".project_edges ('
+                'source_id TEXT NOT NULL, '
+                'target_id TEXT NOT NULL, '
+                'edge_class TEXT NOT NULL, '
+                'weight DOUBLE PRECISION DEFAULT 1.0, '
+                'provenance JSONB DEFAULT NULL, '
+                'PRIMARY KEY (source_id, target_id, edge_class))'
+            ))
+            conn.execute(text(
+                f'CREATE INDEX IF NOT EXISTS idx_project_edges_src '
+                f'ON "{schema}".project_edges(source_id)'
+            ))
+            conn.execute(text(
+                f'CREATE INDEX IF NOT EXISTS idx_project_edges_class '
+                f'ON "{schema}".project_edges(edge_class)'
+            ))
+            conn.execute(text(
+                f'CREATE TABLE IF NOT EXISTS "{schema}".project_relatedness ('
+                'wiki_a TEXT NOT NULL, '
+                'wiki_b TEXT NOT NULL, '
+                'score DOUBLE PRECISION DEFAULT 0.0, '
+                'breakdown JSONB DEFAULT NULL, '
+                'PRIMARY KEY (wiki_a, wiki_b))'
+            ))
+            conn.execute(text(
+                f'CREATE TABLE IF NOT EXISTS "{schema}".project_meta ('
+                'key TEXT PRIMARY KEY, value JSONB)'
+            ))
+
+    def close(self) -> None:
+        try:
+            self._engine.dispose()
+        except Exception:  # pragma: no cover
+            pass
+
+    # ------------------------------------------------------------------
+    # Nodes
+    # ------------------------------------------------------------------
+    def upsert_project_node(
+        self,
+        project_id: str,
+        node_id: str,
+        wiki_id: str,
+        attrs: dict[str, Any],
+    ) -> None:
+        if not project_id or not node_id:
+            return
+        text = self._text
+        schema = self._schema
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    f'INSERT INTO "{schema}".project_nodes (node_id, wiki_id, attrs) '
+                    "VALUES (:nid, :wid, CAST(:attrs AS JSONB)) "
+                    "ON CONFLICT (node_id) DO UPDATE SET "
+                    "wiki_id = EXCLUDED.wiki_id, attrs = EXCLUDED.attrs"
+                ),
+                {
+                    "nid": node_id,
+                    "wid": wiki_id or "",
+                    "attrs": json.dumps(attrs or {}),
+                },
+            )
+
+    def get_project_nodes(self, project_id: str) -> list[dict[str, Any]]:
+        text = self._text
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(f'SELECT node_id, wiki_id, attrs FROM "{self._schema}".project_nodes')
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            attrs = r._mapping["attrs"] or {}
+            out.append({"node_id": r._mapping["node_id"], "wiki_id": r._mapping["wiki_id"], **attrs})
+        return out
+
+    # ------------------------------------------------------------------
+    # Edges
+    # ------------------------------------------------------------------
+    def upsert_project_edge(
+        self,
+        project_id: str,
+        source_node_id: str,
+        target_node_id: str,
+        edge_class: str,
+        weight: float,
+        provenance: dict[str, Any] | None = None,
+    ) -> None:
+        if not project_id or not source_node_id or not target_node_id:
+            return
+        text = self._text
+        schema = self._schema
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    f'INSERT INTO "{schema}".project_edges '
+                    "(source_id, target_id, edge_class, weight, provenance) "
+                    "VALUES (:s, :t, :c, :w, CAST(:p AS JSONB)) "
+                    "ON CONFLICT (source_id, target_id, edge_class) DO UPDATE SET "
+                    "weight = EXCLUDED.weight, provenance = EXCLUDED.provenance"
+                ),
+                {
+                    "s": source_node_id,
+                    "t": target_node_id,
+                    "c": edge_class or "",
+                    "w": float(weight),
+                    "p": json.dumps(provenance) if provenance else None,
+                },
+            )
+
+    def get_project_edges(
+        self,
+        project_id: str,
+        *,
+        source_node_id: str | None = None,
+        edge_class: str | None = None,
+    ) -> list[dict[str, Any]]:
+        text = self._text
+        sql = (
+            f'SELECT source_id, target_id, edge_class, weight, provenance '
+            f'FROM "{self._schema}".project_edges WHERE 1=1'
+        )
+        params: dict[str, Any] = {}
+        if source_node_id is not None:
+            sql += " AND source_id = :s"
+            params["s"] = source_node_id
+        if edge_class is not None:
+            sql += " AND edge_class = :c"
+            params["c"] = edge_class
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(sql), params).fetchall()
+        return [
+            {
+                "source_node_id": r._mapping["source_id"],
+                "target_node_id": r._mapping["target_id"],
+                "edge_class": r._mapping["edge_class"],
+                "weight": float(r._mapping["weight"]),
+                "provenance": r._mapping["provenance"] or {},
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # Relatedness
+    # ------------------------------------------------------------------
+    def upsert_repo_relatedness(
+        self,
+        project_id: str,
+        wiki_a: str,
+        wiki_b: str,
+        score: float,
+        breakdown: dict[str, Any] | None = None,
+    ) -> None:
+        if not project_id or not wiki_a or not wiki_b or wiki_a == wiki_b:
+            return
+        a, b = _pair_key(wiki_a, wiki_b)
+        text = self._text
+        schema = self._schema
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    f'INSERT INTO "{schema}".project_relatedness '
+                    "(wiki_a, wiki_b, score, breakdown) "
+                    "VALUES (:a, :b, :s, CAST(:bd AS JSONB)) "
+                    "ON CONFLICT (wiki_a, wiki_b) DO UPDATE SET "
+                    "score = EXCLUDED.score, breakdown = EXCLUDED.breakdown"
+                ),
+                {
+                    "a": a,
+                    "b": b,
+                    "s": float(score),
+                    "bd": json.dumps(breakdown) if breakdown else None,
+                },
+            )
+
+    def get_repo_relatedness(self, project_id: str) -> list[dict[str, Any]]:
+        text = self._text
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f'SELECT wiki_a, wiki_b, score, breakdown '
+                    f'FROM "{self._schema}".project_relatedness'
+                )
+            ).fetchall()
+        return [
+            {
+                "wiki_a": r._mapping["wiki_a"],
+                "wiki_b": r._mapping["wiki_b"],
+                "score": float(r._mapping["score"]),
+                "breakdown": r._mapping["breakdown"] or {},
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # Meta
+    # ------------------------------------------------------------------
+    def set_project_meta(self, project_id: str, key: str, value: Any) -> None:
+        if not project_id or not key:
+            return
+        try:
+            payload = json.dumps(value)
+        except (TypeError, ValueError):
+            return
+        text = self._text
+        schema = self._schema
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    f'INSERT INTO "{schema}".project_meta (key, value) '
+                    "VALUES (:k, CAST(:v AS JSONB)) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+                ),
+                {"k": key, "v": payload},
+            )
+
+    def get_project_meta(self, project_id: str, key: str) -> Any:
+        text = self._text
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text(f'SELECT value FROM "{self._schema}".project_meta WHERE key = :k'),
+                {"k": key},
+            ).fetchone()
+        if row is None:
+            return None
+        return row._mapping["value"]
+
+
+# ----------------------------------------------------------------------
+# Factory
+# ----------------------------------------------------------------------
+
+
+def open_project_storage(
+    project_id: str,
+    *,
+    cache_dir: str | None = None,
+    settings: Any | None = None,
+) -> ProjectStorageProtocol:
+    """Return the appropriate concrete project storage for the runtime.
+
+    Selection mirrors :func:`open_storage`: PostgreSQL when
+    ``WIKI_STORAGE_BACKEND=postgres`` (and ``WIKI_STORAGE_DSN`` is set),
+    SQLite otherwise. Falls back to :class:`InMemoryProjectStorage` when
+    we cannot open a real backend (so callers never have to special-case
+    a missing store).
+    """
+    try:
+        from .factory import is_postgres_backend
+    except Exception:
+        is_postgres_backend = lambda *_a, **_kw: False  # type: ignore  # noqa: E731
+
+    if settings is None:
+        try:
+            from ...config import get_settings
+
+            settings = get_settings()
+        except Exception:
+            settings = None
+
+    try:
+        if settings is not None and is_postgres_backend(settings):
+            dsn = getattr(settings, "wiki_storage_dsn", "") or ""
+            if dsn:
+                return PostgresProjectStorage(dsn, project_id)
+            logger.warning(
+                "Postgres backend requested but WIKI_STORAGE_DSN is empty; "
+                "falling back to in-memory project storage"
+            )
+            return InMemoryProjectStorage()
+    except Exception:  # pragma: no cover — defensive
+        logger.warning(
+            "Failed to open Postgres project storage; falling back to SQLite",
+            exc_info=True,
+        )
+
+    # SQLite path
+    base_dir = cache_dir
+    if not base_dir and settings is not None:
+        base_dir = getattr(settings, "cache_dir", None)
+    base_dir = base_dir or "./data/cache"
+    try:
+        target_dir = os.path.join(base_dir, "projects")
+        os.makedirs(target_dir, exist_ok=True)
+        safe_id = _PROJECT_SCHEMA_RE.sub("_", str(project_id)).strip("_") or "default"
+        db_path = os.path.join(target_dir, f"{safe_id}.project.db")
+        return SqliteProjectStorage(db_path)
+    except Exception:  # pragma: no cover
+        logger.warning(
+            "Failed to open SQLite project storage at %s; using in-memory",
+            base_dir,
+            exc_info=True,
+        )
+        return InMemoryProjectStorage()
