@@ -177,6 +177,7 @@ from ..constants import (
     DOCUMENTATION_EXTENSIONS as _DOC_EXTENSIONS_MAP,
     KNOWN_FILENAMES as _KNOWN_FILENAMES_MAP,
 )
+from ..extractors import ExtractorRegistry  # #118 — non-code ingestion
 
 # Log feature flag state at import time
 if SEPARATE_DOC_INDEX:
@@ -359,7 +360,20 @@ class EnhancedUnifiedGraphBuilder:
     # Known filenames for extensionless / special-name files
     KNOWN_FILENAMES = _KNOWN_FILENAMES_MAP
     
-    def __init__(self, max_workers: int = 4, debug_mode: bool = False):
+    def __init__(
+        self,
+        max_workers: int = 4,
+        debug_mode: bool = False,
+        extractor_registry: "ExtractorRegistry | None" = None,
+    ):
+        # #118: registry of non-code document extractors. ``None`` keeps
+        # the legacy text-read path (markdown, yaml, plain text) — useful
+        # for tests + callers that don't need PDF/image ingestion.
+        # Production wires this via ``build_default_registry(llm=...)`` at
+        # graph-builder construction time so vision extractors get the
+        # project-configured LLM.
+        self._extractor_registry = extractor_registry
+
         # Tier 1: Rich parsers for comprehensive analysis
         self.rich_parsers = {
             'cpp': CppEnhancedParser(),
@@ -2616,20 +2630,45 @@ class EnhancedUnifiedGraphBuilder:
         """
         Process documentation files (markdown, text, etc.) with text chunking
         instead of symbol extraction.
+
+        #118: extension-registered extractors (PDF via LLM-vision, images
+        via LLM-vision, plain-text variants) intercept here before the
+        legacy text-read. Anything not in the registry falls through to
+        the old ``open(file_path, 'r')`` path so legacy formats keep
+        working.
         """
         results = {}
-        
+
         for file_path in file_paths:
             try:
-                # Read file content
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                
-                # Determine file type (extension first, then known filename)
                 file_extension = Path(file_path).suffix.lower()
                 doc_type = self.DOCUMENTATION_EXTENSIONS.get(file_extension)
                 if not doc_type:
                     doc_type = self.KNOWN_FILENAMES.get(Path(file_path).name, 'text')
+
+                # #118: try the registered extractor first; ``None``
+                # registry or no handler for this extension → legacy path.
+                content: str | None = None
+                if self._extractor_registry is not None:
+                    extractor = self._extractor_registry.get(file_extension)
+                    if extractor is not None:
+                        extracted = extractor.extract(Path(file_path))
+                        if extracted is None:
+                            logger.info(
+                                "[doc-extractor] skipping %s — extractor "
+                                "returned no content", file_path,
+                            )
+                            continue
+                        content = extracted.text
+                        for warning in extracted.warnings:
+                            logger.warning("[doc-extractor] %s", warning)
+
+                if content is None:
+                    # Legacy text-read path for extensions without a
+                    # registered extractor (markdown, yaml, toml, plain
+                    # text, etc.).
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
                 
                 # Simple text chunking for documentation
                 chunks = self._chunk_text_content(content, file_path, doc_type)

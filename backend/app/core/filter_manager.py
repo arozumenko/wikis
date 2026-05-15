@@ -204,6 +204,16 @@ class FilterManager:
             ".txt",
             ".adoc",
             ".org",
+            # #118: extended documentation variants
+            ".mdx",
+            ".qmd",
+            # #118: rendered formats — vision-based extraction
+            ".pdf",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".webp",
             # Web files
             ".html",
             ".htm",

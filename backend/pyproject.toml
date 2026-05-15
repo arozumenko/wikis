@@ -62,6 +62,12 @@ ollama = ["langchain-ollama>=0.3.0"]
 gemini = ["langchain-google-genai>=2.0.0"]
 bedrock = ["langchain-aws>=0.2.0"]
 all-providers = ["wikis-backend[ollama,gemini,bedrock]"]
+# #118 non-code file ingestion extras
+# vision: images (.png/.jpg/.gif/.webp) described via configured LLM
+vision = ["Pillow>=10.0.0"]
+# pdf: PDFs rendered to images then described via configured LLM
+# (pdfium2 is a self-contained wheel — no poppler / no system deps)
+pdf = ["pypdfium2>=4.20.0", "Pillow>=10.0.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23.0",
