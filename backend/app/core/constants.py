@@ -30,12 +30,20 @@ EMBEDDING_BATCH_SIZE = 64
 DOCUMENTATION_EXTENSIONS = {
     # Prose / markup
     '.md': 'markdown',
+    '.mdx': 'markdown',           # #118 — MDX (Docusaurus, Astro)
+    '.qmd': 'markdown',           # #118 — Quarto markdown
     '.rst': 'restructuredtext',
     '.txt': 'plaintext',
     '.adoc': 'asciidoc',
     '.doc': 'document',
     '.docx': 'document',
     '.pdf': 'pdf',
+    # Rendered images (#118) — extractor describes content via LLM vision
+    '.png': 'image',
+    '.jpg': 'image',
+    '.jpeg': 'image',
+    '.gif': 'image',
+    '.webp': 'image',
     # Web / data interchange
     '.html': 'html',
     '.htm': 'html',

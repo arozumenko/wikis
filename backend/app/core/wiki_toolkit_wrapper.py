@@ -71,12 +71,29 @@ class OptimizedWikiToolkitWrapper:
             #     }
             # )
 
+            # #118: build extractor registry from the configured LLM so
+            # PDFs/images get vision-described instead of dumped as
+            # binary blobs. Wrapped to fail soft — a missing LLM or
+            # broken extractor module should not block code indexing.
+            try:
+                from app.core.extractors import build_default_registry
+
+                extractor_registry = build_default_registry(llm=self.llm)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[wiki_toolkit_wrapper] extractor registry init "
+                    "failed; non-code files fall back to legacy path: %s",
+                    exc,
+                )
+                extractor_registry = None
+
             # Initialize filesystem indexer
             self.indexer = FilesystemRepositoryIndexer(
                 cache_dir=self.cache_dir,
                 github_access_token=self.github_access_token,
                 github_username=os.getenv("GITHUB_USERNAME"),
                 embeddings=self.embeddings,
+                extractor_registry=extractor_registry,
             )
 
             # Build repository index from filesystem clone

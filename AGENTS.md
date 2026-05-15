@@ -322,6 +322,28 @@ repo URL
   → wiki page markdown + WikiPageIndex (wikilink graph) → artifact storage (local or S3)
 ```
 
+### Non-code file ingestion (#118)
+
+Beyond source code and markdown, the indexer ingests PDFs, images, and plain-text variants via the **DocumentExtractor** registry at `backend/app/core/extractors/`. Each extractor turns one file into a single text blob that flows through the same chunking + embedding + FTS5 pipeline as native markdown.
+
+**Vision-first design**: formats where text extraction loses critical visual context — tables, formulas, layouts, diagrams — are rendered to images and described by the project-configured multimodal LLM (Claude 3+, GPT-4o, Gemini 1.5+). Plain-text variants (`.mdx`, `.rst`, `.adoc`, `.qmd`) are read directly because there's no visual content to lose.
+
+| Extension | Extractor | Method | Extras |
+|-----------|-----------|--------|--------|
+| `.mdx` `.qmd` `.rst` `.adoc` | `PlainTextExtractor` | UTF-8 read | — |
+| `.png` `.jpg` `.jpeg` `.gif` `.webp` | `ImageExtractor` | LLM vision describe | `[vision]` (Pillow) |
+| `.pdf` | `PDFExtractor` | pdfium2 render → LLM vision per page | `[pdf]` (pypdfium2 + Pillow) |
+| `.md` `.txt` `.yaml` `.toml` `…` | _(legacy text-read path)_ | `open(file, 'r')` | — |
+
+**Cost handling**: every LLM call logs `[extractors.image]` / `[extractors.pdf]` at INFO with input/output token counts. No env-var gating — operators monitor the log stream. A 500-page scanned manual will spend tokens; grep for `[extractors.pdf]` to spot.
+
+**Adding a new extractor**:
+1. Implement the `DocumentExtractor` protocol in `app/core/extractors/`.
+2. Register in `build_default_registry()` (lazy import so the dep stays optional).
+3. Add the extension to `DOCUMENTATION_EXTENSIONS` (`constants.py`) and the `FilterManager` allowlist (`filter_manager.py`).
+4. Add the optional pip extras to `pyproject.toml`.
+5. Bottom-line wiring point: `EnhancedUnifiedGraphBuilder._parse_documentation_files` calls `registry.get(extension)` and falls back to the legacy text-read path when no handler is registered.
+
 ### Auth Cross-Service JWT
 
 ```

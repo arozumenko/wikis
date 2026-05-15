@@ -159,6 +159,22 @@ class HybridWikiToolkitWrapper:
         """Initialize filesystem-based indexer with multi-provider support"""
         logger.info(f"Initializing filesystem-based repository indexer (provider: {self.provider_type})...")
 
+        # #118: build the document-extractor registry from the configured
+        # LLM so non-code formats (PDFs, images, plain-text variants) are
+        # ingested via vision instead of falling back to garbage text
+        # reads. Lazy import keeps backwards compatibility with anyone
+        # who imported this module before the extractors package landed.
+        try:
+            from app.core.extractors import build_default_registry
+
+            extractor_registry = build_default_registry(llm=self.llm)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[hybrid_wrapper] failed to build extractor registry; "
+                "non-code files fall back to legacy text-read: %s", exc,
+            )
+            extractor_registry = None
+
         self.indexer = FilesystemRepositoryIndexer(
             cache_dir=self.cache_dir,
             api_filters=None,
@@ -171,6 +187,7 @@ class HybridWikiToolkitWrapper:
             github_username=self.github_username,
             embeddings=self.embeddings,
             progress_callback=self.progress_callback,
+            extractor_registry=extractor_registry,
         )
 
         # Build repository index using filesystem approach
