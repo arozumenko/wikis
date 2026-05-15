@@ -642,13 +642,11 @@ class WikiService:
             modified_bodies[pid] = body
 
         def _stub_structural(page) -> bool:
-            # PR 5 MVP: structural pages count as failed for the run.
-            # The follow-up that wires make_agent_structural_handler
-            # replaces this with the agent-backed callback. Logged at
-            # DEBUG to avoid spamming production once #137 lands.
-            logger.debug(
-                "[incremental_refresh] structural regen stub for page %s "
-                "(needs full agent integration)",
+            # Fallback when agent construction fails. Logged at WARNING
+            # so partial-feature regressions show up in production logs.
+            logger.warning(
+                "[incremental_refresh] structural regen unavailable for "
+                "page %s (agent construction failed earlier in the run)",
                 page.page_id,
             )
             return False
@@ -709,23 +707,69 @@ class WikiService:
                     patcher = PagePatcher(llm) if llm is not None else None
                     if patcher is None:
                         # The orchestrator unconditionally constructs a
-                        # PagePatcher path; without an LLM, force every
-                        # edit page into structural by short-circuiting
-                        # at the diff-input stage. Simpler: just reject.
-                        # For PR 5 we accept the limitation and skip the
-                        # whole run if the LLM is unavailable.
+                        # PagePatcher path; without an LLM we can't run
+                        # the edit regime. Fail the run loudly here.
                         await invocation.emit(events.task_status(
                             invocation.id, "failed",
                             "LLM unavailable — incremental refresh requires LLM",
                         ))
                         return
 
+                    # #142: build the production structural handler.
+                    # On any failure (agent construction error), fall
+                    # back to the stub so the trivial + edit regimes
+                    # still work for this run. The structural pages
+                    # will be counted as failed; the SSE summary lets
+                    # callers see what was missed.
+                    from app.services.agent_builder import (
+                        build_agent_for_incremental_refresh,
+                    )
+                    from app.services.structural_handler_factory import (
+                        make_agent_structural_handler,
+                    )
+
+                    agent = build_agent_for_incremental_refresh(
+                        wiki_record, storage, llm, self.settings,
+                    )
+                    if agent is not None:
+                        structural_handler = make_agent_structural_handler(
+                            agent,
+                            storage=storage,
+                            # TODO(#142-followup): thread the repo's
+                            # repository_analysis from storage.get_meta()
+                            # so structural prompts see the README-level
+                            # context full regen would inject.
+                            repository_context="",
+                            write_page_body=_write,
+                        )
+                    else:
+                        # Agent construction failed (embeddings, retriever,
+                        # or agent __init__). Emit a status_message so the
+                        # SPA can show "structural regime unavailable" —
+                        # without this signal, callers see a partial-
+                        # success summary that conflates "no structural
+                        # pages in plan" with "every structural page
+                        # silently failed because the deployment is mis-
+                        # configured".
+                        logger.warning(
+                            "[incremental_refresh] agent construction "
+                            "failed; structural regime will fail every page",
+                        )
+                        await invocation.emit(events.message(
+                            "warning",
+                            "Structural regen unavailable for this run "
+                            "(agent construction failed). Trivial + edit "
+                            "regimes will still run; any structural page "
+                            "will count as failed.",
+                        ))
+                        structural_handler = _stub_structural
+
                     svc = IncrementalRegenService(
                         storage=storage,
                         page_patcher=patcher,
                         read_page_body=_read,
                         write_page_body=_write,
-                        structural_handler=_stub_structural,
+                        structural_handler=structural_handler,
                         progress_callback=_emit,
                     )
                     stats = await asyncio.to_thread(svc.run, parsed_nodes)
