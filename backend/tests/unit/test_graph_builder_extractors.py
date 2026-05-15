@@ -251,6 +251,50 @@ def test_vision_eligible_file_without_extractor_warns_once_per_extension(
     assert all("LLM_API_KEY" in w for w in warnings)
 
 
+def test_warned_extensions_reset_per_index_pass(
+    tmp_path: Path, caplog,
+) -> None:
+    """Rio's blocking finding on the second review: the dedup set must
+    reset per index pass, not persist for the builder's lifetime.
+    Otherwise a webhook-triggered re-index after the operator fixed
+    their LLM config would silently suppress the expected WARNING."""
+    import logging
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "spec.pdf").write_bytes(b"%PDF-1.4 not real")
+
+    builder = EnhancedUnifiedGraphBuilder(extractor_registry=None)
+
+    # First pass: WARN expected.
+    with caplog.at_level(logging.WARNING, logger="app.core.code_graph.graph_builder"):
+        builder._parse_documentation_files(
+            [str(docs / "spec.pdf")], str(tmp_path),
+        )
+    first_pass_warnings = [
+        r for r in caplog.records
+        if "will be ingested via the legacy text-read path" in r.getMessage()
+    ]
+    assert len(first_pass_warnings) == 1
+
+    caplog.clear()
+
+    # Second pass on the same builder: WARN must fire AGAIN. If the
+    # dedup set persisted across passes, this would be 0.
+    with caplog.at_level(logging.WARNING, logger="app.core.code_graph.graph_builder"):
+        builder._parse_documentation_files(
+            [str(docs / "spec.pdf")], str(tmp_path),
+        )
+    second_pass_warnings = [
+        r for r in caplog.records
+        if "will be ingested via the legacy text-read path" in r.getMessage()
+    ]
+    assert len(second_pass_warnings) == 1, (
+        "Second-pass WARNING was suppressed; "
+        "_warned_legacy_vision_extensions should reset per index pass"
+    )
+
+
 def test_vision_extension_with_registered_extractor_does_not_warn(
     tmp_path: Path, caplog,
 ) -> None:

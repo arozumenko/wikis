@@ -43,6 +43,14 @@ KNOWN_VISION_EXTENSIONS: frozenset[str] = frozenset({
     ".webp",
 })
 
+# Defend the case-invariant at module load. The graph builder's
+# dispatch lower-cases ``file_extension`` before lookup, so a stray
+# upper-case entry here would silently never match. Cheaper to assert
+# once at import than to debug "why aren't my .JPG files warning?".
+assert all(
+    e == e.lower() and e.startswith(".") for e in KNOWN_VISION_EXTENSIONS
+), "KNOWN_VISION_EXTENSIONS entries must be lower-case + dot-prefixed"
+
 
 @dataclass(frozen=True)
 class ExtractedDocument:

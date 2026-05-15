@@ -376,11 +376,12 @@ class EnhancedUnifiedGraphBuilder:
         # graph-builder construction time so vision extractors get the
         # project-configured LLM.
         self._extractor_registry = extractor_registry
-        # #148: track per-extension WARNINGs for vision-eligible files
-        # that fall back to the legacy text-read path. Without this, a
-        # repo with 200 PDFs and no LLM configured would emit 200
-        # WARNINGs — useless noise. One WARNING per extension per index
-        # pass is the right signal.
+        # #148: per-extension dedup for vision-eligible files that fall
+        # back to the legacy text-read path. Re-initialized at the top
+        # of each ``_parse_documentation_files`` call so a re-index
+        # (e.g. webhook-triggered) sees a fresh state — without this,
+        # if the operator fixed their LLM config between runs, the
+        # second run would still suppress the expected WARNING.
         self._warned_legacy_vision_extensions: set[str] = set()
 
         # Tier 1: Rich parsers for comprehensive analysis
@@ -2647,6 +2648,12 @@ class EnhancedUnifiedGraphBuilder:
         working.
         """
         results = {}
+
+        # #148: reset per-extension WARNING dedup per index pass so a
+        # re-index after a config fix actually surfaces the warning
+        # again (instead of being permanently silenced by the prior
+        # pass on the same builder instance).
+        self._warned_legacy_vision_extensions = set()
 
         for file_path in file_paths:
             try:
