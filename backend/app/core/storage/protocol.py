@@ -624,6 +624,20 @@ class WikiStorageProtocol(Protocol):
         """
         ...
 
+    def delete_wiki_page(self, page_id: str) -> bool:
+        """Remove a single ``wiki_pages`` row by primary key.
+
+        FK CASCADE on ``page_symbols.page_id`` removes its rows in the
+        same transaction. Returns True when a row was deleted, False
+        when no row existed for ``page_id`` (idempotent).
+
+        Used by #141's DELETED regime to drop pages whose entire cluster
+        vanished — the orchestrator needs a per-page primitive because
+        ``delete_wiki_pages(wiki_id)`` would also remove pages that are
+        still alive.
+        """
+        ...
+
     def record_page_symbols(
         self,
         page_id: str,

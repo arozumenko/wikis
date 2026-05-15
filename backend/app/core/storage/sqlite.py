@@ -2273,6 +2273,16 @@ class UnifiedWikiDB:
         self.conn.commit()
         return cur.rowcount or 0
 
+    def delete_wiki_page(self, page_id: str) -> bool:
+        # FK CASCADE on page_symbols.page_id cleans up the reverse index
+        # in the same transaction. Idempotent: missing rows return False
+        # instead of raising.
+        cur = self.conn.execute(
+            "DELETE FROM wiki_pages WHERE page_id = ?", (page_id,),
+        )
+        self.conn.commit()
+        return bool(cur.rowcount)
+
     def record_page_symbols(
         self,
         page_id: str,

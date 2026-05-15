@@ -210,6 +210,43 @@ class TestIncrementalRefreshEndpoint:
         assert resp.headers["X-Incremental-Invocation-Id"] == "in-flight-fake"
 
     @pytest.mark.asyncio
+    async def test_409_when_full_generate_in_progress(
+        self, client_and_setup,
+    ) -> None:
+        """#140 follow-up: incremental refresh must also reject when a
+        full ``generate()`` is mid-flight on the same wiki — both write
+        to the same .wiki.db and an incremental run during a full regen
+        would race the content_hash updates."""
+        client, app = client_and_setup
+        body = {
+            "parsed_nodes": [
+                {
+                    "node_id": "sym-moved",
+                    "content_hash": compute_content_hash("def moved(): pass"),
+                    "rel_path": "new_path.py",
+                },
+            ],
+        }
+        from app.models.invocation import Invocation
+
+        service = app.state.wiki_service
+        service._invocations["full-regen-fake"] = Invocation(
+            id="full-regen-fake",
+            wiki_id="test-wiki",
+            repo_url="https://github.com/example/widgets",
+            branch="main",
+            status="generating",  # full generate() uses this status
+            owner_id="dev-user",
+        )
+
+        resp = await client.post(
+            "/api/v1/wikis/test-wiki/incremental-refresh",
+            json=body,
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.headers["X-Incremental-Invocation-Id"] == "full-regen-fake"
+
+    @pytest.mark.asyncio
     async def test_422_when_payload_exceeds_cap(self, client_and_setup) -> None:
         client, _ = client_and_setup
         oversized = [

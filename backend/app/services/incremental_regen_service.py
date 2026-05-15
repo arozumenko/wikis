@@ -132,6 +132,7 @@ class IncrementalRegenStats:
     structural_regenerated: int = 0
     structural_failed: int = 0
     deleted: int = 0  # #141 — pages whose cluster vanished entirely
+    deleted_failed: int = 0  # #141 — DELETE primitive raised; row may persist
     diff_ratios: list[float] = field(default_factory=list)
     structural_failure_reasons: list[str] = field(default_factory=list)
 
@@ -146,6 +147,7 @@ class IncrementalRegenStats:
             "structural_regenerated": self.structural_regenerated,
             "structural_failed": self.structural_failed,
             "deleted": self.deleted,
+            "deleted_failed": self.deleted_failed,
             "structural_failure_reasons": list(self.structural_failure_reasons),
             "avg_diff_ratio": (
                 sum(self.diff_ratios) / len(self.diff_ratios)
@@ -359,30 +361,43 @@ class IncrementalRegenService:
     ) -> None:
         """#141: drop a page whose entire cluster vanished.
 
-        Deletes the ``wiki_pages`` row (FK CASCADE removes
-        ``page_symbols``), then nulls out the artifact body via the
-        page-body writer. Failing either step doesn't crash the run —
-        the page is already orphaned in the source repo; cleanup is
-        eventual.
+        Calls ``storage.delete_wiki_page(page_id)`` which removes the
+        ``wiki_pages`` row (FK CASCADE removes ``page_symbols`` in the
+        same transaction), then blanks the artifact body via the
+        page-body writer so the SPA stops rendering stale prose if it
+        cached the markdown.
+
+        Both steps are best-effort: a writer that raises records the
+        failure in ``stats.deleted_failed`` + ``structural_failure_reasons``
+        and does **not** increment ``stats.deleted`` (the contract that
+        ``stats.deleted == N`` means N rows are gone matters for the
+        SPA's accounting). The page row deletion is the load-bearing
+        step; the body wipe is cosmetic backup.
         """
         try:
-            # FK CASCADE on page_symbols.page_id handles the join-table
-            # rows. delete_wiki_pages takes a wiki_id and removes all
-            # pages for that wiki, so we use upsert_wiki_page with a
-            # tombstone... actually we need a per-page delete. The
-            # protocol has delete_wiki_pages(wiki_id) but no
-            # delete_wiki_page(page_id) — see #141 for the follow-up
-            # protocol addition.
-            #
-            # Workaround: blank the body via the writer (so the SPA
-            # stops rendering content) and let the next full /refresh
-            # clean up the row. This is the conservative path until the
-            # protocol gets a per-page delete primitive.
+            self._storage.delete_wiki_page(page.page_id)
+        except Exception as exc:  # noqa: BLE001
+            stats.deleted_failed += 1
+            stats.structural_failure_reasons.append(
+                f"{page.page_id}: delete failed: {exc}",
+            )
+            logger.warning(
+                "[incremental_regen_service] delete_wiki_page failed "
+                "for %s: %s",
+                page.page_id, exc,
+            )
+            return
+
+        try:
             self._write_page(page.page_id, "")
         except Exception as exc:  # noqa: BLE001
+            # Row is gone but artifact wipe failed. Treat as success for
+            # the page_deleted contract (the canonical "this page no
+            # longer exists" signal is the missing wiki_pages row), but
+            # log loud — operators may see an orphan artifact in storage.
             logger.warning(
                 "[incremental_regen_service] deleted-page body wipe "
-                "failed for %s: %s",
+                "failed for %s (row already deleted): %s",
                 page.page_id, exc,
             )
 

@@ -60,10 +60,12 @@ def make_agent_structural_handler(
             persist via the same callback (one writer, three readers).
 
     Returns:
-        A ``StructuralHandler`` (``Callable[[PageRegime], bool]``)
-        suitable for :class:`IncrementalRegenService`. Returns ``True``
-        on successful regen, ``False`` when the agent couldn't
-        reconstruct the page (legacy row, missing spec, LLM error).
+        A ``StructuralHandler`` (``Callable[[PageRegime], str | None]``)
+        suitable for :class:`IncrementalRegenService`. Returns ``None``
+        on successful regen, or a short reason string when the agent
+        couldn't reconstruct the page (legacy row, missing spec, LLM
+        error, write failure). The orchestrator records reason strings
+        in :attr:`IncrementalRegenStats.structural_failure_reasons`.
     """
 
     def _handler(page: "PageRegime") -> "str | None":

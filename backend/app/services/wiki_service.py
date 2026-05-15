@@ -591,13 +591,37 @@ class WikiService:
         # in-memory page_bodies dicts diverge. Reject the second caller
         # with the in-flight invocation_id so they can join the existing
         # SSE stream instead of spawning a parallel run.
+        #
+        # Critical: construct + register the invocation BEFORE any
+        # awaits so two callers racing through this function can't both
+        # pass the check. ``status == "running"`` covers incremental
+        # refreshes; ``"generating"`` covers a full ``generate()`` on
+        # the same wiki — both write to the same ``.wiki.db`` and would
+        # corrupt each other's content_hash updates.
+        _BLOCKING_STATUSES = {"running", "generating"}
         for inv in self._invocations.values():
             if (
                 inv.wiki_id == wiki_id
-                and inv.status == "running"
+                and inv.status in _BLOCKING_STATUSES
                 and inv.id != ""
             ):
                 raise IncrementalRefreshInProgressError(wiki_id, inv.id)
+
+        # Reserve the invocation slot atomically (no awaits between the
+        # guard check and this assignment) so a second caller racing
+        # through the check now hits a registered "running" entry and
+        # gets a 409. If the early-out branches below (missing cache key
+        # / db file) fire, we pop the reservation back out before
+        # returning None.
+        invocation = Invocation(
+            id=str(uuid4()),
+            wiki_id=wiki_id,
+            repo_url=wiki_record.repo_url,
+            branch=wiki_record.branch,
+            status="running",
+            owner_id=owner_id,
+        )
+        self._invocations[invocation.id] = invocation
 
         from pathlib import Path as _Path
 
@@ -613,9 +637,11 @@ class WikiService:
             self.settings.cache_dir, wiki_record.repo_url, wiki_record.branch,
         )
         if not cache_key:
+            self._invocations.pop(invocation.id, None)
             return None
         db_path = _Path(self.settings.cache_dir) / f"{cache_key}.wiki.db"
         if not db_path.exists():
+            self._invocations.pop(invocation.id, None)
             return None
 
         # Preload every page body into an in-memory dict so the
@@ -643,18 +669,6 @@ class WikiService:
                 artifact_keys[page_id] = artifact_key
             except FileNotFoundError:
                 continue
-
-        # Create invocation + start a background task so the caller can
-        # subscribe to SSE events immediately while the orchestrator runs.
-        invocation = Invocation(
-            id=str(uuid4()),
-            wiki_id=wiki_id,
-            repo_url=wiki_record.repo_url,
-            branch=wiki_record.branch,
-            status="running",
-            owner_id=owner_id,
-        )
-        self._invocations[invocation.id] = invocation
         # Persist immediately so a process restart between this 202 and
         # task completion doesn't strand the SSE stream — late-connecting
         # clients can still reconnect via Last-Event-ID + replay.

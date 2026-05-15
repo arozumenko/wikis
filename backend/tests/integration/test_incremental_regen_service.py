@@ -369,10 +369,15 @@ class TestIncrementalRegenServiceE2E:
 
         # New behavior (#141): cluster vanished → DELETED, not structural.
         assert stats.deleted == 1
+        assert stats.deleted_failed == 0
         assert stats.structural_regenerated == 0
         assert "page-struct" not in struct_log
-        # The body got wiped to signal the page is gone.
+        # The body got wiped (cosmetic backup signal) AND the row is
+        # gone from storage. Production wiring uses
+        # storage.delete_wiki_page which FK CASCADEs to page_symbols.
         assert page_bodies["page-struct"] == ""
+        assert fixture.get_wiki_page("page-struct") is None
+        assert fixture.get_pages_citing_node("sym-deleted") == []
 
     def test_progress_callback_emits_per_page_and_summary_events(
         self, fixture,
