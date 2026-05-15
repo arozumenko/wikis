@@ -249,7 +249,12 @@ class TestExtract:
         assert "--convert-to" in cmd
         assert "pdf" in cmd
         # Per-invocation user profile to avoid lock contention.
-        assert any(c.startswith("-env:UserInstallation=file://") for c in cmd)
+        # ``file:///`` (three slashes) is the signature of
+        # ``Path.as_uri()`` — the hand-rolled f-string this replaced
+        # would only emit two slashes, so checking for three keeps
+        # this assertion meaningful even alongside the dedicated
+        # ``test_user_installation_uri_uses_path_as_uri`` regression.
+        assert any(c.startswith("-env:UserInstallation=file:///") for c in cmd)
 
         # CR2: inner PDFExtractor was actually called with the produced
         # PDF — a refactor that returned a mock value without invoking
