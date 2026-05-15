@@ -536,3 +536,70 @@ class WikiStorageProtocol(Protocol):
             }
         """
         ...
+
+    # ==================================================================
+    # WIKI PAGES + source→page reverse index (#116 incremental regen)
+    # ==================================================================
+
+    def upsert_wiki_page(self, page: dict[str, Any]) -> None:
+        """Insert or replace a row in ``wiki_pages``.
+
+        ``page`` must include ``page_id`` and ``wiki_id``. All other columns
+        (``id_scheme``, ``title``, ``anchor_slug``, ``content_hash``,
+        ``macro_cluster``, ``micro_cluster``, ``primary_symbol_id``,
+        ``section_index``, ``page_index``, ``generated_at``) are optional and
+        fall back to schema defaults when omitted.
+        """
+        ...
+
+    def get_wiki_page(self, page_id: str) -> dict[str, Any] | None:
+        """Fetch one page row by its ``page_id``. Returns None if missing."""
+        ...
+
+    def get_wiki_pages(self, wiki_id: str) -> list[dict[str, Any]]:
+        """Return all page rows for a wiki, in (section_index, page_index) order."""
+        ...
+
+    def delete_wiki_pages(self, wiki_id: str) -> int:
+        """Remove all rows for a wiki from ``wiki_pages`` (cascades to
+        ``page_symbols``). Returns the number of rows deleted.
+        """
+        ...
+
+    def record_page_symbols(
+        self,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Persist the source→page reverse index for one page.
+
+        Args:
+            page_id: the wiki page these symbols belong to.
+            symbols: list of ``(node_id, citation_kind)`` tuples where
+                citation_kind is ``'primary'``, ``'referenced'``, or
+                ``'related'``.
+            replace: when True (default), all existing rows for ``page_id``
+                are deleted before inserting the new set — this is the
+                desired behaviour after a regen. When False, rows are
+                appended via INSERT OR IGNORE / ON CONFLICT DO NOTHING.
+        """
+        ...
+
+    def get_pages_citing_node(self, node_id: str) -> list[str]:
+        """Return the ``page_id``s of every page that cites ``node_id``.
+
+        Used by [#116] change detection to find which pages need regen
+        when an underlying symbol changes.
+        """
+        ...
+
+    def get_page_symbols(
+        self, page_id: str, citation_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return rows for one page: ``[{node_id, citation_kind}, ...]``.
+
+        When ``citation_kind`` is supplied, only that kind is returned.
+        """
+        ...

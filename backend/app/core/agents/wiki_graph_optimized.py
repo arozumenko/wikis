@@ -58,6 +58,11 @@ from ..state.wiki_state import (
     WikiStructureSpec,
     WikiStyle,
 )
+from ..storage.incremental import (
+    compute_anchor_slug,
+    compute_content_hash,
+    compute_page_id,
+)
 from ..token_counter import CONTEXT_TOKEN_BUDGET, get_token_counter
 
 logger = logging.getLogger(__name__)
@@ -204,6 +209,11 @@ class OptimizedWikiGenerationAgent:
         # Cluster expansion state (lazy-opened)
         self._cluster_db = None       # UnifiedWikiDB instance (opened on first use)
         self._cluster_db_path = None  # Cached path for the unified DB file
+
+        # #116: resolved wiki_id, lazy + cached. Same derivation as export_wiki
+        # so wiki_pages rows we persist now line up with the artifact storage
+        # paths the exporter will use later.
+        self._resolved_wiki_id: str | None = None
 
         # Build code_graph
         self.graph = self._build_graph()
@@ -621,11 +631,42 @@ class OptimizedWikiGenerationAgent:
         # each sub-page comfortably fits within the context token budget.
         self._split_overloaded_pages(wiki_structure)
 
-        # Generate all pages at once (simplified - no batching)
+        # #116: allocate stable page IDs for new wikis (id_scheme='stable_v1').
+        # When we can resolve a wiki_id, page IDs are sha256 of
+        # (wiki_id, macro_cluster, micro_cluster, primary_symbol_id, title)
+        # so they survive cluster-membership churn. When we can't, fall back
+        # to the legacy "{section}#{page}" scheme for safety. Slug uniqueness
+        # is enforced wiki-wide via compute_anchor_slug + a running set.
+        wiki_id = self._resolve_wiki_id()
+        used_slugs: set[str] = set()
+
         sends = []
         for section_idx, section in enumerate(wiki_structure.sections):
             for page_idx, page in enumerate(section.pages):
-                page_id = f"{section_idx}#{page_idx}"
+                metadata = getattr(page, "metadata", {}) or {}
+                macro = metadata.get("section_id", section_idx)
+                micro = metadata.get("page_id", page_idx)
+                cluster_node_ids = metadata.get("cluster_node_ids", []) or []
+                primary_symbol_id = (
+                    cluster_node_ids[0] if cluster_node_ids else None
+                )
+
+                if wiki_id:
+                    page_id = compute_page_id(
+                        wiki_id=wiki_id,
+                        macro_cluster=macro if isinstance(macro, int) else None,
+                        micro_cluster=micro if isinstance(micro, int) else None,
+                        primary_symbol_id=primary_symbol_id,
+                        title=page.page_name,
+                    )
+                    id_scheme = "stable_v1"
+                else:
+                    page_id = f"{section_idx}#{page_idx}"
+                    id_scheme = "legacy"
+
+                anchor_slug = compute_anchor_slug(page.page_name, used_slugs)
+                used_slugs.add(anchor_slug)
+
                 # Use Pydantic v2 model_dump for structured models; fallback to __dict__
                 page_spec_dict = (
                     page.model_dump()
@@ -640,6 +681,19 @@ class OptimizedWikiGenerationAgent:
                             "page_id": page_id,
                             "page_spec": page_spec_dict,
                             "repository_context": state["repository_context"],
+                            # #116 persistence inputs — passed through to
+                            # generate_page_content for wiki_pages + page_symbols upsert.
+                            "page_persist": {
+                                "wiki_id": wiki_id,
+                                "id_scheme": id_scheme,
+                                "anchor_slug": anchor_slug,
+                                "macro_cluster": macro if isinstance(macro, int) else None,
+                                "micro_cluster": micro if isinstance(micro, int) else None,
+                                "primary_symbol_id": primary_symbol_id,
+                                "section_index": section_idx,
+                                "page_index": page_idx,
+                                "cluster_node_ids": list(cluster_node_ids),
+                            },
                         },
                     )
                 )
@@ -864,6 +918,16 @@ class OptimizedWikiGenerationAgent:
                     )
                 except Exception:
                     pass  # never break generation for progress
+
+            # #116: persist wiki_pages row + page_symbols reverse index so
+            # future incremental runs (PR 2+) can find this page by symbol.
+            # Fail-soft: a storage hiccup here must not fail page generation.
+            self._persist_page_metadata(
+                page_id=page_id,
+                page_spec=page_spec,
+                generated_content=generated_content,
+                persist=state.get("page_persist", {}),
+            )
 
             return {
                 "wiki_pages": [
@@ -1695,6 +1759,104 @@ class OptimizedWikiGenerationAgent:
 
         except Exception as exc:
             logger.warning("[UNIFIED_DB] Failed to populate: %s", exc)
+
+    def _resolve_wiki_id(self) -> str | None:
+        """Derive ``{owner}--{repo}--{branch}`` from ``self.repository_url``.
+
+        Returns the same wiki_id that ``export_wiki`` will compute later, so
+        the ``wiki_pages`` rows we persist during page generation key cleanly
+        against the artifacts the exporter will write. Cached after first call.
+        Returns None when the URL can't be parsed — caller must handle that
+        case (skip persistence rather than crash).
+        """
+        if self._resolved_wiki_id is not None:
+            return self._resolved_wiki_id
+        try:
+            from ..artifact_export import normalize_wiki_id
+
+            repo_url = self.repository_url
+            if not repo_url:
+                return None
+            # Match the URL-parsing rules used in export_wiki below.
+            if "://" in repo_url:
+                path = repo_url.split("://", 1)[1].split("/", 1)[1]
+            elif "@" in repo_url and ":" in repo_url:
+                path = repo_url.split(":", 1)[1]
+            else:
+                path = repo_url
+            path = path.rstrip("/").removesuffix(".git")
+            if "/" not in path:
+                return None
+            self._resolved_wiki_id = normalize_wiki_id(
+                repository=path, branch=self.branch,
+            )
+            return self._resolved_wiki_id
+        except Exception as exc:
+            logger.warning("[wiki_pages] could not resolve wiki_id: %s", exc)
+            return None
+
+    def _persist_page_metadata(
+        self,
+        *,
+        page_id: str,
+        page_spec: PageSpec,
+        generated_content: str,
+        persist: dict[str, Any],
+    ) -> None:
+        """Record the wiki_pages + page_symbols rows for one rendered page.
+
+        Fail-soft by design: a DB error here must not bubble up and break
+        page generation. The data is for future incremental runs — if a row
+        is missing the next regen falls back to a full page render.
+        """
+        wiki_id = persist.get("wiki_id")
+        if not wiki_id:
+            # Couldn't resolve wiki_id at dispatch time — running with the
+            # legacy ID scheme. Skip persistence; pre-#116 callers don't
+            # expect these rows either.
+            return
+
+        db = self._open_cluster_db()
+        if db is None:
+            return
+
+        try:
+            db.upsert_wiki_page(
+                {
+                    "page_id": page_id,
+                    "wiki_id": wiki_id,
+                    "id_scheme": persist.get("id_scheme", "stable_v1"),
+                    "title": page_spec.page_name,
+                    "anchor_slug": persist.get("anchor_slug", ""),
+                    "content_hash": compute_content_hash(generated_content),
+                    "macro_cluster": persist.get("macro_cluster"),
+                    "micro_cluster": persist.get("micro_cluster"),
+                    "primary_symbol_id": persist.get("primary_symbol_id"),
+                    "section_index": persist.get("section_index", 0),
+                    "page_index": persist.get("page_index", 0),
+                    "generated_at": datetime.utcnow().isoformat() + "Z",
+                }
+            )
+
+            # Build (node_id, citation_kind) pairs from the planner's cluster
+            # membership. First node is the primary; rest are 'related'. We
+            # don't parse `<code_context>` markdown for 'referenced' rows yet
+            # — that arrives in PR 2 alongside change detection, where it's
+            # actually consumed. Until then the cluster set is enough to
+            # answer "which pages cite this node?".
+            symbols: list[tuple[str, str]] = []
+            cluster_node_ids = persist.get("cluster_node_ids") or []
+            primary = persist.get("primary_symbol_id")
+            for idx, node_id in enumerate(cluster_node_ids):
+                if not node_id:
+                    continue
+                kind = "primary" if idx == 0 and node_id == primary else "related"
+                symbols.append((node_id, kind))
+            db.record_page_symbols(page_id, symbols)
+        except Exception as exc:
+            logger.warning(
+                "[wiki_pages] persist failed for page_id=%s: %s", page_id, exc,
+            )
 
     def _open_cluster_db(self):
         """Open (or return cached) unified DB for cluster expansion."""
