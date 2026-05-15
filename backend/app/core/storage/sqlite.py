@@ -271,6 +271,11 @@ CREATE TABLE IF NOT EXISTS wiki_pages (
     -- this page was generated against. Lets change detection fast-exit on
     -- "repo unchanged since last regen" without diffing every node.
     last_indexed_commit TEXT DEFAULT NULL,
+    -- #116 PR 3 structural-handler wiring: full PageSpec serialized as
+    -- JSON. Lets OptimizedWikiGenerationAgent.regenerate_single_page
+    -- reconstruct the original retrieval inputs (target_symbols,
+    -- target_docs, retrieval_query, etc.) without re-running the planner.
+    page_spec_json     TEXT DEFAULT NULL,
     generated_at       TEXT DEFAULT (datetime('now'))
 );
 """
@@ -526,6 +531,15 @@ class UnifiedWikiDB:
                 )
                 cur.execute(
                     "ALTER TABLE wiki_pages ADD COLUMN last_indexed_commit TEXT DEFAULT NULL"
+                )
+                self.conn.commit()
+            # #116 PR 3 structural-handler wiring: page_spec_json.
+            if "page_spec_json" not in page_cols:
+                logger.info(
+                    "Migrating schema: adding page_spec_json to wiki_pages"
+                )
+                cur.execute(
+                    "ALTER TABLE wiki_pages ADD COLUMN page_spec_json TEXT DEFAULT NULL"
                 )
                 self.conn.commit()
 
@@ -2161,6 +2175,7 @@ class UnifiedWikiDB:
         "section_index",
         "page_index",
         "last_indexed_commit",
+        "page_spec_json",
         "generated_at",
     )
 
@@ -2187,6 +2202,7 @@ class UnifiedWikiDB:
             "section_index": page.get("section_index", 0),
             "page_index": page.get("page_index", 0),
             "last_indexed_commit": page.get("last_indexed_commit"),
+            "page_spec_json": page.get("page_spec_json"),
             "generated_at": page.get("generated_at"),
         }
         cols = ", ".join(self._WIKI_PAGE_COLUMNS)

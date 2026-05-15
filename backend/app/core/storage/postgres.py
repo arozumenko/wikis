@@ -211,6 +211,8 @@ def _define_tables(
         # #116 PR 2: git rev / source-state identifier for the repo snapshot
         # this page was generated against. Fast-exit on "repo unchanged".
         Column("last_indexed_commit", Text),
+        # #116 PR 3 structural-handler wiring: planner's PageSpec as JSON.
+        Column("page_spec_json", Text),
         Column("generated_at", Text),
         schema=schema,
     )
@@ -424,6 +426,18 @@ class PostgresWikiStorage:
                     ) THEN
                         ALTER TABLE {schema}.wiki_pages
                             ADD COLUMN last_indexed_commit TEXT;
+                    END IF;
+                    -- #116 PR 3 structural-handler wiring: page_spec_json.
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = '{schema}' AND table_name = 'wiki_pages'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'wiki_pages'
+                          AND column_name = 'page_spec_json'
+                    ) THEN
+                        ALTER TABLE {schema}.wiki_pages
+                            ADD COLUMN page_spec_json TEXT;
                     END IF;
                     -- page tables / CHECK constraints
                     IF NOT EXISTS (
@@ -2161,6 +2175,7 @@ class PostgresWikiStorage:
         "section_index",
         "page_index",
         "last_indexed_commit",
+        "page_spec_json",
         "generated_at",
     )
 
@@ -2189,6 +2204,7 @@ class PostgresWikiStorage:
             "section_index": page.get("section_index", 0),
             "page_index": page.get("page_index", 0),
             "last_indexed_commit": _s(page.get("last_indexed_commit")),
+            "page_spec_json": _s(page.get("page_spec_json")),
             "generated_at": _s(page.get("generated_at")),
         }
         cols = ", ".join(self._WIKI_PAGE_COLUMNS)
