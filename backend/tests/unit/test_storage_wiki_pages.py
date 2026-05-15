@@ -198,6 +198,23 @@ class TestLastIndexedCommit:
         assert row["last_indexed_commit"] is None
 
 
+class TestPageSpecJson:
+    """#116 structural-handler wiring stores the planner's PageSpec as
+    JSON so regenerate_single_page can reconstruct it without re-running
+    the planner."""
+
+    def test_round_trip(self, db: UnifiedWikiDB) -> None:
+        payload = '{"page_name": "Auth", "target_symbols": ["AuthService"]}'
+        db.upsert_wiki_page(_page("p1", anchor_slug="a", page_spec_json=payload))
+        row = db.get_wiki_page("p1")
+        assert row["page_spec_json"] == payload
+
+    def test_defaults_to_null_when_omitted(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", anchor_slug="a"))
+        row = db.get_wiki_page("p1")
+        assert row["page_spec_json"] is None
+
+
 class TestAtomicWrite:
     """upsert_wiki_page_with_symbols must roll back both writes on failure
     so PR 2 change detection never sees a half-persisted page."""
