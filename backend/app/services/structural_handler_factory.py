@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from app.core.storage.incremental import compute_content_hash
 from app.services.incremental_regen_service import (
     PageBodyWriter,
     StructuralHandler,
@@ -25,6 +26,7 @@ from app.services.incremental_regen_service import (
 
 if TYPE_CHECKING:  # pragma: no cover — import-only
     from app.core.agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
+    from app.core.storage.protocol import WikiStorageProtocol
     from app.services.incremental_regen import PageRegime
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 def make_agent_structural_handler(
     agent: "OptimizedWikiGenerationAgent",
     *,
+    storage: "WikiStorageProtocol",
     repository_context: str,
     write_page_body: PageBodyWriter,
 ) -> StructuralHandler:
@@ -43,6 +46,12 @@ def make_agent_structural_handler(
         agent: an already-constructed
             :class:`OptimizedWikiGenerationAgent`. The orchestrator
             calls back into this for each structural page.
+        storage: the same wiki storage handle the orchestrator uses.
+            After a successful body write the handler stamps the new
+            ``content_hash`` into ``wiki_pages``, matching the
+            behavior of the trivial and edit regimes — without this,
+            the next incremental run would see a hash mismatch and
+            re-classify the page as MODIFIED, looping forever.
         repository_context: the repository-context string the agent
             uses for retrieval. Same value as full regen's
             ``WikiState.repository_context``.
@@ -76,6 +85,25 @@ def make_agent_structural_handler(
                 page.page_id, exc,
             )
             return False
+
+        # Stamp the new content_hash into wiki_pages so the next
+        # incremental run sees this page as unchanged (parity with
+        # trivial + edit regimes). Without this, every structurally-
+        # regenerated page would loop "structural" on every run.
+        try:
+            row = storage.get_wiki_page(page.page_id)
+            if row is not None:
+                row["content_hash"] = compute_content_hash(new_content)
+                storage.upsert_wiki_page(row)
+        except Exception as exc:  # noqa: BLE001 — fail-soft on the stamp
+            logger.warning(
+                "[structural_handler] page %s: content_hash stamp failed "
+                "(next regen will re-process this page): %s",
+                page.page_id, exc,
+            )
+            # Don't fail the overall regen — body is written; only the
+            # bookkeeping hash is stale. Logged loudly so ops can spot it.
+
         return True
 
     return _handler

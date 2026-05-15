@@ -1852,13 +1852,21 @@ class OptimizedWikiGenerationAgent:
 
         Reads ``page_spec_json`` from ``wiki_pages`` (stored by the
         per-page persist hook), reconstructs the original
-        :class:`PageSpec`, then runs the same retrieval + LLM path that
-        full wiki generation uses for one page.
+        :class:`PageSpec`, then runs the same retrieval + simple-mode
+        LLM path that full wiki generation uses for one page.
+
+        **Quality-gated retries from the full pipeline are intentionally
+        skipped here** — structural regen is the "we don't know what
+        else to do" fallback, and an extra round of LLM retries doesn't
+        change the failure mode (low-quality input still produces
+        low-quality output). Callers needing maximum quality should
+        treat ``None`` as a signal to schedule a full ``/refresh``.
 
         Returns the new markdown body, or ``None`` if the page has no
-        persisted spec (legacy wiki, missing row, deserialize failure).
-        Callers should treat ``None`` as "structural regen failed for
-        this page" and fall back accordingly.
+        persisted spec (legacy wiki, missing row, deserialize failure,
+        LLM error, transient storage error). Callers should treat
+        ``None`` as "structural regen failed for this page" and fall
+        back accordingly.
 
         Used by the #116 PR 3 structural-handler factory to satisfy the
         ``edit-demoted-to-structural`` and primary-symbol-deleted
@@ -1874,7 +1882,15 @@ class OptimizedWikiGenerationAgent:
             )
             return None
 
-        page_row = db.get_wiki_page(page_id)
+        try:
+            page_row = db.get_wiki_page(page_id)
+        except Exception as exc:  # noqa: BLE001 — fail-soft on storage read
+            logger.warning(
+                "[regenerate_single_page] page %s: storage read failed: %s",
+                page_id, exc,
+            )
+            return None
+
         if page_row is None:
             logger.warning(
                 "[regenerate_single_page] page %s not in wiki_pages; "
@@ -1918,7 +1934,9 @@ class OptimizedWikiGenerationAgent:
             return None
 
         # Re-run diagram sanitization (the original generate_page_content
-        # path does this; keep parity).
+        # path does this; keep parity). Fail-soft on sanitizer errors —
+        # a bad Mermaid block shouldn't null out an otherwise-good page —
+        # but log loudly so ops can detect silent sanitizer regressions.
         try:
             from ..diagram_sanitizer import SanitizerConfig, sanitize_content
 
@@ -1926,8 +1944,12 @@ class OptimizedWikiGenerationAgent:
                 generated_content, SanitizerConfig(),
             )
             generated_content = sanitized
-        except Exception:  # noqa: BLE001 — sanitizer is fail-soft per parity
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[regenerate_single_page] page %s: diagram sanitization "
+                "failed; emitting un-sanitized content: %s",
+                page_id, exc, exc_info=True,
+            )
 
         return generated_content
 
@@ -1982,12 +2004,17 @@ class OptimizedWikiGenerationAgent:
             # #116 PR 3 structural-handler wiring: store the planner's
             # PageSpec as JSON so regenerate_single_page can reconstruct
             # the retrieval inputs (target_symbols, target_docs, etc.)
-            # without re-running the planner. Falls back to None when
-            # the spec isn't dumpable (legacy fixtures, etc.) — the
-            # structural handler then skips the page rather than crashing.
+            # without re-running the planner. Exclude `metadata` — that
+            # field carries cluster-membership state the planner uses
+            # internally but neither _get_relevant_content_for_page nor
+            # _generate_simple read it back. Skipping it can cut the
+            # stored JSON size by an order of magnitude on big clusters.
+            # Falls back to None when the spec isn't dumpable (legacy
+            # fixtures, etc.) — the structural handler then skips the
+            # page rather than crashing.
             try:
                 page_spec_json = (
-                    page_spec.model_dump_json()
+                    page_spec.model_dump_json(exclude={"metadata"})
                     if hasattr(page_spec, "model_dump_json")
                     else None
                 )
