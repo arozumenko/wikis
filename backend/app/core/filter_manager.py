@@ -214,6 +214,10 @@ class FilterManager:
             ".jpeg",
             ".gif",
             ".webp",
+            # #118 phase 2 — Office formats (LibreOffice → PDF → vision)
+            ".docx",
+            ".xlsx",
+            ".pptx",
             # Web files
             ".html",
             ".htm",

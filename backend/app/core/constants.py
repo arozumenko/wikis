@@ -37,6 +37,8 @@ DOCUMENTATION_EXTENSIONS = {
     '.adoc': 'asciidoc',
     '.doc': 'document',
     '.docx': 'document',
+    '.xlsx': 'spreadsheet',       # #118 phase 2 — LibreOffice → PDF → vision
+    '.pptx': 'presentation',      # #118 phase 2 — LibreOffice → PDF → vision
     '.pdf': 'pdf',
     # Rendered images (#118) — extractor describes content via LLM vision
     '.png': 'image',

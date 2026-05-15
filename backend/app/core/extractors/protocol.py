@@ -41,6 +41,10 @@ KNOWN_VISION_EXTENSIONS: frozenset[str] = frozenset({
     ".jpeg",
     ".gif",
     ".webp",
+    # #118 phase 2 — Office formats (via LibreOffice → PDF → vision)
+    ".docx",
+    ".xlsx",
+    ".pptx",
 })
 
 # Defend the case-invariant at module load. The graph builder's
@@ -223,6 +227,25 @@ def build_default_registry(
             "[extractors] PDF extractor disabled: %s — install "
             "pypdfium2 + Pillow to enable "
             "(pip install wikis-backend[pdf])",
+            exc,
+        )
+
+    # #118 phase 2 — Office formats. The extractor delegates back to
+    # PDFExtractor after LibreOffice converts to PDF, so registering
+    # the office extractor without the [pdf] extras is pointless. We
+    # register anyway and let the PDFExtractor inside the OfficeExtractor
+    # surface the missing-dep error at construction time — the user gets
+    # one consistent WARNING per missing extra.
+    try:
+        from app.core.extractors.office import OfficeExtractor
+
+        registry.register(OfficeExtractor(llm=llm))
+    except ImportError as exc:
+        logger.warning(
+            "[extractors] Office extractor disabled: %s — install "
+            "LibreOffice (apt install libreoffice-core libreoffice-writer "
+            "libreoffice-calc libreoffice-impress, or `brew install "
+            "--cask libreoffice` on macOS) plus the [pdf] extra to enable",
             exc,
         )
 
