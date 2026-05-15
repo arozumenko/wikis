@@ -405,7 +405,10 @@ class WikiStorageProtocol(Protocol):
         ``hub_assignment`` on every node row.
 
         Called before writing a fresh cluster-assignment pass so stale
-        values from a previous cached run don't survive.
+        values from a previous cached run don't survive.  On SQLite the
+        UPDATE runs in the current transaction — the caller is responsible
+        for invoking :meth:`commit` once subsequent cluster writes are
+        finished.  On Postgres the write is auto-committed.
         """
         ...
 

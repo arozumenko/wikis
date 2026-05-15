@@ -503,8 +503,8 @@ class TestAugmentation:
             metadata={"language": "cpp", "node_id": "CppClass",
                        "source": "include/foo.h", "symbol_type": "class"},
         )
-        # _augment_cpp takes (conn, node_id, sym_type, decl_file) and returns parts list
-        parts = _augment_cpp(db.conn, "CppClass", "class", "include/foo.h")
+        # _augment_cpp takes (db, node_id, sym_type, decl_file) and returns parts list
+        parts = _augment_cpp(db, "CppClass", "class", "include/foo.h")
         combined = "\n".join(parts)
         assert "foo.cpp" in combined
         assert "Foo::bar()" in combined
@@ -524,8 +524,8 @@ class TestAugmentation:
             metadata={"language": "go", "node_id": "GoStruct",
                        "source": "pkg/model.go", "symbol_type": "struct"},
         )
-        # _augment_go_rust takes (conn, node_id, sym_type, type_file) and returns parts list
-        parts = _augment_go_rust(db.conn, "GoStruct", "struct", "pkg/model.go")
+        # _augment_go_rust takes (db, node_id, sym_type, type_file) and returns parts list
+        parts = _augment_go_rust(db, "GoStruct", "struct", "pkg/model.go")
         combined = "\n".join(parts)
         assert "Validate" in combined
 
@@ -536,7 +536,7 @@ class TestAugmentation:
                        "source": "main.go", "symbol_type": "function"},
         )
         # _augment_go_rust returns empty list for non-struct types
-        parts = _augment_go_rust(db.conn, "x", "function", "main.go")
+        parts = _augment_go_rust(db, "x", "function", "main.go")
         assert parts == []
 
 

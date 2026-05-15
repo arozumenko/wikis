@@ -124,7 +124,7 @@ Browser → Next.js Web App (:3000)
 - `services/` — Business logic: `wiki_service`, `wiki_management`, `ask_service`, `research_service`, `qa_service`, `qa_cache_manager`, `project_service`, `export_service`, `import_service`, `toolkit_bridge`, `health_check`, `llm_factory`
 - `core/` — The wiki engine (40+ modules):
   - `parsers/` — Tree-sitter for 14+ languages
-  - `code_graph/` — Graph builder + FTS/vector index (`unified_graph_text_index`, `postgres_graph_text_index`)
+  - `code_graph/` — Graph builder + standalone FTS5 index for NX-graph cache (`graph_text_index.py`); the unified-storage equivalent lives in `core/storage/text_index.py` (`StorageTextIndex`) and works for both SQLite and Postgres backends
   - `agents/` — LangGraph wiki generation agents (`wiki_graph_optimized`)
   - `deep_research/` — Multi-step research engine (LangGraph)
   - `wiki_structure_planner/` — LLM outline + cluster planners

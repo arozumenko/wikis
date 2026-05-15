@@ -103,7 +103,6 @@ def build_candidates(
         One record per micro-cluster, with metrics computed.
     """
     candidates: List[CandidateRecord] = []
-    conn = db.conn
 
     for macro_id in sorted(cluster_map.keys()):
         for micro_id in sorted(cluster_map[macro_id].keys()):
@@ -112,7 +111,7 @@ def build_candidates(
                 continue
 
             record = _build_one_candidate(
-                conn, macro_id, micro_id, node_ids,
+                db, macro_id, micro_id, node_ids,
             )
             candidates.append(record)
 
@@ -129,22 +128,28 @@ def build_candidates(
 
 
 def _build_one_candidate(
-    conn, macro_id: int, micro_id: int, node_ids: List[str],
+    db, macro_id: int, micro_id: int, node_ids: List[str],
 ) -> CandidateRecord:
     """Compute metrics for a single micro-cluster."""
-    # Fetch node metadata.
-    # Only the columns the metric routines actually read are selected.
-    # `source_text` is intentionally excluded — it is multi-KB per node and
-    # we only need its length, which we compute via SQL ``length(...)``.
-    placeholders = ",".join("?" * len(node_ids))
-    rows = conn.execute(
-        "SELECT node_id, symbol_name, symbol_type, rel_path, "
-        "       COALESCE(length(source_text), 0) AS source_len, "
-        "       docstring "
-        f"FROM repo_nodes WHERE node_id IN ({placeholders})",
-        node_ids,
-    ).fetchall()
-    nodes = [dict(r) for r in rows]
+    # Fetch node metadata via the protocol.  The original raw query
+    # projected only six columns (and computed ``source_len`` via SQL
+    # ``length(source_text)``) to avoid transferring multi-KB source
+    # blobs; here we fetch full rows and compute ``source_len`` in
+    # Python.  Candidate building runs once per wiki (not in a hot loop)
+    # so the extra payload is acceptable in exchange for backend
+    # neutrality.
+    raw_nodes = db.get_nodes_by_ids(node_ids)
+    nodes: List[Dict[str, Any]] = []
+    for n in raw_nodes:
+        source_text = n.get("source_text") or ""
+        nodes.append({
+            "node_id": n.get("node_id"),
+            "symbol_name": n.get("symbol_name"),
+            "symbol_type": n.get("symbol_type"),
+            "rel_path": n.get("rel_path"),
+            "source_len": len(source_text),
+            "docstring": n.get("docstring"),
+        })
 
     total = len(nodes) or 1  # avoid division by zero
 
