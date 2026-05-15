@@ -356,6 +356,27 @@ Backend auth.py → fetches JWKS from web :3000/api/auth/jwks → validates JWT
 LOCAL DEV: AUTH_ENABLED=false bypasses all JWT validation
 ```
 
+### Language Parsers (#119 — lightweight tier)
+
+Three tiers of parser coverage at `backend/app/core/parsers/`:
+
+| Tier | Parsers | Path | Approach |
+|------|---------|------|----------|
+| **Rich (deep)** | C++, C#, Go, Java, Python, JavaScript, TypeScript, Rust | `<lang>_parser.py` / `<lang>_visitor_parser.py` (1500–4000 LOC each) | Per-language type inference, field resolution, template instantiation |
+| **Basic (lightweight visitor)** | Ruby, PHP, Kotlin, Scala, Lua | `basic_visitor.py` + `lang_configs/<lang>.py` (~30 LOC config each) | Generic tree-sitter visitor driven by per-language `LanguageConfig` (node-type strings for class/function/call/import + inheritance field/types + name fallbacks + name-chain drill-down) |
+| **Regex fallback** | (legacy / unsupported) | `code_splitter.py` | Last-resort extraction for languages without any tree-sitter coverage |
+
+All three tiers produce the same `Symbol` / `Relationship` / `ParseResult` shape so downstream graph builders, retrievers, and the wiki agent need zero special-casing.
+
+**Adding a new lightweight language**:
+1. Inspect the tree-sitter grammar — find node-type strings for class/function/import/call/inheritance (a 20-line introspection script is enough).
+2. Create `backend/app/core/parsers/lang_configs/<lang>.py` with a `LanguageConfig` instance.
+3. Re-export from `lang_configs/__init__.py`'s `build_basic_parsers()` factory.
+4. Add a `tests/fixtures/parsers/<lang>/hello.<ext>` fixture exercising class + methods + inheritance + calls.
+5. Add a test class to `tests/unit/test_basic_visitor_parser.py` following the existing per-language pattern.
+
+**Promotion path basic → deep**: when a language sees enough user demand to justify type inference / cross-file resolution (Ruby + PHP are the likely first candidates), write a full parser inheriting from `BaseParser` directly. The `LanguageConfig` can either retire or stay as a fallback for partial parses.
+
 ### LLM Provider Pattern
 
 All providers implement `BaseLanguageModel` (LangChain). Add a new provider in `backend/app/services/llm_factory.py`:
