@@ -155,37 +155,6 @@ def get_language_hints(language: str) -> LanguageHints:
     return _HINTS_BY_LANGUAGE.get(language.lower(), _DEFAULT_HINTS)
 
 
-def detect_dominant_language(conn, node_ids: list) -> Optional[str]:
-    """Detect the dominant language in a set of nodes.
-
-    Parameters
-    ----------
-    conn : sqlite3.Connection
-        DB connection.
-    node_ids : list[str]
-        Node IDs to check.
-
-    Returns
-    -------
-    str or None
-        The most common language, or None if empty.
-    """
-    if not node_ids:
-        return None
-
-    placeholders = ",".join("?" for _ in node_ids)
-    rows = conn.execute(
-        f"SELECT language, COUNT(*) as cnt FROM repo_nodes "
-        f"WHERE node_id IN ({placeholders}) AND language IS NOT NULL "
-        f"GROUP BY language ORDER BY cnt DESC LIMIT 1",
-        node_ids,
-    ).fetchall()
-
-    if rows:
-        return rows[0][0]
-    return None
-
-
 def should_include_in_expansion(
     hints: LanguageHints,
     symbol_type: str,

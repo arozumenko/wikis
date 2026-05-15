@@ -5,9 +5,8 @@ Per-symbol-type bidirectional expansion strategies extracted from
 ``expansion_engine.py`` (NX-graph-based) and adapted for the
 unified-DB-based cluster expansion path.
 
-These helpers operate on raw DB connections (not NX graphs) so they
-can be used by ``cluster_expansion.py`` without loading the full graph
-into memory.
+All helpers take a :class:`WikiStorageProtocol` (``db``) rather than a
+raw connection so they work against both SQLite and PostgreSQL backends.
 """
 
 from __future__ import annotations
@@ -55,42 +54,35 @@ EXPANSION_WORTHY_TYPES = frozenset({
 # ═════════════════════════════════════════════════════════════════════════════
 
 def resolve_alias_chain_db(
-    conn, node_id: str, max_hops: int = 5,
+    db, node_id: str, max_hops: int = 5,
 ) -> Optional[str]:
     """Follow ``alias_of`` edges from a type_alias to a concrete type.
 
-    Operates on the unified DB connection, not an NX graph.
     Returns the concrete target node_id, or None if resolution fails.
     """
     visited = {node_id}
     current = node_id
 
     for _ in range(max_hops):
-        rows = conn.execute(
-            "SELECT target_id FROM repo_edges "
-            "WHERE source_id = ? AND rel_type = 'alias_of' LIMIT 1",
-            (current,),
-        ).fetchall()
-
-        if not rows:
+        edges = [
+            e for e in db.get_edge_targets(current)
+            if (e.get("rel_type") or "").lower() == "alias_of"
+        ]
+        if not edges:
             break
 
-        target = rows[0][0] if isinstance(rows[0], (tuple, list)) else rows[0]["target_id"]
+        target = edges[0]["target_id"]
         if target in visited:
             break
         visited.add(target)
 
         # Check if target is still a type_alias
-        node = conn.execute(
-            "SELECT symbol_type FROM repo_nodes WHERE node_id = ?",
-            (target,),
-        ).fetchone()
-
+        node = db.get_node(target)
         if not node:
             break
 
-        stype = (node[0] if isinstance(node, (tuple, list)) else node["symbol_type"]) or ""
-        if stype.lower() == "type_alias":
+        stype = (node.get("symbol_type") or "").lower()
+        if stype == "type_alias":
             current = target
         else:
             return target  # Concrete type reached
@@ -103,7 +95,7 @@ def resolve_alias_chain_db(
 # ═════════════════════════════════════════════════════════════════════════════
 
 def expand_symbol_smart(
-    conn,
+    db,
     node_id: str,
     symbol_type: str,
     seen_ids: Set[str],
@@ -126,27 +118,27 @@ def expand_symbol_smart(
     candidates: List[Tuple[str, Dict[str, Any], str, float]] = []
 
     if stype in ('class', 'interface', 'struct', 'enum', 'trait'):
-        candidates = _expand_class_db(conn, node_id, seen_ids, page_boundary_ids, macro_id)
+        candidates = _expand_class_db(db, node_id, seen_ids, page_boundary_ids, macro_id)
     elif stype == 'function':
-        candidates = _expand_function_db(conn, node_id, seen_ids, page_boundary_ids, macro_id)
+        candidates = _expand_function_db(db, node_id, seen_ids, page_boundary_ids, macro_id)
     elif stype == 'constant':
-        candidates = _expand_constant_db(conn, node_id, seen_ids, page_boundary_ids, macro_id)
+        candidates = _expand_constant_db(db, node_id, seen_ids, page_boundary_ids, macro_id)
     elif stype == 'type_alias':
-        candidates = _expand_type_alias_db(conn, node_id, seen_ids, page_boundary_ids, macro_id)
+        candidates = _expand_type_alias_db(db, node_id, seen_ids, page_boundary_ids, macro_id)
     elif stype == 'macro':
-        candidates = _expand_macro_db(conn, node_id, seen_ids, page_boundary_ids, macro_id)
+        candidates = _expand_macro_db(db, node_id, seen_ids, page_boundary_ids, macro_id)
     else:
         # Generic 1-hop for unknown types
-        candidates = _expand_generic_db(conn, node_id, seen_ids, page_boundary_ids, macro_id)
+        candidates = _expand_generic_db(db, node_id, seen_ids, page_boundary_ids, macro_id)
 
     # Phase 7: expand via extra language-specific relationship types
     if extra_rel_types:
         extra_candidates = _collect_neighbors(
-            conn, node_id, extra_rel_types, "out", seen_ids,
+            db, node_id, extra_rel_types, "out", seen_ids,
             page_boundary_ids, macro_id, limit=5, reason_prefix="lang_hint:",
         )
         extra_candidates.extend(_collect_neighbors(
-            conn, node_id, extra_rel_types, "in", seen_ids,
+            db, node_id, extra_rel_types, "in", seen_ids,
             page_boundary_ids, macro_id, limit=5, reason_prefix="lang_hint:",
         ))
         candidates.extend(extra_candidates)
@@ -165,46 +157,36 @@ def expand_symbol_smart(
     return result
 
 
-def _get_outgoing(conn, node_id, rel_types=None):
-    """Get outgoing edges from node_id, optionally filtered by rel_type."""
-    rows = conn.execute(
-        "SELECT target_id, rel_type, weight FROM repo_edges WHERE source_id = ?",
-        (node_id,),
-    ).fetchall()
+def _get_outgoing(db, node_id, rel_types=None):
+    """Get outgoing edges from node_id, optionally filtered by rel_type.
+
+    Returns a list of ``(target_id, rel_type, weight)`` tuples.  The
+    ``rel_type`` filter is applied case-insensitively against the lowered
+    edge ``rel_type``.
+    """
+    edges = db.get_edge_targets(node_id)
     result = []
-    for row in rows:
-        tid = row[0] if isinstance(row, (tuple, list)) else row["target_id"]
-        rtype = (row[1] if isinstance(row, (tuple, list)) else row["rel_type"]) or ""
-        w = (row[2] if isinstance(row, (tuple, list)) else row["weight"]) or 1.0
-        if rel_types is None or rtype.lower() in rel_types:
-            result.append((tid, rtype.lower(), w))
+    for e in edges:
+        rtype = (e.get("rel_type") or "").lower()
+        if rel_types is None or rtype in rel_types:
+            result.append((e["target_id"], rtype, e.get("weight") or 1.0))
     return result
 
 
-def _get_incoming(conn, node_id, rel_types=None):
+def _get_incoming(db, node_id, rel_types=None):
     """Get incoming edges to node_id, optionally filtered by rel_type."""
-    rows = conn.execute(
-        "SELECT source_id, rel_type, weight FROM repo_edges WHERE target_id = ?",
-        (node_id,),
-    ).fetchall()
+    edges = db.get_edge_sources(node_id)
     result = []
-    for row in rows:
-        sid = row[0] if isinstance(row, (tuple, list)) else row["source_id"]
-        rtype = (row[1] if isinstance(row, (tuple, list)) else row["rel_type"]) or ""
-        w = (row[2] if isinstance(row, (tuple, list)) else row["weight"]) or 1.0
-        if rel_types is None or rtype.lower() in rel_types:
-            result.append((sid, rtype.lower(), w))
+    for e in edges:
+        rtype = (e.get("rel_type") or "").lower()
+        if rel_types is None or rtype in rel_types:
+            result.append((e["source_id"], rtype, e.get("weight") or 1.0))
     return result
 
 
-def _fetch_node(conn, node_id):
-    """Fetch a node dict from DB."""
-    row = conn.execute(
-        "SELECT * FROM repo_nodes WHERE node_id = ?", (node_id,)
-    ).fetchone()
-    if not row:
-        return None
-    return dict(row)
+def _fetch_node(db, node_id):
+    """Fetch a node dict from the storage backend."""
+    return db.get_node(node_id)
 
 
 def _is_valid_expansion(node, page_boundary_ids, macro_id):
@@ -228,16 +210,16 @@ def _is_valid_expansion(node, page_boundary_ids, macro_id):
     return True
 
 
-def _collect_neighbors(conn, node_id, rel_types, direction, seen_ids,
+def _collect_neighbors(db, node_id, rel_types, direction, seen_ids,
                        page_boundary_ids, macro_id, limit=5, reason_prefix=""):
     """Collect validated neighbors in a given direction."""
-    edges = _get_outgoing(conn, node_id, rel_types) if direction == "out" \
-        else _get_incoming(conn, node_id, rel_types)
+    edges = _get_outgoing(db, node_id, rel_types) if direction == "out" \
+        else _get_incoming(db, node_id, rel_types)
     result = []
     for nid, rtype, weight in edges:
         if nid in seen_ids or len(result) >= limit:
             continue
-        node = _fetch_node(conn, nid)
+        node = _fetch_node(db, nid)
         if not _is_valid_expansion(node, page_boundary_ids, macro_id):
             continue
         reason = f"{reason_prefix}{rtype}" if reason_prefix else rtype
@@ -247,38 +229,38 @@ def _collect_neighbors(conn, node_id, rel_types, direction, seen_ids,
 
 # ── Class/Interface/Struct expansion ─────────────────────────────────
 
-def _expand_class_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
+def _expand_class_db(db, node_id, seen_ids, page_boundary_ids, macro_id):
     """Expand class-like symbol: base classes, implementors, composed types, callers."""
     candidates = []
 
     # P0 forward: inheritance targets (base classes)
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'inheritance', 'implementation'}, "out",
+        db, node_id, {'inheritance', 'implementation'}, "out",
         seen_ids, page_boundary_ids, macro_id, limit=3, reason_prefix="base:"))
 
     # P0 backward: derived classes / implementors
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'inheritance', 'implementation'}, "in",
+        db, node_id, {'inheritance', 'implementation'}, "in",
         seen_ids, page_boundary_ids, macro_id, limit=3, reason_prefix="derived:"))
 
     # P0 forward: creates/instantiates
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'creates', 'instantiates'}, "out",
+        db, node_id, {'creates', 'instantiates'}, "out",
         seen_ids, page_boundary_ids, macro_id, limit=2, reason_prefix="creates:"))
 
     # P1 forward: composition/aggregation
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'composition', 'aggregation'}, "out",
+        db, node_id, {'composition', 'aggregation'}, "out",
         seen_ids, page_boundary_ids, macro_id, limit=2, reason_prefix="composes:"))
 
     # P1 backward: composed-by
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'composition', 'aggregation'}, "in",
+        db, node_id, {'composition', 'aggregation'}, "in",
         seen_ids, page_boundary_ids, macro_id, limit=2, reason_prefix="composed_by:"))
 
     # P2: references
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'references'}, "out",
+        db, node_id, {'references'}, "out",
         seen_ids, page_boundary_ids, macro_id, limit=2, reason_prefix="refs:"))
 
     return candidates
@@ -286,28 +268,28 @@ def _expand_class_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
 
 # ── Function expansion ───────────────────────────────────────────────
 
-def _expand_function_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
+def _expand_function_db(db, node_id, seen_ids, page_boundary_ids, macro_id):
     """Expand function: callees, callers, parameter types, return type."""
     candidates = []
 
     # P0 forward: calls (callees)
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'calls'}, "out",
+        db, node_id, {'calls'}, "out",
         seen_ids, page_boundary_ids, macro_id, limit=3, reason_prefix="calls:"))
 
     # P0 backward: callers
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'calls'}, "in",
+        db, node_id, {'calls'}, "in",
         seen_ids, page_boundary_ids, macro_id, limit=3, reason_prefix="called_by:"))
 
     # P0: creates
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'creates', 'instantiates'}, "out",
+        db, node_id, {'creates', 'instantiates'}, "out",
         seen_ids, page_boundary_ids, macro_id, limit=2, reason_prefix="creates:"))
 
     # P1: references (parameter/return types)
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'references', 'composition'}, "out",
+        db, node_id, {'references', 'composition'}, "out",
         seen_ids, page_boundary_ids, macro_id, limit=2, reason_prefix="refs:"))
 
     return candidates
@@ -315,18 +297,18 @@ def _expand_function_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
 
 # ── Constant expansion ───────────────────────────────────────────────
 
-def _expand_constant_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
+def _expand_constant_db(db, node_id, seen_ids, page_boundary_ids, macro_id):
     """Expand constant: referenced-by, definition chain."""
     candidates = []
 
     # Backward: who references this constant
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'references'}, "in",
+        db, node_id, {'references'}, "in",
         seen_ids, page_boundary_ids, macro_id, limit=3, reason_prefix="referenced_by:"))
 
     # Forward: alias chain if it's typed
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'alias_of', 'references'}, "out",
+        db, node_id, {'alias_of', 'references'}, "out",
         seen_ids, page_boundary_ids, macro_id, limit=2, reason_prefix="type:"))
 
     return candidates
@@ -334,25 +316,25 @@ def _expand_constant_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
 
 # ── Type alias expansion ─────────────────────────────────────────────
 
-def _expand_type_alias_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
+def _expand_type_alias_db(db, node_id, seen_ids, page_boundary_ids, macro_id):
     """Expand type_alias: resolve chain, referenced-by, usage sites."""
     candidates = []
 
     # Follow alias chain to concrete type
-    concrete = resolve_alias_chain_db(conn, node_id)
+    concrete = resolve_alias_chain_db(db, node_id)
     if concrete and concrete != node_id and concrete not in seen_ids:
-        node = _fetch_node(conn, concrete)
+        node = _fetch_node(db, concrete)
         if _is_valid_expansion(node, page_boundary_ids, macro_id):
             candidates.append((concrete, node, "alias_resolves_to", 5.0))
 
     # Backward: who uses this alias
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'references'}, "in",
+        db, node_id, {'references'}, "in",
         seen_ids, page_boundary_ids, macro_id, limit=3, reason_prefix="used_by:"))
 
     # Forward: what this alias references beyond the chain
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'references', 'composition'}, "out",
+        db, node_id, {'references', 'composition'}, "out",
         seen_ids, page_boundary_ids, macro_id, limit=2, reason_prefix="refs:"))
 
     return candidates
@@ -360,18 +342,18 @@ def _expand_type_alias_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
 
 # ── Macro expansion ──────────────────────────────────────────────────
 
-def _expand_macro_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
+def _expand_macro_db(db, node_id, seen_ids, page_boundary_ids, macro_id):
     """Expand macro: usage sites, referenced symbols."""
     candidates = []
 
     # Backward: who uses this macro
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'references', 'calls'}, "in",
+        db, node_id, {'references', 'calls'}, "in",
         seen_ids, page_boundary_ids, macro_id, limit=3, reason_prefix="used_by:"))
 
     # Forward: what the macro references
     candidates.extend(_collect_neighbors(
-        conn, node_id, {'references'}, "out",
+        db, node_id, {'references'}, "out",
         seen_ids, page_boundary_ids, macro_id, limit=2, reason_prefix="refs:"))
 
     return candidates
@@ -379,16 +361,16 @@ def _expand_macro_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
 
 # ── Generic expansion ────────────────────────────────────────────────
 
-def _expand_generic_db(conn, node_id, seen_ids, page_boundary_ids, macro_id):
+def _expand_generic_db(db, node_id, seen_ids, page_boundary_ids, macro_id):
     """Generic 1-hop expansion for unknown symbol types."""
     candidates = []
 
     # Outgoing non-skip edges
-    all_out = _get_outgoing(conn, node_id)
+    all_out = _get_outgoing(db, node_id)
     for nid, rtype, weight in all_out:
         if rtype in SKIP_RELATIONSHIPS or nid in seen_ids:
             continue
-        node = _fetch_node(conn, nid)
+        node = _fetch_node(db, nid)
         if _is_valid_expansion(node, page_boundary_ids, macro_id):
             candidates.append((nid, node, rtype, weight))
         if len(candidates) >= 5:

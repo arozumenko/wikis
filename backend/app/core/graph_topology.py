@@ -217,10 +217,7 @@ def flag_hubs_in_db(db, hubs: Set[str]) -> None:
 
     for nid in hubs:
         db.set_hub(nid, is_hub=True)
-    if hasattr(db, 'commit'):
-        db.commit()
-    elif hasattr(db, 'conn'):
-        db.conn.commit()
+    db.commit()
 
     logger.info("Flagged %d hubs in unified DB", len(hubs))
 
@@ -960,10 +957,7 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
         return 0
 
     # Strategy: delete all edges, re-insert with weights from the graph.
-    if hasattr(db, 'delete_all_edges'):
-        db.delete_all_edges()
-    else:
-        db.conn.execute("DELETE FROM repo_edges")
+    db.delete_all_edges()
 
     edge_batch = []
 
@@ -995,10 +989,7 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
     if edge_batch:
         db.upsert_edges_batch(edge_batch)
 
-    if hasattr(db, 'commit'):
-        db.commit()
-    elif hasattr(db, 'conn'):
-        db.conn.commit()
+    db.commit()
 
     count = db.edge_count()
     logger.info("Persisted %d weighted edges to unified DB", count)

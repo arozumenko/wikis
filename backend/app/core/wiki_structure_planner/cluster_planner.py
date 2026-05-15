@@ -262,10 +262,9 @@ class ClusterStructurePlanner:
         self._cluster_graph: Optional[nx.MultiDiGraph] = None
         self._central_k: Optional[int] = None
 
-        # Pre-compute test-exclusion SQL fragment once
-        flags = get_feature_flags()
-        self._exclude_tests = flags.exclude_tests
-        self._test_sql = " AND is_test = 0" if self._exclude_tests else ""
+        # Resolve test-exclusion flag once; passed to protocol methods that
+        # support an ``exclude_tests`` argument.
+        self._exclude_tests = get_feature_flags().exclude_tests
 
     # ── adaptive central-k ────────────────────────────────────────────
 
@@ -475,15 +474,9 @@ class ClusterStructurePlanner:
         Returns ``{macro_id: {micro_id: [node_ids]}}`` where every node_id
         belongs to a non-test architectural symbol.
         """
-        flags = get_feature_flags()
-        test_filter = self._test_sql
-
-        rows = self.db.conn.execute(
-            "SELECT node_id, macro_cluster, micro_cluster "
-            "FROM repo_nodes "
-            "WHERE macro_cluster IS NOT NULL AND is_architectural = 1"
-            + test_filter
-        ).fetchall()
+        rows = self.db.get_clustered_architectural_nodes(
+            exclude_tests=self._exclude_tests
+        )
 
         result: Dict[int, Dict[int, List[str]]] = {}
         for row in rows:
@@ -1118,18 +1111,13 @@ class ClusterStructurePlanner:
         G = nx.MultiDiGraph()
 
         # Add all architectural nodes (excluding test nodes when flag is on)
-        rows = self.db.conn.execute(
-            "SELECT node_id FROM repo_nodes WHERE is_architectural = 1"
-            + self._test_sql
-        ).fetchall()
-        for row in rows:
-            G.add_node(row["node_id"])
+        for node_id in self.db.get_architectural_node_ids(
+            exclude_tests=self._exclude_tests
+        ):
+            G.add_node(node_id)
 
         # Add all edges with weights
-        edge_rows = self.db.conn.execute(
-            "SELECT source_id, target_id, rel_type, weight FROM repo_edges"
-        ).fetchall()
-        for row in edge_rows:
+        for row in self.db.get_all_edges():
             src, tgt = row["source_id"], row["target_id"]
             if src in G and tgt in G:
                 G.add_edge(

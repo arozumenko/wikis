@@ -38,7 +38,6 @@ from langchain_core.documents import Document
 from .code_graph.shared_expansion import expand_symbol_smart
 from .feature_flags import get_feature_flags
 from .wiki_structure_planner.language_heuristics import (
-    detect_dominant_language,
     get_language_hints,
     should_include_in_expansion,
     compute_augmentation_budget_fraction,
@@ -405,16 +404,15 @@ def _augment_document(db, doc: Document) -> int:
     if not node_id:
         return 0
 
-    conn = db.conn
     original_len = len(doc.page_content)
     augmented_parts: List[str] = []
 
     if lang in _CPP_LANGUAGES:
-        augmented_parts = _augment_cpp(conn, node_id, sym_type, rel_path)
+        augmented_parts = _augment_cpp(db, node_id, sym_type, rel_path)
     elif lang in _GO_LANGUAGES:
-        augmented_parts = _augment_go_rust(conn, node_id, sym_type, rel_path)
+        augmented_parts = _augment_go_rust(db, node_id, sym_type, rel_path)
     elif lang in _RUST_LANGUAGES:
-        augmented_parts = _augment_go_rust(conn, node_id, sym_type, rel_path)
+        augmented_parts = _augment_go_rust(db, node_id, sym_type, rel_path)
 
     if augmented_parts:
         extra = "\n\n".join(augmented_parts)
@@ -431,22 +429,21 @@ def _augment_document(db, doc: Document) -> int:
 
 
 def _augment_cpp(
-    conn, node_id: str, sym_type: str, decl_file: str,
+    db, node_id: str, sym_type: str, decl_file: str,
 ) -> List[str]:
     """C++ augmentation: find defines_body implementations for declarations."""
     parts: List[str] = []
 
     if sym_type in ('function', 'method', 'constructor'):
         # Function/method: look for incoming defines_body (impl → decl)
-        rows = conn.execute(
-            "SELECT n.source_text, n.rel_path FROM repo_edges e "
-            "JOIN repo_nodes n ON e.source_id = n.node_id "
-            "WHERE e.target_id = ? AND e.rel_type = 'defines_body'",
-            (node_id,),
-        ).fetchall()
-        for row in rows:
-            impl_text = row[0] or ""
-            impl_file = row[1] or ""
+        impls = db.find_related_nodes(
+            node_id,
+            rel_types=['defines_body'],
+            direction='in',
+        )
+        for impl in impls:
+            impl_text = impl.get("source_text") or ""
+            impl_file = impl.get("rel_path") or ""
             if impl_text.strip() and impl_file != decl_file:
                 parts.append(
                     f"/* Implementation from {impl_file} */\n{impl_text}"
@@ -454,60 +451,59 @@ def _augment_cpp(
 
     elif sym_type in ('class', 'struct'):
         # Class/struct: find methods defined by this class, then their impls
-        method_rows = conn.execute(
-            "SELECT e.target_id FROM repo_edges e "
-            "JOIN repo_nodes n ON e.target_id = n.node_id "
-            "WHERE e.source_id = ? AND e.rel_type = 'defines' "
-            "AND n.symbol_type IN ('method', 'constructor', 'function')",
-            (node_id,),
-        ).fetchall()
+        methods = db.find_related_nodes(
+            node_id,
+            rel_types=['defines'],
+            direction='out',
+            target_symbol_types=['method', 'constructor', 'function'],
+        )
 
         impl_by_file: Dict[str, List[str]] = {}
-        for method_row in method_rows:
-            method_id = method_row[0]
-            impl_rows = conn.execute(
-                "SELECT n.source_text, n.rel_path FROM repo_edges e "
-                "JOIN repo_nodes n ON e.source_id = n.node_id "
-                "WHERE e.target_id = ? AND e.rel_type = 'defines_body'",
-                (method_id,),
-            ).fetchall()
-            for row in impl_rows:
-                impl_text = row[0] or ""
-                impl_file = row[1] or ""
+        for method in methods:
+            method_id = method.get("node_id")
+            if not method_id:
+                continue
+            impls = db.find_related_nodes(
+                method_id,
+                rel_types=['defines_body'],
+                direction='in',
+            )
+            for impl in impls:
+                impl_text = impl.get("source_text") or ""
+                impl_file = impl.get("rel_path") or ""
                 if impl_text.strip() and impl_file != decl_file:
                     impl_by_file.setdefault(impl_file, []).append(impl_text)
 
-        for impl_file, impls in sorted(impl_by_file.items()):
+        for impl_file, impls_text in sorted(impl_by_file.items()):
             header = (
                 f"/* Implementations from {impl_file} "
-                f"({len(impls)} method{'s' if len(impls) != 1 else ''}) */"
+                f"({len(impls_text)} method{'s' if len(impls_text) != 1 else ''}) */"
             )
-            parts.append(header + "\n" + "\n\n".join(impls))
+            parts.append(header + "\n" + "\n\n".join(impls_text))
 
     return parts
 
 
 def _augment_go_rust(
-    conn, node_id: str, sym_type: str, type_file: str,
+    db, node_id: str, sym_type: str, type_file: str,
 ) -> List[str]:
     """Go/Rust augmentation: find cross-file receiver/impl methods."""
     if sym_type not in ('struct', 'class', 'enum', 'trait'):
         return []
 
     # Find methods defined by this type in other files
-    rows = conn.execute(
-        "SELECT n.source_text, n.rel_path, n.symbol_type FROM repo_edges e "
-        "JOIN repo_nodes n ON e.target_id = n.node_id "
-        "WHERE e.source_id = ? AND e.rel_type = 'defines' "
-        "AND n.symbol_type IN ('method', 'function', 'constructor') "
-        "AND n.rel_path != ?",
-        (node_id, type_file),
-    ).fetchall()
+    methods = db.find_related_nodes(
+        node_id,
+        rel_types=['defines'],
+        direction='out',
+        target_symbol_types=['method', 'function', 'constructor'],
+        exclude_path=type_file,
+    )
 
     methods_by_file: Dict[str, List[str]] = {}
-    for row in rows:
-        text = row[0] or ""
-        mfile = row[1] or ""
+    for method in methods:
+        text = method.get("source_text") or ""
+        mfile = method.get("rel_path") or ""
         if text.strip() and mfile:
             methods_by_file.setdefault(mfile, []).append(text)
 
@@ -677,13 +673,11 @@ def expand_for_page(
 
     if flags.smart_expansion:
         # ── Phase 4: Per-symbol-type smart expansion ─────────────
-        conn = db.conn
-
         # ── Phase 7: Language hints (optional) ───────────────────
         lang_hints = None
         if flags.language_hints:
             seed_ids_for_lang = list(matched_nodes.keys())[:50]
-            dominant_lang = detect_dominant_language(conn, seed_ids_for_lang)
+            dominant_lang = db.detect_dominant_language(seed_ids_for_lang)
             if dominant_lang:
                 lang_hints = get_language_hints(dominant_lang)
                 logger.info(
@@ -699,7 +693,7 @@ def expand_for_page(
             seed_node = matched_nodes[seed_id]
             seed_type = (seed_node.get("symbol_type") or "").lower()
             neighbors = expand_symbol_smart(
-                conn, seed_id, seed_type, seen_ids,
+                db, seed_id, seed_type, seen_ids,
                 page_boundary_ids=page_boundary_ids,
                 macro_id=macro_id,
                 per_symbol_budget=MAX_NEIGHBORS_PER_SYMBOL,
@@ -790,41 +784,29 @@ def _resolve_symbols(
     Returns ``{node_id: node_dict}`` preserving insertion order.
     """
     result: Dict[str, Dict[str, Any]] = {}
-    conn = db.conn
 
     for name in symbol_names:
         if not name:
             continue
 
-        # Exact match on symbol_name, optionally within cluster
-        if macro_id is not None:
-            rows = conn.execute(
-                "SELECT * FROM repo_nodes "
-                "WHERE symbol_name = ? AND macro_cluster = ? "
-                "AND is_architectural = 1 "
-                "ORDER BY end_line - start_line DESC "
-                "LIMIT 5",
-                (name, macro_id),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM repo_nodes "
-                "WHERE symbol_name = ? "
-                "AND is_architectural = 1 "
-                "ORDER BY end_line - start_line DESC "
-                "LIMIT 5",
-                (name,),
-            ).fetchall()
+        # Exact match on symbol_name, optionally within cluster.  The
+        # protocol method orders by code span (end_line - start_line)
+        # descending, matching the original raw-SQL ordering.
+        rows = db.find_nodes_by_name(
+            name,
+            macro_cluster=macro_id,
+            architectural_only=True,
+            limit=5,
+        )
 
         if not rows:
-            # Fallback: FTS5 fuzzy search scoped to cluster
+            # Fallback: FTS fuzzy search scoped to cluster
             rows = _fts_fallback(db, name, macro_id)
 
         for row in rows:
-            node = dict(row)
-            nid = node.get("node_id", "")
+            nid = row.get("node_id", "")
             if nid and nid not in result:
-                result[nid] = node
+                result[nid] = row
 
     return result
 
@@ -832,32 +814,20 @@ def _resolve_symbols(
 def _fts_fallback(
     db, name: str, macro_id: Optional[int] = None,
 ) -> list:
-    """Use FTS5 to find a symbol by name when exact SQL match fails."""
+    """Use FTS to find a symbol by name when exact SQL match fails.
+
+    Delegates to ``WikiStorageProtocol.search_fts_by_symbol_name`` so both
+    SQLite (FTS5) and PostgreSQL (tsvector) backends are supported.
+    """
     try:
-        # Escape FTS5 special characters
-        safe_name = name.replace('"', '""')
-        if macro_id is not None:
-            rows = db.conn.execute(
-                'SELECT n.* FROM repo_fts f '
-                'JOIN repo_nodes n ON f.node_id = n.node_id '
-                'WHERE repo_fts MATCH ? '
-                'AND n.macro_cluster = ? '
-                'AND n.is_architectural = 1 '
-                'ORDER BY rank LIMIT 3',
-                (f'symbol_name:"{safe_name}"', macro_id),
-            ).fetchall()
-        else:
-            rows = db.conn.execute(
-                'SELECT n.* FROM repo_fts f '
-                'JOIN repo_nodes n ON f.node_id = n.node_id '
-                'WHERE repo_fts MATCH ? '
-                'AND n.is_architectural = 1 '
-                'ORDER BY rank LIMIT 3',
-                (f'symbol_name:"{safe_name}"',),
-            ).fetchall()
-        return rows
+        return db.search_fts_by_symbol_name(
+            name,
+            macro_cluster=macro_id,
+            architectural_only=True,
+            limit=3,
+        )
     except Exception as exc:
-        logger.debug("[CLUSTER_EXPANSION] FTS5 fallback failed for '%s': %s", name, exc)
+        logger.debug("[CLUSTER_EXPANSION] FTS fallback failed for '%s': %s", name, exc)
         return []
 
 
@@ -882,47 +852,34 @@ def _collect_expansion_neighbors(
     edge weight (descending, i.e. highest-weight edges first).
     """
     candidates: List[Tuple[str, Dict[str, Any], str, float]] = []
-    conn = db.conn
 
     for seed_id in seed_ids:
-        # Outgoing edges
-        out_edges = conn.execute(
-            "SELECT target_id, rel_type, weight FROM repo_edges WHERE source_id = ?",
-            (seed_id,),
-        ).fetchall()
-        # Incoming edges (structurally important: who inherits/implements me)
-        in_edges = conn.execute(
-            "SELECT source_id, rel_type, weight FROM repo_edges WHERE target_id = ?",
-            (seed_id,),
-        ).fetchall()
+        # Outgoing edges (lightweight projection: target_id, rel_type, weight).
+        out_edges = db.get_edge_targets(seed_id)
+        # Incoming edges (structurally important: who inherits/implements me).
+        in_edges = db.get_edge_sources(seed_id)
 
         neighbor_ids: Set[str] = set()
         edge_info: List[Tuple[str, str, float]] = []  # (nid, rel_type, weight)
 
-        for row in out_edges:
-            tid = row[0]
-            if tid not in seen_ids and tid not in neighbor_ids:
+        for e in out_edges:
+            tid = e.get("target_id")
+            if tid and tid not in seen_ids and tid not in neighbor_ids:
                 neighbor_ids.add(tid)
-                edge_info.append((tid, row[1] or "unknown", row[2] or 1.0))
+                edge_info.append((tid, e.get("rel_type") or "unknown", e.get("weight") or 1.0))
 
-        for row in in_edges:
-            sid = row[0]
-            if sid not in seen_ids and sid not in neighbor_ids:
+        for e in in_edges:
+            sid = e.get("source_id")
+            if sid and sid not in seen_ids and sid not in neighbor_ids:
                 neighbor_ids.add(sid)
-                edge_info.append((sid, row[1] or "unknown", row[2] or 1.0))
+                edge_info.append((sid, e.get("rel_type") or "unknown", e.get("weight") or 1.0))
 
         if not neighbor_ids:
             continue
 
-        # Batch-fetch node metadata
-        # (SQLite doesn't have array params, but we can build an IN clause)
-        id_list = list(neighbor_ids)
-        placeholders = ",".join("?" * len(id_list))
-        rows = conn.execute(
-            f"SELECT * FROM repo_nodes WHERE node_id IN ({placeholders})",
-            id_list,
-        ).fetchall()
-        node_map = {dict(r)["node_id"]: dict(r) for r in rows}
+        # Batch-fetch node metadata via the protocol (backend-agnostic).
+        rows = db.get_nodes_by_ids(list(neighbor_ids))
+        node_map = {r["node_id"]: r for r in rows if r.get("node_id")}
 
         for nid, rel_type, weight in edge_info:
             node = node_map.get(nid)
@@ -974,26 +931,11 @@ def _get_cluster_docs(
 
     Returns nodes sorted by path (deterministic ordering).
     """
-    conn = db.conn
-    if micro_id is not None:
-        rows = conn.execute(
-            "SELECT * FROM repo_nodes "
-            "WHERE macro_cluster = ? AND micro_cluster = ? AND is_doc = 1 "
-            "ORDER BY rel_path",
-            (macro_id, micro_id),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM repo_nodes "
-            "WHERE macro_cluster = ? AND is_doc = 1 "
-            "ORDER BY rel_path",
-            (macro_id,),
-        ).fetchall()
+    rows = db.get_doc_nodes_by_cluster(macro_id, micro=micro_id)
 
     result = []
     exclude = get_feature_flags().exclude_tests
-    for r in rows:
-        node = dict(r)
+    for node in rows:
         if node.get("node_id", "") not in seen_ids:
             if not _is_excluded_test_node(node, exclude):
                 result.append(node)

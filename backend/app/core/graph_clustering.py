@@ -1254,10 +1254,7 @@ def persist_clusters(
     """
     # Reset all existing cluster / hub columns so stale assignments
     # from a previous run on the same cached DB file do not survive.
-    db.conn.execute(
-        "UPDATE repo_nodes SET macro_cluster = NULL, micro_cluster = NULL,"
-        " is_hub = 0, hub_assignment = NULL"
-    )
+    db.reset_clusters()
 
     # Batch-build (node_id, macro, micro) tuples
     batch: List[Tuple[str, int, Optional[int]]] = []
@@ -1275,7 +1272,7 @@ def persist_clusters(
     for hub_id, (macro_id, _micro_id) in hub_assignments.items():
         db.set_hub(hub_id, is_hub=True, assignment=str(macro_id))
 
-    db.conn.commit()
+    db.commit()
 
     stats = {
         "nodes_clustered": len(batch),
@@ -2290,7 +2287,4 @@ def _resolve_parent(
 
 def _load_hubs_from_db(db) -> Set[str]:
     """Load hub node IDs from the unified DB."""
-    rows = db.conn.execute(
-        "SELECT node_id FROM repo_nodes WHERE is_hub = 1"
-    ).fetchall()
-    return {row["node_id"] for row in rows}
+    return set(db.get_hub_node_ids())

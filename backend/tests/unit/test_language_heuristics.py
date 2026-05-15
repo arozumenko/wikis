@@ -5,7 +5,6 @@ import pytest
 from app.core.wiki_structure_planner.language_heuristics import (
     LanguageHints,
     compute_augmentation_budget_fraction,
-    detect_dominant_language,
     get_language_hints,
     should_include_in_expansion,
 )
@@ -169,47 +168,3 @@ class TestComputeAugmentationBudgetFraction:
         assert compute_augmentation_budget_fraction(hints) <= 0.6
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# detect_dominant_language
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestDetectDominantLanguage:
-    @pytest.fixture()
-    def db_conn(self):
-        """Create an in-memory SQLite DB with minimal schema."""
-        import sqlite3
-
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        conn.execute(
-            "CREATE TABLE repo_nodes ("
-            "  node_id TEXT PRIMARY KEY,"
-            "  language TEXT"
-            ")"
-        )
-        conn.executemany(
-            "INSERT INTO repo_nodes (node_id, language) VALUES (?, ?)",
-            [
-                ("n1", "python"),
-                ("n2", "python"),
-                ("n3", "go"),
-                ("n4", None),
-            ],
-        )
-        conn.commit()
-        yield conn
-        conn.close()
-
-    def test_detects_dominant(self, db_conn):
-        result = detect_dominant_language(db_conn, ["n1", "n2", "n3"])
-        assert result == "python"
-
-    def test_empty_ids(self, db_conn):
-        assert detect_dominant_language(db_conn, []) is None
-
-    def test_nonexistent_ids(self, db_conn):
-        assert detect_dominant_language(db_conn, ["nonexistent"]) is None
-
-    def test_all_null_language(self, db_conn):
-        assert detect_dominant_language(db_conn, ["n4"]) is None

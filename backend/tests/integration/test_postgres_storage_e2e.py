@@ -253,7 +253,7 @@ class TestPostgresPathPrefix:
 
 class TestPostgresGraphTextIndex:
     def test_search(self, storage, sample_graph):
-        from app.core.code_graph.postgres_graph_text_index import PostgresGraphTextIndex
+        from app.core.storage.text_index import StorageTextIndex as PostgresGraphTextIndex
 
         storage.from_networkx(sample_graph)
         idx = PostgresGraphTextIndex(storage)
@@ -262,7 +262,7 @@ class TestPostgresGraphTextIndex:
         assert any("Config" in d.metadata.get("symbol_name", "") for d in docs)
 
     def test_search_by_name(self, storage, sample_graph):
-        from app.core.code_graph.postgres_graph_text_index import PostgresGraphTextIndex
+        from app.core.storage.text_index import StorageTextIndex as PostgresGraphTextIndex
 
         storage.from_networkx(sample_graph)
         idx = PostgresGraphTextIndex(storage)
@@ -270,7 +270,7 @@ class TestPostgresGraphTextIndex:
         assert len(docs) > 0
 
     def test_search_by_path_prefix(self, storage, sample_graph):
-        from app.core.code_graph.postgres_graph_text_index import PostgresGraphTextIndex
+        from app.core.storage.text_index import StorageTextIndex as PostgresGraphTextIndex
 
         storage.from_networkx(sample_graph)
         idx = PostgresGraphTextIndex(storage)
@@ -278,7 +278,7 @@ class TestPostgresGraphTextIndex:
         assert len(results) == 3
 
     def test_get_by_node_id(self, storage, sample_graph):
-        from app.core.code_graph.postgres_graph_text_index import PostgresGraphTextIndex
+        from app.core.storage.text_index import StorageTextIndex as PostgresGraphTextIndex
 
         storage.from_networkx(sample_graph)
         idx = PostgresGraphTextIndex(storage)
