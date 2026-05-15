@@ -916,6 +916,14 @@ class UnifiedWikiDB:
         """
         self._populate_fts5()
 
+    def apply_incremental_node_writes(self, nodes: list[dict[str, Any]]) -> None:
+        """Bundle ``upsert_nodes_batch`` + ``refresh_fts_index`` so callers
+        cannot leave FTS stale. See protocol docstring + issue #131."""
+        if not nodes:
+            return
+        self._upsert_nodes_batch(nodes)
+        self._populate_fts5()
+
     def search_fts5(
         self,
         query: str,
