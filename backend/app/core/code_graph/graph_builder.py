@@ -395,6 +395,23 @@ class EnhancedUnifiedGraphBuilder:
             'typescript': TypeScriptEnhancedParser(),
             'rust': RustVisitorParser(),
         }
+
+        # #119: Tier 1.5 — lightweight tree-sitter visitor parsers driven
+        # by per-language LanguageConfig. Same ParseResult shape as the
+        # rich parsers, so they slot into ``rich_parsers`` and the
+        # downstream dispatch at ``:699`` doesn't need to know they're
+        # shallower. These replace what used to be regex-based
+        # extraction in ``code_splitter`` for ruby/kotlin/scala and add
+        # tree-sitter coverage for php/lua.
+        try:
+            from ..parsers.lang_configs import build_basic_parsers as _build_basic
+
+            self.rich_parsers.update(_build_basic())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[graph_builder] basic-visitor parsers unavailable: %s",
+                exc,
+            )
         
         # Configuration
         self.max_workers = max_workers
