@@ -331,3 +331,72 @@ class ErrorResponse(BaseModel):
     error: str
     detail: str | None = None
     code: str  # machine-readable error code
+
+
+# ---------------------------------------------------------------------------
+# Change detection (#116 PR 2 — incremental regen diagnostics)
+# ---------------------------------------------------------------------------
+
+
+class ParsedNodeInput(BaseModel):
+    """One node from a fresh parse, supplied to the diff endpoint.
+
+    Only the three fields needed for change classification are required;
+    callers can pass the same dicts they would otherwise hand to
+    ``upsert_nodes_batch`` (extra keys are ignored).
+    """
+
+    node_id: str
+    content_hash: str | None = None
+    rel_path: str = ""
+
+
+class DiffWikiRequest(BaseModel):
+    """Body for ``POST /wikis/{wiki_id}/diff`` — supply the freshly parsed
+    nodes; the server diffs them against the indexed snapshot.
+
+    Capped at 50 000 nodes per request to bound the cost of the per-node
+    reverse-index lookup. The largest repos in our corpus parse to ~30k
+    architectural nodes; 50k gives ~1.5x headroom before PR 3 swaps in the
+    batched ``get_pages_citing_nodes`` query.
+    """
+
+    parsed_nodes: list[ParsedNodeInput] = Field(default_factory=list, max_length=50_000)
+
+
+class NodeChangeResponse(BaseModel):
+    """One change in the response. Field population depends on ``kind``."""
+
+    kind: Literal["added", "modified", "deleted", "moved"]
+    node_id: str
+    old_hash: str | None = None
+    new_hash: str | None = None
+    old_path: str | None = None
+    new_path: str | None = None
+
+
+class ChangeSetResponse(BaseModel):
+    """Aggregate change set — one entry per kind."""
+
+    added: list[NodeChangeResponse] = Field(default_factory=list)
+    modified: list[NodeChangeResponse] = Field(default_factory=list)
+    moved: list[NodeChangeResponse] = Field(default_factory=list)
+    deleted: list[NodeChangeResponse] = Field(default_factory=list)
+    total: int
+
+
+class AffectedPageResponse(BaseModel):
+    """One wiki page touched by the change set."""
+
+    page_id: str
+    title: str | None = None
+    anchor_slug: str | None = None
+    changes: list[NodeChangeResponse] = Field(default_factory=list)
+
+
+class DiffWikiResponse(BaseModel):
+    """Result of the diff endpoint — no writes occur."""
+
+    wiki_id: str
+    change_set: ChangeSetResponse
+    affected_pages: list[AffectedPageResponse] = Field(default_factory=list)

@@ -40,6 +40,11 @@ from app.models import (
     WikiSummary,
 )
 from app.models.api import (
+    AffectedPageResponse,
+    ChangeSetResponse,
+    DiffWikiRequest,
+    DiffWikiResponse,
+    NodeChangeResponse,
     ProjectAddWikiRequest,
     ProjectCreateRequest,
     ProjectListResponse,
@@ -821,6 +826,123 @@ async def refresh_wiki(
         invocation_id=invocation.id,
         status=invocation.status,
         message=f"Refresh started. Track via GET /api/v1/invocations/{invocation.id}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# #116 PR 2 — incremental regen diagnostics (no LLM, no writes)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/wikis/{wiki_id}/diff", response_model=DiffWikiResponse)
+async def diff_wiki(
+    wiki_id: str,
+    body: DiffWikiRequest,
+    request: Request,
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+) -> DiffWikiResponse:
+    """Diff a fresh-parse payload against the indexed snapshot.
+
+    The caller supplies the freshly parsed nodes (id + content_hash + path);
+    the server compares them against the wiki's stored ``repo_nodes`` and
+    returns the resulting change set plus the wiki pages those changes
+    touch (via the ``page_symbols`` reverse index from #116 PR 1).
+
+    Read-only: no parsing, no LLM, no writes. PR 3 will wire the actual
+    re-parse loop on top of this primitive.
+    """
+    from app.core.storage import open_storage
+    from app.services.change_detector import ChangeDetector
+    from app.services.wiki_management import _derive_cache_key
+
+    # Auth check — wiki must exist AND caller must be the owner. The diff
+    # surface exposes content_hash + node_id internals; that's an
+    # implementation detail of the repo, not shareable user data, so we
+    # don't honor the wiki's shared-visibility flag for this endpoint
+    # (unlike /search). Mirrors the /refresh guard.
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+    if wiki.owner_id and wiki.owner_id != user_id:
+        raise HTTPException(403, "Only the wiki owner can diff the index")
+
+    settings = request.app.state.settings
+
+    # Resolve the wiki's unified DB. We open read-only; the detector only
+    # reads from repo_nodes + page_symbols.
+    cache_key = _derive_cache_key(settings.cache_dir, wiki.repo_url, wiki.branch)
+    if not cache_key:
+        raise HTTPException(
+            404,
+            f"Unified DB not found for wiki {wiki_id} — index may be stale or evicted",
+        )
+    from pathlib import Path as _Path
+
+    db_path = _Path(settings.cache_dir) / f"{cache_key}.wiki.db"
+    # cache_index entry can survive the underlying file being deleted
+    # (manual cleanup, full disk, etc.). Treat that as the same 404 as
+    # "no cache_index entry" rather than crashing with 500 in open_storage.
+    if not db_path.exists():
+        raise HTTPException(
+            404,
+            f"Unified DB file missing at {db_path.name} — index may be stale or evicted",
+        )
+    storage = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
+
+    try:
+        detector = ChangeDetector(storage)
+        change_set = detector.detect_changes(
+            [n.model_dump() for n in body.parsed_nodes]
+        )
+        affected = detector.affected_pages(change_set)
+
+        # Enrich affected pages with title + slug from wiki_pages where we
+        # have them. Pages predating #116 won't have rows here and just get
+        # title=None — callers fall back to displaying page_id directly.
+        page_titles: dict[str, dict[str, str]] = {}
+        for page in affected:
+            row = storage.get_wiki_page(page.page_id)
+            if row:
+                page_titles[page.page_id] = {
+                    "title": row.get("title") or "",
+                    "anchor_slug": row.get("anchor_slug") or "",
+                }
+    finally:
+        try:
+            storage.close()
+        except Exception:  # noqa: S110 — best-effort close
+            pass
+
+    def _to_response(change) -> NodeChangeResponse:
+        return NodeChangeResponse(
+            kind=change.kind.value,
+            node_id=change.node_id,
+            old_hash=change.old_hash,
+            new_hash=change.new_hash,
+            old_path=change.old_path,
+            new_path=change.new_path,
+        )
+
+    return DiffWikiResponse(
+        wiki_id=wiki_id,
+        change_set=ChangeSetResponse(
+            added=[_to_response(c) for c in change_set.added],
+            modified=[_to_response(c) for c in change_set.modified],
+            moved=[_to_response(c) for c in change_set.moved],
+            deleted=[_to_response(c) for c in change_set.deleted],
+            total=change_set.total,
+        ),
+        affected_pages=[
+            AffectedPageResponse(
+                page_id=p.page_id,
+                title=page_titles.get(p.page_id, {}).get("title") or None,
+                anchor_slug=page_titles.get(p.page_id, {}).get("anchor_slug") or None,
+                changes=[_to_response(c) for c in p.changes],
+            )
+            for p in affected
+        ],
     )
 
 
