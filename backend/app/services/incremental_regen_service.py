@@ -84,6 +84,15 @@ PageBodyWriter = Callable[[str, str], None]
 #: was successfully regenerated; False to mark as failed in the stats.
 StructuralHandler = Callable[[PageRegime], bool]
 
+#: Per-event progress callback. Signature: ``(event_name, payload)`` →
+#: ``None``. Receives one call per dispatched page (``"page_unchanged"`` /
+#: ``"page_patched"`` / ``"page_edited"`` / ``"page_regenerated"``) plus
+#: one call with ``"incremental_summary"`` at the end. ``payload`` is a
+#: small dict the SSE layer can plumb directly into its event builders.
+#: PR 5 wires this to `app.events` builders + an `Invocation.emit`.
+#: Optional — orchestrator runs fine without one (tests don't need it).
+ProgressCallback = Callable[[str, dict[str, Any]], None]
+
 
 @dataclass
 class IncrementalRegenStats:
@@ -133,12 +142,21 @@ class IncrementalRegenService:
         read_page_body: PageBodyReader,
         write_page_body: PageBodyWriter,
         structural_handler: StructuralHandler,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
         self._storage = storage
         self._patcher = page_patcher
         self._read_page = read_page_body
         self._write_page = write_page_body
         self._structural_handler = structural_handler
+        # PR 5: optional event sink. None when called from unit tests
+        # or callers that don't need SSE; production wires it to the
+        # invocation's emit() via `app.events` builders.
+        self._progress_callback = progress_callback
+        # Title cache for SSE events. Lazy-populated on first lookup per
+        # page_id so we don't pay an N+1 storage round-trip when emitting
+        # one event per page. ``None`` value means "tried and missing".
+        self._title_cache: dict[str, str | None] = {}
 
     def run(
         self,
@@ -186,7 +204,12 @@ class IncrementalRegenService:
         stats = IncrementalRegenStats(total_pages=plan.total)
         stats.unchanged = len(plan.unchanged)
 
-        # Step 5: per-regime dispatch.
+        # Step 5: per-regime dispatch. Emit a per-page event for every
+        # page touched — including the "unchanged" bucket so the SPA
+        # can render a complete picture without computing deltas.
+        for page in plan.unchanged:
+            self._emit_page_event("page_unchanged", page)
+
         for page in plan.trivial:
             self._dispatch_trivial(page, stats)
 
@@ -199,7 +222,12 @@ class IncrementalRegenService:
             )
 
         for page in plan.structural:
-            self._dispatch_structural(page, stats)
+            self._dispatch_structural(
+                page, stats, demoted_from_edit=False,
+            )
+
+        # Step 6: summary event for the SPA banner.
+        self._emit("incremental_summary", {"stats": stats.as_dict()})
 
         logger.info(
             "[incremental_regen_service] run complete: %s",
@@ -221,7 +249,7 @@ class IncrementalRegenService:
                 "demoting to structural",
                 page.page_id,
             )
-            self._dispatch_structural(page, stats)
+            self._dispatch_structural(page, stats, demoted_from_edit=False)
             return
 
         patch = patch_trivial_page(page.page_id, body, page.changes)
@@ -231,6 +259,10 @@ class IncrementalRegenService:
         # comparisons see the new body. Title / cluster / etc unchanged.
         self._update_page_content_hash(page.page_id, patch.new_content_hash)
         stats.trivial_patched += 1
+        self._emit_page_event(
+            "page_patched", page,
+            citation_count=patch.paths_rewritten,
+        )
 
     def _dispatch_edit(
         self,
@@ -279,6 +311,9 @@ class IncrementalRegenService:
             self._write_page(page.page_id, result.new_content)
             self._update_page_content_hash(page.page_id, result.new_content_hash)
             stats.edit_applied += 1
+            self._emit_page_event(
+                "page_edited", page, diff_ratio=result.diff_ratio,
+            )
             return
 
         # Quality gate rejected — fall back to structural for this page.
@@ -287,10 +322,14 @@ class IncrementalRegenService:
             page.page_id, result.reason,
         )
         stats.edit_demoted_to_structural += 1
-        self._dispatch_structural(page, stats)
+        self._dispatch_structural(page, stats, demoted_from_edit=True)
 
     def _dispatch_structural(
-        self, page: PageRegime, stats: IncrementalRegenStats,
+        self,
+        page: PageRegime,
+        stats: IncrementalRegenStats,
+        *,
+        demoted_from_edit: bool,
     ) -> None:
         try:
             ok = self._structural_handler(page)
@@ -305,6 +344,10 @@ class IncrementalRegenService:
 
         if ok:
             stats.structural_regenerated += 1
+            self._emit_page_event(
+                "page_regenerated", page,
+                demoted_from_edit=demoted_from_edit,
+            )
         else:
             stats.structural_failed += 1
 
@@ -353,6 +396,68 @@ class IncrementalRegenService:
             )
             return {}
         return {row["node_id"]: dict(row) for row in rows if row.get("node_id")}
+
+    def _title_for(self, page_id: str) -> str:
+        """Look up + cache a page title for SSE telemetry. Returns the
+        page_id itself when no title is known (legacy row, deleted page).
+
+        First lookup hits the storage; subsequent lookups for the same
+        page_id come from ``self._title_cache``. PR 5 reviewers flagged
+        this as an N+1 hot path when many pages are dispatched in one
+        run — the cache turns it into O(N) titles, one per unique page.
+        """
+        if page_id in self._title_cache:
+            return self._title_cache[page_id] or page_id
+        try:
+            row = self._storage.get_wiki_page(page_id)
+            title = (row or {}).get("title") or None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[incremental_regen_service] title lookup failed for %s: %s",
+                page_id, exc,
+            )
+            title = None
+        self._title_cache[page_id] = title
+        return title or page_id
+
+    def _emit_page_event(
+        self,
+        event_name: str,
+        page: PageRegime,
+        **extra: Any,
+    ) -> None:
+        """Emit a per-page event via the configured callback.
+
+        Fail-soft: a raising callback gets logged at DEBUG and the
+        dispatch path continues. Telemetry is observability, not
+        load-bearing for correctness.
+        """
+        if self._progress_callback is None:
+            return
+        payload: dict[str, Any] = {
+            "page_id": page.page_id,
+            "page_title": self._title_for(page.page_id),
+        }
+        payload.update(extra)
+        try:
+            self._progress_callback(event_name, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[incremental_regen_service] progress_callback raised on %s: %s",
+                event_name, exc,
+            )
+
+    def _emit(self, event_name: str, payload: dict[str, Any]) -> None:
+        """Forward a non-page event (summary) to the configured callback."""
+        if self._progress_callback is None:
+            return
+        try:
+            self._progress_callback(event_name, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[incremental_regen_service] progress_callback raised on %s: %s",
+                event_name, exc,
+            )
 
     def _update_page_content_hash(self, page_id: str, new_hash: str) -> None:
         """Update only ``content_hash`` on an existing ``wiki_pages`` row.

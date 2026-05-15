@@ -44,6 +44,8 @@ from app.models.api import (
     ChangeSetResponse,
     DiffWikiRequest,
     DiffWikiResponse,
+    IncrementalRefreshRequest,
+    IncrementalRefreshResponse,
     NodeChangeResponse,
     ProjectAddWikiRequest,
     ProjectCreateRequest,
@@ -943,6 +945,63 @@ async def diff_wiki(
             )
             for p in affected
         ],
+    )
+
+
+@router.post(
+    "/wikis/{wiki_id}/incremental-refresh",
+    response_model=IncrementalRefreshResponse,
+    status_code=202,
+)
+async def incremental_refresh_wiki(
+    wiki_id: str,
+    body: IncrementalRefreshRequest,
+    user: CurrentUser = Depends(get_current_user),
+    service: WikiService = Depends(get_wiki_service),
+    management: WikiManagementService = Depends(get_wiki_management),
+) -> IncrementalRefreshResponse:
+    """Trigger an incremental refresh on a previously-generated wiki.
+
+    The caller supplies pre-parsed nodes (same shape as ``/diff``).
+    The server diffs them against the indexed snapshot, dispatches each
+    affected page through the trivial / edit / structural regimes, and
+    streams progress over SSE.
+
+    Owner-only — same access model as ``/refresh`` since this surfaces
+    internal content_hash + node_id state through the per-page events.
+    """
+    user_id = user.id if user else None
+    wiki_record = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki_record is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+    if wiki_record.owner_id and wiki_record.owner_id != user_id:
+        raise HTTPException(
+            403, "Only the wiki owner can incrementally refresh",
+        )
+
+    result = await service.incremental_refresh(
+        wiki_id,
+        [n.model_dump() for n in body.parsed_nodes],
+        management,
+        owner_id=user_id or "",
+    )
+    if result is None:
+        raise HTTPException(
+            404,
+            f"Wiki {wiki_id} unindexed or unified DB missing — "
+            "run /refresh first to bootstrap the incremental state",
+        )
+
+    invocation, summary = result
+    return IncrementalRefreshResponse(
+        wiki_id=wiki_id,
+        invocation_id=invocation.id,
+        status=summary["status"],
+        page_count=summary["page_count"],
+        message=(
+            f"Incremental refresh started. Track via "
+            f"GET /api/v1/invocations/{invocation.id}/stream"
+        ),
     )
 
 
