@@ -400,6 +400,11 @@ def page_deleted(progress_token: str, page_id: str, page_title: str) -> MCPEvent
     PR 3's dispatcher routes the page through structural regen; a
     dedicated event fires only when the page is actually dropped, not
     just regenerated.
+
+    NOTE: builder defined for completeness but the orchestrator does
+    not currently emit it — PR 3's classifier never produces a
+    "delete this page" regime. Tracked in the #116 follow-up issues
+    for when cluster-vanished detection lands.
     """
     return _incremental_page_event(
         "page_deleted", progress_token, page_id, page_title,

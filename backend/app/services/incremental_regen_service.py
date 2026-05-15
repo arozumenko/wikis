@@ -153,6 +153,10 @@ class IncrementalRegenService:
         # or callers that don't need SSE; production wires it to the
         # invocation's emit() via `app.events` builders.
         self._progress_callback = progress_callback
+        # Title cache for SSE events. Lazy-populated on first lookup per
+        # page_id so we don't pay an N+1 storage round-trip when emitting
+        # one event per page. ``None`` value means "tried and missing".
+        self._title_cache: dict[str, str | None] = {}
 
     def run(
         self,
@@ -393,36 +397,58 @@ class IncrementalRegenService:
             return {}
         return {row["node_id"]: dict(row) for row in rows if row.get("node_id")}
 
+    def _title_for(self, page_id: str) -> str:
+        """Look up + cache a page title for SSE telemetry. Returns the
+        page_id itself when no title is known (legacy row, deleted page).
+
+        First lookup hits the storage; subsequent lookups for the same
+        page_id come from ``self._title_cache``. PR 5 reviewers flagged
+        this as an N+1 hot path when many pages are dispatched in one
+        run — the cache turns it into O(N) titles, one per unique page.
+        """
+        if page_id in self._title_cache:
+            return self._title_cache[page_id] or page_id
+        try:
+            row = self._storage.get_wiki_page(page_id)
+            title = (row or {}).get("title") or None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[incremental_regen_service] title lookup failed for %s: %s",
+                page_id, exc,
+            )
+            title = None
+        self._title_cache[page_id] = title
+        return title or page_id
+
     def _emit_page_event(
         self,
         event_name: str,
         page: PageRegime,
         **extra: Any,
     ) -> None:
-        """Helper that pulls page title from storage and emits a per-page
-        event. Fail-soft: if the title lookup or callback fails, the
-        dispatch path continues — telemetry is observability, not
+        """Emit a per-page event via the configured callback.
+
+        Fail-soft: a raising callback gets logged at DEBUG and the
+        dispatch path continues. Telemetry is observability, not
         load-bearing for correctness.
         """
         if self._progress_callback is None:
             return
+        payload: dict[str, Any] = {
+            "page_id": page.page_id,
+            "page_title": self._title_for(page.page_id),
+        }
+        payload.update(extra)
         try:
-            page_row = self._storage.get_wiki_page(page.page_id)
-            title = (page_row or {}).get("title") or page.page_id
-            payload: dict[str, Any] = {
-                "page_id": page.page_id,
-                "page_title": title,
-            }
-            payload.update(extra)
-            self._emit(event_name, payload)
+            self._progress_callback(event_name, payload)
         except Exception as exc:  # noqa: BLE001
             logger.debug(
-                "[incremental_regen_service] event emit failed (%s): %s",
+                "[incremental_regen_service] progress_callback raised on %s: %s",
                 event_name, exc,
             )
 
     def _emit(self, event_name: str, payload: dict[str, Any]) -> None:
-        """Forward an event to the configured callback if any."""
+        """Forward a non-page event (summary) to the configured callback."""
         if self._progress_callback is None:
             return
         try:

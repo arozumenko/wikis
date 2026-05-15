@@ -624,6 +624,10 @@ class WikiService:
             owner_id=owner_id,
         )
         self._invocations[invocation.id] = invocation
+        # Persist immediately so a process restart between this 202 and
+        # task completion doesn't strand the SSE stream — late-connecting
+        # clients can still reconnect via Last-Event-ID + replay.
+        await self._persist_invocations()
         await invocation.emit(events.task_status(
             invocation.id, "running", "Incremental refresh started",
         ))
@@ -640,38 +644,45 @@ class WikiService:
         def _stub_structural(page) -> bool:
             # PR 5 MVP: structural pages count as failed for the run.
             # The follow-up that wires make_agent_structural_handler
-            # replaces this with the agent-backed callback.
-            logger.info(
+            # replaces this with the agent-backed callback. Logged at
+            # DEBUG to avoid spamming production once #137 lands.
+            logger.debug(
                 "[incremental_refresh] structural regen stub for page %s "
                 "(needs full agent integration)",
                 page.page_id,
             )
             return False
 
+        # Page-event builders keyed by event_name. Each takes
+        # (invocation_id, page_id, page_title, **extras). The summary
+        # event has a different shape (no per-page IDs) so it's handled
+        # explicitly below.
+        _page_event_builders: dict[str, Any] = {
+            "page_unchanged": events.page_unchanged,
+            "page_patched": events.page_patched,
+            "page_edited": events.page_edited,
+            "page_regenerated": events.page_regenerated,
+        }
+
         def _emit(event_name: str, payload: dict[str, Any]) -> None:
-            builder = {
-                "page_unchanged": events.page_unchanged,
-                "page_patched": events.page_patched,
-                "page_edited": events.page_edited,
-                "page_regenerated": events.page_regenerated,
-                "incremental_summary": lambda token, **_: events.incremental_summary(
-                    token, payload.get("stats", {}),
-                ),
-            }.get(event_name)
+            if event_name == "incremental_summary":
+                invocation.emit_sync(events.incremental_summary(
+                    invocation.id, payload.get("stats", {}),
+                ))
+                return
+            builder = _page_event_builders.get(event_name)
             if builder is None:
                 return
-            if event_name == "incremental_summary":
-                invocation.emit_sync(builder(invocation.id))
-            else:
-                # Per-page events: extract page_id/title plus extras.
-                kwargs = {k: v for k, v in payload.items()
-                          if k not in {"page_id", "page_title"}}
-                invocation.emit_sync(builder(
-                    invocation.id,
-                    payload["page_id"],
-                    payload["page_title"],
-                    **kwargs,
-                ))
+            kwargs = {
+                k: v for k, v in payload.items()
+                if k not in {"page_id", "page_title"}
+            }
+            invocation.emit_sync(builder(
+                invocation.id,
+                payload["page_id"],
+                payload["page_title"],
+                **kwargs,
+            ))
 
         # LLM for surgical edits. Use the project's configured one.
         # Failing to construct an LLM is fatal for the edit regime but
@@ -742,7 +753,7 @@ class WikiService:
 
                 await invocation.emit(events.task_status(
                     invocation.id, "completed",
-                    f"Incremental refresh complete: {stats.as_dict()}",
+                    "Incremental refresh complete",
                 ))
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
@@ -751,13 +762,39 @@ class WikiService:
                 await invocation.emit(events.task_status(
                     invocation.id, "failed", str(exc),
                 ))
+            finally:
+                # Re-persist so the terminal status survives a restart.
+                await self._persist_invocations()
 
         task = asyncio.create_task(_run())
         self._tasks[invocation.id] = task
 
+        # Page-count denominator for the SPA progress bar. Use the
+        # actual wiki_pages row count, not the .md artifact count —
+        # the bucket can contain auxiliary files (README copies,
+        # changelogs) that aren't part of the plan.
+        try:
+            tmp_storage = open_storage(
+                repo_id=cache_key, db_path=str(db_path), readonly=True,
+            )
+            try:
+                wiki_page_count = len(tmp_storage.get_wiki_pages(wiki_id))
+            finally:
+                try:
+                    tmp_storage.close()
+                except Exception:  # noqa: S110 — best-effort close
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[incremental_refresh] wiki_page_count lookup failed; "
+                "falling back to body count: %s",
+                exc,
+            )
+            wiki_page_count = len(page_bodies)
+
         # Pre-compute stats summary the route can include in its response
         # *before* the background run completes. Final stats arrive via SSE.
-        return invocation, {"status": "running", "page_count": len(page_bodies)}
+        return invocation, {"status": "running", "page_count": wiki_page_count}
 
     async def resume(self, wiki_id: str, management: WikiManagementService, owner_id: str = "") -> Invocation | None:
         """Resume a partial wiki generation, skipping already-completed pages."""
