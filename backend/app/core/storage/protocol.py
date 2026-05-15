@@ -400,6 +400,57 @@ class WikiStorageProtocol(Protocol):
         """Delete every row in the edges table (full replace before re-persist)."""
         ...
 
+    def reset_clusters(self) -> None:
+        """Clear ``macro_cluster``, ``micro_cluster``, ``is_hub``, and
+        ``hub_assignment`` on every node row.
+
+        Called before writing a fresh cluster-assignment pass so stale
+        values from a previous cached run don't survive.
+        """
+        ...
+
+    def get_hub_node_ids(self) -> list[str]:
+        """Return ``node_id`` values of all nodes flagged ``is_hub = 1``."""
+        ...
+
+    def get_clustered_architectural_nodes(
+        self,
+        exclude_tests: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return rows ``{node_id, macro_cluster, micro_cluster}`` for every
+        architectural node assigned to a macro cluster.
+
+        When *exclude_tests* is True, rows with ``is_test = 1`` are skipped.
+        Used by the cluster planner to build its
+        ``{macro → {micro → [node_ids]}}`` index from raw rows.
+        """
+        ...
+
+    def get_architectural_node_ids(
+        self,
+        exclude_tests: bool = False,
+        limit: int = 10_000,
+    ) -> list[str]:
+        """Return ``node_id`` values for all architectural nodes.
+
+        Lightweight projection used when only IDs are needed (e.g. populating
+        a NetworkX graph for PageRank).  When *exclude_tests* is True, rows
+        with ``is_test = 1`` are skipped.
+        """
+        ...
+
+    def get_all_edges(
+        self,
+        limit: int = 500_000,
+    ) -> list[dict[str, Any]]:
+        """Return all edge rows with at minimum ``source_id``, ``target_id``,
+        ``rel_type``, ``weight``.
+
+        Used for bulk graph reconstruction (PageRank, topology analysis).
+        The *limit* parameter guards against OOM on very large repos.
+        """
+        ...
+
     # ── Language detection ───────────────────────────────────────────
 
     def detect_dominant_language(self, node_ids: list[str]) -> str | None:

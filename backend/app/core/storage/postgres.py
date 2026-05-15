@@ -50,108 +50,6 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Compatibility layer for raw conn.execute(SQL, (params,)) callers
-# ---------------------------------------------------------------------------
-
-class _CompatRow:
-    """Row wrapper supporting both index access ``row[0]`` and dict ``row['col']``."""
-
-    __slots__ = ("_values", "_keys")
-
-    def __init__(self, keys: tuple, values: tuple):
-        self._keys = keys
-        self._values = values
-
-    def __getitem__(self, idx):
-        if isinstance(idx, str):
-            try:
-                return self._values[self._keys.index(idx)]
-            except ValueError:
-                raise KeyError(idx) from None
-        return self._values[idx]
-
-    def keys(self):
-        return self._keys
-
-    def __iter__(self):
-        return iter(self._values)
-
-    def __len__(self):
-        return len(self._values)
-
-
-class _CompatResultSet:
-    """Thin result proxy returned by ``_ConnCompat.execute``."""
-
-    __slots__ = ("_rows",)
-
-    def __init__(self, rows: list[_CompatRow]):
-        self._rows = rows
-
-    def fetchall(self):
-        return self._rows
-
-    def fetchone(self):
-        return self._rows[0] if self._rows else None
-
-
-class _ConnCompat:
-    """Makes a SQLAlchemy engine quack like a :class:`sqlite3.Connection`.
-
-    Translates ``?``-placeholder SQL into ``:pN``-named-parameter SQL,
-    sets ``search_path`` to the repository schema, and wraps result rows
-    so they support both integer-index and dict-key access.
-
-    Only used by legacy callers that still pass ``db.conn``.
-    """
-
-    def __init__(self, engine: Engine, schema: str):
-        self._engine = engine
-        self._schema = schema
-
-    # noinspection PyMethodMayBeStatic
-    def _adapt(self, sql: str, params: tuple | list | None):
-        """Convert ``?`` placeholders → ``:p0, :p1, …`` and build param dict."""
-        if params is None:
-            return sql, {}
-        named: dict[str, Any] = {}
-        idx = 0
-        parts: list[str] = []
-        for ch in sql:
-            if ch == "?":
-                name = f"p{idx}"
-                parts.append(f":{name}")
-                named[name] = params[idx]
-                idx += 1
-            else:
-                parts.append(ch)
-        return "".join(parts), named
-
-    def execute(self, sql: str, params=None):
-        adapted_sql, named_params = self._adapt(sql, params)
-        with self._engine.begin() as conn:
-            conn.execute(text(f"SET search_path TO {self._schema}, public"))
-            result = conn.execute(text(adapted_sql), named_params)
-            # DML statements (UPDATE/INSERT/DELETE without RETURNING) produce a
-            # Result with ``returns_rows == False``.  SQLAlchemy auto-closes
-            # those, so calling ``.fetchall()`` raises "This result object does
-            # not return rows.  It has been closed automatically."
-            if not result.returns_rows:
-                return _CompatResultSet([])
-            keys = tuple(result.keys())
-            rows = [_CompatRow(keys, tuple(r)) for r in result.fetchall()]
-            return _CompatResultSet(rows)
-
-    def commit(self) -> None:
-        """No-op: every :meth:`execute` already commits via ``engine.begin()``.
-
-        Kept for API parity with :class:`sqlite3.Connection` so legacy
-        callers (``persist_clusters`` etc.) work unchanged.
-        """
-        return None
-
-
-# ---------------------------------------------------------------------------
 # pgvector availability
 # ---------------------------------------------------------------------------
 _PGVECTOR_AVAILABLE = False
@@ -457,15 +355,6 @@ class PostgresWikiStorage:
     def db_path(self) -> Path:
         """Sentinel path for PostgreSQL backend."""
         return Path(f"postgres:{self._schema}")
-
-    @property
-    def conn(self):
-        """Return a compatibility wrapper that quacks like sqlite3.Connection.
-
-        Used by ``shared_expansion.py`` and ``language_heuristics.py`` which
-        still call ``db.conn.execute(SQL, (params,))``.
-        """
-        return _ConnCompat(self._engine, self._schema)
 
     @property
     def vec_available(self) -> bool:
@@ -1692,6 +1581,77 @@ class PostgresWikiStorage:
         """Delete every row in the edges table."""
         with self._engine.begin() as conn:
             conn.execute(text(f"DELETE FROM {self._edges}"))
+
+    def reset_clusters(self) -> None:
+        """Clear cluster + hub columns on every node row (fresh-pass reset)."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"UPDATE {self._nodes} "
+                    f"SET macro_cluster = NULL, micro_cluster = NULL, "
+                    f"is_hub = 0, hub_assignment = NULL"
+                )
+            )
+
+    def get_hub_node_ids(self) -> list[str]:
+        """Return node_ids of all nodes flagged ``is_hub = 1``."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(f"SELECT node_id FROM {self._nodes} WHERE is_hub = 1")
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_clustered_architectural_nodes(
+        self,
+        exclude_tests: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return {node_id, macro_cluster, micro_cluster} for clustered
+        architectural nodes."""
+        sql = (
+            f"SELECT node_id, macro_cluster, micro_cluster "
+            f"FROM {self._nodes} "
+            f"WHERE macro_cluster IS NOT NULL AND is_architectural = 1"
+        )
+        if exclude_tests:
+            sql += " AND is_test = 0"
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(sql)).fetchall()
+        return [
+            {"node_id": r[0], "macro_cluster": r[1], "micro_cluster": r[2]}
+            for r in rows
+        ]
+
+    def get_architectural_node_ids(
+        self,
+        exclude_tests: bool = False,
+        limit: int = 10_000,
+    ) -> list[str]:
+        """Return node_ids of all architectural nodes (lightweight projection)."""
+        sql = f"SELECT node_id FROM {self._nodes} WHERE is_architectural = 1"
+        if exclude_tests:
+            sql += " AND is_test = 0"
+        sql += " LIMIT :limit"
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(sql), {"limit": limit}).fetchall()
+        return [r[0] for r in rows]
+
+    def get_all_edges(
+        self,
+        limit: int = 500_000,
+    ) -> list[dict[str, Any]]:
+        """Return all edge rows (bounded by *limit* to guard against OOM)."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT source_id, target_id, rel_type, weight "
+                    f"FROM {self._edges} LIMIT :limit"
+                ),
+                {"limit": limit},
+            ).fetchall()
+        return [
+            {"source_id": r[0], "target_id": r[1], "rel_type": r[2], "weight": r[3]}
+            for r in rows
+        ]
 
     # ── Language detection ───────────────────────────────────────────
 

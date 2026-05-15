@@ -832,32 +832,20 @@ def _resolve_symbols(
 def _fts_fallback(
     db, name: str, macro_id: Optional[int] = None,
 ) -> list:
-    """Use FTS5 to find a symbol by name when exact SQL match fails."""
+    """Use FTS to find a symbol by name when exact SQL match fails.
+
+    Delegates to ``WikiStorageProtocol.search_fts_by_symbol_name`` so both
+    SQLite (FTS5) and PostgreSQL (tsvector) backends are supported.
+    """
     try:
-        # Escape FTS5 special characters
-        safe_name = name.replace('"', '""')
-        if macro_id is not None:
-            rows = db.conn.execute(
-                'SELECT n.* FROM repo_fts f '
-                'JOIN repo_nodes n ON f.node_id = n.node_id '
-                'WHERE repo_fts MATCH ? '
-                'AND n.macro_cluster = ? '
-                'AND n.is_architectural = 1 '
-                'ORDER BY rank LIMIT 3',
-                (f'symbol_name:"{safe_name}"', macro_id),
-            ).fetchall()
-        else:
-            rows = db.conn.execute(
-                'SELECT n.* FROM repo_fts f '
-                'JOIN repo_nodes n ON f.node_id = n.node_id '
-                'WHERE repo_fts MATCH ? '
-                'AND n.is_architectural = 1 '
-                'ORDER BY rank LIMIT 3',
-                (f'symbol_name:"{safe_name}"',),
-            ).fetchall()
-        return rows
+        return db.search_fts_by_symbol_name(
+            name,
+            macro_cluster=macro_id,
+            architectural_only=True,
+            limit=3,
+        )
     except Exception as exc:
-        logger.debug("[CLUSTER_EXPANSION] FTS5 fallback failed for '%s': %s", name, exc)
+        logger.debug("[CLUSTER_EXPANSION] FTS fallback failed for '%s': %s", name, exc)
         return []
 
 

@@ -1,8 +1,9 @@
 # DeepWiki ↔ Wikis Storage & Pipeline Parity Audit
 
-> **Branch**: `feat/unified-db-and-clustering`
+> **Branch**: `feat/unified-db-and-clustering` (merged via PR #111)
 > **Date**: 2025-04-15
-> **Status**: ✅ Audit Complete — Action Items Pending
+> **Last reviewed**: 2026-05-15
+> **Status**: ✅ Audit Complete — all 7 Priorities ✅ DONE. Priority 2 final cleanup landed 2026-05-15: 5 new protocol methods (`reset_clusters`, `get_hub_node_ids`, `get_clustered_architectural_nodes`, `get_architectural_node_ids`, `get_all_edges`) added on both backends; remaining 11 raw `db.conn` call sites refactored to protocol methods; `_ConnCompat` shim + `UnifiedGraphTextIndex` + `postgres_graph_text_index` re-export shim removed.
 
 ---
 
@@ -694,8 +695,10 @@ The following DeepWiki features are **intentionally excluded** from Wikis:
 - [x] `language_heuristics.py` standalone function kept for test compat; production uses protocol
 - [x] Refactor `cluster_expansion.py`: pass protocol, not `db.conn`
 - [x] Remove `filesystem_indexer.py` raw `udb.conn.commit()` → `udb.commit()`
-- [ ] Collapse 3 FTS classes into protocol methods
-- [ ] Remove `_ConnCompat` shim after all raw SQL eliminated
+- [x] Add 5 new protocol methods (`reset_clusters`, `get_hub_node_ids`, `get_clustered_architectural_nodes`, `get_architectural_node_ids`, `get_all_edges`) on both backends (2026-05-15)
+- [x] Refactor remaining 11 raw-SQL call sites in `graph_topology.py`, `graph_clustering.py`, `cluster_expansion.py`, `cluster_planner.py` to protocol methods (2026-05-15)
+- [x] Collapse 3 FTS classes — kept `StorageTextIndex` (protocol-based) and `GraphTextIndex` (standalone NX-only); deleted `UnifiedGraphTextIndex` (zero consumers) and `postgres_graph_text_index.py` re-export shim (2026-05-15)
+- [x] Remove `_ConnCompat`, `_CompatRow`, `_CompatResultSet`, and the `conn` property on `PostgresWikiStorage` (2026-05-15)
 
 ### Priority 3 — Scoring & Ranking Parity ✅ DONE
 - [x] Align FTS5 BM25 weights: `bm25(repo_fts, 10.0, 4.0, 2.0, 1.0)` matching Postgres ratio (A=1.0, B=0.4, C=0.2, D=0.1)

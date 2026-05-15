@@ -173,7 +173,6 @@ class TestPlannerConstruction:
         ):
             planner = ClusterStructurePlanner(db, llm)
             assert planner._exclude_tests is True
-            assert "is_test" in planner._test_sql
 
         db.close()
 

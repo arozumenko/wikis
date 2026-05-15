@@ -14,9 +14,10 @@ AI-powered documentation generator that turns any code repository into a browsab
 | Backend framework | FastAPI + uvicorn |
 | LLM orchestration | LangChain, LangGraph, deepagents |
 | LLM providers | OpenAI, Anthropic, Gemini, Ollama, AWS Bedrock (optional extras) |
-| Embeddings + search | FAISS, BM25, SQLite FTS5, sentence-transformers |
+| Embeddings + search | FAISS, BM25, SQLite FTS5 + sqlite-vec, PostgreSQL tsvector + pgvector, sentence-transformers |
 | Code parsing | tree-sitter-language-pack (14+ languages) |
 | Backend DB | SQLAlchemy async + aiosqlite (SQLite default) / asyncpg (PostgreSQL) |
+| Wiki storage | `WikiStorageProtocol` with two backends: sqlite-vec (`UnifiedWikiDB`, default) or pgvector — selected by `WIKI_STORAGE_BACKEND` |
 | MCP server | FastMCP (embedded HTTP at `:8000/mcp`; standalone stdio CLI) |
 | Frontend language | TypeScript 5.4 |
 | Frontend framework | Next.js 15 (App Router + React 18 SPA) |
@@ -44,25 +45,35 @@ wikis/
 │   │   ├── events.py         ← SSE event models
 │   │   ├── api/
 │   │   │   └── routes.py     ← HTTP handlers (thin — delegate to services)
-│   │   ├── core/             ← Wiki engine (45+ modules)
-│   │   │   ├── agents/       ← LangGraph wiki generation agents
-│   │   │   ├── code_graph/   ← NetworkX + SQLite FTS5 code index
+│   │   ├── core/             ← Wiki engine (40+ modules)
+│   │   │   ├── agents/       ← LangGraph wiki generation agents (`wiki_graph_optimized`)
+│   │   │   ├── code_graph/   ← Graph builder + unified FTS/vector index (SQLite or Postgres)
 │   │   │   ├── deep_research/← Multi-step agentic research engine
 │   │   │   ├── parsers/      ← tree-sitter for 14+ languages
 │   │   │   ├── repo_providers/← GitHub, GitLab, Bitbucket, Azure DevOps
-│   │   │   ├── wiki_structure_planner/ ← LLM-driven outline planner
-│   │   │   ├── retrievers.py ← Ensemble retrieval (FAISS + BM25 + reranking)
-│   │   │   └── vectorstore.py← FAISS index management
-│   │   ├── models/           ← Pydantic request/response/event models
+│   │   │   ├── storage/      ← `WikiStorageProtocol` + `sqlite.py` (UnifiedWikiDB) / `postgres.py`
+│   │   │   ├── wiki_structure_planner/ ← LLM outline + cluster planners
+│   │   │   ├── prompts/      ← LangChain prompt templates
+│   │   │   ├── state/        ← LangGraph state (`WikiState`)
+│   │   │   ├── multi_retriever.py / unified_retriever.py ← Ensemble retrieval (dense + sparse + reranking)
+│   │   │   ├── wiki_search_engine.py / project_search_engine.py ← FTS + graph re-ranking
+│   │   │   ├── wiki_page_index.py / wiki_page_search.py ← Wikilink graph + page search adapter
+│   │   │   ├── graph_clustering.py / cluster_expansion.py / cluster_planner.py ← Leiden pipeline
+│   │   │   ├── graph_topology.py ← Topology enrichment (hubs, density)
+│   │   │   └── feature_flags.py ← `WIKIS_CLUSTER_*` toggles
+│   │   ├── models/           ← Pydantic request/response/event/search models
 │   │   ├── services/         ← Business logic layer
-│   │   │   ├── wiki_service.py
+│   │   │   ├── wiki_service.py / wiki_management.py
 │   │   │   ├── ask_service.py
 │   │   │   ├── research_service.py
-│   │   │   ├── qa_service.py ← QA Knowledge Flywheel
-│   │   │   ├── qa_cache_manager.py
-│   │   │   ├── llm_factory.py← LLM + embeddings provider factory
-│   │   │   └── wiki_management.py
-│   │   └── storage/          ← S3 / local artifact storage abstraction
+│   │   │   ├── qa_service.py / qa_cache_manager.py ← QA Knowledge Flywheel + cache
+│   │   │   ├── project_service.py
+│   │   │   ├── export_service.py / import_service.py ← Wiki bundle export/import
+│   │   │   ├── toolkit_bridge.py ← Bridges core wiki toolkit to services
+│   │   │   ├── health_check.py
+│   │   │   ├── context_limits.py / context_overflow.py
+│   │   │   └── llm_factory.py← LLM + embeddings provider factory
+│   │   └── storage/          ← Artifact storage abstraction (local / S3) — distinct from `core/storage/`
 │   ├── mcp_server/
 │   │   └── server.py         ← FastMCP tools (wiki, ask, research)
 │   ├── scripts/
@@ -168,15 +179,19 @@ All vars live in `.env` at project root. Both services read it.
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `LLM_PROVIDER` | Yes | `openai` \| `anthropic` \| `gemini` \| `ollama` \| `bedrock` \| `github` \| `copilot` \| `custom` |
+| `LLM_PROVIDER` | Yes | `openai` \| `anthropic` \| `custom` \| `ollama` \| `gemini` \| `bedrock` \| `github` \| `copilot` |
 | `LLM_API_KEY` | Yes | API key for the chosen provider |
 | `LLM_MODEL` | Yes | Model name (e.g. `gpt-4o-mini`) |
 | `JWT_PRIVATE_KEY` | Yes (prod) | RS256 private key for web → backend auth |
 | `JWT_PUBLIC_KEY` | Yes (prod) | RS256 public key validated by backend |
 | `EMBEDDING_PROVIDER` | No | Defaults to `LLM_PROVIDER`; required for Anthropic |
-| `DATABASE_URL` | No | Empty = SQLite; set for PostgreSQL |
+| `DATABASE_URL` | No | App DB (users, projects, invocations). Empty = SQLite; set for PostgreSQL |
+| `WIKI_STORAGE_BACKEND` | No | `sqlite` (default — UnifiedWikiDB + sqlite-vec) or `postgres` (pgvector) |
+| `WIKI_STORAGE_DSN` | No | PostgreSQL DSN for wiki storage when backend = `postgres` |
 | `AUTH_ENABLED` | No | `false` disables JWT check (local dev only) |
-| `STORAGE_BACKEND` | No | `local` (default) or `s3` |
+| `STORAGE_BACKEND` | No | Artifact storage: `local` (default) or `s3` |
+| `LLM_MAX_CONCURRENCY` | No | Cap concurrent LLM calls (per process) |
+| `WIKIS_CLUSTER_*` | No | Feature flags for the Leiden clustering pipeline (default on) |
 
 Generate JWT keys:
 ```bash
@@ -298,12 +313,13 @@ Backend (:8000)
 repo URL
   → LocalRepositoryManager (clone / pull)
   → FilesystemIndexer (language detection, file filtering)
-  → tree-sitter parsers (14+ languages) + code_graph (NetworkX + FTS5)
-  → FAISS vector index (sentence-transformers embeddings)
-  → WikiStructurePlanner (LLM: generates page outline)
+  → tree-sitter parsers (14+ languages) → graph builder
+  → WikiStorageProtocol (UnifiedWikiDB / SQLite + sqlite-vec  OR  PostgreSQL + pgvector)
+  → graph topology enrichment (hubs, density) + Leiden clustering (cluster_expansion, coverage_ledger)
+  → WikiStructurePlanner (agent planner OR cluster planner — set by PLANNER_TYPE)
   → OptimizedWikiGenerationAgent (LangGraph: parallel page writer)
   → SSE progress events → SPA GenerationProgress component
-  → artifacts stored (local or S3)
+  → wiki page markdown + WikiPageIndex (wikilink graph) → artifact storage (local or S3)
 ```
 
 ### Auth Cross-Service JWT
@@ -324,13 +340,25 @@ All providers implement `BaseLanguageModel` (LangChain). Add a new provider in `
 
 ### MCP Server
 
-MCP tools are wired directly to backend services (no HTTP round-trip). Available tools:
-- `list_wikis` — list available wikis for the user
-- `get_wiki_page` — retrieve a specific wiki page
-- `ask` — Q&A against a wiki's knowledge base
-- `research` — deep multi-step research
+MCP tools are wired directly to backend services (no HTTP round-trip) in `app/main.py` via `set_services()`. 13 tools across discovery, Q&A, research, code mapping, and search:
 
-Connect from Claude Code: `http://localhost:8000/mcp`
+| Group | Tool | Purpose |
+|-------|------|---------|
+| Discovery | `search_wikis` | List/filter wikis the user can access |
+| Discovery | `list_wiki_pages` | Page index for a wiki |
+| Discovery | `get_wiki_page` | Fetch a wiki page (with offset/limit) |
+| Discovery | `list_projects` | List/filter projects |
+| Q&A | `ask_codebase` | Q&A against one wiki |
+| Q&A | `ask_project` | Q&A across all wikis in a project |
+| Research | `research_codebase` | Deep multi-step research over one wiki |
+| Research | `research_project` | Deep research across a project |
+| Mapping | `map_codebase` | Code map for a wiki (entry points → flow) |
+| Mapping | `map_project` | Code map across project entry points |
+| Search | `search_wiki` | FTS + wikilink graph re-rank over one wiki |
+| Search | `search_project` | FTS + graph search across project wikis |
+| Search | `get_page_neighbors` | Wikilink graph neighbors of a page |
+
+Connect from Claude Code: `http://localhost:8000/mcp` (streamable HTTP). Standalone stdio CLI: `wikis-mcp`.
 
 ---
 

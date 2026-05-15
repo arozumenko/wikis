@@ -1650,6 +1650,62 @@ class UnifiedWikiDB:
         """Delete every row in the edges table."""
         self.conn.execute("DELETE FROM repo_edges")
 
+    def reset_clusters(self) -> None:
+        """Clear cluster + hub columns on every node row (fresh-pass reset)."""
+        self.conn.execute(
+            "UPDATE repo_nodes "
+            "SET macro_cluster = NULL, micro_cluster = NULL, "
+            "is_hub = 0, hub_assignment = NULL"
+        )
+
+    def get_hub_node_ids(self) -> list[str]:
+        """Return node_ids of all nodes flagged ``is_hub = 1``."""
+        rows = self.conn.execute(
+            "SELECT node_id FROM repo_nodes WHERE is_hub = 1"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_clustered_architectural_nodes(
+        self,
+        exclude_tests: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return {node_id, macro_cluster, micro_cluster} for clustered
+        architectural nodes."""
+        sql = (
+            "SELECT node_id, macro_cluster, micro_cluster "
+            "FROM repo_nodes "
+            "WHERE macro_cluster IS NOT NULL AND is_architectural = 1"
+        )
+        if exclude_tests:
+            sql += " AND is_test = 0"
+        rows = self.conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_architectural_node_ids(
+        self,
+        exclude_tests: bool = False,
+        limit: int = 10_000,
+    ) -> list[str]:
+        """Return node_ids of all architectural nodes (lightweight projection)."""
+        sql = "SELECT node_id FROM repo_nodes WHERE is_architectural = 1"
+        if exclude_tests:
+            sql += " AND is_test = 0"
+        sql += " LIMIT ?"
+        rows = self.conn.execute(sql, (limit,)).fetchall()
+        return [r[0] for r in rows]
+
+    def get_all_edges(
+        self,
+        limit: int = 500_000,
+    ) -> list[dict[str, Any]]:
+        """Return all edge rows (bounded by *limit* to guard against OOM)."""
+        rows = self.conn.execute(
+            "SELECT source_id, target_id, rel_type, weight "
+            "FROM repo_edges LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # ── Language detection ───────────────────────────────────────────
 
     def detect_dominant_language(self, node_ids: list[str]) -> str | None:

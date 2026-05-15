@@ -116,30 +116,51 @@ Browser → Next.js Web App (:3000)
 - `next.config.ts` — Package transpilation and MUI import optimization (no rewrite config here)
 
 ### Backend Structure (`backend/app/`)
-- `main.py` — FastAPI app factory + lifespan hooks
+- `main.py` — FastAPI app factory + lifespan hooks (wires services + MCP)
 - `config.py` — Pydantic settings (env vars)
 - `auth.py` — JWT validation via JWKS from web app
+- `db.py` — SQLAlchemy async engine + session factory
 - `api/routes.py` — HTTP route handlers (thin; delegate to services)
-- `services/` — Business logic: `wiki_service`, `ask_service`, `research_service`, `llm_factory`
-- `core/` — The wiki engine (45+ modules preserved from original plugin):
+- `services/` — Business logic: `wiki_service`, `wiki_management`, `ask_service`, `research_service`, `qa_service`, `qa_cache_manager`, `project_service`, `export_service`, `import_service`, `toolkit_bridge`, `health_check`, `llm_factory`
+- `core/` — The wiki engine (40+ modules):
   - `parsers/` — Tree-sitter for 14+ languages
-  - `code_graph/` — NetworkX graph + SQLite FTS5 indexing
-  - `agents/` — LangGraph wiki generation agents
-  - `deep_research/` — Multi-step research engine
-  - `vectorstore.py` — FAISS management
-  - `retrievers.py` — Ensemble retrieval (dense + sparse + reranking)
+  - `code_graph/` — Graph builder + FTS/vector index (`unified_graph_text_index`, `postgres_graph_text_index`)
+  - `agents/` — LangGraph wiki generation agents (`wiki_graph_optimized`)
+  - `deep_research/` — Multi-step research engine (LangGraph)
+  - `wiki_structure_planner/` — LLM outline + cluster planners
+  - `storage/` — Wiki storage protocol + backends (`sqlite.py` UnifiedWikiDB / `postgres.py` pgvector) selected via `WIKI_STORAGE_BACKEND`
+  - `multi_retriever.py`, `unified_retriever.py` — ensemble retrieval (dense + sparse + reranking)
+  - `wiki_search_engine.py`, `project_search_engine.py`, `wiki_page_index.py` — search + wikilink graph
+  - `graph_clustering.py`, `cluster_expansion.py`, `graph_topology.py` — Leiden clustering + topology enrichment
   - `repo_providers/` — GitHub, GitLab, Bitbucket, Azure DevOps
-- `models/` — Pydantic request/response/event models
-- `storage/` — S3/local storage abstraction
+  - `feature_flags.py` — `WIKIS_CLUSTER_*` toggles
+- `models/` — Pydantic request/response/event/search models
+- `storage/` — Artifact storage abstraction (local / S3)
+- `mcp_server/` (sibling to `app/`) — FastMCP tools wired to services in `app/main.py`
 
 ### Auth Cross-Service JWT
 The web app issues RS256 JWTs. The backend validates them using `JWT_PUBLIC_KEY`. For local dev without auth: `AUTH_ENABLED=false`.
 
 ### Wiki Generation Pipeline
-Repository → `LocalRepositoryManager` (clone) → `FilesystemIndexer` (filter) → tree-sitter parsers → `CodeGraph` (NetworkX + FTS5) + FAISS vector index → `WikiStructurePlanner` (LLM outline) → `OptimizedWikiGenerationAgent` (LangGraph parallel page writer) → SSE events to frontend.
+Repository → `LocalRepositoryManager` (clone) → `FilesystemIndexer` (filter) → tree-sitter parsers → graph builder + `WikiStorageProtocol` (SQLite/FTS5 + sqlite-vec **or** PostgreSQL/tsvector + pgvector) → topology enrichment + Leiden clustering → `WikiStructurePlanner` (LLM outline) → `OptimizedWikiGenerationAgent` (LangGraph parallel page writer) → SSE events to frontend.
+
+### Wiki Storage Backend
+Graph nodes/edges, FTS, vector embeddings, and clustering metadata all sit behind `WikiStorageProtocol` (`backend/app/core/storage/`):
+- **`sqlite`** (default) — `UnifiedWikiDB` with FTS5 + sqlite-vec; zero infra
+- **`postgres`** — `PostgresWikiStorage` with `tsvector`/`tsquery` + pgvector
+
+Select via `WIKI_STORAGE_BACKEND` env var. Search engines (`WikiSearchEngine`, `ProjectSearchEngine`) are backend-agnostic.
+
+### MCP Server
+Embedded at `:8000/mcp` (streamable HTTP) and available as a stdio CLI (`wikis-mcp`). 13 tools wired to services in `app/main.py`:
+- Discovery: `search_wikis`, `list_wiki_pages`, `get_wiki_page`, `list_projects`
+- Q&A: `ask_codebase`, `ask_project`
+- Research: `research_codebase`, `research_project`
+- Code mapping: `map_codebase`, `map_project`
+- Search/graph: `search_wiki`, `search_project`, `get_page_neighbors`
 
 ### LLM Provider Pattern
-Add providers in `backend/app/services/llm_factory.py`. LangChain interfaces (`BaseLanguageModel`, `Embeddings`) are used throughout — all providers are interchangeable. Providers are installed as optional pip extras (`ollama`, `gemini`, `bedrock`, `all-providers`).
+Add providers in `backend/app/services/llm_factory.py`. LangChain interfaces (`BaseChatModel`, `Embeddings`) are used throughout — all providers are interchangeable. Supported: `openai`, `anthropic`, `custom` (OpenAI-compatible), `ollama`, `gemini`, `bedrock`, `github` (GitHub Models), `copilot`. Installed as optional pip extras.
 
 ### Frontend API Client
 - `web/src/spa/api/` — Generated TypeScript API client (from `npm run generate:types`)
