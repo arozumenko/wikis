@@ -333,7 +333,10 @@ Beyond source code and markdown, the indexer ingests PDFs, images, and plain-tex
 | `.mdx` `.qmd` `.rst` `.adoc` | `PlainTextExtractor` | UTF-8 read | — |
 | `.png` `.jpg` `.jpeg` `.gif` `.webp` | `ImageExtractor` | LLM vision describe | `[vision]` (Pillow) |
 | `.pdf` | `PDFExtractor` | pdfium2 render → LLM vision per page | `[pdf]` (pypdfium2 + Pillow) |
+| `.docx` `.xlsx` `.pptx` | `OfficeExtractor` | LibreOffice headless → PDF → PDFExtractor | `[office]` + system `libreoffice` |
 | `.md` `.txt` `.yaml` `.toml` `…` | _(legacy text-read path)_ | `open(file, 'r')` | — |
+
+**Office system dep**: `OfficeExtractor` shells out to `soffice` (LibreOffice headless). The backend Docker image installs it via apt. Local-dev macOS users: `brew install --cask libreoffice`. Without it, `OfficeExtractor` fails to construct at registry-build time, logs the missing-binary WARNING, and `.docx/.xlsx/.pptx` files fall through to the legacy text-read path (binary garbage in `source_text`).
 
 **Cost handling**: every LLM call logs `[extractors.image]` / `[extractors.pdf]` at INFO with input/output token counts. No env-var gating — operators monitor the log stream. A 500-page scanned manual will spend tokens; grep for `[extractors.pdf]` to spot.
 

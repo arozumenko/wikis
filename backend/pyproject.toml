@@ -68,6 +68,12 @@ vision = ["Pillow>=10.0.0"]
 # pdf: PDFs rendered to images then described via configured LLM
 # (pdfium2 is a self-contained wheel — no poppler / no system deps)
 pdf = ["pypdfium2>=4.20.0", "Pillow>=10.0.0"]
+# office: .docx/.xlsx/.pptx via LibreOffice headless → PDF → reuse [pdf]
+# pipeline. NO PIP DEPS — LibreOffice is a system binary. The Docker
+# image installs it via apt; macOS dev uses `brew install --cask
+# libreoffice`. This extra exists for parity (so `pip install -e
+# .[office]` doesn't 404) and pulls in [pdf] which IS needed.
+office = ["wikis-backend[pdf]"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23.0",
