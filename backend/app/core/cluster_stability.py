@@ -141,20 +141,17 @@ def compute_jaccard_remap(
             matched_count += 1
 
     # Unmatched new clusters get fresh IDs starting at max(old_ids) + 1
-    # (or 0 if no old clusters existed).
+    # (or 0 if no old clusters existed). Since the seed is strictly
+    # above every key in old_sets, the freshly-allocated IDs cannot
+    # collide with any old ID. A historical-ID skip (allocating past
+    # IDs from regens older than the previous one) would require
+    # threading a wiki_meta high-water mark through — out of scope
+    # for PR 4; see follow-up issue.
     next_id = (max(old_sets.keys()) + 1) if old_sets else 0
-    # Skip over any old IDs we *didn't* claim — they're "dead" but
-    # incrementing past them keeps fresh IDs above the historical
-    # high-water mark, so wiki_pages rows from earlier-than-previous
-    # regens don't accidentally re-collide.
-    while next_id in old_sets and next_id not in claimed_old:
-        next_id += 1
 
     for new_id in ordered_new_ids:
         if new_id in remap:
             continue
-        while next_id in old_sets:
-            next_id += 1
         remap[new_id] = next_id
         next_id += 1
 
@@ -210,6 +207,12 @@ def stabilize_hierarchical_assignments(
 
     Returns:
         ``(stable_macro_assignments, stable_micro_assignments)``.
+
+        **Keying note:** the returned micro dict is keyed by the
+        *stable* (post-remap) macro IDs, not the fresh macro IDs Leiden
+        picked. Callers iterating ``stable_macro_assignments.values()``
+        will get matching keys; callers holding pre-remap macro IDs
+        should map them through the macro remap first.
 
     If ``old_clusters`` is empty (no prior run) this returns the input
     assignments unchanged.

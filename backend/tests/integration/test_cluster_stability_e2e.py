@@ -59,7 +59,9 @@ class TestApplyClusterStability:
         # No prior cluster assignments in the DB → remap is a no-op.
         macro = {"a": 0, "b": 1}
         micro = {0: {"a": 0}, 1: {"b": 0}}
-        out_macro, out_micro = _apply_cluster_stability(db, macro, micro)
+        out_macro, out_micro, out_hubs = _apply_cluster_stability(
+            db, macro, micro, {},
+        )
         assert out_macro == macro
         assert out_micro == micro
 
@@ -77,14 +79,16 @@ class TestApplyClusterStability:
         fresh_macro = {"a": 0, "b": 0, "c": 0, "d": 1, "e": 1}
         fresh_micro = {0: {"a": 9, "b": 9, "c": 9}, 1: {"d": 4, "e": 4}}
 
-        stable_macro, stable_micro = _apply_cluster_stability(
-            db, fresh_macro, fresh_micro,
+        stable_macro, stable_micro, stable_hubs = _apply_cluster_stability(
+            db, fresh_macro, fresh_micro, {},
         )
         # Every node lands back in its prior cluster.
         assert stable_macro == {"a": 5, "b": 5, "c": 5, "d": 7, "e": 7}
         # Micros remap too (only one micro per cluster, so all → 0).
         assert stable_micro[5] == {"a": 0, "b": 0, "c": 0}
         assert stable_micro[7] == {"d": 0, "e": 0}
+        # No hubs in this fixture → empty stable hubs.
+        assert stable_hubs == {}
 
     def test_page_id_is_stable_when_clusters_are_stable(
         self, db: UnifiedWikiDB,
@@ -109,8 +113,8 @@ class TestApplyClusterStability:
         assert page_id_unstable != page_id_prior
 
         # After remap, page_id matches the prior run.
-        stable_macro, stable_micro = _apply_cluster_stability(
-            db, fresh_macro, fresh_micro,
+        stable_macro, stable_micro, _ = _apply_cluster_stability(
+            db, fresh_macro, fresh_micro, {},
         )
         # The stable macro for "auth.AuthService" should now be 5, micro 0.
         assert stable_macro["auth.AuthService"] == 5
@@ -126,6 +130,35 @@ class TestApplyClusterStability:
         )
         assert page_id_post_remap == page_id_prior
 
+    def test_hub_assignments_are_remapped_too(self, db: UnifiedWikiDB) -> None:
+        """Tech-lead blocker fix: hub_assignments dict must be rebuilt
+        from the post-remap macro/micro dicts. Without this, persist_clusters
+        would overwrite the remapped macro/micro cells for hub nodes
+        with their pre-remap IDs via the INSERT OR REPLACE batch path."""
+        # Prior state: cluster 5 has a hub h_arch + member m_1.
+        _seed_node(db, "h_arch", macro=5, micro=0)
+        _seed_node(db, "m_1", macro=5, micro=0)
+
+        # Fresh Leiden produced different IDs (macro 99). The caller has
+        # already merged hubs into the assignment dicts.
+        fresh_macro = {"h_arch": 99, "m_1": 99}
+        fresh_micro = {99: {"h_arch": 42, "m_1": 42}}
+        # The hub_assignments dict still carries the *fresh* (pre-remap)
+        # macro/micro tuples — this is what reintegrate_hubs returns.
+        fresh_hubs = {"h_arch": (99, 42)}
+
+        stable_macro, stable_micro, stable_hubs = _apply_cluster_stability(
+            db, fresh_macro, fresh_micro, fresh_hubs,
+        )
+
+        # macro_assignments + micro_assignments remap to the prior IDs.
+        assert stable_macro["h_arch"] == 5
+        assert stable_micro[5]["h_arch"] == 0
+
+        # And — the critical bit — hub_assignments matches.
+        # Without the fix, this would still be (99, 42).
+        assert stable_hubs["h_arch"] == (5, 0)
+
     def test_handles_db_read_error_gracefully(self, db: UnifiedWikiDB) -> None:
         """If the DB read fails, the helper should fall back to passthrough
         — never crash the clustering pipeline."""
@@ -138,6 +171,11 @@ class TestApplyClusterStability:
 
         macro = {"a": 0}
         micro = {0: {"a": 0}}
-        out_macro, out_micro = _apply_cluster_stability(db, macro, micro)
+        hubs = {"a": (0, 0)}
+        out_macro, out_micro, out_hubs = _apply_cluster_stability(
+            db, macro, micro, hubs,
+        )
         assert out_macro == macro
         assert out_micro == micro
+        # Hubs pass through unchanged when the remap is skipped.
+        assert out_hubs == hubs
