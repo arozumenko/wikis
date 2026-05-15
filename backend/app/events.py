@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -303,4 +304,124 @@ def page_complete(progress_token: str, page_id: str, page_title: str) -> MCPEven
             "timestamp": _now_iso(),
         },
         event_alias="page_complete",
+    )
+
+
+# ---------------------------------------------------------------------------
+# #116 PR 5 — incremental regen events (per-page regime + run summary)
+# ---------------------------------------------------------------------------
+#
+# These are emitted by :class:`IncrementalRegenService` via its
+# ``progress_callback``. Each per-page event carries the page_id + title
+# so the SPA can render a live list; the summary event arrives once at the
+# end with the aggregate :class:`IncrementalRegenStats` payload.
+#
+# Event aliases match the named regimes from #116 issue:
+# ``page_unchanged`` / ``page_patched`` / ``page_edited`` /
+# ``page_regenerated`` / ``page_deleted`` / ``incremental_summary``.
+
+
+def _incremental_page_event(
+    alias: str,
+    progress_token: str,
+    page_id: str,
+    page_title: str,
+    **extra: Any,
+) -> MCPEvent:
+    payload = {
+        "progressToken": progress_token,
+        "_pageId": page_id,
+        "_pageTitle": page_title,
+        "timestamp": _now_iso(),
+        **extra,
+    }
+    return MCPEvent(
+        "notifications/progress",
+        payload,
+        event_alias=alias,
+    )
+
+
+def page_unchanged(progress_token: str, page_id: str, page_title: str) -> MCPEvent:
+    """Page was untouched by the change set — no LLM call."""
+    return _incremental_page_event(
+        "page_unchanged", progress_token, page_id, page_title,
+    )
+
+
+def page_patched(
+    progress_token: str,
+    page_id: str,
+    page_title: str,
+    citation_count: int = 0,
+) -> MCPEvent:
+    """Trivial-regime patch — file paths rewritten via regex, no LLM."""
+    return _incremental_page_event(
+        "page_patched", progress_token, page_id, page_title,
+        citationCount=citation_count,
+    )
+
+
+def page_edited(
+    progress_token: str,
+    page_id: str,
+    page_title: str,
+    diff_ratio: float = 0.0,
+) -> MCPEvent:
+    """Edit-regime surgical LLM patch passed the quality gate."""
+    return _incremental_page_event(
+        "page_edited", progress_token, page_id, page_title,
+        diffRatio=diff_ratio,
+    )
+
+
+def page_regenerated(
+    progress_token: str,
+    page_id: str,
+    page_title: str,
+    demoted_from_edit: bool = False,
+) -> MCPEvent:
+    """Structural regen — full single-page LLM regenerate.
+
+    ``demoted_from_edit`` is True when the page started in the edit
+    regime but the quality gate rejected the surgical output, forcing
+    a structural fallback. PR 5 telemetry distinguishes the two cases.
+    """
+    return _incremental_page_event(
+        "page_regenerated", progress_token, page_id, page_title,
+        demotedFromEdit=demoted_from_edit,
+    )
+
+
+def page_deleted(progress_token: str, page_id: str, page_title: str) -> MCPEvent:
+    """A page's primary symbol vanished — its row was removed.
+
+    Reserved for the cluster-vanished case (entire module deleted).
+    PR 3's dispatcher routes the page through structural regen; a
+    dedicated event fires only when the page is actually dropped, not
+    just regenerated.
+    """
+    return _incremental_page_event(
+        "page_deleted", progress_token, page_id, page_title,
+    )
+
+
+def incremental_summary(
+    progress_token: str,
+    stats: Mapping[str, Any],
+) -> MCPEvent:
+    """Run summary emitted once at the end of an incremental refresh.
+
+    ``stats`` is :meth:`IncrementalRegenStats.as_dict()` — all regime
+    counts + ``avg_diff_ratio`` + ``total_pages``. The SPA renders this
+    as a banner like "12 unchanged · 3 patched · 1 regenerated".
+    """
+    return MCPEvent(
+        "notifications/progress",
+        {
+            "progressToken": progress_token,
+            "stats": dict(stats),
+            "timestamp": _now_iso(),
+        },
+        event_alias="incremental_summary",
     )

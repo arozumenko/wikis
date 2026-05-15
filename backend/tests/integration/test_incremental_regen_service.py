@@ -368,6 +368,132 @@ class TestIncrementalRegenServiceE2E:
         assert stats.structural_regenerated == 1
         assert "page-struct" in struct_log
 
+    def test_progress_callback_emits_per_page_and_summary_events(
+        self, fixture,
+    ) -> None:
+        """PR 5: an optional progress_callback receives one event per
+        dispatched page (every regime) plus an incremental_summary at
+        the end. This is what wires the SSE stream to the SPA banner."""
+        events: list[tuple[str, dict]] = []
+        # Original body for the edit-regime page. Long enough that a
+        # near-identical LLM output stays well below the quality-gate
+        # threshold.
+        edit_body = (
+            "# Editables\n\nThe modify_me function does work. "
+            "It takes no arguments and returns nothing."
+        )
+        edit_llm_output = (
+            "# Editables\n\nThe modify_me function does work now. "
+            "It takes no arguments and returns a result."
+        )
+        page_bodies = {
+            "page-trivial": "x",
+            "page-edit": edit_body,
+            "page-struct": "x",
+        }
+
+        def _structural(page) -> bool:
+            return True
+
+        from app.core.agents.page_patcher import PagePatcher
+        from app.services.incremental_regen_service import IncrementalRegenService
+
+        svc = IncrementalRegenService(
+            storage=fixture,
+            page_patcher=PagePatcher(_StubLLM(edit_llm_output)),
+            read_page_body=lambda pid: page_bodies.get(pid),
+            write_page_body=lambda pid, body: page_bodies.__setitem__(pid, body),
+            structural_handler=_structural,
+            progress_callback=lambda name, payload: events.append((name, payload)),
+        )
+
+        # sym-deleted absent → page-struct goes structural via primary override
+        # sym-moved changes path → page-trivial routes trivial
+        parsed = [
+            _parsed("sym-moved", "def moved(): pass", "new_path.py"),
+            _parsed("sym-modified", "def modify_me(): return 1"),
+            _parsed("sym-bystander", "def b(): pass"),
+        ]
+        stats = svc.run(parsed)
+
+        # Order: unchanged (0 here) → trivial → edit → structural → summary.
+        names = [n for n, _ in events]
+        assert names == [
+            "page_patched", "page_edited", "page_regenerated",
+            "incremental_summary",
+        ]
+
+        # Summary carries the full stats dict.
+        _, summary_payload = events[-1]
+        assert summary_payload["stats"]["total_pages"] == stats.total_pages
+        assert summary_payload["stats"]["trivial_patched"] == 1
+        assert summary_payload["stats"]["edit_applied"] == 1
+        assert summary_payload["stats"]["structural_regenerated"] == 1
+
+        # page_regenerated event carries demoted_from_edit=False — this
+        # page was a primary-symbol-deleted override, not an edit demotion.
+        regen_payload = events[2][1]
+        assert regen_payload["demoted_from_edit"] is False
+
+    def test_progress_callback_marks_quality_gate_demotion(self, fixture) -> None:
+        """When the surgical quality gate rejects, the page is demoted
+        to structural with demoted_from_edit=True so PR 5 telemetry
+        can distinguish "needed structural" from "tried surgical and
+        bailed out"."""
+        events: list[tuple[str, dict]] = []
+
+        def _structural(page) -> bool:
+            return True
+
+        from app.core.agents.page_patcher import PagePatcher
+        from app.services.incremental_regen_service import IncrementalRegenService
+
+        svc = IncrementalRegenService(
+            storage=fixture,
+            # Output completely unlike the original → quality gate rejects.
+            page_patcher=PagePatcher(_StubLLM("quux baz wibble different entirely")),
+            read_page_body=lambda pid: "x" * 50,  # original body
+            write_page_body=lambda pid, body: None,
+            structural_handler=_structural,
+            progress_callback=lambda name, payload: events.append((name, payload)),
+        )
+
+        parsed = [
+            _parsed("sym-moved", "def moved(): pass", "old_path.py"),
+            _parsed("sym-modified", "def modify_me(): return 1"),
+            _parsed("sym-deleted", "def goner(): pass"),
+            _parsed("sym-bystander", "def b(): pass"),
+        ]
+        svc.run(parsed)
+
+        regen_events = [p for n, p in events if n == "page_regenerated"]
+        assert len(regen_events) == 1
+        # The demoted-from-edit signal is on.
+        assert regen_events[0]["demoted_from_edit"] is True
+
+    def test_progress_callback_failure_does_not_break_run(self, fixture) -> None:
+        """The callback is observability — a raising callback must not
+        crash the regen."""
+        def _exploding_callback(name, payload):
+            raise RuntimeError("telemetry sink down")
+
+        from app.core.agents.page_patcher import PagePatcher
+        from app.services.incremental_regen_service import IncrementalRegenService
+
+        svc = IncrementalRegenService(
+            storage=fixture,
+            page_patcher=PagePatcher(_StubLLM("# OK")),
+            read_page_body=lambda pid: "x",
+            write_page_body=lambda pid, body: None,
+            structural_handler=lambda page: True,
+            progress_callback=_exploding_callback,
+        )
+
+        parsed = [_parsed("sym-bystander", "def b(): pass")]
+        # No assertion needed beyond "this doesn't raise"; the run
+        # completes despite every callback invocation raising.
+        svc.run(parsed)
+
     def test_structural_handler_failure_is_counted_not_raised(self, fixture) -> None:
         # A raising structural handler must not bubble; it counts in
         # structural_failed and the rest of the run continues.

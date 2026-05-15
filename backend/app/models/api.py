@@ -400,3 +400,36 @@ class DiffWikiResponse(BaseModel):
     wiki_id: str
     change_set: ChangeSetResponse
     affected_pages: list[AffectedPageResponse] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Incremental refresh (#116 PR 5 — three-regime dispatch)
+# ---------------------------------------------------------------------------
+
+
+class IncrementalRefreshRequest(BaseModel):
+    """POST ``/wikis/{id}/incremental-refresh`` body.
+
+    Caller supplies pre-parsed nodes (same shape as ``/diff``). Capped at
+    50_000 nodes per request to bound the orchestrator's snapshot work.
+    """
+
+    parsed_nodes: list[ParsedNodeInput] = Field(
+        default_factory=list, max_length=50_000,
+    )
+
+
+class IncrementalRefreshResponse(BaseModel):
+    """Initial response — actual progress flows over SSE.
+
+    The orchestrator runs asynchronously after this returns; subscribe
+    to ``/invocations/{invocation_id}/stream`` for ``page_unchanged``,
+    ``page_patched``, ``page_edited``, ``page_regenerated``, and the
+    final ``incremental_summary`` event with the run stats.
+    """
+
+    wiki_id: str
+    invocation_id: str
+    status: str  # "running" — terminal state arrives via SSE
+    page_count: int  # how many pages the run will potentially touch
+    message: str | None = None

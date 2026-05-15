@@ -539,6 +539,226 @@ class WikiService:
         )
         return await self.generate(request, owner_id=owner_id, force=True)
 
+    async def incremental_refresh(
+        self,
+        wiki_id: str,
+        parsed_nodes: list[dict[str, Any]],
+        management: "WikiManagementService",
+        owner_id: str = "",
+    ) -> tuple[Invocation, dict[str, Any]] | None:
+        """Run an incremental refresh on a wiki with caller-supplied parsed nodes.
+
+        Closes the #116 incremental-regen feature: change detection +
+        three-regime dispatch + SSE telemetry, all driven from a
+        pre-parsed node payload (same shape as ``/diff``).
+
+        Production note: the structural-regen handler is intentionally a
+        no-op fallback here — pages that would need a full single-page
+        regen are counted in ``stats.structural_failed`` rather than
+        actually regenerated. PR 5+ will wire ``make_agent_structural_handler``
+        once the agent-construction prerequisites (indexer + retriever +
+        LLM) are plumbed for the incremental path.
+
+        Returns ``(invocation, stats_dict)`` on success; ``None`` when
+        the wiki doesn't exist or its unified DB is missing.
+        """
+        # Ownership check is enforced at the route layer; we just need
+        # the record to look up repo_url + cache_key.
+        wiki_record = await management.get_wiki(wiki_id, user_id=owner_id or None)
+        if wiki_record is None:
+            return None
+
+        from pathlib import Path as _Path
+
+        from app.core.agents.page_patcher import PagePatcher
+        from app.core.storage import open_storage
+        from app.services.incremental_regen import PageRegime  # noqa: F401
+        from app.services.incremental_regen_service import (
+            IncrementalRegenService,
+        )
+        from app.services.wiki_management import _derive_cache_key
+
+        cache_key = _derive_cache_key(
+            self.settings.cache_dir, wiki_record.repo_url, wiki_record.branch,
+        )
+        if not cache_key:
+            return None
+        db_path = _Path(self.settings.cache_dir) / f"{cache_key}.wiki.db"
+        if not db_path.exists():
+            return None
+
+        # Preload every page body into an in-memory dict so the
+        # orchestrator's sync callbacks don't need to bridge into
+        # async artifact I/O. The dict is the source of truth during
+        # the run; modified entries get flushed back at the end.
+        page_bodies: dict[str, str] = {}
+        artifact_keys: dict[str, str] = {}
+        existing = await self.storage.list_artifacts(
+            "wiki_artifacts", prefix=wiki_id,
+        )
+        for artifact_key in existing:
+            if not artifact_key.endswith(".md"):
+                continue
+            page_id = (
+                artifact_key.removeprefix(f"{wiki_id}/")
+                .removeprefix("wiki_pages/")
+                .removesuffix(".md")
+            )
+            try:
+                raw = await self.storage.download("wiki_artifacts", artifact_key)
+                page_bodies[page_id] = (
+                    raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                )
+                artifact_keys[page_id] = artifact_key
+            except FileNotFoundError:
+                continue
+
+        # Create invocation + start a background task so the caller can
+        # subscribe to SSE events immediately while the orchestrator runs.
+        invocation = Invocation(
+            id=str(uuid4()),
+            wiki_id=wiki_id,
+            repo_url=wiki_record.repo_url,
+            branch=wiki_record.branch,
+            status="running",
+            owner_id=owner_id,
+        )
+        self._invocations[invocation.id] = invocation
+        await invocation.emit(events.task_status(
+            invocation.id, "running", "Incremental refresh started",
+        ))
+
+        modified_bodies: dict[str, str] = {}
+
+        def _read(pid: str) -> str | None:
+            return page_bodies.get(pid)
+
+        def _write(pid: str, body: str) -> None:
+            page_bodies[pid] = body
+            modified_bodies[pid] = body
+
+        def _stub_structural(page) -> bool:
+            # PR 5 MVP: structural pages count as failed for the run.
+            # The follow-up that wires make_agent_structural_handler
+            # replaces this with the agent-backed callback.
+            logger.info(
+                "[incremental_refresh] structural regen stub for page %s "
+                "(needs full agent integration)",
+                page.page_id,
+            )
+            return False
+
+        def _emit(event_name: str, payload: dict[str, Any]) -> None:
+            builder = {
+                "page_unchanged": events.page_unchanged,
+                "page_patched": events.page_patched,
+                "page_edited": events.page_edited,
+                "page_regenerated": events.page_regenerated,
+                "incremental_summary": lambda token, **_: events.incremental_summary(
+                    token, payload.get("stats", {}),
+                ),
+            }.get(event_name)
+            if builder is None:
+                return
+            if event_name == "incremental_summary":
+                invocation.emit_sync(builder(invocation.id))
+            else:
+                # Per-page events: extract page_id/title plus extras.
+                kwargs = {k: v for k, v in payload.items()
+                          if k not in {"page_id", "page_title"}}
+                invocation.emit_sync(builder(
+                    invocation.id,
+                    payload["page_id"],
+                    payload["page_title"],
+                    **kwargs,
+                ))
+
+        # LLM for surgical edits. Use the project's configured one.
+        # Failing to construct an LLM is fatal for the edit regime but
+        # the orchestrator still handles trivial + structural regimes
+        # without it (the patcher's quality gate rejects on LLM error).
+        try:
+            from app.services.llm_factory import create_llm
+
+            llm = create_llm(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[incremental_refresh] LLM init failed; edit regime will "
+                "fall back to structural: %s",
+                exc,
+            )
+            llm = None
+
+        async def _run() -> None:
+            try:
+                storage = open_storage(
+                    repo_id=cache_key, db_path=str(db_path), readonly=False,
+                )
+                try:
+                    patcher = PagePatcher(llm) if llm is not None else None
+                    if patcher is None:
+                        # The orchestrator unconditionally constructs a
+                        # PagePatcher path; without an LLM, force every
+                        # edit page into structural by short-circuiting
+                        # at the diff-input stage. Simpler: just reject.
+                        # For PR 5 we accept the limitation and skip the
+                        # whole run if the LLM is unavailable.
+                        await invocation.emit(events.task_status(
+                            invocation.id, "failed",
+                            "LLM unavailable — incremental refresh requires LLM",
+                        ))
+                        return
+
+                    svc = IncrementalRegenService(
+                        storage=storage,
+                        page_patcher=patcher,
+                        read_page_body=_read,
+                        write_page_body=_write,
+                        structural_handler=_stub_structural,
+                        progress_callback=_emit,
+                    )
+                    stats = await asyncio.to_thread(svc.run, parsed_nodes)
+                finally:
+                    try:
+                        storage.close()
+                    except Exception:  # noqa: S110 — best-effort close
+                        pass
+
+                # Flush modified bodies back to artifact storage.
+                for pid, body in modified_bodies.items():
+                    key = artifact_keys.get(
+                        pid,
+                        f"{wiki_id}/wiki_pages/{pid}.md",
+                    )
+                    try:
+                        await self.storage.upload(
+                            "wiki_artifacts", key, body.encode("utf-8"),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "[incremental_refresh] body flush failed for %s: %s",
+                            pid, exc,
+                        )
+
+                await invocation.emit(events.task_status(
+                    invocation.id, "completed",
+                    f"Incremental refresh complete: {stats.as_dict()}",
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "[incremental_refresh] run failed for wiki %s", wiki_id,
+                )
+                await invocation.emit(events.task_status(
+                    invocation.id, "failed", str(exc),
+                ))
+
+        task = asyncio.create_task(_run())
+        self._tasks[invocation.id] = task
+
+        # Pre-compute stats summary the route can include in its response
+        # *before* the background run completes. Final stats arrive via SSE.
+        return invocation, {"status": "running", "page_count": len(page_bodies)}
+
     async def resume(self, wiki_id: str, management: WikiManagementService, owner_id: str = "") -> Invocation | None:
         """Resume a partial wiki generation, skipping already-completed pages."""
         from app.models.api import GenerateWikiRequest
