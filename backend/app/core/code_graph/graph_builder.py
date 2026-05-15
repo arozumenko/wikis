@@ -177,7 +177,10 @@ from ..constants import (
     DOCUMENTATION_EXTENSIONS as _DOC_EXTENSIONS_MAP,
     KNOWN_FILENAMES as _KNOWN_FILENAMES_MAP,
 )
-from ..extractors import ExtractorRegistry  # #118 — non-code ingestion
+from ..extractors import (  # #118 — non-code ingestion
+    KNOWN_VISION_EXTENSIONS,
+    ExtractorRegistry,
+)
 
 # Log feature flag state at import time
 if SEPARATE_DOC_INDEX:
@@ -373,6 +376,12 @@ class EnhancedUnifiedGraphBuilder:
         # graph-builder construction time so vision extractors get the
         # project-configured LLM.
         self._extractor_registry = extractor_registry
+        # #148: track per-extension WARNINGs for vision-eligible files
+        # that fall back to the legacy text-read path. Without this, a
+        # repo with 200 PDFs and no LLM configured would emit 200
+        # WARNINGs — useless noise. One WARNING per extension per index
+        # pass is the right signal.
+        self._warned_legacy_vision_extensions: set[str] = set()
 
         # Tier 1: Rich parsers for comprehensive analysis
         self.rich_parsers = {
@@ -2649,33 +2658,61 @@ class EnhancedUnifiedGraphBuilder:
                 # #118: try the registered extractor first; ``None``
                 # registry or no handler for this extension → legacy path.
                 content: str | None = None
-                if self._extractor_registry is not None:
-                    extractor = self._extractor_registry.get(file_extension)
-                    if extractor is not None:
-                        extracted = extractor.extract(Path(file_path))
-                        if extracted is None:
-                            # WARNING (not INFO): a vision-based
-                            # extractor was registered but returned
-                            # nothing. This is the load-bearing signal
-                            # for a misconfigured LLM (wrong key, model
-                            # without vision, rate limited) — without
-                            # WARNING-level visibility, every PDF /
-                            # image in the repo would silently disappear
-                            # from the index. The extractor's internal
-                            # WARNING (rate-limit, blank, etc.) already
-                            # tells operators *why*; this line tells
-                            # them *that it happened for this file*.
-                            logger.warning(
-                                "[doc-extractor] %s skipped: extractor "
-                                "%s returned no content (check earlier "
-                                "WARNINGs from app.core.extractors.* for "
-                                "the cause)",
-                                file_path, type(extractor).__name__,
-                            )
-                            continue
-                        content = extracted.text
-                        for warning in extracted.warnings:
-                            logger.warning("[doc-extractor] %s", warning)
+                extractor = (
+                    self._extractor_registry.get(file_extension)
+                    if self._extractor_registry is not None
+                    else None
+                )
+
+                # #148: a vision-eligible file with no registered
+                # extractor will produce binary-garbage source_text via
+                # the legacy open() path. WARN once per extension per
+                # index pass so operators see the actual cause (missing
+                # LLM config or missing pip extra) rather than just
+                # noticing useless content in the wiki after the fact.
+                if (
+                    extractor is None
+                    and file_extension in KNOWN_VISION_EXTENSIONS
+                    and file_extension not in self._warned_legacy_vision_extensions
+                ):
+                    self._warned_legacy_vision_extensions.add(file_extension)
+                    logger.warning(
+                        "[doc-extractor] %s files in this repo will be "
+                        "ingested via the legacy text-read path because "
+                        "no vision-based extractor is registered. The "
+                        "resulting source_text will be binary garbage. "
+                        "Configure LLM_API_KEY with a vision-capable "
+                        "model (Claude 3+, GPT-4o, Gemini 1.5+) and "
+                        "install the appropriate pip extra "
+                        "([vision] for images, [pdf] for PDFs) to fix. "
+                        "First affected file: %s",
+                        file_extension, file_path,
+                    )
+
+                if extractor is not None:
+                    extracted = extractor.extract(Path(file_path))
+                    if extracted is None:
+                        # WARNING (not INFO): a vision-based extractor
+                        # was registered but returned nothing. This is
+                        # the load-bearing signal for a misconfigured
+                        # LLM (wrong key, model without vision, rate
+                        # limited) — without WARNING-level visibility,
+                        # every PDF / image in the repo would silently
+                        # disappear from the index. The extractor's
+                        # internal WARNING (rate-limit, blank, etc.)
+                        # already tells operators *why*; this line tells
+                        # them *that it happened for this file*.
+                        logger.warning(
+                            "[doc-extractor] %s skipped: extractor "
+                            "%s returned no content (check earlier "
+                            "WARNINGs from app.core.extractors.* for "
+                            "the cause)",
+                            file_path, type(extractor).__name__,
+                        )
+                        continue
+                    content = extracted.text
+                    for warning in extracted.warnings:
+                        logger.warning("[doc-extractor] %s", warning)
 
                 if content is None:
                     # Legacy text-read path for extensions without a

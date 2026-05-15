@@ -24,6 +24,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+#: Extensions that ship with vision-based extractors today.
+#:
+#: Used by :func:`build_default_registry` (to tell operators which
+#: formats fall back to the legacy text-read path when ``llm=None``) and
+#: by the graph builder (to WARN the first time a file in this set hits
+#: the legacy path, since binary-garbage ``source_text`` is a silent
+#: failure mode otherwise — see #148).
+#:
+#: Update this set when adding new vision-based extractors so the
+#: operator-visibility signal stays accurate.
+KNOWN_VISION_EXTENSIONS: frozenset[str] = frozenset({
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+})
+
+
 @dataclass(frozen=True)
 class ExtractedDocument:
     """The output of a :class:`DocumentExtractor` run.
@@ -150,34 +170,52 @@ def build_default_registry(
             text-read path, which produces a useless binary blob but
             doesn't crash). Most callers pass the project-configured LLM
             from ``app.services.llm_factory``.
+
+    Operator-visibility (#148): when ``llm`` is ``None`` we log
+    WARNING once with the list of file extensions that will fall back
+    to legacy text-read. Operators who installed ``[vision]`` / ``[pdf]``
+    extras but forgot to configure ``LLM_API_KEY`` see one line at
+    startup explaining why their PDFs/images become binary garbage in
+    the index — instead of having to grep for symptoms after the fact.
     """
     from app.core.extractors.plain_text import PlainTextExtractor
 
     registry = ExtractorRegistry()
     registry.register(PlainTextExtractor())
 
-    if llm is not None:
-        try:
-            from app.core.extractors.image import ImageExtractor
+    if llm is None:
+        logger.warning(
+            "[extractors] vision-based extractors not registered "
+            "(llm=None at build_default_registry). The following "
+            "extensions will fall back to the legacy text-read path "
+            "and produce binary-garbage content in the index: %s. "
+            "Configure LLM_API_KEY + an LLM_PROVIDER that supports "
+            "vision (Claude 3+, GPT-4o, Gemini 1.5+) to enable.",
+            sorted(KNOWN_VISION_EXTENSIONS),
+        )
+        return registry
 
-            registry.register(ImageExtractor(llm=llm))
-        except ImportError as exc:
-            logger.warning(
-                "[extractors] image extractor disabled: %s — install "
-                "Pillow to enable (pip install wikis-backend[vision])",
-                exc,
-            )
+    try:
+        from app.core.extractors.image import ImageExtractor
 
-        try:
-            from app.core.extractors.pdf import PDFExtractor
+        registry.register(ImageExtractor(llm=llm))
+    except ImportError as exc:
+        logger.warning(
+            "[extractors] image extractor disabled: %s — install "
+            "Pillow to enable (pip install wikis-backend[vision])",
+            exc,
+        )
 
-            registry.register(PDFExtractor(llm=llm))
-        except ImportError as exc:
-            logger.warning(
-                "[extractors] PDF extractor disabled: %s — install "
-                "pypdfium2 + Pillow to enable "
-                "(pip install wikis-backend[pdf])",
-                exc,
-            )
+    try:
+        from app.core.extractors.pdf import PDFExtractor
+
+        registry.register(PDFExtractor(llm=llm))
+    except ImportError as exc:
+        logger.warning(
+            "[extractors] PDF extractor disabled: %s — install "
+            "pypdfium2 + Pillow to enable "
+            "(pip install wikis-backend[pdf])",
+            exc,
+        )
 
     return registry

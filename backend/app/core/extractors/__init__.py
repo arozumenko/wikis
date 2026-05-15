@@ -27,6 +27,7 @@ so previously-supported formats (.md, .yaml, .toml, etc.) keep working.
 """
 
 from app.core.extractors.protocol import (
+    KNOWN_VISION_EXTENSIONS,
     DocumentExtractor,
     ExtractedDocument,
     ExtractorRegistry,
@@ -37,5 +38,6 @@ __all__ = [
     "DocumentExtractor",
     "ExtractedDocument",
     "ExtractorRegistry",
+    "KNOWN_VISION_EXTENSIONS",
     "build_default_registry",
 ]

@@ -194,3 +194,89 @@ def test_no_registry_uses_legacy_text_read_path(tmp_path: Path) -> None:
 
     assert str(docs / "README.md") in results
     assert "Hello" in results[str(docs / "README.md")].symbols[0].source_text
+
+
+def test_vision_eligible_file_without_extractor_warns_once_per_extension(
+    tmp_path: Path, caplog,
+) -> None:
+    """#148: when a .pdf or .png lands on the legacy text-read path
+    (no extractor registered — missing LLM config or pip extra), WARN
+    so operators see why their wiki has binary-garbage entries.
+
+    Once per extension per index pass — three PDFs and two PNGs in the
+    same run produce two WARNINGs, not five. Otherwise a 200-PDF repo
+    would emit 200 useless WARNINGs.
+    """
+    import logging
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "spec.pdf").write_bytes(b"%PDF-1.4 not a real pdf")
+    (docs / "spec2.pdf").write_bytes(b"%PDF-1.4 not a real pdf either")
+    (docs / "diag.png").write_bytes(_TINY_PNG)
+    (docs / "diag2.png").write_bytes(_TINY_PNG)
+    (docs / "README.md").write_text("# Hello\n")  # not vision-eligible
+
+    # Builder constructed WITHOUT a registry → vision-eligible files
+    # have no extractor.
+    builder = EnhancedUnifiedGraphBuilder(extractor_registry=None)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.code_graph.graph_builder"):
+        builder._parse_documentation_files(
+            [
+                str(docs / "spec.pdf"),
+                str(docs / "spec2.pdf"),
+                str(docs / "diag.png"),
+                str(docs / "diag2.png"),
+                str(docs / "README.md"),
+            ],
+            str(tmp_path),
+        )
+
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "will be ingested via the legacy text-read path" in r.getMessage()
+    ]
+
+    # Exactly two warnings: one for .pdf, one for .png. README.md is not
+    # in KNOWN_VISION_EXTENSIONS so doesn't fire one.
+    assert len(warnings) == 2
+    pdf_warns = [w for w in warnings if ".pdf" in w]
+    png_warns = [w for w in warnings if ".png" in w]
+    assert len(pdf_warns) == 1
+    assert len(png_warns) == 1
+    # The WARNING names the actionable config so operators don't have
+    # to grep the docs to find out what to set.
+    assert all("LLM_API_KEY" in w for w in warnings)
+
+
+def test_vision_extension_with_registered_extractor_does_not_warn(
+    tmp_path: Path, caplog,
+) -> None:
+    """The legacy-fallthrough WARNING must NOT fire when an extractor
+    IS registered for the extension. Otherwise the WARNING would be
+    permanent operator noise in correctly-configured deployments."""
+    import logging
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "diag.png").write_bytes(_TINY_PNG)
+
+    from app.core.extractors import ExtractorRegistry
+    from app.core.extractors.image import ImageExtractor
+    registry = ExtractorRegistry()
+    registry.register(ImageExtractor(llm=_StubLLM()))
+
+    builder = EnhancedUnifiedGraphBuilder(extractor_registry=registry)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.code_graph.graph_builder"):
+        builder._parse_documentation_files(
+            [str(docs / "diag.png")], str(tmp_path),
+        )
+
+    fallthrough_warnings = [
+        r.getMessage() for r in caplog.records
+        if "will be ingested via the legacy text-read path" in r.getMessage()
+    ]
+    assert fallthrough_warnings == []

@@ -86,6 +86,45 @@ def test_build_default_registry_without_llm_skips_vision() -> None:
     assert registry.get(".pdf") is None
 
 
+def test_build_default_registry_without_llm_logs_warning(caplog) -> None:
+    """#148: operator-visibility signal. Building the registry without
+    an LLM logs WARNING listing the extensions that will fall back to
+    the legacy text-read path — operators see one line at startup
+    instead of having to grep for symptoms after the fact."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="app.core.extractors.protocol"):
+        build_default_registry(llm=None)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "expected a WARNING when build_default_registry(llm=None)"
+    msg = warnings[0].getMessage()
+    # Names a few representative extensions from KNOWN_VISION_EXTENSIONS
+    # so the operator sees which formats are affected.
+    assert ".pdf" in msg
+    assert ".png" in msg
+    # Names the config field the operator needs to set.
+    assert "LLM_API_KEY" in msg
+
+
+def test_build_default_registry_with_llm_does_not_warn(caplog) -> None:
+    """Inverse of the previous test — happy path stays quiet."""
+    import logging
+
+    class _StubLLM:
+        def invoke(self, _):
+            return None
+
+    with caplog.at_level(logging.WARNING, logger="app.core.extractors.protocol"):
+        build_default_registry(llm=_StubLLM())
+
+    # No "vision-based extractors not registered" WARNING.
+    assert not any(
+        "vision-based extractors not registered" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 # ---------------------------------------------------------------------------
 # Plain-text extractor
 # ---------------------------------------------------------------------------
