@@ -122,6 +122,20 @@ class WikiStorageProtocol(Protocol):
         """Total number of nodes."""
         ...
 
+    def refresh_fts_index(self) -> None:
+        """Rebuild the FTS index from ``repo_nodes`` (full refresh).
+
+        SQLite stores FTS5 as a standalone virtual table without triggers
+        on ``repo_nodes``, so the index goes stale after partial upserts.
+        Postgres uses a BEFORE INSERT OR UPDATE trigger so its FTS column
+        stays in sync automatically — this method is a no-op on Postgres.
+
+        Any [#116] PR 3+ incremental write path that doesn't go through
+        ``from_networkx`` should call this once after the upsert batch so
+        downstream search reflects the change.
+        """
+        ...
+
     def fetch_indexed_node_meta(self) -> dict[str, dict[str, str | None]]:
         """Return ``{node_id: {"content_hash": ..., "rel_path": ...}}``
         for every indexed node.

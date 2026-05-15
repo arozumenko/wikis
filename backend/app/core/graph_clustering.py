@@ -2051,6 +2051,16 @@ def _run_phase3_hierarchical_leiden(
         if micro_id is not None:
             micro_assignments.setdefault(macro_id, {})[hub_id] = micro_id
 
+    # Step 3b (#116 PR 4): cluster ID stability.
+    # Before persisting, remap freshly-assigned macro/micro IDs onto the
+    # previous run's IDs where Jaccard similarity exceeds the threshold.
+    # Keeps compute_page_id hashes stable across regens for clusters whose
+    # membership barely shifted; brand-new clusters still get fresh IDs.
+    if getattr(feature_flags, "cluster_stability", False):
+        macro_assignments, micro_assignments = _apply_cluster_stability(
+            db, macro_assignments, micro_assignments,
+        )
+
     # Step 4: Persist
     results["persistence"] = persist_clusters(
         db, macro_assignments, micro_assignments, hub_assignments,
@@ -2239,6 +2249,13 @@ def run_phase3(
 
     logger.info("Propagated cluster assignments to %d child nodes", propagated)
 
+    # Step 5b (#116 PR 4): cluster ID stability — see _run_phase3_hierarchical_leiden
+    # for the rationale.
+    if getattr(feature_flags, "cluster_stability", False):
+        macro_assignments, micro_assignments = _apply_cluster_stability(
+            db, macro_assignments, micro_assignments,
+        )
+
     # Step 6: Persist
     results["persistence"] = persist_clusters(
         db, macro_assignments, micro_assignments, hub_assignments,
@@ -2255,6 +2272,40 @@ def run_phase3(
         results["hubs"]["total"],
     )
     return results
+
+
+def _apply_cluster_stability(
+    db,
+    macro_assignments: Dict[str, int],
+    micro_assignments: Dict[int, Dict[str, int]],
+) -> tuple[Dict[str, int], Dict[int, Dict[str, int]]]:
+    """Remap fresh cluster IDs onto stable IDs from the previous run.
+
+    Safe to call on first generation (no prior clusters) — returns the
+    inputs unchanged. Reads the previous state via ``db.get_all_clusters``
+    *before* persist_clusters wipes it, so this must run after fresh
+    clustering but before persistence.
+    """
+    from .cluster_stability import stabilize_hierarchical_assignments
+
+    try:
+        old_clusters = db.get_all_clusters() or {}
+    except Exception as exc:  # noqa: BLE001 — fail-soft, log + fall through
+        logger.warning(
+            "[cluster_stability] could not read old clusters; "
+            "skipping remap: %s",
+            exc,
+        )
+        return macro_assignments, micro_assignments
+
+    if not old_clusters:
+        logger.info("[cluster_stability] no prior clusters — skipping remap")
+        return macro_assignments, micro_assignments
+
+    stable_macro, stable_micro = stabilize_hierarchical_assignments(
+        macro_assignments, micro_assignments, old_clusters=old_clusters,
+    )
+    return stable_macro, stable_micro
 
 
 def _resolve_parent(

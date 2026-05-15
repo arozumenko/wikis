@@ -62,6 +62,12 @@ class FeatureFlags:
     #: but they do not participate in clustering or form wiki pages.
     exclude_tests: bool = True
 
+    #: Remap Leiden-assigned cluster IDs to their best-matching IDs from
+    #: the previous run (#116 PR 4). Keeps page_id hashes stable when
+    #: cluster membership barely shifts. Disable to revert to the
+    #: pre-PR4 behavior where every regen renumbers clusters.
+    cluster_stability: bool = True
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -72,4 +78,5 @@ def get_feature_flags() -> FeatureFlags:
         coverage_ledger=_env_bool("WIKIS_CLUSTER_COVERAGE_LEDGER"),
         language_hints=_env_bool("WIKIS_CLUSTER_LANGUAGE_HINTS"),
         exclude_tests=_env_bool("WIKIS_EXCLUDE_TESTS"),
+        cluster_stability=_env_bool("WIKIS_CLUSTER_STABILITY"),
     )
