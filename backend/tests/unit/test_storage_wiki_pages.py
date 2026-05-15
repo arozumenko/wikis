@@ -198,6 +198,55 @@ class TestLastIndexedCommit:
         assert row["last_indexed_commit"] is None
 
 
+class TestAtomicWrite:
+    """upsert_wiki_page_with_symbols must roll back both writes on failure
+    so PR 2 change detection never sees a half-persisted page."""
+
+    def test_happy_path_persists_both(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page_with_symbols(
+            _page("p1"),
+            [("sym-1", "primary"), ("sym-2", "related")],
+        )
+        assert db.get_wiki_page("p1") is not None
+        rows = db.get_page_symbols("p1")
+        assert {(r["node_id"], r["citation_kind"]) for r in rows} == {
+            ("sym-1", "primary"),
+            ("sym-2", "related"),
+        }
+
+    def test_invalid_citation_kind_rolls_back_page_row(
+        self, db: UnifiedWikiDB,
+    ) -> None:
+        # CHECK constraint on citation_kind will reject 'bogus'; the page
+        # row inserted earlier in the same transaction must roll back too.
+        with pytest.raises(Exception):
+            db.upsert_wiki_page_with_symbols(
+                _page("p1"),
+                [("sym-1", "bogus")],  # CHECK fails on this row
+            )
+        assert db.get_wiki_page("p1") is None
+        assert db.get_pages_citing_node("sym-1") == []
+
+    def test_slug_collision_rolls_back_symbols(self, db: UnifiedWikiDB) -> None:
+        # First page takes the slug; second insert with same slug must
+        # raise IntegrityError, and its symbols must not land in the DB.
+        db.upsert_wiki_page_with_symbols(
+            _page("p1", anchor_slug="overview"),
+            [("sym-shared", "primary")],
+        )
+        with pytest.raises(Exception):
+            db.upsert_wiki_page_with_symbols(
+                _page("p2", anchor_slug="overview"),  # UNIQUE collision
+                [("sym-shared", "related"), ("sym-other", "related")],
+            )
+        # p2 row didn't land.
+        assert db.get_wiki_page("p2") is None
+        # sym-other wasn't inserted (it was only on p2's symbols).
+        assert db.get_pages_citing_node("sym-other") == []
+        # p1's symbols survived intact.
+        assert "p1" in db.get_pages_citing_node("sym-shared")
+
+
 class TestReverseLookup:
     def test_get_pages_citing_node_dedupes_across_kinds(self, db: UnifiedWikiDB) -> None:
         # One node may appear as primary on one page and referenced on another.

@@ -395,6 +395,81 @@ def test_page_ids_stable_across_runs(tmp_path) -> None:
     assert ids_a == ids_b
 
 
+def test_split_overloaded_pages_inherit_parent_metadata(tmp_path) -> None:
+    """_split_overloaded_pages must copy parent metadata into sub-pages so
+    PR 2 change detection still finds them via the source→page reverse
+    index. Without this fix, sub-pages had empty metadata → no
+    page_symbols rows → invisible to get_pages_citing_node."""
+    agent, _ = _make_agent(tmp_path)
+    agent.retriever_stack = SimpleNamespace(
+        relationship_graph=None, _name_index={},
+    )
+    agent._total_pages = 0
+    agent._pages_generated = 0
+    agent.progress_callback = None
+    agent._repository_file_count = 1
+
+    # Build a structure with one page that will be split into chunks.
+    parent_metadata = {
+        "planner_mode": "cluster",
+        "section_id": 0,
+        "page_id": 1,
+        "cluster_node_ids": ["auth.AuthService", "auth.login"],
+        "primary_symbol_id": "auth.AuthService",
+    }
+    structure = WikiStructureSpec(
+        wiki_title="W",
+        overview="O",
+        sections=[
+            SectionSpec(
+                section_name="S",
+                section_order=0,
+                description="d",
+                rationale="r",
+                pages=[
+                    PageSpec(
+                        page_name="Auth Service",
+                        page_order=0,
+                        description="d",
+                        content_focus="c",
+                        rationale="r",
+                        target_symbols=[f"sym_{i}" for i in range(20)],
+                        metadata=parent_metadata,
+                    ),
+                ],
+            ),
+        ],
+        total_pages=1,
+    )
+
+    # Force a small per-page cap so the page gets split.
+    import os
+
+    prev = os.environ.get("WIKIS_MAX_SYMBOLS_PER_PAGE")
+    os.environ["WIKIS_MAX_SYMBOLS_PER_PAGE"] = "5"
+    try:
+        sends = agent.dispatch_page_generation(
+            WikiState(repository_context="x", wiki_structure_spec=structure),
+            config={},
+        )
+    finally:
+        if prev is None:
+            os.environ.pop("WIKIS_MAX_SYMBOLS_PER_PAGE", None)
+        else:
+            os.environ["WIKIS_MAX_SYMBOLS_PER_PAGE"] = prev
+
+    # The split produced multiple sub-pages; each must carry parent's
+    # cluster_node_ids + primary_symbol_id so the persist hook records
+    # page_symbols rows.
+    assert len(sends) > 1, "expected the page to be split into sub-pages"
+    for send in sends:
+        persist = send.arg["page_persist"]
+        assert persist["primary_symbol_id"] == "auth.AuthService"
+        assert persist["cluster_node_ids"] == [
+            "auth.AuthService", "auth.login",
+        ]
+
+
 def test_page_id_uses_planner_primary_not_cluster_first(tmp_path) -> None:
     """Regression for tech-lead finding: page_id must derive from the planner's
     deterministic primary_symbol_id (PageRank champion), NOT from

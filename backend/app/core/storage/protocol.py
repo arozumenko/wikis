@@ -601,6 +601,28 @@ class WikiStorageProtocol(Protocol):
         """
         ...
 
+    def upsert_wiki_page_with_symbols(
+        self,
+        page: dict[str, Any],
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Atomically upsert a ``wiki_pages`` row and its ``page_symbols`` rows.
+
+        Equivalent to calling ``upsert_wiki_page(page)`` followed by
+        ``record_page_symbols(page['page_id'], symbols, replace=replace)``
+        inside a single transaction. If any step raises, both writes roll
+        back together so callers never observe a page with stale (or
+        missing) citations.
+
+        Used by the wiki generation agent's per-page persistence hook,
+        where partial writes would leave an orphaned page row whose
+        absence of citation entries is indistinguishable from a page that
+        legitimately cites nothing.
+        """
+        ...
+
     def get_pages_citing_node(self, node_id: str) -> list[str]:
         """Return the ``page_id``s of every page that cites ``node_id``.
 

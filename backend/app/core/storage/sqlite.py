@@ -2078,6 +2078,13 @@ class UnifiedWikiDB:
     )
 
     def upsert_wiki_page(self, page: dict[str, Any]) -> None:
+        self._upsert_wiki_page_no_commit(page)
+        self.conn.commit()
+
+    def _upsert_wiki_page_no_commit(self, page: dict[str, Any]) -> None:
+        """Execute the upsert without committing. Lets
+        ``upsert_wiki_page_with_symbols`` group two writes in one transaction.
+        """
         if "page_id" not in page or "wiki_id" not in page:
             raise ValueError("upsert_wiki_page: 'page_id' and 'wiki_id' are required")
         row = {
@@ -2109,7 +2116,6 @@ class UnifiedWikiDB:
             f"ON CONFLICT(page_id) DO UPDATE SET {update_set}",
             row,
         )
-        self.conn.commit()
 
     def get_wiki_page(self, page_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -2159,15 +2165,57 @@ class UnifiedWikiDB:
         *,
         replace: bool = True,
     ) -> None:
+        self._record_page_symbols_no_commit(page_id, symbols, replace=replace)
+        self.conn.commit()
+
+    def _record_page_symbols_no_commit(
+        self,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool,
+    ) -> None:
+        """Execute the symbol writes without committing. Pairs with
+        ``_upsert_wiki_page_no_commit`` for atomic combined writes.
+        """
         if replace:
             self.conn.execute("DELETE FROM page_symbols WHERE page_id = ?", (page_id,))
         if symbols:
+            # ON CONFLICT DO NOTHING scopes the ignore to PK collisions only.
+            # Using INSERT OR IGNORE would silently swallow CHECK violations
+            # (e.g. invalid citation_kind) and corrupt the reverse index.
             self.conn.executemany(
-                "INSERT OR IGNORE INTO page_symbols (page_id, node_id, citation_kind) "
-                "VALUES (?, ?, ?)",
+                "INSERT INTO page_symbols (page_id, node_id, citation_kind) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (page_id, node_id, citation_kind) DO NOTHING",
                 [(page_id, node_id, kind) for node_id, kind in symbols],
             )
-        self.conn.commit()
+
+    def upsert_wiki_page_with_symbols(
+        self,
+        page: dict[str, Any],
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Single-transaction upsert of the page row + its symbol rows.
+
+        On any failure between the two writes we ROLLBACK so callers don't
+        end up with a wiki_pages row whose absent citations are
+        indistinguishable from "page has nothing to cite."
+        """
+        try:
+            self._upsert_wiki_page_no_commit(page)
+            self._record_page_symbols_no_commit(
+                page["page_id"], symbols, replace=replace,
+            )
+            self.conn.commit()
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:  # noqa: S110 — best-effort rollback
+                pass
+            raise
 
     def get_pages_citing_node(self, node_id: str) -> list[str]:
         rows = self.conn.execute(

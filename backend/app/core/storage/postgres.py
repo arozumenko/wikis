@@ -2046,6 +2046,14 @@ class PostgresWikiStorage:
     )
 
     def upsert_wiki_page(self, page: dict[str, Any]) -> None:
+        with self._engine.begin() as conn:
+            self._upsert_wiki_page_in_conn(conn, page)
+
+    def _upsert_wiki_page_in_conn(self, conn, page: dict[str, Any]) -> None:
+        """Execute the upsert on an existing connection (no transaction
+        management). Lets ``upsert_wiki_page_with_symbols`` group two writes
+        in a single transaction.
+        """
         if "page_id" not in page or "wiki_id" not in page:
             raise ValueError("upsert_wiki_page: 'page_id' and 'wiki_id' are required")
         _s = self._strip_nul
@@ -2074,8 +2082,7 @@ class PostgresWikiStorage:
             f"VALUES ({placeholders}) "
             f"ON CONFLICT (page_id) DO UPDATE SET {update_set}"
         )
-        with self._engine.begin() as conn:
-            conn.execute(sql, row)
+        conn.execute(sql, row)
 
     def get_wiki_page(self, page_id: str) -> dict[str, Any] | None:
         with self._engine.connect() as conn:
@@ -2142,34 +2149,65 @@ class PostgresWikiStorage:
         *,
         replace: bool = True,
     ) -> None:
-        _s = self._strip_nul
         with self._engine.begin() as conn:
-            if replace:
-                conn.execute(
-                    text(
-                        f"DELETE FROM {self._schema}.page_symbols "
-                        "WHERE page_id = :pid"
-                    ),
-                    {"pid": page_id},
-                )
-            if symbols:
-                rows = [
-                    {
-                        "page_id": _s(page_id),
-                        "node_id": _s(node_id),
-                        "citation_kind": _s(kind),
-                    }
-                    for node_id, kind in symbols
-                ]
-                conn.execute(
-                    text(
-                        f"INSERT INTO {self._schema}.page_symbols "
-                        "(page_id, node_id, citation_kind) "
-                        "VALUES (:page_id, :node_id, :citation_kind) "
-                        "ON CONFLICT (page_id, node_id, citation_kind) DO NOTHING"
-                    ),
-                    rows,
-                )
+            self._record_page_symbols_in_conn(conn, page_id, symbols, replace=replace)
+
+    def _record_page_symbols_in_conn(
+        self,
+        conn,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool,
+    ) -> None:
+        """Execute the symbol writes on an existing connection. Pairs with
+        ``_upsert_wiki_page_in_conn`` for atomic combined writes.
+        """
+        _s = self._strip_nul
+        if replace:
+            conn.execute(
+                text(
+                    f"DELETE FROM {self._schema}.page_symbols "
+                    "WHERE page_id = :pid"
+                ),
+                {"pid": page_id},
+            )
+        if symbols:
+            rows = [
+                {
+                    "page_id": _s(page_id),
+                    "node_id": _s(node_id),
+                    "citation_kind": _s(kind),
+                }
+                for node_id, kind in symbols
+            ]
+            conn.execute(
+                text(
+                    f"INSERT INTO {self._schema}.page_symbols "
+                    "(page_id, node_id, citation_kind) "
+                    "VALUES (:page_id, :node_id, :citation_kind) "
+                    "ON CONFLICT (page_id, node_id, citation_kind) DO NOTHING"
+                ),
+                rows,
+            )
+
+    def upsert_wiki_page_with_symbols(
+        self,
+        page: dict[str, Any],
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Single-transaction upsert of the page row + its symbol rows.
+
+        ``self._engine.begin()`` provides the transaction boundary; if
+        either write raises, SQLAlchemy rolls back automatically.
+        """
+        with self._engine.begin() as conn:
+            self._upsert_wiki_page_in_conn(conn, page)
+            self._record_page_symbols_in_conn(
+                conn, page["page_id"], symbols, replace=replace,
+            )
 
     def get_pages_citing_node(self, node_id: str) -> list[str]:
         with self._engine.connect() as conn:

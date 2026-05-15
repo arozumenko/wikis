@@ -805,8 +805,18 @@ class OptimizedWikiGenerationAgent:
                     chunks.append(current_chunk)
 
                 # Create sub-pages
+                parent_metadata = dict(getattr(page, "metadata", {}) or {})
                 for part_idx, chunk in enumerate(chunks, start=1):
                     suffix = f" (Part {part_idx})" if len(chunks) > 1 else ""
+                    # #116: inherit parent metadata so split sub-pages get a
+                    # populated page_symbols reverse index. Less accurate than
+                    # distributing cluster_node_ids per chunk (every sub-page
+                    # claims the full parent cluster) but vastly better than
+                    # leaving page_symbols empty — PR 2 change detection still
+                    # finds these pages when any cluster symbol changes.
+                    sub_metadata = dict(parent_metadata)
+                    sub_metadata["split_part"] = part_idx
+                    sub_metadata["split_total"] = len(chunks)
                     sub_page = PageSpec(
                         page_name=f"{page.page_name}{suffix}",
                         page_order=page.page_order * 100 + part_idx,
@@ -818,6 +828,7 @@ class OptimizedWikiGenerationAgent:
                         target_folders=list(getattr(page, "target_folders", []) or []),
                         key_files=list(getattr(page, "key_files", []) or []),
                         retrieval_query=getattr(page, "retrieval_query", ""),
+                        metadata=sub_metadata,
                     )
                     new_pages.append(sub_page)
 
@@ -1858,8 +1869,27 @@ class OptimizedWikiGenerationAgent:
         with self._progress_lock:
             self._persist_attempts += 1
 
+        # Build (node_id, citation_kind) pairs from the planner's cluster
+        # membership. First node is the primary; rest are 'related'. We don't
+        # parse `<code_context>` markdown for 'referenced' rows yet — that
+        # arrives in PR 2 alongside change detection, where it's actually
+        # consumed. Until then the cluster set is enough to answer "which
+        # pages cite this node?".
+        symbols: list[tuple[str, str]] = []
+        cluster_node_ids = persist.get("cluster_node_ids") or []
+        primary = persist.get("primary_symbol_id")
+        for idx, node_id in enumerate(cluster_node_ids):
+            if not node_id:
+                continue
+            kind = "primary" if idx == 0 and node_id == primary else "related"
+            symbols.append((node_id, kind))
+
         try:
-            db.upsert_wiki_page(
+            # Atomic write: either both the page row and its symbol rows
+            # land, or neither does. Avoids an orphaned wiki_pages row whose
+            # missing citations are indistinguishable from "page cites nothing"
+            # for PR 2 change detection.
+            db.upsert_wiki_page_with_symbols(
                 {
                     "page_id": page_id,
                     "wiki_id": wiki_id,
@@ -1873,24 +1903,9 @@ class OptimizedWikiGenerationAgent:
                     "section_index": persist.get("section_index", 0),
                     "page_index": persist.get("page_index", 0),
                     "generated_at": datetime.utcnow().isoformat() + "Z",
-                }
+                },
+                symbols,
             )
-
-            # Build (node_id, citation_kind) pairs from the planner's cluster
-            # membership. First node is the primary; rest are 'related'. We
-            # don't parse `<code_context>` markdown for 'referenced' rows yet
-            # — that arrives in PR 2 alongside change detection, where it's
-            # actually consumed. Until then the cluster set is enough to
-            # answer "which pages cite this node?".
-            symbols: list[tuple[str, str]] = []
-            cluster_node_ids = persist.get("cluster_node_ids") or []
-            primary = persist.get("primary_symbol_id")
-            for idx, node_id in enumerate(cluster_node_ids):
-                if not node_id:
-                    continue
-                kind = "primary" if idx == 0 and node_id == primary else "related"
-                symbols.append((node_id, kind))
-            db.record_page_symbols(page_id, symbols)
             with self._progress_lock:
                 self._persist_successes += 1
         except Exception as exc:
