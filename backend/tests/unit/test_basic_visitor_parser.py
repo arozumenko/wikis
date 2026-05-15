@@ -54,6 +54,14 @@ def _names_by_type(result, symbol_type: SymbolType) -> set[str]:
     return {s.name for s in result.symbols if s.symbol_type == symbol_type}
 
 
+def _symbol(result, name: str):
+    """Look up a symbol by name. Returns the first match or None."""
+    for s in result.symbols:
+        if s.name == name:
+            return s
+    return None
+
+
 def _call_pairs(result) -> set[tuple[str, str]]:
     """Set of (source, target) for every CALLS edge — useful for
     asserting on shape without caring about the call-site line."""
@@ -70,6 +78,22 @@ def _inherit_pairs(result) -> set[tuple[str, str]]:
         for r in result.relationships
         if r.relationship_type == RelationshipType.INHERITANCE
     }
+
+
+def _assert_positions_populated(result) -> None:
+    """Every emitted symbol must have a non-trivial range. Catches
+    regressions where positions all collapse to (0, 0) (code-review
+    CR2: name-only assertions wouldn't notice this kind of bug)."""
+    assert result.symbols, "no symbols emitted — separate failure"
+    for s in result.symbols:
+        assert s.range.start.line >= 1, (
+            f"symbol {s.name!r} has start.line={s.range.start.line} "
+            f"— expected 1-indexed line, got 0 or negative"
+        )
+        assert s.range.end.line >= s.range.start.line, (
+            f"symbol {s.name!r} has end before start "
+            f"({s.range.start.line}..{s.range.end.line})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +204,13 @@ class TestRuby:
             for src, tgt in pairs
         )
 
+    def test_symbol_positions_populated(self, result) -> None:
+        _assert_positions_populated(result)
+        # ``Greeter`` class is declared on line 3 in the fixture.
+        greeter = _symbol(result, "Greeter")
+        assert greeter is not None
+        assert greeter.range.start.line == 3
+
 
 class TestPHP:
     @pytest.fixture
@@ -218,6 +249,14 @@ class TestPHP:
             for src, tgt in pairs
         )
 
+    def test_symbol_positions_populated(self, result) -> None:
+        _assert_positions_populated(result)
+        greeter = _symbol(result, "Greeter")
+        assert greeter is not None
+        # ``Greeter`` class is declared on line 7 in the fixture
+        # (after ``<?php``, blank line, namespace, blank, use, blank).
+        assert greeter.range.start.line == 7
+
 
 class TestKotlin:
     @pytest.fixture
@@ -241,6 +280,13 @@ class TestKotlin:
             "greet" in src and tgt == "formatName"
             for src, tgt in pairs
         )
+
+    def test_symbol_positions_populated(self, result) -> None:
+        _assert_positions_populated(result)
+        greeter = _symbol(result, "Greeter")
+        assert greeter is not None
+        # ``class Greeter`` is declared on line 5 in the fixture.
+        assert greeter.range.start.line == 5
 
 
 class TestScala:
@@ -268,6 +314,13 @@ class TestScala:
             for src, tgt in pairs
         )
 
+    def test_symbol_positions_populated(self, result) -> None:
+        _assert_positions_populated(result)
+        greeter = _symbol(result, "Greeter")
+        assert greeter is not None
+        # ``class Greeter`` is on line 5 in the fixture.
+        assert greeter.range.start.line == 5
+
 
 class TestLua:
     @pytest.fixture
@@ -293,3 +346,10 @@ class TestLua:
         # last name (``format_name``).
         pairs = _call_pairs(result)
         assert any(tgt == "format_name" for _, tgt in pairs)
+
+    def test_symbol_positions_populated(self, result) -> None:
+        _assert_positions_populated(result)
+        greet = _symbol(result, "greet")
+        assert greet is not None
+        # ``function Greeter:greet`` is on line 5 in the fixture.
+        assert greet.range.start.line == 5

@@ -403,14 +403,27 @@ class EnhancedUnifiedGraphBuilder:
         # shallower. These replace what used to be regex-based
         # extraction in ``code_splitter`` for ruby/kotlin/scala and add
         # tree-sitter coverage for php/lua.
+        #
+        # Failure mode: logs at ERROR (not WARNING) and names every
+        # language we lost. Ruby / Kotlin / Scala fall back to the
+        # regex ``basic_languages`` path; PHP and Lua have NO fallback
+        # and disappear entirely. Operators need the loud signal so
+        # they can react (typically: missing tree-sitter grammar wheel).
         try:
             from ..parsers.lang_configs import build_basic_parsers as _build_basic
 
             self.rich_parsers.update(_build_basic())
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[graph_builder] basic-visitor parsers unavailable: %s",
-                exc,
+            from ..parsers.lang_configs import KOTLIN, LUA, PHP, RUBY, SCALA
+
+            lost = [cfg.name for cfg in (RUBY, PHP, KOTLIN, SCALA, LUA)]
+            logger.error(
+                "[graph_builder] basic-visitor parsers FAILED to "
+                "initialise (%s) — the following languages will not "
+                "be parsed via tree-sitter: %s. Ruby/Kotlin/Scala fall "
+                "back to the regex code_splitter path; PHP and Lua "
+                "have no fallback and will be skipped entirely.",
+                exc, lost,
             )
         
         # Configuration
@@ -1694,6 +1707,20 @@ class EnhancedUnifiedGraphBuilder:
                 if hasattr(relationship, 'annotations') and relationship.annotations:
                     rel_annotations = relationship.annotations.copy()
                 
+                # #119 — Map the Relationship.confidence float to the
+                # storage layer's confidence enum (``EXTRACTED`` /
+                # ``INFERRED``). The deep parsers leave confidence at
+                # the dataclass default 1.0 → ``EXTRACTED``. The basic
+                # visitor parser emits 0.6 on name-only CALLS edges →
+                # ``INFERRED``. The 0.8 threshold matches the existing
+                # python parser's "indirect call" tier. Without this
+                # mapping the float annotation was being silently
+                # dropped at the storage boundary (Rio R3).
+                rel_confidence = getattr(relationship, 'confidence', 1.0)
+                confidence_str = (
+                    'INFERRED' if rel_confidence < 0.8 else 'EXTRACTED'
+                )
+
                 # Collect edge for bulk addition
                 edge_data = {
                     'relationship_type': rel_type,
@@ -1701,6 +1728,7 @@ class EnhancedUnifiedGraphBuilder:
                     'target_file': target_file_name,
                     'analysis_level': 'comprehensive',
                     'annotations': rel_annotations,
+                    'confidence': confidence_str,
                     # Store metadata for deferred node creation
                     '_source_symbol': source_symbol,
                     '_target_symbol': target_symbol,

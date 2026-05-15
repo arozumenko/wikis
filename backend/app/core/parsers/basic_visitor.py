@@ -248,7 +248,11 @@ class BasicVisitorParser(BaseParser):
             supported_rels.add(RelationshipType.CALLS)
         if self.config.import_nodes:
             supported_rels.add(RelationshipType.IMPORTS)
-        if self.config.inherit_field:
+        # Either ``inherit_field`` OR ``inherit_node_types`` produces the
+        # edge — check both. Rio R1: without the second branch, 4 of 5
+        # shipped configs (Kotlin/PHP/Scala/Lua) silently advertise no
+        # INHERITANCE capability despite actually emitting it.
+        if self.config.inherit_field or self.config.inherit_node_types:
             supported_rels.add(RelationshipType.INHERITANCE)
         supported_rels.add(RelationshipType.DEFINES)
 
@@ -398,7 +402,12 @@ class BasicVisitorParser(BaseParser):
                 self._visit_structural(child, state, parent_id)
             return
 
-        # Class-like declarations.
+        # Class-like declarations. Note: the ``return`` statements
+        # below are unconditional once this branch matches — even if
+        # ``_make_symbol`` returns None (anonymous class, malformed
+        # source), we don't fall through to the default recurse at the
+        # bottom (which would re-walk the same subtree). The class
+        # branch takes ownership of the node.
         if t in cfg.class_nodes or t in cfg.struct_nodes or t in cfg.interface_nodes:
             symbol_type = SymbolType.CLASS
             if t in cfg.interface_nodes:
@@ -409,52 +418,67 @@ class BasicVisitorParser(BaseParser):
                 node, state, symbol_type, parent_id,
                 scope=Scope.GLOBAL if parent_id is None else Scope.CLASS,
             )
-            if class_symbol is not None:
-                state.symbols.append(class_symbol)
-                # Inheritance edge — config gives us either a field name
-                # or a set of child node types to look for.
-                parent_node = None
-                if cfg.inherit_field:
-                    parent_node = node.child_by_field_name(cfg.inherit_field)
-                if parent_node is None and cfg.inherit_node_types:
-                    for child in node.children:
-                        if child.type in cfg.inherit_node_types:
-                            parent_node = child
-                            break
-                if parent_node is not None:
-                    parent_name = _read_node_text(parent_node, state.source_bytes).strip()
-                    # Strip language-specific prefix tokens (``extends ``,
-                    # ``: ``, ``< ``) — the inherit edge target is just
-                    # the parent type name.
-                    for prefix in ("extends ", "implements ", "<", ":"):
-                        if parent_name.startswith(prefix):
-                            parent_name = parent_name[len(prefix):].strip()
-                    if parent_name:
-                        state.relationships.append(
-                            Relationship(
-                                source_symbol=class_symbol.get_qualified_name(),
-                                target_symbol=parent_name,
-                                relationship_type=RelationshipType.INHERITANCE,
-                                source_file=state.file_path,
-                                source_range=_node_range(parent_node),
-                            )
-                        )
-                # Recurse over all children with this class as parent_id
-                # so methods get it as their parent_symbol. We don't try
-                # to narrow to a body field — walking everything is
-                # cheap and robust across grammars whose class bodies
-                # are different child shapes.
+            if class_symbol is None:
+                # Anonymous / unnamed class — recurse over children
+                # without changing the parent_id, then exit this branch.
+                # Without this explicit return, control would fall to
+                # the default-recurse at the bottom of the function and
+                # walk the same subtree twice (code-review CR1).
                 for child in node.children:
-                    self._visit_structural(child, state, class_symbol.get_qualified_name())
+                    self._visit_structural(child, state, parent_id)
                 return
 
-        # Enum.
+            state.symbols.append(class_symbol)
+            # Inheritance edge — config gives us either a field name
+            # or a set of child node types to look for.
+            parent_node = None
+            if cfg.inherit_field:
+                parent_node = node.child_by_field_name(cfg.inherit_field)
+            if parent_node is None and cfg.inherit_node_types:
+                for child in node.children:
+                    if child.type in cfg.inherit_node_types:
+                        parent_node = child
+                        break
+            if parent_node is not None:
+                parent_name = _read_node_text(parent_node, state.source_bytes).strip()
+                # Strip language-specific prefix tokens (``extends ``,
+                # ``: ``, ``< ``) — the inherit edge target is just
+                # the parent type name.
+                for prefix in ("extends ", "implements ", "<", ":"):
+                    if parent_name.startswith(prefix):
+                        parent_name = parent_name[len(prefix):].strip()
+                if parent_name:
+                    state.relationships.append(
+                        Relationship(
+                            source_symbol=class_symbol.get_qualified_name(),
+                            target_symbol=parent_name,
+                            relationship_type=RelationshipType.INHERITANCE,
+                            source_file=state.file_path,
+                            source_range=_node_range(parent_node),
+                        )
+                    )
+            # Recurse over all children with this class as parent_id
+            # so methods get it as their parent_symbol. We don't try
+            # to narrow to a body field — walking everything is
+            # cheap and robust across grammars whose class bodies
+            # are different child shapes.
+            for child in node.children:
+                self._visit_structural(child, state, class_symbol.get_qualified_name())
+            return
+
+        # Enum. Recurse with the enum's own qualified name as parent_id
+        # so any callable members (PHP 8.1 backed enum methods, Kotlin
+        # ``enum class`` companion methods) attribute to the enum and
+        # not to the surrounding scope. Rio R2.
         if t in cfg.enum_nodes:
             enum_symbol = _make_symbol(node, state, SymbolType.ENUM, parent_id)
             if enum_symbol is not None:
                 state.symbols.append(enum_symbol)
+                enum_parent = enum_symbol.get_qualified_name()
+            else:
+                enum_parent = parent_id
             for child in node.children:
-                self._visit_structural(child, state, parent_id)
+                self._visit_structural(child, state, enum_parent)
             return
 
         # Callable declaration. The same node type may be a function at
@@ -474,20 +498,27 @@ class BasicVisitorParser(BaseParser):
             sym_type = SymbolType.METHOD if is_method else SymbolType.FUNCTION
             scope = Scope.CLASS if is_method else Scope.GLOBAL
             fn_symbol = _make_symbol(node, state, sym_type, parent_id, scope=scope)
-            if fn_symbol is not None:
-                state.symbols.append(fn_symbol)
-                body = node.child_by_field_name(cfg.body_field)
-                if body is None:
-                    # Some grammars don't expose body via a field — find
-                    # the largest child that looks like a block.
-                    for child in node.children:
-                        if "body" in child.type or "block" in child.type or "statements" in child.type:
-                            body = child
-                            break
-                if body is not None:
-                    state.bodies.append((fn_symbol.get_qualified_name(), body))
-                # Don't recurse into the body during the structural pass.
+            if fn_symbol is None:
+                # Anonymous / lambda-shaped callable — don't fall through
+                # to the default recurse (would re-walk the same body
+                # as a structural pass, double-counting nested
+                # declarations). The body will still be walked once the
+                # outer scope's calls pass runs.
                 return
+
+            state.symbols.append(fn_symbol)
+            body = node.child_by_field_name(cfg.body_field)
+            if body is None:
+                # Some grammars don't expose body via a field — find
+                # the largest child that looks like a block.
+                for child in node.children:
+                    if "body" in child.type or "block" in child.type or "statements" in child.type:
+                        body = child
+                        break
+            if body is not None:
+                state.bodies.append((fn_symbol.get_qualified_name(), body))
+            # Don't recurse into the body during the structural pass.
+            return
 
         # Default: recurse over children with the same parent_id.
         for child in node.children:
@@ -503,24 +534,37 @@ class BasicVisitorParser(BaseParser):
         state: _VisitState,
         containing_id: str,
     ) -> None:
-        """Walk a single function/method body and emit ``CALLS`` edges."""
+        """Walk a single function/method body and emit ``CALLS`` edges.
+
+        Dedup keyed on ``(containing_id, target, start_line)`` so a
+        chained call like ``Greeter().greet("world")`` — which produces
+        two nested call nodes in most grammars — emits two distinct
+        edges (one to ``Greeter`` constructor, one to ``greet``) but
+        the same call site walked twice doesn't double-count. The line
+        component lets a function legitimately call the same target on
+        two lines without dedup collapsing them.
+        """
         cfg = self.config
+        seen: set[tuple[str, str, int]] = set()
         stack = [body]
         while stack:
             node = stack.pop()
             if node.type in cfg.call_nodes:
                 target_name = _extract_call_target(node, state.source_bytes)
                 if target_name:
-                    state.relationships.append(
-                        Relationship(
-                            source_symbol=containing_id,
-                            target_symbol=target_name,
-                            relationship_type=RelationshipType.CALLS,
-                            source_file=state.file_path,
-                            source_range=_node_range(node),
-                            confidence=0.6,  # name-only resolution
+                    key = (containing_id, target_name, node.start_point[0])
+                    if key not in seen:
+                        seen.add(key)
+                        state.relationships.append(
+                            Relationship(
+                                source_symbol=containing_id,
+                                target_symbol=target_name,
+                                relationship_type=RelationshipType.CALLS,
+                                source_file=state.file_path,
+                                source_range=_node_range(node),
+                                confidence=0.6,  # name-only resolution
+                            )
                         )
-                    )
             stack.extend(node.children)
 
 
@@ -664,8 +708,12 @@ def _extract_call_target(node: Node, source_bytes: bytes) -> str | None:
     if not text:
         return None
     # Reduce ``a.b.c`` → ``c`` for member calls; deep parsers handle the
-    # full chain. ``:`` and ``::`` separators (Ruby / C++-style) too.
-    for sep in (".", "::", ":"):
+    # full chain. Cover the standard member-access separators across
+    # the supported languages: ``.`` (most), ``::`` (C++/Ruby/PHP),
+    # ``:`` (Ruby symbols / Lua method index), ``->`` (PHP / Rust deref).
+    # Order matters: longer separators first so ``::`` isn't shadowed by
+    # ``:``.
+    for sep in ("->", "::", ".", ":"):
         if sep in text:
             text = text.rsplit(sep, 1)[-1]
     return text or None
