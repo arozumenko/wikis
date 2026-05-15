@@ -9,18 +9,23 @@ This service ties together the four PR 1–4 building blocks:
 
 Dispatch flow:
 
-1. Snapshot old node source for "edit" candidates *before* the upsert.
-2. Apply the parsed-node batch via ``apply_incremental_node_writes``
-   (single call → upsert + FTS refresh bundled per issue #131).
-3. Run :class:`ChangeDetector` against the now-current snapshot to
-   produce the :class:`ChangeSet` and :class:`AffectedPage` list.
-4. Classify with :func:`classify_pages` into a :class:`RegimePlan`.
+1. Run :class:`ChangeDetector` against the pre-upsert storage state.
+2. Classify with :func:`classify_pages` into a :class:`RegimePlan`.
+3. Snapshot pre-upsert ``source_text`` for the nodes referenced by
+   edit-regime pages only — keeps the lookup small enough that it
+   stays under SQLite's ``IN`` clause bind-variable limit on large
+   repos.
+4. Apply the parsed-node batch via ``apply_incremental_node_writes``
+   (single call → upsert + FTS refresh bundled per issue #131). After
+   this the storage handle reflects the new repository state.
 5. Per regime:
    - ``unchanged`` → no-op.
    - ``trivial`` → :func:`patch_trivial_page`, persist body, update
      ``wiki_pages.content_hash``.
-   - ``edit`` → build per-symbol diffs, run :class:`PagePatcher`. If
-     the quality gate rejects, demote to ``structural``.
+   - ``edit`` → pre-rewrite moved paths via :func:`patch_trivial_page`
+     so the LLM doesn't have to (regex job, not prose-edit), then run
+     :class:`PagePatcher` on the resulting body. Demote to
+     ``structural`` if the quality gate rejects.
    - ``structural`` → delegate to the injected ``structural_handler``
      callback (production wires this to the existing wiki-generation
      agent; tests can stub it).
@@ -32,12 +37,11 @@ callers inject :class:`PagePatcher` (which owns the LLM) and the
 page-content read/write callbacks. Keeps PR 3 unit-testable without
 spinning up the full :class:`OptimizedWikiGenerationAgent`.
 
-Wait — step 1 of the flow above is subtle: we need to snapshot OLD
-node source text BEFORE the upsert so the surgical editor has both
-sides of the diff. We can't read it from storage after the upsert
-(storage will hold the new source). The orchestrator captures it via
-``storage.get_nodes_by_ids`` over the modified-node set, keyed by
-``node_id``, before calling ``apply_incremental_node_writes``.
+The snapshot step (3) lives between classify and upsert because:
+- After upsert, storage holds new state, so the surgical patcher's
+  "before" content would be lost.
+- Before classify, we don't know which edit-regime pages need
+  snapshotting, so scoping to that set requires the plan first.
 """
 
 from __future__ import annotations
@@ -62,7 +66,7 @@ from app.services.incremental_regen import (
     RegimePlan,
     classify_pages,
 )
-from app.services.trivial_patcher import patch_trivial_page
+from app.services.trivial_patcher import patch_trivial_page  # noqa: F401 — used in _dispatch_edit
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +87,15 @@ StructuralHandler = Callable[[PageRegime], bool]
 
 @dataclass
 class IncrementalRegenStats:
-    """Per-run summary surfaced to operators + PR 5 telemetry."""
+    """Per-run summary surfaced to operators + PR 5 telemetry.
 
+    PR 5's SSE banner reads ``total_pages`` to render "N pages
+    processed" and the per-regime counts for the breakdown. The
+    ``avg_diff_ratio`` is for tuning :data:`DEFAULT_DIFF_THRESHOLD`
+    empirically once telemetry is in production.
+    """
+
+    total_pages: int = 0
     unchanged: int = 0
     trivial_patched: int = 0
     edit_applied: int = 0
@@ -96,6 +107,7 @@ class IncrementalRegenStats:
     def as_dict(self) -> dict[str, Any]:
         """Telemetry-friendly snapshot."""
         return {
+            "total_pages": self.total_pages,
             "unchanged": self.unchanged,
             "trivial_patched": self.trivial_patched,
             "edit_applied": self.edit_applied,
@@ -144,18 +156,24 @@ class IncrementalRegenService:
             :class:`IncrementalRegenStats` with per-regime counts and
             the avg diff_ratio (for tuning the quality gate over time).
         """
-        # Step 1: snapshot old node source/sig BEFORE the upsert. The
-        # surgical patcher's SymbolDiff needs both sides; once we upsert
-        # parsed_nodes the storage holds only the new state.
-        old_node_snapshot = self._snapshot_old_state(parsed_nodes)
-
-        # Step 2: detect changes (still against pre-upsert state).
+        # Step 1: detect changes (storage still holds the pre-upsert state).
         detector = ChangeDetector(self._storage)
         change_set = detector.detect_changes(parsed_nodes)
         affected = detector.affected_pages(change_set)
+
+        # Step 2: classify into regime buckets. classify_pages reads
+        # wiki_pages.primary_symbol_id for the deleted-primary override;
+        # still the pre-upsert state at this point.
         plan = classify_pages(change_set, affected, self._storage)
 
-        # Step 3: persist the new node state — single bundled call that
+        # Step 3: snapshot pre-upsert source_text *only* for nodes
+        # referenced by edit-regime pages. Scoping to that set keeps
+        # the lookup well below SQLite's IN-clause bind-variable
+        # limit (default 999) even on large repos.
+        edit_node_ids = self._collect_edit_node_ids(plan)
+        old_node_snapshot = self._snapshot_old_state(edit_node_ids)
+
+        # Step 4: persist the new node state — single bundled call that
         # also refreshes FTS (#131). After this the storage handle
         # reflects the new repository state.
         self._storage.apply_incremental_node_writes(parsed_nodes)
@@ -165,10 +183,10 @@ class IncrementalRegenService:
             n["node_id"]: n for n in parsed_nodes if n.get("node_id")
         }
 
-        stats = IncrementalRegenStats()
+        stats = IncrementalRegenStats(total_pages=plan.total)
         stats.unchanged = len(plan.unchanged)
 
-        # Step 4: per-regime dispatch.
+        # Step 5: per-regime dispatch.
         for page in plan.trivial:
             self._dispatch_trivial(page, stats)
 
@@ -232,7 +250,15 @@ class IncrementalRegenService:
             self._dispatch_structural(page, stats)
             return
 
-        symbol_diffs, moved_paths = _build_diff_inputs(
+        # Pre-rewrite moved paths deterministically before invoking the
+        # LLM. Path swaps are a mechanical regex job — outsourcing them
+        # to the LLM wastes context, risks errors, and leaks
+        # implementation details into the prompt. After this, the LLM
+        # sees a clean body and focuses on prose for MODIFIED symbols.
+        trivial = patch_trivial_page(page.page_id, body, page.changes)
+        body = trivial.new_content
+
+        symbol_diffs, _moved_paths = _build_diff_inputs(
             page.changes, old_node_snapshot, new_by_id,
         )
 
@@ -243,7 +269,9 @@ class IncrementalRegenService:
             primary_symbol_id=page_row.get("primary_symbol_id"),
             current_content=body,
             symbol_diffs=symbol_diffs,
-            moved_paths=moved_paths,
+            # Paths already rewritten by trivial_patcher above —
+            # don't ask the LLM to do it again.
+            moved_paths={},
         )
         stats.diff_ratios.append(result.diff_ratio)
 
@@ -284,19 +312,39 @@ class IncrementalRegenService:
     # internals
     # ------------------------------------------------------------------
 
-    def _snapshot_old_state(
-        self, parsed_nodes: Iterable[Mapping[str, Any]],
-    ) -> dict[str, dict[str, Any]]:
-        """Read pre-upsert ``source_text`` for nodes that might end up in
-        the edit regime. We snapshot every node in the parsed batch
-        because the regime isn't decided yet — it's cheap and avoids
-        a second storage hit later.
+    def _collect_edit_node_ids(self, plan: RegimePlan) -> list[str]:
+        """Gather every MODIFIED node_id referenced by edit-regime pages.
+
+        Bounded by the change set rather than the full parsed batch.
+        Even on large repos a single regen typically touches a handful
+        of pages with a handful of modified symbols each, so this stays
+        well within SQLite's bind-variable limit.
         """
-        ids = [n["node_id"] for n in parsed_nodes if n.get("node_id")]
-        if not ids:
+        seen: set[str] = set()
+        for page in plan.edit:
+            for change in page.changes:
+                if change.kind is ChangeKind.MODIFIED and change.node_id:
+                    seen.add(change.node_id)
+        return sorted(seen)
+
+    def _snapshot_old_state(
+        self, node_ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Read pre-upsert ``source_text`` for the given node_ids.
+
+        Caller is responsible for scoping the input to the set that
+        actually needs snapshotting (edit-regime nodes only) so the
+        underlying ``get_nodes_by_ids`` IN-clause stays under the
+        SQLite bind-variable limit.
+
+        Fails soft: on storage error returns an empty dict and warns,
+        so the surgical patcher proceeds with empty "before" content
+        rather than crashing the entire regen.
+        """
+        if not node_ids:
             return {}
         try:
-            rows = self._storage.get_nodes_by_ids(ids)
+            rows = self._storage.get_nodes_by_ids(node_ids)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[incremental_regen_service] could not snapshot old nodes; "
@@ -365,12 +413,21 @@ def _build_diff_inputs(
     return symbol_diffs, moved_paths
 
 
+_SIGNATURE_FIELD_CAP = 128
+
+
 def _signature_diff(old: Mapping[str, Any], new: Mapping[str, Any]) -> str | None:
-    """Short human-readable note about signature shape changes, or None."""
+    """Short human-readable note about signature shape changes, or None.
+
+    Each captured field is truncated to ``_SIGNATURE_FIELD_CAP`` chars
+    before ``repr()`` so a function with a weirdly large default value
+    (e.g. a giant string literal) can't produce a malformed prompt
+    block that confuses the LLM.
+    """
     fragments = []
     for field_name in ("signature", "parameters", "return_type"):
-        o = (old.get(field_name) or "").strip()
-        n = (new.get(field_name) or "").strip()
+        o = (old.get(field_name) or "").strip()[:_SIGNATURE_FIELD_CAP]
+        n = (new.get(field_name) or "").strip()[:_SIGNATURE_FIELD_CAP]
         if o != n:
             fragments.append(f"{field_name}: {o!r} → {n!r}")
     if not fragments:

@@ -66,6 +66,32 @@ Now return the revised page markdown. Start with the first heading and
 end with the last line of body; no fences, no explanation."""
 
 
+#: Per-source cap for the surgical-edit prompt. A typical changed
+#: symbol is well under this; the cap protects against pathological
+#: cases like a 1000-line class whose body would blow the LLM context
+#: window. Picked at 2000 chars (~500 tokens) as a generous default;
+#: tunable per-deployment via the constant or a future settings field.
+MAX_SOURCE_CHARS_IN_PROMPT = 2000
+
+
+def _truncate_and_fence_safe(text: str, *, limit: int = MAX_SOURCE_CHARS_IN_PROMPT) -> str:
+    """Make a snippet safe to embed inside a ```fenced``` block.
+
+    Two protections:
+    * Truncate to ``limit`` chars so big symbols don't blow the context
+      window. Appends an explicit truncation marker so the LLM knows
+      it's seeing a partial view.
+    * Replace triple-backticks with a visually similar Unicode sequence
+      so the rendered prompt's fences stay well-formed.
+    """
+    if not text:
+        return ""
+    safe = text.replace("```", "ʼʼʼ")  # U+02BC modifier letter apostrophe
+    if len(safe) > limit:
+        return safe[:limit].rstrip() + "\n[...truncated for prompt budget...]"
+    return safe.rstrip()
+
+
 def format_symbol_diff(
     symbol_name: str,
     old_source: str,
@@ -77,14 +103,18 @@ def format_symbol_diff(
     Kept as a standalone function so the prompt assembly is testable
     without instantiating an LLM client. Output is one block per
     symbol, separated by a blank line.
+
+    Both source snippets pass through :func:`_truncate_and_fence_safe`
+    so the prompt stays bounded and the fenced blocks can't be broken
+    by triple-backticks lurking in the source itself.
     """
     parts = [f"### {symbol_name}"]
     if signature_change:
         parts.append(f"Signature change: {signature_change}")
     parts.append("```before")
-    parts.append(old_source.rstrip())
+    parts.append(_truncate_and_fence_safe(old_source))
     parts.append("```")
     parts.append("```after")
-    parts.append(new_source.rstrip())
+    parts.append(_truncate_and_fence_safe(new_source))
     parts.append("```")
     return "\n".join(parts)

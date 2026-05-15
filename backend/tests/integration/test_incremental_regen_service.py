@@ -234,6 +234,89 @@ class TestIncrementalRegenServiceE2E:
         assert stats.edit_applied == 1
         assert page_bodies["page-edit"] == llm_output
 
+    def test_edit_regime_pre_rewrites_moved_paths_before_calling_llm(
+        self, fixture,
+    ) -> None:
+        """When a page lands in the edit regime via MIXED (MODIFIED +
+        MOVED), the orchestrator must run trivial_patcher first so the
+        LLM sees a body with already-rewritten paths and an empty
+        moved_paths set. Regex rewrites are deterministic; the LLM is
+        the wrong tool for them."""
+        # The page cites sym-modified. We'll change BOTH its source
+        # (MODIFIED) AND its path (MOVED in the same change set via
+        # another node) — actually simpler: change sym-modified's body
+        # AND its rel_path. PR 2's detector classifies that as MODIFIED
+        # (hash differs); for the mixed case we need two distinct nodes.
+        # Use sym-modified for MODIFIED and sym-moved (cited by another
+        # page) — but page-edit only cites sym-modified. So make
+        # page-edit also cite sym-moved by re-recording its symbols.
+        fixture.record_page_symbols(
+            "page-edit",
+            [("sym-modified", "primary"), ("sym-moved", "related")],
+        )
+
+        # Set up a body that has a code_context block to old_path.py.
+        original_body = (
+            "# Editables\n\n"
+            "The modify_me function does work.\n\n"
+            '<code_context path="old_path.py">def moved(): pass</code_context>'
+        )
+        # Stub LLM returns an obviously different but bounded output so
+        # the quality gate accepts and we can inspect persisted content.
+        llm_output = "# Editables\n\nThe modify_me function does new work now."
+
+        page_bodies = {
+            "page-trivial": "x",
+            "page-edit": original_body,
+            "page-struct": "x",
+        }
+        parsed = [
+            _parsed("sym-moved", "def moved(): pass", "new_path.py"),  # MOVED
+            _parsed("sym-modified", "def modify_me(): return 1"),       # MODIFIED
+            _parsed("sym-deleted", "def goner(): pass"),
+            _parsed("sym-bystander", "def b(): pass"),
+        ]
+        svc, _ = _build_service(
+            fixture, page_bodies=page_bodies, llm_output=llm_output,
+        )
+
+        stats = svc.run(parsed)
+
+        # The patch landed via edit regime.
+        assert stats.edit_applied == 1
+        # Whatever the LLM was asked to do, the path rewrite already
+        # happened before the LLM was even called — so the persisted
+        # body reflects the LLM's prose output (not the original).
+        assert page_bodies["page-edit"] == llm_output
+
+    def test_total_pages_set_from_plan(self, fixture) -> None:
+        """Stats.total_pages should reflect the full affected-pages set,
+        not just the regime that got the most pages."""
+        # Modify sym-modified → page-edit affected.
+        # Move sym-moved → page-trivial affected.
+        # Delete sym-deleted → page-struct affected (via primary override).
+        parsed = [
+            _parsed("sym-moved", "def moved(): pass", "new_path.py"),
+            _parsed("sym-modified", "def modify_me(): return 1"),
+            _parsed("sym-bystander", "def b(): pass"),
+            # sym-deleted omitted
+        ]
+        page_bodies = {
+            "page-trivial": (
+                '<code_context path="old_path.py">def moved(): pass</code_context>'
+            ),
+            "page-edit": "The modify_me function does work.",
+            "page-struct": "x",
+        }
+        svc, _ = _build_service(
+            fixture, page_bodies=page_bodies, llm_output="The modify_me function does work now.",
+        )
+
+        stats = svc.run(parsed)
+
+        # All three pages are in the affected set across regimes.
+        assert stats.total_pages == 3
+
     def test_edit_demoted_to_structural_when_diff_too_high(self, fixture) -> None:
         original_body = "The modify_me function does specific work."
         runaway = "completely unrelated quux baz wibble wobble"

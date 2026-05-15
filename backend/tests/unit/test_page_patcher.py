@@ -203,6 +203,38 @@ def test_no_diffs_and_no_paths_short_circuits_without_llm_call() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_huge_source_is_truncated_and_marked() -> None:
+    """source_text larger than MAX_SOURCE_CHARS_IN_PROMPT should be
+    truncated with an explicit marker so the LLM knows it's a partial
+    view (prevents context overflow + signals incompleteness)."""
+    from app.core.prompts.surgical_edit_prompts import (
+        MAX_SOURCE_CHARS_IN_PROMPT,
+        format_symbol_diff,
+    )
+
+    giant = "x" * (MAX_SOURCE_CHARS_IN_PROMPT * 3)
+    rendered = format_symbol_diff("Foo", giant, giant)
+
+    assert "[...truncated for prompt budget...]" in rendered
+    # The rendered block should be much smaller than 3x the cap.
+    assert len(rendered) < MAX_SOURCE_CHARS_IN_PROMPT * 2.5
+
+
+def test_triple_backticks_in_source_are_escaped() -> None:
+    """A symbol whose docstring contains ``` would break the fenced
+    block. The escaper swaps to a similar Unicode glyph so the prompt
+    stays well-formed."""
+    from app.core.prompts.surgical_edit_prompts import format_symbol_diff
+
+    poisoned = 'def foo():\n    """\n    ```python\n    bar()\n    ```\n    """\n    pass'
+    rendered = format_symbol_diff("foo", poisoned, poisoned)
+    # The original triple-backticks in the source are escaped...
+    assert "```python" not in rendered
+    # ...while the outer fences for the before/after blocks remain.
+    assert rendered.count("```before") == 1
+    assert rendered.count("```after") == 1
+
+
 def test_prompt_includes_symbol_diffs_and_moved_paths() -> None:
     stub = _StubLLM("foo")  # short output rejected → we just want the call recorded
     patcher = PagePatcher(stub)
