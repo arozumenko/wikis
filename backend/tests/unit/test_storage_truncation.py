@@ -100,6 +100,19 @@ class TestLimitNone:
         rows = db.get_nodes_by_cluster(macro=1, limit=None)
         assert len(rows) == 25
 
+    def test_get_nodes_by_cluster_none_with_micro_filter(self, db):
+        # Different SQL branch when ``micro`` is provided — assert that
+        # limit=None still works correctly across the two-predicate path.
+        for i in range(15):
+            _insert_arch_node(db, f"a_{i}", macro_cluster=1, micro_cluster=1)
+        for i in range(15):
+            _insert_arch_node(db, f"b_{i}", macro_cluster=1, micro_cluster=2)
+        db.commit()
+
+        rows = db.get_nodes_by_cluster(macro=1, micro=1, limit=None)
+        assert len(rows) == 15
+        assert all(r["node_id"].startswith("a_") for r in rows)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Warning log fires when a finite limit is hit

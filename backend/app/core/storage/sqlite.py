@@ -56,29 +56,16 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+from ._helpers import warn_if_truncated as _shared_warn_if_truncated  # noqa: E402
+
 
 def _warn_if_truncated(rows: list[Any], limit: int | None, method: str, **ctx: Any) -> None:
-    """Log a WARNING when *rows* count equals the active *limit*.
+    """Backend-scoped wrapper around the shared truncation warning helper.
 
-    The protocol's bounded fetchers (``get_architectural_nodes``,
-    ``get_nodes_by_cluster``, ``get_architectural_node_ids``,
-    ``get_all_edges``) silently truncate when the row count hits the cap.
-    On large repos this can corrupt downstream graph reconstruction
-    (PageRank, coverage analysis).  This helper makes the boundary visible
-    in operator logs without changing behaviour.
-
-    Callers that need *all* rows should pass ``limit=None``.
+    Preserves ``app.core.storage.sqlite`` as the logger name on the
+    emitted record so operators can filter by backend.
     """
-    if limit is None:
-        return
-    if len(rows) >= limit:
-        ctx_str = ", ".join(f"{k}={v}" for k, v in ctx.items() if v is not None)
-        suffix = f" ({ctx_str})" if ctx_str else ""
-        logger.warning(
-            "[STORAGE] %s hit row cap (limit=%d)%s; result is likely truncated. "
-            "Pass limit=None when full coverage is required.",
-            method, limit, suffix,
-        )
+    _shared_warn_if_truncated(rows, limit, method, logger=logger, **ctx)
 
 
 # ---------------------------------------------------------------------------

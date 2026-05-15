@@ -929,7 +929,10 @@ class ClusterStructurePlanner:
         Scoring: min(edge_count, 10) + has_docstring(2)
         Only architectural nodes are considered — methods, fields, etc. are excluded.
         """
-        nodes = self.db.get_nodes_by_cluster(macro=macro_id)
+        # ``limit=None``: the algorithm scores *every* candidate and then
+        # takes the top-N, so a silent cap on the input would bias scoring
+        # toward whichever rows the DB returns first.
+        nodes = self.db.get_nodes_by_cluster(macro=macro_id, limit=None)
         if not nodes:
             return []
 
