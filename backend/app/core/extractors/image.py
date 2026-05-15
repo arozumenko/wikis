@@ -56,6 +56,19 @@ _MIME_BY_SUFFIX = {
 }
 
 
+# Anthropic caps image-input at 5 MiB base64-encoded (~3.75 MiB raw);
+# OpenAI/Gemini are higher but we use the strictest cap as a
+# provider-agnostic safety net. base64-encoded size is ~4/3 the raw
+# size, so a raw cap of 3 MiB stays well under 5 MiB base64 and still
+# admits typical screenshots / scanned pages.
+#
+# Files above the cap are skipped with a WARNING (rather than letting
+# the provider return a generic 400) so operators see the actual cause.
+# Future: per-provider caps could be threaded through if we add provider
+# detection to the LLM factory.
+_MAX_RAW_BYTES = 3 * 1024 * 1024
+
+
 class ImageExtractor:
     """Describe images via LLM vision so they're retrievable as text."""
 
@@ -66,12 +79,7 @@ class ImageExtractor:
     def supported_extensions(self) -> tuple[str, ...]:
         return tuple(_MIME_BY_SUFFIX.keys())
 
-    def extract(
-        self,
-        file_path: Path,
-        *,
-        llm: "BaseChatModel | None" = None,
-    ) -> ExtractedDocument | None:
+    def extract(self, file_path: Path) -> ExtractedDocument | None:
         from langchain_core.messages import HumanMessage
 
         suffix = file_path.suffix.lower()
@@ -90,10 +98,19 @@ class ImageExtractor:
         if not raw:
             return None
 
-        # Override allows tests to inject a stub model via the runtime
-        # arg; production passes None and uses the registry-time handle.
-        active_llm = llm if llm is not None else self._llm
-        if active_llm is None:
+        if len(raw) > _MAX_RAW_BYTES:
+            # Pre-empt the provider's 400 with an explicit reason so the
+            # operator log doesn't say "rate limited" or "invalid_request"
+            # for what's actually a too-large image.
+            logger.warning(
+                "[extractors.image] %s skipped: %.1f MiB exceeds the "
+                "%.1f MiB raw-byte cap (Anthropic's strictest "
+                "vision-input limit). Resize the image or run a "
+                "preprocessor to ingest it.",
+                file_path,
+                len(raw) / (1024 * 1024),
+                _MAX_RAW_BYTES / (1024 * 1024),
+            )
             return None
 
         b64 = base64.b64encode(raw).decode("ascii")
@@ -106,7 +123,7 @@ class ImageExtractor:
         ])
 
         try:
-            response = active_llm.invoke([message])
+            response = self._llm.invoke([message])
         except Exception as exc:  # noqa: BLE001
             # Provider-side failures (rate limit, vision not supported by
             # this model, bad credentials) all funnel here. Log once at

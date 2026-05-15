@@ -264,20 +264,28 @@ class TestImageExtractor:
         p.write_bytes(b"")
         assert ImageExtractor(llm=_StubLLM()).extract(p) is None
 
-    def test_runtime_llm_arg_overrides_constructor(self, tmp_path: Path) -> None:
-        """Callers can inject a different LLM at extract time — used by
-        tests + experimental swaps without rebuilding the registry."""
-        p = tmp_path / "img.png"
-        p.write_bytes(_TINY_PNG)
-        ctor_stub = _StubLLM("from constructor")
-        override_stub = _StubLLM("from override")
+    def test_oversized_image_is_skipped_with_warning(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Pre-flight cap (3 MiB raw) prevents silent provider 400s from
+        Anthropic (5 MiB base64 limit). The skip must surface as WARNING
+        so operators can see why an image disappeared."""
+        import logging
 
-        result = ImageExtractor(llm=ctor_stub).extract(p, llm=override_stub)
+        p = tmp_path / "huge.png"
+        # 4 MiB of zero bytes — over the cap, won't decode as a real
+        # PNG but the size check fires before any image-decode path.
+        p.write_bytes(b"\x00" * (4 * 1024 * 1024))
+        stub = _StubLLM()
 
-        assert result is not None
-        assert result.text == "from override"
-        assert ctor_stub.invoke_count == 0
-        assert override_stub.invoke_count == 1
+        with caplog.at_level(logging.WARNING, logger="app.core.extractors.image"):
+            result = ImageExtractor(llm=stub).extract(p)
+
+        assert result is None
+        # LLM was NOT called — the size check short-circuited.
+        assert stub.invoke_count == 0
+        # The warning surfaces the actual cause, not a generic provider error.
+        assert any("exceeds" in rec.message for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------

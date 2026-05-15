@@ -2654,9 +2654,23 @@ class EnhancedUnifiedGraphBuilder:
                     if extractor is not None:
                         extracted = extractor.extract(Path(file_path))
                         if extracted is None:
-                            logger.info(
-                                "[doc-extractor] skipping %s — extractor "
-                                "returned no content", file_path,
+                            # WARNING (not INFO): a vision-based
+                            # extractor was registered but returned
+                            # nothing. This is the load-bearing signal
+                            # for a misconfigured LLM (wrong key, model
+                            # without vision, rate limited) — without
+                            # WARNING-level visibility, every PDF /
+                            # image in the repo would silently disappear
+                            # from the index. The extractor's internal
+                            # WARNING (rate-limit, blank, etc.) already
+                            # tells operators *why*; this line tells
+                            # them *that it happened for this file*.
+                            logger.warning(
+                                "[doc-extractor] %s skipped: extractor "
+                                "%s returned no content (check earlier "
+                                "WARNINGs from app.core.extractors.* for "
+                                "the cause)",
+                                file_path, type(extractor).__name__,
                             )
                             continue
                         content = extracted.text

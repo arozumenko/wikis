@@ -145,13 +145,52 @@ class TestPDFExtractor:
         result = PDFExtractor(llm=_StubLLM()).extract(bad)
         assert result is None
 
-    def test_construction_fails_loud_without_deps(self, monkeypatch) -> None:
-        """If pypdfium2 / Pillow aren't installed, the extractor must
-        raise ImportError at construction time so ``build_default_registry``
-        catches it and logs — not at the first PDF in the repo (which
-        would silently skip every PDF)."""
-        # We can't actually uninstall the deps here, but we can verify
-        # the construction-time imports do exist by importing the class.
-        # The actual ImportError path is exercised in build_default_registry
-        # by the absence of the modules.
-        assert PDFExtractor(llm=_StubLLM()) is not None
+    def test_construction_fails_loud_without_pypdfium2(self, monkeypatch) -> None:
+        """When ``pypdfium2`` isn't importable, construction must raise
+        ImportError so ``build_default_registry`` catches and logs the
+        hint at registry-build time — not silently at the first PDF in
+        the repo (where every PDF would be skipped without an obvious
+        cause).
+        """
+        import sys
+
+        # Hide pypdfium2 from the import machinery for the duration of
+        # this test; ``setitem`` to None makes Python treat it as
+        # "module not found" rather than a cached value.
+        monkeypatch.setitem(sys.modules, "pypdfium2", None)
+
+        with pytest.raises(ImportError):
+            PDFExtractor(llm=_StubLLM())
+
+    def test_construction_fails_loud_without_pillow(self, monkeypatch) -> None:
+        """Same shape as the pypdfium2 test but for PIL — both deps must
+        be present at construction time so missing-dep failures land at
+        registry build, not deep in the index pass.
+        """
+        import sys
+
+        monkeypatch.setitem(sys.modules, "PIL", None)
+
+        with pytest.raises(ImportError):
+            PDFExtractor(llm=_StubLLM())
+
+    def test_render_scale_is_constructor_configurable(
+        self, tmp_path: Path,
+    ) -> None:
+        """A non-default render_scale must flow through to ``page.render``.
+        Verifies the constructor knob is wired, so Phase 2 can add env-
+        var wiring without touching the contract.
+        """
+        pdf_path = _make_pdf(tmp_path / "doc.pdf", page_count=1)
+        captured_scales: list[float] = []
+
+        # Monkey-patch the render path indirectly: a custom subclass
+        # captures the scale used during the single render call.
+        class _SpyExtractor(PDFExtractor):
+            def _describe_page(self, pdf, page_index, file_path):
+                captured_scales.append(self._render_scale)
+                return ("Scale=%.1f" % self._render_scale, 0, 0, None)
+
+        result = _SpyExtractor(llm=_StubLLM(), render_scale=3.5).extract(pdf_path)
+        assert result is not None
+        assert captured_scales == [3.5]

@@ -78,13 +78,36 @@ def _seed_mixed_docs(tmp_path: Path) -> Path:
 def test_documentation_files_route_through_extractor_registry(
     tmp_path: Path,
 ) -> None:
+    """Verifies (a) extractor.extract is actually called per file (spy on
+    the registry) and (b) extractor output lands as ``source_text``. A
+    future refactor that bypasses the registry would fail the call-spy
+    assertion before content-match coincidences could hide it.
+    """
     docs = _seed_mixed_docs(tmp_path)
     llm = _StubLLM("A sequence diagram showing client → API → DB.")
 
+    # Wrap each extractor's extract() so the test can assert each was
+    # invoked with the expected file path.
+    plain = PlainTextExtractor()
+    image = ImageExtractor(llm=llm)
+    pdf = PDFExtractor(llm=llm)
+
+    extract_calls: list[tuple[str, Path]] = []
+
+    def _wrap(extractor, label: str):
+        original = extractor.extract
+
+        def _spy(file_path: Path):
+            extract_calls.append((label, file_path))
+            return original(file_path)
+
+        extractor.extract = _spy  # type: ignore[method-assign]
+        return extractor
+
     registry = ExtractorRegistry()
-    registry.register(PlainTextExtractor())
-    registry.register(ImageExtractor(llm=llm))
-    registry.register(PDFExtractor(llm=llm))
+    registry.register(_wrap(plain, "plain"))
+    registry.register(_wrap(image, "image"))
+    registry.register(_wrap(pdf, "pdf"))
 
     builder = EnhancedUnifiedGraphBuilder(extractor_registry=registry)
 
@@ -92,12 +115,19 @@ def test_documentation_files_route_through_extractor_registry(
         str(docs / "guide.rst"),
         str(docs / "diagram.png"),
         str(docs / "spec.pdf"),
-        str(docs / "README.md"),  # legacy path
+        str(docs / "README.md"),  # legacy path — no extractor registered
     ]
     results = builder._parse_documentation_files(file_paths, str(tmp_path))
 
     # All four files produced parse results.
     assert len(results) == 4
+
+    # Registry was consulted for every non-legacy file. Catches future
+    # refactors that accidentally bypass the dispatch.
+    call_labels = {label for label, _ in extract_calls}
+    assert call_labels == {"plain", "image", "pdf"}
+    # .md was NOT routed through the registry (no extractor registered).
+    assert not any(p.suffix == ".md" for _, p in extract_calls)
 
     # .rst was read through the plain-text extractor.
     rst_result = results[str(docs / "guide.rst")]

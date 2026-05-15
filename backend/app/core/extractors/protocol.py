@@ -73,26 +73,26 @@ class DocumentExtractor(Protocol):
         """
         ...
 
-    def extract(
-        self,
-        file_path: Path,
-        *,
-        llm: "BaseChatModel | None" = None,
-    ) -> ExtractedDocument | None:
+    def extract(self, file_path: Path) -> ExtractedDocument | None:
         """Extract text from ``file_path``.
 
         Args:
             file_path: Absolute path to the file.
-            llm: A configured LangChain chat model. Required for
-                vision-based extractors; ignored by text-only ones.
-                Passed in so the graph builder can construct a single LLM
-                instance and reuse it across the index pass.
 
         Returns:
             ``ExtractedDocument`` with the text + telemetry, or ``None``
             when the file is unreadable / empty / unsupported in a way
-            the extractor can detect at runtime (e.g. an LLM-vision
-            extractor invoked without an LLM).
+            the extractor can detect at runtime (e.g. corrupt PDF, blank
+            image, or any error the extractor can recover from without
+            crashing the whole index pass).
+
+        Implementation notes:
+            Vision-based extractors hold their configured LLM as an
+            instance attribute set at construction time. The graph
+            builder constructs the registry once via
+            :func:`build_default_registry` and reuses it across the
+            index pass; tests inject a stub LLM by constructing a new
+            extractor with the stub in its constructor.
         """
         ...
 

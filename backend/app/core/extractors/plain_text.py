@@ -22,12 +22,8 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from app.core.extractors.protocol import ExtractedDocument
-
-if TYPE_CHECKING:
-    from langchain_core.language_models import BaseChatModel
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +42,7 @@ class PlainTextExtractor:
     def supported_extensions(self) -> tuple[str, ...]:
         return (".mdx", ".qmd", ".rst", ".adoc")
 
-    def extract(
-        self,
-        file_path: Path,
-        *,
-        llm: "BaseChatModel | None" = None,
-    ) -> ExtractedDocument | None:
+    def extract(self, file_path: Path) -> ExtractedDocument | None:
         try:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()

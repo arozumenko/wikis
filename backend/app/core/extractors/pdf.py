@@ -50,7 +50,7 @@ _PER_PAGE_PROMPT = (
 # pypdfium2 returns pixels per inch via a scale factor; 2.0 gives ~144 DPI
 # which is sharp enough for vision OCR on most text-bearing PDFs while
 # keeping the image bytes small enough to stay under per-message size caps.
-_RENDER_SCALE = 2.0
+_DEFAULT_RENDER_SCALE = 2.0
 
 
 class PDFExtractor:
@@ -60,9 +60,23 @@ class PDFExtractor:
     working without the ``[pdf]`` extra installed. Raises ``ImportError``
     at construction time when deps are missing — :func:`build_default_registry`
     catches and logs.
+
+    Args:
+        llm: Configured LangChain chat model with vision capability.
+        render_scale: pdfium2 scale factor. Defaults to 2.0 (~144 DPI).
+            Lower values cut tokens at the cost of OCR accuracy; higher
+            values catch fine print on dense PDFs but risk exceeding the
+            provider's per-image size cap. Threaded through as a
+            constructor arg so future deploys can wire an env var
+            without a contract change.
     """
 
-    def __init__(self, *, llm: "BaseChatModel") -> None:
+    def __init__(
+        self,
+        *,
+        llm: "BaseChatModel",
+        render_scale: float = _DEFAULT_RENDER_SCALE,
+    ) -> None:
         # Import-time check: fail fast at registry-build time, not at the
         # first PDF in the repo (where the failure would be one file
         # silently skipped per missed dependency).
@@ -70,22 +84,14 @@ class PDFExtractor:
         from PIL import Image as _Image  # noqa: F401
 
         self._llm = llm
+        self._render_scale = render_scale
 
     @property
     def supported_extensions(self) -> tuple[str, ...]:
         return (".pdf",)
 
-    def extract(
-        self,
-        file_path: Path,
-        *,
-        llm: "BaseChatModel | None" = None,
-    ) -> ExtractedDocument | None:
+    def extract(self, file_path: Path) -> ExtractedDocument | None:
         import pypdfium2 as pdfium
-
-        active_llm = llm if llm is not None else self._llm
-        if active_llm is None:
-            return None
 
         try:
             pdf = pdfium.PdfDocument(str(file_path))
@@ -104,16 +110,18 @@ class PDFExtractor:
             warnings: list[str] = []
             total_in = 0
             total_out = 0
+            extracted_pages = 0
 
             for page_index in range(page_count):
                 page_text, in_tokens, out_tokens, warning = (
-                    self._describe_page(pdf, page_index, active_llm, file_path)
+                    self._describe_page(pdf, page_index, file_path)
                 )
                 total_in += in_tokens
                 total_out += out_tokens
                 if warning:
                     warnings.append(warning)
                 if page_text:
+                    extracted_pages += 1
                     page_descriptions.append(
                         f"## Page {page_index + 1}\n\n{page_text}"
                     )
@@ -124,10 +132,14 @@ class PDFExtractor:
             return None
 
         # One total-spend line per file so the log is greppable without
-        # walking every per-page line.
+        # walking every per-page line. ``pages_extracted`` distinguishes
+        # "doc had 200 pages, 50 had usable content" from "doc had 50
+        # pages, all rendered" — both look like 50-page docs from
+        # tokens alone otherwise.
         logger.info(
-            "[extractors.pdf] file=%s pages=%d input_tokens=%d output_tokens=%d",
-            file_path.name, page_count, total_in, total_out,
+            "[extractors.pdf] file=%s pages_total=%d pages_extracted=%d "
+            "input_tokens=%d output_tokens=%d",
+            file_path.name, page_count, extracted_pages, total_in, total_out,
         )
 
         return ExtractedDocument(
@@ -143,7 +155,6 @@ class PDFExtractor:
         self,
         pdf,
         page_index: int,
-        llm: "BaseChatModel",
         file_path: Path,
     ) -> tuple[str, int, int, str | None]:
         """Render a single page and ask the LLM to describe it.
@@ -157,13 +168,14 @@ class PDFExtractor:
         from langchain_core.messages import HumanMessage
         from PIL import Image  # noqa: F401 — kept for type-check parity
 
+        # Acquire the page in an inner try/finally so a render-pipeline
+        # exception (e.g. corrupt page, Pillow encoding error) still
+        # closes the PDFium handle eagerly. Without this, handles
+        # accumulate until the outer ``pdf.close()`` in :meth:`extract`
+        # runs at end-of-document — fine for small PDFs but burns
+        # memory linearly for large ones with intermittent failures.
         try:
             page = pdf[page_index]
-            pil_image = page.render(scale=_RENDER_SCALE).to_pil()
-            buf = io.BytesIO()
-            pil_image.save(buf, format="PNG")
-            png_bytes = buf.getvalue()
-            page.close()
         except Exception as exc:  # noqa: BLE001
             warning = (
                 f"page {page_index + 1} of {file_path.name}: "
@@ -171,6 +183,22 @@ class PDFExtractor:
             )
             logger.warning("[extractors.pdf] %s", warning)
             return ("", 0, 0, warning)
+
+        try:
+            try:
+                pil_image = page.render(scale=self._render_scale).to_pil()
+                buf = io.BytesIO()
+                pil_image.save(buf, format="PNG")
+                png_bytes = buf.getvalue()
+            except Exception as exc:  # noqa: BLE001
+                warning = (
+                    f"page {page_index + 1} of {file_path.name}: "
+                    f"render failed: {exc}"
+                )
+                logger.warning("[extractors.pdf] %s", warning)
+                return ("", 0, 0, warning)
+        finally:
+            page.close()
 
         b64 = base64.b64encode(png_bytes).decode("ascii")
         message = HumanMessage(content=[
@@ -182,7 +210,7 @@ class PDFExtractor:
         ])
 
         try:
-            response = llm.invoke([message])
+            response = self._llm.invoke([message])
         except Exception as exc:  # noqa: BLE001
             warning = (
                 f"page {page_index + 1} of {file_path.name}: "
