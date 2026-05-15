@@ -27,7 +27,9 @@ the install instructions.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from dataclasses import replace
@@ -142,9 +144,16 @@ class OfficeExtractor:
         # The argument list intentionally avoids `shell=True` and passes
         # the source path as a positional arg, not interpolated into a
         # string — paths with spaces or shell metachars are safe.
+        #
+        # ``profile_dir.as_uri()`` is the stdlib-correct way to encode a
+        # path as a file:// URI (handles spaces, %, unicode, and the
+        # Windows drive-letter case). Hand-rolling ``f"file://{path}"``
+        # silently breaks on macOS tmpdirs under ``/var/folders/…`` and
+        # any homedir with a space — LibreOffice then falls back to the
+        # shared system profile, defeating the per-invocation isolation.
         cmd = [
             self._soffice,
-            f"-env:UserInstallation=file://{profile_dir}",
+            f"-env:UserInstallation={profile_dir.as_uri()}",
             "--headless",
             "--convert-to",
             "pdf",
@@ -153,21 +162,23 @@ class OfficeExtractor:
             str(source),
         ]
 
+        # ``subprocess.run(timeout=...)`` only SIGKILLs the direct child
+        # when the timeout fires. LibreOffice forks several helpers
+        # (``oosplash``, ``soffice.bin``, JVM child processes) that
+        # would survive as zombies reparented to PID 1 — over a long
+        # index pass on a docs-heavy repo that leaks RAM + file
+        # descriptors. ``start_new_session=True`` puts the whole tree
+        # in a fresh process group; on TimeoutExpired we
+        # ``os.killpg(SIGKILL)`` it as one unit. POSIX-only; Windows is
+        # not a deploy target for this extractor (LibreOffice headless
+        # behaves differently there anyway).
         try:
-            result = subprocess.run(  # noqa: S603 — fixed binary, no shell
+            proc = subprocess.Popen(  # noqa: S603 — fixed binary, no shell
                 cmd,
-                capture_output=True,
-                timeout=self._timeout,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                "[extractors.office] %s conversion timed out after %ds — "
-                "skipping (file may be corrupt, encrypted, or unusually "
-                "large)",
-                source.name, self._timeout,
-            )
-            return None
         except OSError as exc:
             logger.warning(
                 "[extractors.office] %s conversion failed to launch "
@@ -175,11 +186,38 @@ class OfficeExtractor:
             )
             return None
 
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        try:
+            _, stderr_bytes = proc.communicate(timeout=self._timeout)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            # Reap the whole process group so the LibreOffice helpers
+            # don't get reparented to init.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                # Race: process already exited between the timeout
+                # firing and the killpg call. Nothing to clean up.
+                pass
+            # Drain pipes + reap the direct child so we don't leave a
+            # zombie. ``communicate`` here is a no-timeout wait because
+            # we already SIGKILLed; it returns immediately.
+            try:
+                proc.communicate()
+            except Exception:  # noqa: S110 — best-effort drain
+                pass
+            logger.warning(
+                "[extractors.office] %s conversion timed out after %ds — "
+                "skipping (file may be corrupt, encrypted, or unusually "
+                "large)",
+                source, self._timeout,
+            )
+            return None
+
+        if returncode != 0:
+            stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
             logger.warning(
                 "[extractors.office] %s conversion exited %d: %s",
-                source.name, result.returncode,
+                source.name, returncode,
                 stderr or "(no stderr — check soffice logs)",
             )
             return None
