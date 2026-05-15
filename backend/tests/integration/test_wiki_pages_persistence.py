@@ -19,6 +19,7 @@ output → IDs → DB rows survive a regeneration.
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -67,7 +68,10 @@ def _make_agent(tmp_path) -> tuple[OptimizedWikiGenerationAgent, UnifiedWikiDB]:
     agent._resolved_wiki_id = None
     agent._cluster_db = db
     agent._cluster_db_path = str(db.db_path)
-    # _persist_page_metadata expects no other attrs.
+    agent._progress_lock = threading.Lock()
+    agent._persist_attempts = 0
+    agent._persist_successes = 0
+    agent._persist_failures = 0
     return agent, db
 
 
@@ -94,6 +98,7 @@ def _make_structure() -> WikiStructureSpec:
                             "section_id": 0,
                             "page_id": 1,
                             "cluster_node_ids": ["auth.AuthService", "auth.login"],
+                            "primary_symbol_id": "auth.AuthService",
                         },
                     ),
                 ],
@@ -116,6 +121,7 @@ def _make_structure() -> WikiStructureSpec:
                             "section_id": 2,
                             "page_id": 3,
                             "cluster_node_ids": ["cache.CacheManager"],
+                            "primary_symbol_id": "cache.CacheManager",
                         },
                     ),
                 ],
@@ -306,6 +312,11 @@ class TestPersistPageMetadata:
         # Reverse lookup works — the join table is the source→page index.
         assert db.get_pages_citing_node("auth.AuthService") == ["page-1"]
 
+        # Persist telemetry: a success bumps attempts + successes.
+        assert agent._persist_attempts == 1
+        assert agent._persist_successes == 1
+        assert agent._persist_failures == 0
+
     def test_skips_persistence_when_wiki_id_missing(self, tmp_path) -> None:
         agent, db = _make_agent(tmp_path)
         agent._persist_page_metadata(
@@ -351,6 +362,11 @@ class TestPersistPageMetadata:
         call("p1")
         call("p2")  # second insert with same wiki+slug — must not raise
 
+        # Telemetry reflects the failure so finalize_wiki can warn.
+        assert agent._persist_failures == 1
+        assert agent._persist_successes == 1
+        assert agent._persist_attempts == 2
+
 
 # ---------------------------------------------------------------------------
 # Cross-run stability — same plan → same IDs and rows
@@ -377,3 +393,64 @@ def test_page_ids_stable_across_runs(tmp_path) -> None:
     ids_a = [s.arg["page_id"] for s in sends_a]
     ids_b = [s.arg["page_id"] for s in sends_b]
     assert ids_a == ids_b
+
+
+def test_page_id_uses_planner_primary_not_cluster_first(tmp_path) -> None:
+    """Regression for tech-lead finding: page_id must derive from the planner's
+    deterministic primary_symbol_id (PageRank champion), NOT from
+    cluster_node_ids[0] — that list used to come from a set-iteration whose
+    order varied across runs. We verify by reordering cluster_node_ids
+    between two otherwise-identical inputs and asserting page_id is stable.
+    """
+    agent_a, _ = _make_agent(tmp_path / "a")
+    agent_b, _ = _make_agent(tmp_path / "b")
+    for agent in (agent_a, agent_b):
+        agent.retriever_stack = SimpleNamespace(relationship_graph=None)
+        agent._total_pages = 0
+        agent._pages_generated = 0
+        agent.progress_callback = None
+
+    def _one_page(cluster_first: str, cluster_rest: list[str]) -> WikiStructureSpec:
+        return WikiStructureSpec(
+            wiki_title="W",
+            overview="O",
+            sections=[
+                SectionSpec(
+                    section_name="S",
+                    section_order=0,
+                    description="d",
+                    rationale="r",
+                    pages=[
+                        PageSpec(
+                            page_name="Auth Service",
+                            page_order=0,
+                            description="d",
+                            content_focus="c",
+                            rationale="r",
+                            metadata={
+                                "section_id": 0,
+                                "page_id": 1,
+                                "cluster_node_ids": [cluster_first, *cluster_rest],
+                                "primary_symbol_id": "auth.AuthService",
+                            },
+                        ),
+                    ],
+                ),
+            ],
+            total_pages=1,
+        )
+
+    # Same primary_symbol_id from planner, different list order in
+    # cluster_node_ids: agent should pin to the planner primary, so the
+    # page_id is identical.
+    s_a = WikiState(
+        repository_context="x",
+        wiki_structure_spec=_one_page("auth.AuthService", ["auth.login"]),
+    )
+    s_b = WikiState(
+        repository_context="x",
+        wiki_structure_spec=_one_page("auth.login", ["auth.AuthService"]),
+    )
+    [send_a] = agent_a.dispatch_page_generation(s_a, config={})
+    [send_b] = agent_b.dispatch_page_generation(s_b, config={})
+    assert send_a.arg["page_id"] == send_b.arg["page_id"]

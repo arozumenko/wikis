@@ -215,6 +215,15 @@ class OptimizedWikiGenerationAgent:
         # paths the exporter will use later.
         self._resolved_wiki_id: str | None = None
 
+        # #116: persist-hook telemetry. _persist_page_metadata is fail-soft
+        # (a DB hiccup never breaks page generation), but PR 2's change
+        # detection silently degrades if rows are missing. These counters
+        # give us a single end-of-run log line ("N/M pages stored") so ops
+        # and PR 2 can detect partial persistence without grepping warnings.
+        self._persist_attempts = 0
+        self._persist_successes = 0
+        self._persist_failures = 0
+
         # Build code_graph
         self.graph = self._build_graph()
 
@@ -631,6 +640,12 @@ class OptimizedWikiGenerationAgent:
         # each sub-page comfortably fits within the context token budget.
         self._split_overloaded_pages(wiki_structure)
 
+        # #116: reset persist counters at the start of every dispatch so
+        # finalize_wiki sees the counts for the current run only.
+        self._persist_attempts = 0
+        self._persist_successes = 0
+        self._persist_failures = 0
+
         # #116: allocate stable page IDs for new wikis (id_scheme='stable_v1').
         # When we can resolve a wiki_id, page IDs are sha256 of
         # (wiki_id, macro_cluster, micro_cluster, primary_symbol_id, title)
@@ -647,8 +662,14 @@ class OptimizedWikiGenerationAgent:
                 macro = metadata.get("section_id", section_idx)
                 micro = metadata.get("page_id", page_idx)
                 cluster_node_ids = metadata.get("cluster_node_ids", []) or []
+                # Prefer the planner's PageRank-derived primary (deterministic
+                # given a stable graph); fall back to the first node in the
+                # ORDER BY-sorted cluster list. cluster_node_ids[0] alone was
+                # non-deterministic before storage sort landed — keep the
+                # belt-and-braces in case an older planner is still feeding us.
                 primary_symbol_id = (
-                    cluster_node_ids[0] if cluster_node_ids else None
+                    metadata.get("primary_symbol_id")
+                    or (cluster_node_ids[0] if cluster_node_ids else None)
                 )
 
                 if wiki_id:
@@ -982,6 +1003,20 @@ class OptimizedWikiGenerationAgent:
         """Finalize wiki generation and prepare for export"""
 
         logger.info("🏁 Finalizing wiki generation")
+        # #116: one-line persistence health line. Stays quiet on the happy
+        # path (skipped when nothing attempted); raises to WARNING when any
+        # page failed so PR 2's incremental path can detect partial state.
+        if self._persist_attempts > 0:
+            level = (
+                logging.WARNING if self._persist_failures else logging.INFO
+            )
+            logger.log(
+                level,
+                "[wiki_pages] persist summary: %d/%d pages stored (failures=%d)",
+                self._persist_successes,
+                self._persist_attempts,
+                self._persist_failures,
+            )
         if self.progress_callback:
             try:
                 self.progress_callback("storing", 0.92, "Finalizing wiki — assembling pages and diagrams...")
@@ -1820,6 +1855,9 @@ class OptimizedWikiGenerationAgent:
         if db is None:
             return
 
+        with self._progress_lock:
+            self._persist_attempts += 1
+
         try:
             db.upsert_wiki_page(
                 {
@@ -1853,7 +1891,11 @@ class OptimizedWikiGenerationAgent:
                 kind = "primary" if idx == 0 and node_id == primary else "related"
                 symbols.append((node_id, kind))
             db.record_page_symbols(page_id, symbols)
+            with self._progress_lock:
+                self._persist_successes += 1
         except Exception as exc:
+            with self._progress_lock:
+                self._persist_failures += 1
             logger.warning(
                 "[wiki_pages] persist failed for page_id=%s: %s", page_id, exc,
             )

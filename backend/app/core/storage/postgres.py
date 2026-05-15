@@ -31,6 +31,7 @@ import networkx as nx
 from sqlalchemy import (
     Column,
     Float,
+    ForeignKeyConstraint,
     Index,
     Integer,
     MetaData,
@@ -204,16 +205,27 @@ def _define_tables(
         Column("primary_symbol_id", Text),
         Column("section_index", Integer, server_default="0"),
         Column("page_index", Integer, server_default="0"),
+        # #116 PR 2: git rev / source-state identifier for the repo snapshot
+        # this page was generated against. Fast-exit on "repo unchanged".
+        Column("last_indexed_commit", Text),
         Column("generated_at", Text),
         schema=schema,
     )
 
+    # Match SQLite: FK to wiki_pages with ON DELETE CASCADE so
+    # delete_wiki_pages cleans up the reverse index automatically. Without
+    # this, dropping a wiki on Postgres leaves orphan page_symbols rows.
     page_symbols = Table(
         "page_symbols",
         metadata,
         Column("page_id", Text, primary_key=True),
         Column("node_id", Text, primary_key=True),
         Column("citation_kind", Text, primary_key=True),
+        ForeignKeyConstraint(
+            ["page_id"],
+            [f"{schema}.wiki_pages.page_id"] if schema else ["wiki_pages.page_id"],
+            ondelete="CASCADE",
+        ),
         schema=schema,
     )
 
@@ -389,6 +401,18 @@ class PostgresWikiStorage:
                     ) THEN
                         ALTER TABLE {schema}.repo_nodes ADD COLUMN content_hash TEXT;
                     END IF;
+                    -- #116 PR 2 prep: last_indexed_commit on wiki_pages.
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = '{schema}' AND table_name = 'wiki_pages'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'wiki_pages'
+                          AND column_name = 'last_indexed_commit'
+                    ) THEN
+                        ALTER TABLE {schema}.wiki_pages
+                            ADD COLUMN last_indexed_commit TEXT;
+                    END IF;
                     -- page tables / CHECK constraints
                     IF NOT EXISTS (
                         SELECT 1 FROM pg_constraint
@@ -413,6 +437,23 @@ class PostgresWikiStorage:
                             ALTER TABLE {schema}.page_symbols
                                 ADD CONSTRAINT page_symbols_kind_chk
                                 CHECK (citation_kind IN ('primary','referenced','related'));
+                        EXCEPTION WHEN undefined_table THEN
+                            NULL;
+                        END;
+                    END IF;
+                    -- #116: FK with ON DELETE CASCADE so delete_wiki_pages
+                    -- cleans up the page_symbols reverse index. Idempotent.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'page_symbols_page_id_fkey'
+                          AND connamespace = '{schema}'::regnamespace
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE {schema}.page_symbols
+                                ADD CONSTRAINT page_symbols_page_id_fkey
+                                FOREIGN KEY (page_id)
+                                REFERENCES {schema}.wiki_pages(page_id)
+                                ON DELETE CASCADE;
                         EXCEPTION WHEN undefined_table THEN
                             NULL;
                         END;
@@ -1735,6 +1776,9 @@ class PostgresWikiStorage:
         )
         if exclude_tests:
             sql += " AND is_test = 0"
+        # #116: deterministic order — see sqlite.py:get_clustered_architectural_nodes
+        # for the reasoning. Page IDs depend on cluster_node_ids[0] stability.
+        sql += " ORDER BY macro_cluster, micro_cluster, node_id"
         with self._engine.connect() as conn:
             rows = conn.execute(text(sql)).fetchall()
         return [
@@ -1997,6 +2041,7 @@ class PostgresWikiStorage:
         "primary_symbol_id",
         "section_index",
         "page_index",
+        "last_indexed_commit",
         "generated_at",
     )
 
@@ -2016,6 +2061,7 @@ class PostgresWikiStorage:
             "primary_symbol_id": _s(page.get("primary_symbol_id")),
             "section_index": page.get("section_index", 0),
             "page_index": page.get("page_index", 0),
+            "last_indexed_commit": _s(page.get("last_indexed_commit")),
             "generated_at": _s(page.get("generated_at")),
         }
         cols = ", ".join(self._WIKI_PAGE_COLUMNS)
@@ -2049,6 +2095,34 @@ class PostgresWikiStorage:
                 ),
                 {"wid": wiki_id},
             ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_wiki_pages_by_cluster(
+        self,
+        wiki_id: str,
+        macro_cluster: int,
+        micro_cluster: int | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            if micro_cluster is None:
+                rows = conn.execute(
+                    text(
+                        f"SELECT * FROM {self._schema}.wiki_pages "
+                        "WHERE wiki_id = :wid AND macro_cluster = :macro "
+                        "ORDER BY section_index ASC, page_index ASC"
+                    ),
+                    {"wid": wiki_id, "macro": macro_cluster},
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text(
+                        f"SELECT * FROM {self._schema}.wiki_pages "
+                        "WHERE wiki_id = :wid AND macro_cluster = :macro "
+                        "AND micro_cluster = :micro "
+                        "ORDER BY section_index ASC, page_index ASC"
+                    ),
+                    {"wid": wiki_id, "macro": macro_cluster, "micro": micro_cluster},
+                ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def delete_wiki_pages(self, wiki_id: str) -> int:

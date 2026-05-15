@@ -161,6 +161,43 @@ class TestRecordPageSymbols:
         assert {r["node_id"] for r in referenced} == {"sym-2", "sym-3"}
 
 
+class TestGetByCluster:
+    def test_filters_by_macro_only(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", anchor_slug="a", macro_cluster=0, micro_cluster=1))
+        db.upsert_wiki_page(_page("p2", anchor_slug="b", macro_cluster=0, micro_cluster=2))
+        db.upsert_wiki_page(_page("p3", anchor_slug="c", macro_cluster=1, micro_cluster=1))
+
+        rows = db.get_wiki_pages_by_cluster("wiki-1", macro_cluster=0)
+        assert {r["page_id"] for r in rows} == {"p1", "p2"}
+
+    def test_filters_by_macro_and_micro(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", anchor_slug="a", macro_cluster=0, micro_cluster=1))
+        db.upsert_wiki_page(_page("p2", anchor_slug="b", macro_cluster=0, micro_cluster=2))
+
+        rows = db.get_wiki_pages_by_cluster("wiki-1", macro_cluster=0, micro_cluster=1)
+        assert [r["page_id"] for r in rows] == ["p1"]
+
+    def test_scopes_by_wiki(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", wiki_id="w1", anchor_slug="a", macro_cluster=0))
+        db.upsert_wiki_page(_page("p2", wiki_id="w2", anchor_slug="b", macro_cluster=0))
+        rows = db.get_wiki_pages_by_cluster("w1", macro_cluster=0)
+        assert [r["page_id"] for r in rows] == ["p1"]
+
+
+class TestLastIndexedCommit:
+    def test_round_trip(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(
+            _page("p1", anchor_slug="a", last_indexed_commit="abc123def")
+        )
+        row = db.get_wiki_page("p1")
+        assert row["last_indexed_commit"] == "abc123def"
+
+    def test_defaults_to_null_when_omitted(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", anchor_slug="a"))
+        row = db.get_wiki_page("p1")
+        assert row["last_indexed_commit"] is None
+
+
 class TestReverseLookup:
     def test_get_pages_citing_node_dedupes_across_kinds(self, db: UnifiedWikiDB) -> None:
         # One node may appear as primary on one page and referenced on another.

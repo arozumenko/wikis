@@ -560,6 +560,20 @@ class WikiStorageProtocol(Protocol):
         """Return all page rows for a wiki, in (section_index, page_index) order."""
         ...
 
+    def get_wiki_pages_by_cluster(
+        self,
+        wiki_id: str,
+        macro_cluster: int,
+        micro_cluster: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return page rows for a (macro, micro) cluster within a wiki.
+
+        Used by [#116] PR 2/3 to find pages affected by a cluster-level
+        change. When ``micro_cluster`` is None, every page in the macro
+        cluster is returned regardless of micro.
+        """
+        ...
+
     def delete_wiki_pages(self, wiki_id: str) -> int:
         """Remove all rows for a wiki from ``wiki_pages`` (cascades to
         ``page_symbols``). Returns the number of rows deleted.

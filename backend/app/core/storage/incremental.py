@@ -80,6 +80,15 @@ def compute_page_id(
     wiki: (cluster_macro, cluster_micro, primary_symbol, title). ``title``
     is normalized so trivial editorial tweaks ("API Overview" →
     "Api overview") don't shift the ID — only an intentional retitle does.
+
+    **Stability caveat (until PR 4 of #116 lands):** ``macro_cluster`` and
+    ``micro_cluster`` are raw Leiden partition IDs. Leiden is deterministic
+    given a fixed seed *and* an unchanged graph, but cluster IDs themselves
+    are assigned in arbitrary partition order. Even small graph changes can
+    therefore renumber every cluster and shift every page_id. PR 4 lifts
+    this via Jaccard mapping of new clusters onto old IDs. Until then,
+    callers relying on cross-regen page_id stability should treat IDs as
+    stable *within* a single repo state — not across edits to the repo.
     """
     parts = [
         wiki_id or "",

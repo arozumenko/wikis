@@ -250,19 +250,23 @@ CREATE TABLE IF NOT EXISTS wiki_meta (
 # ---------------------------------------------------------------------------
 _SCHEMA_WIKI_PAGES = """
 CREATE TABLE IF NOT EXISTS wiki_pages (
-    page_id           TEXT PRIMARY KEY,
-    wiki_id           TEXT NOT NULL,
-    id_scheme         TEXT NOT NULL DEFAULT 'stable_v1'
-                      CHECK (id_scheme IN ('legacy','stable_v1')),
-    title             TEXT NOT NULL DEFAULT '',
-    anchor_slug       TEXT NOT NULL DEFAULT '',
-    content_hash      TEXT DEFAULT NULL,
-    macro_cluster     INTEGER DEFAULT NULL,
-    micro_cluster     INTEGER DEFAULT NULL,
-    primary_symbol_id TEXT DEFAULT NULL,
-    section_index     INTEGER DEFAULT 0,
-    page_index        INTEGER DEFAULT 0,
-    generated_at      TEXT DEFAULT (datetime('now'))
+    page_id            TEXT PRIMARY KEY,
+    wiki_id            TEXT NOT NULL,
+    id_scheme          TEXT NOT NULL DEFAULT 'stable_v1'
+                       CHECK (id_scheme IN ('legacy','stable_v1')),
+    title              TEXT NOT NULL DEFAULT '',
+    anchor_slug        TEXT NOT NULL DEFAULT '',
+    content_hash       TEXT DEFAULT NULL,
+    macro_cluster      INTEGER DEFAULT NULL,
+    micro_cluster      INTEGER DEFAULT NULL,
+    primary_symbol_id  TEXT DEFAULT NULL,
+    section_index      INTEGER DEFAULT 0,
+    page_index         INTEGER DEFAULT 0,
+    -- #116 PR 2: git rev / source-state identifier for the repo snapshot
+    -- this page was generated against. Lets change detection fast-exit on
+    -- "repo unchanged since last regen" without diffing every node.
+    last_indexed_commit TEXT DEFAULT NULL,
+    generated_at       TEXT DEFAULT (datetime('now'))
 );
 """
 
@@ -490,6 +494,22 @@ class UnifiedWikiDB:
                 "ON repo_nodes(content_hash) WHERE content_hash IS NOT NULL"
             )
             self.conn.commit()
+
+        # #116 PR 2 prep: last_indexed_commit on wiki_pages for fast-exit
+        # change detection. Idempotent — only fires on legacy schemas that
+        # have wiki_pages but lack this column.
+        if "wiki_pages" in tables:
+            page_cols = {
+                row[1] for row in cur.execute("PRAGMA table_info(wiki_pages)")
+            }
+            if "last_indexed_commit" not in page_cols:
+                logger.info(
+                    "Migrating schema: adding last_indexed_commit to wiki_pages"
+                )
+                cur.execute(
+                    "ALTER TABLE wiki_pages ADD COLUMN last_indexed_commit TEXT DEFAULT NULL"
+                )
+                self.conn.commit()
 
         # §11.6 / B1: edge confidence column. ALTER TABLE in sqlite cannot
         # add a CHECK constraint after the fact, but the default + the
@@ -1791,6 +1811,11 @@ class UnifiedWikiDB:
         )
         if exclude_tests:
             sql += " AND is_test = 0"
+        # #116: deterministic order is load-bearing — the planner's
+        # cluster_node_ids list feeds compute_page_id via primary_symbol_id.
+        # Without ORDER BY the row order is undefined → page IDs shift on
+        # every regen, defeating the stable-ID scheme.
+        sql += " ORDER BY macro_cluster, micro_cluster, node_id"
         rows = self.conn.execute(sql).fetchall()
         return [dict(r) for r in rows]
 
@@ -2048,6 +2073,7 @@ class UnifiedWikiDB:
         "primary_symbol_id",
         "section_index",
         "page_index",
+        "last_indexed_commit",
         "generated_at",
     )
 
@@ -2066,6 +2092,7 @@ class UnifiedWikiDB:
             "primary_symbol_id": page.get("primary_symbol_id"),
             "section_index": page.get("section_index", 0),
             "page_index": page.get("page_index", 0),
+            "last_indexed_commit": page.get("last_indexed_commit"),
             "generated_at": page.get("generated_at"),
         }
         cols = ", ".join(self._WIKI_PAGE_COLUMNS)
@@ -2096,6 +2123,28 @@ class UnifiedWikiDB:
             "ORDER BY section_index ASC, page_index ASC",
             (wiki_id,),
         ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_wiki_pages_by_cluster(
+        self,
+        wiki_id: str,
+        macro_cluster: int,
+        micro_cluster: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if micro_cluster is None:
+            rows = self.conn.execute(
+                "SELECT * FROM wiki_pages "
+                "WHERE wiki_id = ? AND macro_cluster = ? "
+                "ORDER BY section_index ASC, page_index ASC",
+                (wiki_id, macro_cluster),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM wiki_pages "
+                "WHERE wiki_id = ? AND macro_cluster = ? AND micro_cluster = ? "
+                "ORDER BY section_index ASC, page_index ASC",
+                (wiki_id, macro_cluster, micro_cluster),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def delete_wiki_pages(self, wiki_id: str) -> int:
