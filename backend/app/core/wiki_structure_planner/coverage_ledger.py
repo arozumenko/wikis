@@ -92,9 +92,10 @@ class CoverageLedger:
         # ``get_architectural_nodes`` returns full node dicts; the original
         # raw query projected five columns to keep the payload light, but
         # this is called once at construction time so the difference is
-        # negligible.  Raise the default limit to cover repos with very
-        # many architectural symbols.
-        rows = self.db.get_architectural_nodes(limit=100_000)
+        # negligible.  ``limit=None`` matches the original raw-SQL
+        # behaviour (no LIMIT) so very large repos aren't silently
+        # truncated.
+        rows = self.db.get_architectural_nodes(limit=None)
 
         for node in rows:
             nid = node.get("node_id")
@@ -138,8 +139,9 @@ class CoverageLedger:
         # Filter to macro if requested.  ``get_nodes_by_cluster`` returns
         # all nodes in the macro (any micro); filter to architectural in
         # Python since the protocol doesn't expose a combined predicate.
+        # ``limit=None`` matches the original raw-SQL behaviour.
         if macro_id is not None:
-            rows = self.db.get_nodes_by_cluster(macro_id, limit=100_000)
+            rows = self.db.get_nodes_by_cluster(macro_id, limit=None)
             scope_ids = {
                 r["node_id"] for r in rows
                 if r.get("is_architectural") and r.get("node_id")

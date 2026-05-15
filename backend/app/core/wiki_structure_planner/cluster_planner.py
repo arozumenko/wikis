@@ -929,7 +929,10 @@ class ClusterStructurePlanner:
         Scoring: min(edge_count, 10) + has_docstring(2)
         Only architectural nodes are considered — methods, fields, etc. are excluded.
         """
-        nodes = self.db.get_nodes_by_cluster(macro=macro_id)
+        # ``limit=None``: the algorithm scores *every* candidate and then
+        # takes the top-N, so a silent cap on the input would bias scoring
+        # toward whichever rows the DB returns first.
+        nodes = self.db.get_nodes_by_cluster(macro=macro_id, limit=None)
         if not nodes:
             return []
 
@@ -1110,14 +1113,17 @@ class ClusterStructurePlanner:
 
         G = nx.MultiDiGraph()
 
-        # Add all architectural nodes (excluding test nodes when flag is on)
+        # Add all architectural nodes (excluding test nodes when flag is on).
+        # ``limit=None`` matches the original raw-SQL behaviour and avoids
+        # silently truncating large repos.
         for node_id in self.db.get_architectural_node_ids(
-            exclude_tests=self._exclude_tests
+            exclude_tests=self._exclude_tests,
+            limit=None,
         ):
             G.add_node(node_id)
 
-        # Add all edges with weights
-        for row in self.db.get_all_edges():
+        # Add all edges with weights.  Same rationale for ``limit=None``.
+        for row in self.db.get_all_edges(limit=None):
             src, tgt = row["source_id"], row["target_id"]
             if src in G and tgt in G:
                 G.add_edge(
