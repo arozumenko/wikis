@@ -439,6 +439,24 @@ class PostgresWikiStorage:
                         ALTER TABLE {schema}.wiki_pages
                             ADD COLUMN page_spec_json TEXT;
                     END IF;
+                    -- #138: validate JSON well-formedness at write time
+                    -- so corruption surfaces during the upsert instead
+                    -- of when structural regen tries to deserialize.
+                    -- Idempotent: only fires when the constraint is missing.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'wiki_pages_page_spec_json_chk'
+                          AND connamespace = '{schema}'::regnamespace
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE {schema}.wiki_pages
+                                ADD CONSTRAINT wiki_pages_page_spec_json_chk
+                                CHECK (page_spec_json IS NULL
+                                       OR (page_spec_json::json IS NOT NULL));
+                        EXCEPTION WHEN undefined_table OR invalid_text_representation THEN
+                            NULL;
+                        END;
+                    END IF;
                     -- page tables / CHECK constraints
                     IF NOT EXISTS (
                         SELECT 1 FROM pg_constraint

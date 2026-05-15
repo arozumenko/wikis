@@ -275,7 +275,10 @@ CREATE TABLE IF NOT EXISTS wiki_pages (
     -- JSON. Lets OptimizedWikiGenerationAgent.regenerate_single_page
     -- reconstruct the original retrieval inputs (target_symbols,
     -- target_docs, retrieval_query, etc.) without re-running the planner.
-    page_spec_json     TEXT DEFAULT NULL,
+    -- #138: CHECK enforces well-formed JSON so corruption surfaces at
+    -- write time, not when structural regen tries to deserialize.
+    page_spec_json     TEXT DEFAULT NULL
+                       CHECK (page_spec_json IS NULL OR json_valid(page_spec_json)),
     generated_at       TEXT DEFAULT (datetime('now'))
 );
 """
@@ -534,12 +537,21 @@ class UnifiedWikiDB:
                 )
                 self.conn.commit()
             # #116 PR 3 structural-handler wiring: page_spec_json.
+            # #138: CHECK json_valid added at ALTER time so legacy
+            # schemas that haven't yet seen the column also get the
+            # validity guard. Schemas that already added the column
+            # before PR will keep it unconstrained — recreating the
+            # table to retrofit the CHECK is heavier than the value;
+            # next full re-index picks up the constraint via the
+            # CREATE TABLE path.
             if "page_spec_json" not in page_cols:
                 logger.info(
                     "Migrating schema: adding page_spec_json to wiki_pages"
                 )
                 cur.execute(
-                    "ALTER TABLE wiki_pages ADD COLUMN page_spec_json TEXT DEFAULT NULL"
+                    "ALTER TABLE wiki_pages ADD COLUMN page_spec_json TEXT "
+                    "DEFAULT NULL "
+                    "CHECK (page_spec_json IS NULL OR json_valid(page_spec_json))"
                 )
                 self.conn.commit()
 

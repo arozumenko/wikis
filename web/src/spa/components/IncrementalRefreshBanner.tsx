@@ -26,7 +26,7 @@ interface IncrementalRefreshBannerProps {
 }
 
 interface PageEvent {
-  kind: 'unchanged' | 'patched' | 'edited' | 'regenerated';
+  kind: 'unchanged' | 'patched' | 'edited' | 'regenerated' | 'deleted';
   pageId: string;
   pageTitle: string;
 }
@@ -80,6 +80,17 @@ export function IncrementalRefreshBanner({
               ...prev,
               {
                 kind: 'regenerated',
+                pageId: event._pageId ?? '',
+                pageTitle: event._pageTitle ?? '',
+              },
+            ]);
+            break;
+          case 'page_deleted':
+            // #141: page's cluster vanished — orchestrator drops it.
+            setEvents((prev) => [
+              ...prev,
+              {
+                kind: 'deleted',
                 pageId: event._pageId ?? '',
                 pageTitle: event._pageTitle ?? '',
               },
@@ -157,6 +168,11 @@ export function IncrementalRefreshBanner({
         {stats!.structural_failed > 0 ? (
           <StatChip label="failed" count={stats!.structural_failed} color="error" />
         ) : null}
+        <StatChip
+          label="deleted"
+          count={(stats! as IncrementalRegenStats & { deleted?: number }).deleted ?? 0}
+          color="default"
+        />
       </Box>
     </Alert>
   );

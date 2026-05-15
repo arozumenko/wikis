@@ -21,6 +21,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class IncrementalRefreshInProgressError(Exception):
+    """Raised by :meth:`WikiService.incremental_refresh` when another
+    incremental refresh is already running for the same wiki_id.
+
+    #140 idempotency guard: two concurrent runs against the same
+    ``.wiki.db`` race each other's content-hash updates and may produce
+    inconsistent state. The route translates this into a 409.
+    """
+
+    def __init__(self, wiki_id: str, in_progress_invocation_id: str) -> None:
+        self.wiki_id = wiki_id
+        self.in_progress_invocation_id = in_progress_invocation_id
+        super().__init__(
+            f"Incremental refresh already in progress for wiki {wiki_id} "
+            f"(invocation {in_progress_invocation_id})"
+        )
+
+
 class WikiService:
     """Orchestrates wiki generation from repository analysis."""
 
@@ -568,6 +586,19 @@ class WikiService:
         if wiki_record is None:
             return None
 
+        # #140: idempotency guard. Two concurrent runs on the same wiki
+        # race each other's content_hash updates + the trivial-patcher's
+        # in-memory page_bodies dicts diverge. Reject the second caller
+        # with the in-flight invocation_id so they can join the existing
+        # SSE stream instead of spawning a parallel run.
+        for inv in self._invocations.values():
+            if (
+                inv.wiki_id == wiki_id
+                and inv.status == "running"
+                and inv.id != ""
+            ):
+                raise IncrementalRefreshInProgressError(wiki_id, inv.id)
+
         from pathlib import Path as _Path
 
         from app.core.agents.page_patcher import PagePatcher
@@ -641,15 +672,18 @@ class WikiService:
             page_bodies[pid] = body
             modified_bodies[pid] = body
 
-        def _stub_structural(page) -> bool:
+        def _stub_structural(page) -> str:
             # Fallback when agent construction fails. Logged at WARNING
             # so partial-feature regressions show up in production logs.
+            # Returning a reason string (per #134's new contract) lets
+            # the orchestrator's structural_failure_reasons telemetry
+            # capture *why* the fallback fired.
             logger.warning(
                 "[incremental_refresh] structural regen unavailable for "
                 "page %s (agent construction failed earlier in the run)",
                 page.page_id,
             )
-            return False
+            return "agent construction unavailable for this run"
 
         # Page-event builders keyed by event_name. Each takes
         # (invocation_id, page_id, page_title, **extras). The summary
@@ -660,6 +694,8 @@ class WikiService:
             "page_patched": events.page_patched,
             "page_edited": events.page_edited,
             "page_regenerated": events.page_regenerated,
+            # #141: page_deleted now wired into the dispatcher.
+            "page_deleted": events.page_deleted,
         }
 
         def _emit(event_name: str, payload: dict[str, Any]) -> None:

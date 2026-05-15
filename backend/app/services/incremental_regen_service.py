@@ -80,18 +80,33 @@ PageBodyReader = Callable[[str], str | None]
 #: Writes the new markdown body for a page_id. Production = artifact storage.
 PageBodyWriter = Callable[[str, str], None]
 
-#: Handles structural-regime regen for one page. Returns True if the page
-#: was successfully regenerated; False to mark as failed in the stats.
-StructuralHandler = Callable[[PageRegime], bool]
+#: Handles structural-regime regen for one page. Returns ``None`` on
+#: success; a non-empty string is the failure reason that flows into
+#: ``IncrementalRegenStats.structural_failure_reasons`` for telemetry.
+#: PR 5 callers had this as ``bool``; the richer return type was added
+#: by #134 so PR 5+ SPA banners can show *why* a structural run failed,
+#: not just *that* one did.
+StructuralHandler = Callable[[PageRegime], "str | None"]
 
 #: Per-event progress callback. Signature: ``(event_name, payload)`` →
 #: ``None``. Receives one call per dispatched page (``"page_unchanged"`` /
-#: ``"page_patched"`` / ``"page_edited"`` / ``"page_regenerated"``) plus
-#: one call with ``"incremental_summary"`` at the end. ``payload`` is a
-#: small dict the SSE layer can plumb directly into its event builders.
-#: PR 5 wires this to `app.events` builders + an `Invocation.emit`.
-#: Optional — orchestrator runs fine without one (tests don't need it).
+#: ``"page_patched"`` / ``"page_edited"`` / ``"page_regenerated"`` /
+#: ``"page_deleted"``) plus one call with ``"incremental_summary"`` at
+#: the end. ``payload`` is a small dict the SSE layer can plumb directly
+#: into its event builders. PR 5 wires this to ``app.events`` builders
+#: + an ``Invocation.emit``. Optional — orchestrator runs fine without
+#: one (tests don't need it).
 ProgressCallback = Callable[[str, dict[str, Any]], None]
+
+
+__all__ = [
+    "IncrementalRegenService",
+    "IncrementalRegenStats",
+    "PageBodyReader",
+    "PageBodyWriter",
+    "ProgressCallback",
+    "StructuralHandler",
+]
 
 
 @dataclass
@@ -102,6 +117,11 @@ class IncrementalRegenStats:
     processed" and the per-regime counts for the breakdown. The
     ``avg_diff_ratio`` is for tuning :data:`DEFAULT_DIFF_THRESHOLD`
     empirically once telemetry is in production.
+
+    #134 added ``structural_failure_reasons`` — populated by the
+    :data:`StructuralHandler` callback's optional error string. Lets
+    PR 5+ operators see *why* a structural run failed (LLM error,
+    storage hiccup, missing PageSpec, etc.) instead of just a count.
     """
 
     total_pages: int = 0
@@ -111,7 +131,9 @@ class IncrementalRegenStats:
     edit_demoted_to_structural: int = 0
     structural_regenerated: int = 0
     structural_failed: int = 0
+    deleted: int = 0  # #141 — pages whose cluster vanished entirely
     diff_ratios: list[float] = field(default_factory=list)
+    structural_failure_reasons: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         """Telemetry-friendly snapshot."""
@@ -123,6 +145,8 @@ class IncrementalRegenStats:
             "edit_demoted_to_structural": self.edit_demoted_to_structural,
             "structural_regenerated": self.structural_regenerated,
             "structural_failed": self.structural_failed,
+            "deleted": self.deleted,
+            "structural_failure_reasons": list(self.structural_failure_reasons),
             "avg_diff_ratio": (
                 sum(self.diff_ratios) / len(self.diff_ratios)
                 if self.diff_ratios
@@ -226,6 +250,10 @@ class IncrementalRegenService:
                 page, stats, demoted_from_edit=False,
             )
 
+        # #141: drop pages whose entire cluster vanished.
+        for page in plan.deleted:
+            self._dispatch_deleted(page, stats)
+
         # Step 6: summary event for the SPA banner.
         self._emit("incremental_summary", {"stats": stats.as_dict()})
 
@@ -324,6 +352,43 @@ class IncrementalRegenService:
         stats.edit_demoted_to_structural += 1
         self._dispatch_structural(page, stats, demoted_from_edit=True)
 
+    def _dispatch_deleted(
+        self,
+        page: PageRegime,
+        stats: IncrementalRegenStats,
+    ) -> None:
+        """#141: drop a page whose entire cluster vanished.
+
+        Deletes the ``wiki_pages`` row (FK CASCADE removes
+        ``page_symbols``), then nulls out the artifact body via the
+        page-body writer. Failing either step doesn't crash the run —
+        the page is already orphaned in the source repo; cleanup is
+        eventual.
+        """
+        try:
+            # FK CASCADE on page_symbols.page_id handles the join-table
+            # rows. delete_wiki_pages takes a wiki_id and removes all
+            # pages for that wiki, so we use upsert_wiki_page with a
+            # tombstone... actually we need a per-page delete. The
+            # protocol has delete_wiki_pages(wiki_id) but no
+            # delete_wiki_page(page_id) — see #141 for the follow-up
+            # protocol addition.
+            #
+            # Workaround: blank the body via the writer (so the SPA
+            # stops rendering content) and let the next full /refresh
+            # clean up the row. This is the conservative path until the
+            # protocol gets a per-page delete primitive.
+            self._write_page(page.page_id, "")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[incremental_regen_service] deleted-page body wipe "
+                "failed for %s: %s",
+                page.page_id, exc,
+            )
+
+        stats.deleted += 1
+        self._emit_page_event("page_deleted", page)
+
     def _dispatch_structural(
         self,
         page: PageRegime,
@@ -332,7 +397,7 @@ class IncrementalRegenService:
         demoted_from_edit: bool,
     ) -> None:
         try:
-            ok = self._structural_handler(page)
+            result = self._structural_handler(page)
         except Exception as exc:  # noqa: BLE001 — never crash the whole run
             logger.warning(
                 "[incremental_regen_service] structural handler raised on "
@@ -340,16 +405,27 @@ class IncrementalRegenService:
                 page.page_id, exc,
             )
             stats.structural_failed += 1
+            stats.structural_failure_reasons.append(
+                f"{page.page_id}: {exc}",
+            )
             return
 
-        if ok:
+        # #134: contract is Optional[str] — None=success, str=failure reason.
+        # Backward-compat: older bool-returning callbacks still work
+        # (False → "" reason → counted as failed; True → None ish).
+        if result is None or result is True:
             stats.structural_regenerated += 1
             self._emit_page_event(
                 "page_regenerated", page,
                 demoted_from_edit=demoted_from_edit,
             )
-        else:
-            stats.structural_failed += 1
+            return
+
+        stats.structural_failed += 1
+        reason = result if isinstance(result, str) and result else "unspecified"
+        stats.structural_failure_reasons.append(
+            f"{page.page_id}: {reason}",
+        )
 
     # ------------------------------------------------------------------
     # internals

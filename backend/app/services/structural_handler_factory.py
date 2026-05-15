@@ -66,7 +66,7 @@ def make_agent_structural_handler(
         reconstruct the page (legacy row, missing spec, LLM error).
     """
 
-    def _handler(page: "PageRegime") -> bool:
+    def _handler(page: "PageRegime") -> "str | None":
         new_content = agent.regenerate_single_page(
             page.page_id, repository_context=repository_context,
         )
@@ -76,7 +76,7 @@ def make_agent_structural_handler(
                 "structural regen failed",
                 page.page_id,
             )
-            return False
+            return "agent returned None (missing PageSpec or LLM error)"
         try:
             write_page_body(page.page_id, new_content)
         except Exception as exc:  # noqa: BLE001
@@ -84,7 +84,7 @@ def make_agent_structural_handler(
                 "[structural_handler] page %s: write failed: %s",
                 page.page_id, exc,
             )
-            return False
+            return f"page-body write failed: {exc}"
 
         # Stamp the new content_hash into wiki_pages so the next
         # incremental run sees this page as unchanged (parity with
@@ -104,6 +104,6 @@ def make_agent_structural_handler(
             # Don't fail the overall regen — body is written; only the
             # bookkeeping hash is stale. Logged loudly so ops can spot it.
 
-        return True
+        return None  # success
 
     return _handler

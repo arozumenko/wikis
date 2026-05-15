@@ -27,13 +27,19 @@ from app.services.incremental_regen import (
 
 
 class _StubStorage:
-    """Minimal storage stub — only ``get_wiki_page`` is read by the classifier."""
+    """Minimal storage stub — only ``get_wiki_page`` and
+    ``get_page_symbols`` are read by the classifier."""
 
     def __init__(self, pages: dict[str, dict] | None = None) -> None:
         self._pages = pages or {}
 
     def get_wiki_page(self, page_id: str) -> dict | None:
         return self._pages.get(page_id)
+
+    def get_page_symbols(self, page_id: str, citation_kind: str | None = None) -> list:
+        # Empty by default. Tests that need cluster-vanished routing
+        # define their own storage stub with a real return value.
+        return []
 
 
 def _change(kind: ChangeKind, node_id: str = "n", **kwargs) -> NodeChange:
@@ -47,6 +53,70 @@ def _affected(page_id: str, *changes: NodeChange) -> AffectedPage:
 # ---------------------------------------------------------------------------
 # Rule 1: primary symbol deleted → structural (overrides everything else)
 # ---------------------------------------------------------------------------
+
+
+class TestAllSymbolsDeleted:
+    """#141: when every node the page cites is in change_set.deleted,
+    route to Regime.DELETED. Takes priority over primary-symbol-deleted."""
+
+    def test_all_cited_symbols_deleted_routes_deleted(self) -> None:
+        change_set = ChangeSet(
+            deleted=[
+                _change(ChangeKind.DELETED, "sym-1", old_hash="a"),
+                _change(ChangeKind.DELETED, "sym-2", old_hash="b"),
+            ]
+        )
+        affected = [
+            _affected(
+                "p1",
+                _change(ChangeKind.DELETED, "sym-1"),
+                _change(ChangeKind.DELETED, "sym-2"),
+            ),
+        ]
+        # Stub storage that reports page-1 cites exactly sym-1 + sym-2.
+        class _ClusterVanishedStorage:
+            def get_wiki_page(self, page_id):
+                return {"primary_symbol_id": "sym-1"}
+
+            def get_page_symbols(self, page_id, citation_kind=None):
+                return [
+                    {"node_id": "sym-1", "citation_kind": "primary"},
+                    {"node_id": "sym-2", "citation_kind": "related"},
+                ]
+
+        plan = classify_pages(change_set, affected, _ClusterVanishedStorage())
+        assert len(plan.deleted) == 1
+        assert plan.deleted[0].page_id == "p1"
+        assert "all" in plan.deleted[0].reason.lower()
+        # Did NOT route to structural even though primary is deleted —
+        # DELETED is more specific.
+        assert plan.structural == []
+
+    def test_one_symbol_survives_routes_structural_not_deleted(self) -> None:
+        """If at least one cited symbol survives, the page is structural,
+        not deleted — it can still be regenerated around the survivor."""
+        change_set = ChangeSet(
+            deleted=[_change(ChangeKind.DELETED, "sym-1", old_hash="a")]
+        )
+        affected = [
+            _affected("p1", _change(ChangeKind.DELETED, "sym-1")),
+        ]
+
+        class _OneSurvivorStorage:
+            def get_wiki_page(self, page_id):
+                return {"primary_symbol_id": "sym-1"}
+
+            def get_page_symbols(self, page_id, citation_kind=None):
+                return [
+                    {"node_id": "sym-1", "citation_kind": "primary"},
+                    {"node_id": "sym-2", "citation_kind": "related"},
+                ]
+
+        plan = classify_pages(change_set, affected, _OneSurvivorStorage())
+        # sym-2 survived → not fully deleted → falls through to
+        # structural via the primary-deleted override.
+        assert plan.deleted == []
+        assert len(plan.structural) == 1
 
 
 class TestPrimarySymbolDeletedOverride:

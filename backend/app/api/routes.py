@@ -979,12 +979,24 @@ async def incremental_refresh_wiki(
             403, "Only the wiki owner can incrementally refresh",
         )
 
-    result = await service.incremental_refresh(
-        wiki_id,
-        [n.model_dump() for n in body.parsed_nodes],
-        management,
-        owner_id=user_id or "",
-    )
+    from app.services.wiki_service import IncrementalRefreshInProgressError
+
+    try:
+        result = await service.incremental_refresh(
+            wiki_id,
+            [n.model_dump() for n in body.parsed_nodes],
+            management,
+            owner_id=user_id or "",
+        )
+    except IncrementalRefreshInProgressError as exc:
+        # #140: surface the in-flight invocation_id so the caller can
+        # join the existing SSE stream instead of retrying blindly.
+        raise HTTPException(
+            409,
+            detail=str(exc),
+            headers={"X-Incremental-Invocation-Id": exc.in_progress_invocation_id},
+        ) from exc
+
     if result is None:
         raise HTTPException(
             404,

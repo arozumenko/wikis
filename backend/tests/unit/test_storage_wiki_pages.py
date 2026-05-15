@@ -214,6 +214,16 @@ class TestPageSpecJson:
         row = db.get_wiki_page("p1")
         assert row["page_spec_json"] is None
 
+    def test_malformed_json_rejected_by_check(self, db: UnifiedWikiDB) -> None:
+        """#138: CHECK json_valid surfaces corruption at write time
+        instead of when structural regen tries to deserialize."""
+        with pytest.raises(Exception):  # sqlite3.IntegrityError
+            db.upsert_wiki_page(
+                _page("p1", anchor_slug="a", page_spec_json="{not json"),
+            )
+        # Verify the row didn't land.
+        assert db.get_wiki_page("p1") is None
+
 
 class TestAtomicWrite:
     """upsert_wiki_page_with_symbols must roll back both writes on failure

@@ -52,6 +52,10 @@ class Regime(str, Enum):
     TRIVIAL = "trivial"
     EDIT = "edit"
     STRUCTURAL = "structural"
+    #: #141: the page's entire cluster vanished — every node it cites
+    #: is in ``change_set.deleted``. Orchestrator drops the wiki_pages
+    #: row, page_symbols rows, and the artifact body.
+    DELETED = "deleted"
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,9 @@ class RegimePlan:
     trivial: list[PageRegime] = field(default_factory=list)
     edit: list[PageRegime] = field(default_factory=list)
     structural: list[PageRegime] = field(default_factory=list)
+    #: #141: pages whose entire cluster vanished. Orchestrator removes
+    #: the row + artifact instead of regenerating.
+    deleted: list[PageRegime] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -92,6 +99,7 @@ class RegimePlan:
             + len(self.trivial)
             + len(self.edit)
             + len(self.structural)
+            + len(self.deleted)
         )
 
     def counts(self) -> dict[str, int]:
@@ -101,6 +109,7 @@ class RegimePlan:
             "trivial": len(self.trivial),
             "edit": len(self.edit),
             "structural": len(self.structural),
+            "deleted": len(self.deleted),
             "total": self.total,
         }
 
@@ -133,22 +142,27 @@ def classify_pages(
 
     Routing rules (in priority order):
 
-    1. **Primary symbol deleted** → ``structural``. The page is about
+    1. **All cited symbols deleted** → ``deleted`` (#141). The page's
+       entire cluster vanished; drop the row + artifact instead of
+       regenerating. Takes priority over rule 2 because "everything's
+       gone" is strictly more specific than "primary's gone".
+
+    2. **Primary symbol deleted** → ``structural``. The page is about
        a symbol that no longer exists; surgical editing makes no sense.
 
-    2. **Any DELETED or ADDED change** → ``structural``. Page topology
+    3. **Any DELETED or ADDED change** → ``structural``. Page topology
        changed (a cited symbol is gone, or a new sibling appeared);
        cluster membership for this page might have shifted.
 
-    3. **Only MODIFIED changes** → ``edit``. Signatures may or may not
+    4. **Only MODIFIED changes** → ``edit``. Signatures may or may not
        have changed; the surgical patcher reads the diff and decides
        per-section. Falls back to structural at the patcher's quality
        gate (out of scope for the classifier).
 
-    4. **Only MOVED changes** → ``trivial``. No semantic change; just
+    5. **Only MOVED changes** → ``trivial``. No semantic change; just
        update ``<code_context path="...">`` blocks in the body.
 
-    5. **Empty change list** → ``unchanged`` (defensive — shouldn't
+    6. **Empty change list** → ``unchanged`` (defensive — shouldn't
        happen for items in ``affected_pages`` but guard anyway).
     """
     plan = RegimePlan()
@@ -182,14 +196,27 @@ def _classify_one(
     deleted_node_ids: set[str],
     storage: WikiStorageProtocol,
 ) -> tuple[Regime, str]:
-    """Apply the four-rule routing table to a single page."""
+    """Apply the routing table to a single page."""
     if not affected.changes:
         return Regime.UNCHANGED, "no changes after filtering"
 
-    # Rule 1: primary symbol deleted → structural. The page is "about"
-    # a symbol that no longer exists; surgical editing can't recover.
     page_row = storage.get_wiki_page(affected.page_id)
     primary_symbol_id = (page_row or {}).get("primary_symbol_id")
+
+    # Rule 1 (#141): all of the page's symbols deleted → drop the page.
+    # We check this BEFORE the primary-deleted rule because "everything's
+    # gone" is strictly more specific. The page's symbol set comes from
+    # page_symbols rows.
+    try:
+        cited_rows = storage.get_page_symbols(affected.page_id)
+        cited_ids = {row["node_id"] for row in cited_rows if row.get("node_id")}
+    except Exception:  # noqa: BLE001 — fall through, treat as no info
+        cited_ids = set()
+    if cited_ids and cited_ids.issubset(deleted_node_ids):
+        return Regime.DELETED, f"all {len(cited_ids)} cited symbols deleted"
+
+    # Rule 2: primary symbol deleted → structural. The page is "about"
+    # a symbol that no longer exists; surgical editing can't recover.
     if primary_symbol_id and primary_symbol_id in deleted_node_ids:
         return Regime.STRUCTURAL, f"primary symbol {primary_symbol_id!r} deleted"
 

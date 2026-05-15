@@ -92,7 +92,7 @@ def test_happy_path_writes_stamps_hash_and_returns_true() -> None:
         write_page_body=lambda pid, body: writes.append((pid, body)),
     )
 
-    assert handler(_FakePage(page_id="p1")) is True
+    assert handler(_FakePage(page_id="p1")) is None  # None = success
     assert writes == [("p1", "# Regenerated\n\nFresh content.")]
     # content_hash stamp ran: storage saw an upsert with the new hash.
     assert len(storage.upsert_calls) == 1
@@ -117,7 +117,9 @@ def test_agent_returns_none_skips_write_and_stamp_and_returns_false() -> None:
         write_page_body=lambda pid, body: writes.append((pid, body)),
     )
 
-    assert handler(_FakePage(page_id="legacy-no-spec")) is False
+    # New contract: failure returns the reason string, not False.
+    result = handler(_FakePage(page_id="legacy-no-spec"))
+    assert isinstance(result, str) and "agent returned None" in result
     assert writes == []
     # No stamp attempted either.
     assert storage.upsert_calls == []
@@ -139,8 +141,9 @@ def test_writer_failure_is_caught_and_skips_stamp_and_returns_false() -> None:
     )
 
     # Must not propagate the writer's exception — orchestrator depends
-    # on every structural callback returning bool, not raising.
-    assert handler(_FakePage(page_id="p1")) is False
+    # on every structural callback returning Optional[str], not raising.
+    result = handler(_FakePage(page_id="p1"))
+    assert isinstance(result, str) and "write failed" in result
     # Hash stamp should NOT happen when the body write failed.
     assert storage.upsert_calls == []
 
@@ -163,7 +166,7 @@ def test_content_hash_stamp_failure_does_not_fail_the_regen() -> None:
     )
 
     # Body wrote; only the hash stamp failed → still True.
-    assert handler(_FakePage(page_id="p1")) is True
+    assert handler(_FakePage(page_id="p1")) is None  # None = success
     assert writes == [("p1", "# Some content")]
 
 
@@ -181,7 +184,7 @@ def test_content_hash_stamp_skipped_when_page_row_missing() -> None:
         write_page_body=lambda pid, body: writes.append((pid, body)),
     )
 
-    assert handler(_FakePage(page_id="p1")) is True
+    assert handler(_FakePage(page_id="p1")) is None  # None = success
     assert writes == [("p1", "# Some content")]
     # No upsert attempted on a missing row.
     assert storage.upsert_calls == []

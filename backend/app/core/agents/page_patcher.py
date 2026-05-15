@@ -248,21 +248,24 @@ class PagePatcher:
 def compute_diff_ratio(old: str, new: str) -> float:
     """Estimate how much of ``old`` was rewritten in ``new``.
 
-    Token-set Jaccard distance: tokenize both on whitespace, treat as
-    multisets, compute ``1 - |intersection| / |union|``. Returns a
-    value in [0, 1] where 0 means identical and 1 means disjoint.
+    Token-set Jaccard distance: tokenize both on whitespace,
+    case-normalize, treat as multisets, compute
+    ``1 - |intersection| / |union|``. Returns a value in [0, 1] where
+    0 means identical and 1 means disjoint.
 
     Cheap and language-agnostic. Doesn't catch reorderings (a paragraph
     swap looks like 0 diff) but those aren't the failure mode we worry
     about — the failure mode is "LLM rewrote stuff it shouldn't have",
     which always introduces new tokens.
 
-    Documentation knob: PR 5 telemetry can compare this to the
-    threshold to see how often surgical edits get accepted vs.
-    rejected, and tune the threshold per-deployment.
+    #135: tokens are lower-cased before comparison so casing tweaks
+    in body prose ("API" → "api") don't inflate the diff ratio. We
+    explicitly DO NOT want this for code identifiers (where case is
+    significant), but body-prose comparison is the only place this
+    metric is used.
     """
-    old_tokens = old.split()
-    new_tokens = new.split()
+    old_tokens = [t.lower() for t in old.split()]
+    new_tokens = [t.lower() for t in new.split()]
     if not old_tokens and not new_tokens:
         return 0.0
     old_set = set(old_tokens)

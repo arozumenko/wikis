@@ -170,6 +170,46 @@ class TestIncrementalRefreshEndpoint:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
+    async def test_409_when_refresh_already_in_progress(
+        self, client_and_setup,
+    ) -> None:
+        """#140: a second concurrent /incremental-refresh on the same
+        wiki must return 409 with the in-flight invocation_id so the
+        caller can join its SSE stream instead of spawning a racing run."""
+        client, app = client_and_setup
+        body = {
+            "parsed_nodes": [
+                {
+                    "node_id": "sym-moved",
+                    "content_hash": compute_content_hash("def moved(): pass"),
+                    "rel_path": "new_path.py",
+                },
+            ],
+        }
+        # First request: register an in-flight invocation in the service.
+        # We inject one directly to avoid racing the actual orchestrator.
+        from app.models.invocation import Invocation
+
+        service = app.state.wiki_service
+        service._invocations["in-flight-fake"] = Invocation(
+            id="in-flight-fake",
+            wiki_id="test-wiki",
+            repo_url="https://github.com/example/widgets",
+            branch="main",
+            status="running",
+            owner_id="dev-user",
+        )
+
+        resp = await client.post(
+            "/api/v1/wikis/test-wiki/incremental-refresh",
+            json=body,
+        )
+        assert resp.status_code == 409, resp.text
+        # The in-flight invocation_id is surfaced so the caller can
+        # subscribe to its SSE stream.
+        assert resp.headers["X-Incremental-Invocation-Id"] == "in-flight-fake"
+
+    @pytest.mark.asyncio
     async def test_422_when_payload_exceeds_cap(self, client_and_setup) -> None:
         client, _ = client_and_setup
         oversized = [
