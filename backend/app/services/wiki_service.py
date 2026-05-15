@@ -735,14 +735,33 @@ class WikiService:
                         structural_handler = make_agent_structural_handler(
                             agent,
                             storage=storage,
-                            repository_context="",  # PR follow-up: thread repo_context
+                            # TODO(#142-followup): thread the repo's
+                            # repository_analysis from storage.get_meta()
+                            # so structural prompts see the README-level
+                            # context full regen would inject.
+                            repository_context="",
                             write_page_body=_write,
                         )
                     else:
+                        # Agent construction failed (embeddings, retriever,
+                        # or agent __init__). Emit a status_message so the
+                        # SPA can show "structural regime unavailable" —
+                        # without this signal, callers see a partial-
+                        # success summary that conflates "no structural
+                        # pages in plan" with "every structural page
+                        # silently failed because the deployment is mis-
+                        # configured".
                         logger.warning(
                             "[incremental_refresh] agent construction "
                             "failed; structural regime will fail every page",
                         )
+                        await invocation.emit(events.message(
+                            "warning",
+                            "Structural regen unavailable for this run "
+                            "(agent construction failed). Trivial + edit "
+                            "regimes will still run; any structural page "
+                            "will count as failed.",
+                        ))
                         structural_handler = _stub_structural
 
                     svc = IncrementalRegenService(

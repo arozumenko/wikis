@@ -155,4 +155,25 @@ def build_agent_for_incremental_refresh(
         )
         return None
 
+    # Pre-wire the agent's cluster_db handle to the storage we already
+    # have open. Without this, regenerate_single_page calls
+    # _open_cluster_db() which falls through to _find_unified_db() — that
+    # heuristic checks the indexer (None on our stub), then walks
+    # cache_index.json + glob fallbacks. The walk usually works but is
+    # fragile (cache_index drift, moved DB files, etc.) and would open a
+    # second connection to the same DB. Direct wiring is correctness +
+    # efficiency.
+    agent._cluster_db = storage
+    try:
+        agent._cluster_db_path = str(storage.db_path)
+    except Exception:  # noqa: BLE001
+        # Postgres storage uses a sentinel path that may not stringify;
+        # the _cluster_db handle above is sufficient.
+        agent._cluster_db_path = None
+
+    logger.info(
+        "[agent_builder] incremental agent ready (DB-only retrieval, "
+        "no cloned repo on disk — _get_relevant_content_for_page "
+        "strategy 3 is disabled by design)",
+    )
     return agent

@@ -130,6 +130,24 @@ class TestBuildAgent:
         assert agent.repository_url == "https://github.com/example/widgets"
         assert agent.branch == "main"
 
+    def test_builder_pre_wires_cluster_db(self, fixture) -> None:
+        """Regression for the Critical finding in the PR #143 review:
+        without _cluster_db pre-wiring, regenerate_single_page falls
+        through to _find_unified_db() which is fragile (cache_index
+        drift, glob fallback). The builder must wire it directly."""
+        db, wiki_record, llm, settings = fixture
+        with patch(
+            "app.services.llm_factory.create_embeddings",
+            side_effect=Exception("test"),
+        ):
+            agent = build_agent_for_incremental_refresh(
+                wiki_record, db, llm, settings,
+            )
+
+        assert agent is not None
+        assert agent._cluster_db is db
+        assert agent._cluster_db_path == str(db.db_path)
+
     def test_returns_none_when_retriever_construction_fails(
         self, fixture,
     ) -> None:
@@ -157,13 +175,15 @@ class TestBuildAgent:
             )
 
         assert agent is not None
-        # Hand the agent a cached cluster_db handle so regenerate_single_page
-        # doesn't re-search for one. The builder doesn't wire _cluster_db
-        # (production resolves it via _find_unified_db), so we set it here.
-        agent._cluster_db = db
-        agent._cluster_db_path = str(db.db_path)
+        # No manual _cluster_db wiring needed — the builder pre-wires it
+        # to the storage handle the caller passed in. This test exercises
+        # the same code path production hits.
+        assert agent._cluster_db is db
 
-        # Stub the two heavy methods regenerate_single_page calls.
+        # Stub the two heavy methods regenerate_single_page calls so we
+        # don't need a real LLM or retrieval. The wiring under test is
+        # everything around them: storage read of page_spec_json →
+        # PageSpec deserialize → method dispatch → return value.
         with patch.object(
             agent, "_get_relevant_content_for_page",
             return_value={"files": [], "content": "x", "total_docs": 0},
