@@ -714,6 +714,12 @@ class UnifiedWikiDB:
     def node_count(self) -> int:
         return self.conn.execute("SELECT count(*) FROM repo_nodes").fetchone()[0]
 
+    def fetch_indexed_node_hashes(self) -> dict[str, str | None]:
+        rows = self.conn.execute(
+            "SELECT node_id, content_hash FROM repo_nodes"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
     # ══════════════════════════════════════════════════════════════════
     # EDGE operations
     # ══════════════════════════════════════════════════════════════════

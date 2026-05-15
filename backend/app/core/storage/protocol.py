@@ -122,6 +122,20 @@ class WikiStorageProtocol(Protocol):
         """Total number of nodes."""
         ...
 
+    def fetch_indexed_node_hashes(self) -> dict[str, str | None]:
+        """Return ``{node_id: content_hash}`` for every indexed node.
+
+        Used by [#116] PR 2 change detection as the "previous state" the
+        detector diffs against. ``content_hash`` may be ``None`` for nodes
+        indexed before PR 1 landed — callers treat those as "hash unknown",
+        which forces a re-parse comparison rather than a hash equality
+        check.
+
+        Returns an empty dict for an unindexed wiki — callers must handle
+        that as "first generation, everything is new".
+        """
+        ...
+
     # ==================================================================
     # EDGE operations
     # ==================================================================
