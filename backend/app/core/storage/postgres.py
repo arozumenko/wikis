@@ -455,8 +455,12 @@ class PostgresWikiStorage:
                     --
                     -- The EXCEPTION block stays as a defensive net for
                     -- any other DDL-time failure (privileges, locked
-                    -- table) — it RAISEs NOTICE rather than silently
-                    -- swallowing so the deploy log shows the gap.
+                    -- table) — it RAISEs WARNING (not NOTICE) so the
+                    -- message hits server logs by default + most
+                    -- driver-side handlers (psycopg2 conn.notices /
+                    -- psycopg3 notice handlers). NOTICE is below the
+                    -- default log_min_messages threshold and gets
+                    -- silently swallowed in most deploy configurations.
                     IF NOT EXISTS (
                         SELECT 1 FROM pg_constraint
                         WHERE conname = 'wiki_pages_page_spec_json_chk'
@@ -474,7 +478,7 @@ class PostgresWikiStorage:
                             -- main DDL path. Safe to skip.
                             NULL;
                         WHEN OTHERS THEN
-                            RAISE NOTICE 'wiki_pages_page_spec_json_chk migration skipped: %', SQLERRM;
+                            RAISE WARNING 'wiki_pages_page_spec_json_chk migration skipped: %', SQLERRM;
                         END;
                     END IF;
                     -- page tables / CHECK constraints

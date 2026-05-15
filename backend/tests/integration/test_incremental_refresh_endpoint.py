@@ -210,6 +210,52 @@ class TestIncrementalRefreshEndpoint:
         assert resp.headers["X-Incremental-Invocation-Id"] == "in-flight-fake"
 
     @pytest.mark.asyncio
+    async def test_invocation_status_flips_terminal_after_run(
+        self, client_and_setup,
+    ) -> None:
+        """C1 regression test: after the background ``_run()`` completes,
+        ``invocation.status`` must transition off ``"running"``. Without
+        this, the widened idempotency guard would 409-lock the wiki
+        forever — every subsequent refresh (or full generate) would see
+        the phantom ``"running"`` entry from a prior completed run.
+        """
+        client, app = client_and_setup
+        body = {
+            "parsed_nodes": [
+                {
+                    "node_id": "sym-moved",
+                    "content_hash": compute_content_hash("def moved(): pass"),
+                    "rel_path": "new_path.py",
+                },
+            ],
+        }
+        resp = await client.post(
+            "/api/v1/wikis/test-wiki/incremental-refresh", json=body,
+        )
+        assert resp.status_code == 202
+        invocation_id = resp.json()["invocation_id"]
+
+        # Wait for the background task to complete. The fixture's
+        # WikiService stashes the task in self._tasks; awaiting it
+        # gives us the deterministic "run finished" signal.
+        service = app.state.wiki_service
+        task = service._tasks.get(invocation_id)
+        assert task is not None
+        await task
+
+        # Status must be terminal — not "running".
+        invocation = service._invocations[invocation_id]
+        assert invocation.status in {"complete", "failed"}, (
+            f"expected terminal status, got {invocation.status!r}"
+        )
+
+        # And a subsequent refresh must NOT be 409'd by the completed entry.
+        resp2 = await client.post(
+            "/api/v1/wikis/test-wiki/incremental-refresh", json=body,
+        )
+        assert resp2.status_code == 202, resp2.text
+
+    @pytest.mark.asyncio
     async def test_409_when_full_generate_in_progress(
         self, client_and_setup,
     ) -> None:

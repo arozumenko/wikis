@@ -379,6 +379,47 @@ class TestIncrementalRegenServiceE2E:
         assert fixture.get_wiki_page("page-struct") is None
         assert fixture.get_pages_citing_node("sym-deleted") == []
 
+    def test_deleted_regime_idempotent_when_row_already_gone(
+        self, fixture,
+    ) -> None:
+        """I3: if the wiki_pages row was already removed (e.g. by an
+        earlier partial-failure run), the dispatcher must NOT bump
+        ``stats.deleted`` or emit a ``page_deleted`` event for a non-
+        event. ``delete_wiki_page`` returns False; dispatcher no-ops.
+        """
+        # Manually delete the page row up-front so the regime's call
+        # to delete_wiki_page returns False instead of True.
+        fixture.delete_wiki_page("page-struct")
+        assert fixture.get_wiki_page("page-struct") is None
+
+        page_bodies = {
+            "page-trivial": "x",
+            "page-edit": "x",
+            "page-struct": "x",
+        }
+        parsed = [
+            _parsed("sym-moved", "def moved(): pass", "old_path.py"),
+            _parsed("sym-modified", "def modify_me(): pass"),
+            _parsed("sym-bystander", "def b(): pass"),
+            # sym-deleted absent → cluster vanished for page-struct
+        ]
+        events: list[tuple[str, dict]] = []
+
+        svc = IncrementalRegenService(
+            storage=fixture,
+            page_patcher=PagePatcher(_StubLLM("UNUSED")),
+            read_page_body=lambda pid: page_bodies.get(pid),
+            write_page_body=lambda pid, body: page_bodies.__setitem__(pid, body),
+            structural_handler=lambda page: None,
+            progress_callback=lambda name, payload: events.append((name, payload)),
+        )
+        stats = svc.run(parsed)
+
+        # Row was already gone — no stats bump, no SSE event.
+        assert stats.deleted == 0
+        assert stats.deleted_failed == 0
+        assert not any(name == "page_deleted" for name, _ in events)
+
     def test_progress_callback_emits_per_page_and_summary_events(
         self, fixture,
     ) -> None:

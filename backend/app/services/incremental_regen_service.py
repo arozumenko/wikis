@@ -373,9 +373,15 @@ class IncrementalRegenService:
         ``stats.deleted == N`` means N rows are gone matters for the
         SPA's accounting). The page row deletion is the load-bearing
         step; the body wipe is cosmetic backup.
+
+        ``delete_wiki_page`` returns ``False`` when the row was already
+        missing (idempotent retry after a partial-failure run). In that
+        case the dispatch is a no-op: no stats bump, no SSE event,
+        because the page was already removed by an earlier run and
+        re-announcing it would mislead the SPA's progress counter.
         """
         try:
-            self._storage.delete_wiki_page(page.page_id)
+            row_removed = self._storage.delete_wiki_page(page.page_id)
         except Exception as exc:  # noqa: BLE001
             stats.deleted_failed += 1
             stats.structural_failure_reasons.append(
@@ -385,6 +391,14 @@ class IncrementalRegenService:
                 "[incremental_regen_service] delete_wiki_page failed "
                 "for %s: %s",
                 page.page_id, exc,
+            )
+            return
+
+        if not row_removed:
+            logger.debug(
+                "[incremental_regen_service] delete_wiki_page: page %s "
+                "already absent (idempotent retry?)",
+                page.page_id,
             )
             return
 

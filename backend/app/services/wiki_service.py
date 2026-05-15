@@ -759,6 +759,7 @@ class WikiService:
                         # The orchestrator unconditionally constructs a
                         # PagePatcher path; without an LLM we can't run
                         # the edit regime. Fail the run loudly here.
+                        invocation.status = "failed"
                         await invocation.emit(events.task_status(
                             invocation.id, "failed",
                             "LLM unavailable — incremental refresh requires LLM",
@@ -845,11 +846,20 @@ class WikiService:
                             pid, exc,
                         )
 
+                # Critical: flip the in-memory status off "running" BEFORE
+                # the persist in the finally block. Without this, the
+                # idempotency guard at the top of incremental_refresh
+                # would 409-lock the wiki forever — every subsequent
+                # refresh (and full generate, since the guard widened to
+                # include "generating") sees this phantom "running"
+                # entry. Mirrors _run_generation's terminal-state writes.
+                invocation.status = "complete"
                 await invocation.emit(events.task_status(
                     invocation.id, "completed",
                     "Incremental refresh complete",
                 ))
             except Exception as exc:  # noqa: BLE001
+                invocation.status = "failed"
                 logger.exception(
                     "[incremental_refresh] run failed for wiki %s", wiki_id,
                 )
