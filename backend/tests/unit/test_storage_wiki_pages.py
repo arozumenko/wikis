@@ -102,6 +102,30 @@ class TestListAndDelete:
         # FK cascade — page_symbols rows gone too.
         assert db.get_pages_citing_node("n1") == []
 
+    def test_delete_wiki_page_removes_single_row(self, db: UnifiedWikiDB) -> None:
+        """#141: per-page delete primitive used by the DELETED regime.
+        Leaves sibling pages intact and cascades to page_symbols."""
+        db.upsert_wiki_page(_page("p1", anchor_slug="p1"))
+        db.upsert_wiki_page(_page("p2", anchor_slug="p2"))
+        db.record_page_symbols("p1", [("n1", "primary")])
+        db.record_page_symbols("p2", [("n2", "primary")])
+
+        deleted = db.delete_wiki_page("p1")
+        assert deleted is True
+        assert db.get_wiki_page("p1") is None
+        # FK cascade — p1's symbols gone.
+        assert db.get_pages_citing_node("n1") == []
+        # Sibling untouched.
+        assert db.get_wiki_page("p2") is not None
+        assert db.get_pages_citing_node("n2") == ["p2"]
+
+    def test_delete_wiki_page_idempotent_on_missing(
+        self, db: UnifiedWikiDB,
+    ) -> None:
+        """Missing page returns False instead of raising — the DELETED
+        regime can be retried safely after a partial-failure run."""
+        assert db.delete_wiki_page("never-existed") is False
+
 
 # ---------------------------------------------------------------------------
 # page_symbols
@@ -213,6 +237,16 @@ class TestPageSpecJson:
         db.upsert_wiki_page(_page("p1", anchor_slug="a"))
         row = db.get_wiki_page("p1")
         assert row["page_spec_json"] is None
+
+    def test_malformed_json_rejected_by_check(self, db: UnifiedWikiDB) -> None:
+        """#138: CHECK json_valid surfaces corruption at write time
+        instead of when structural regen tries to deserialize."""
+        with pytest.raises(Exception):  # sqlite3.IntegrityError
+            db.upsert_wiki_page(
+                _page("p1", anchor_slug="a", page_spec_json="{not json"),
+            )
+        # Verify the row didn't land.
+        assert db.get_wiki_page("p1") is None
 
 
 class TestAtomicWrite:

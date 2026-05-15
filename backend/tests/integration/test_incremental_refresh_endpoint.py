@@ -170,6 +170,129 @@ class TestIncrementalRefreshEndpoint:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
+    async def test_409_when_refresh_already_in_progress(
+        self, client_and_setup,
+    ) -> None:
+        """#140: a second concurrent /incremental-refresh on the same
+        wiki must return 409 with the in-flight invocation_id so the
+        caller can join its SSE stream instead of spawning a racing run."""
+        client, app = client_and_setup
+        body = {
+            "parsed_nodes": [
+                {
+                    "node_id": "sym-moved",
+                    "content_hash": compute_content_hash("def moved(): pass"),
+                    "rel_path": "new_path.py",
+                },
+            ],
+        }
+        # First request: register an in-flight invocation in the service.
+        # We inject one directly to avoid racing the actual orchestrator.
+        from app.models.invocation import Invocation
+
+        service = app.state.wiki_service
+        service._invocations["in-flight-fake"] = Invocation(
+            id="in-flight-fake",
+            wiki_id="test-wiki",
+            repo_url="https://github.com/example/widgets",
+            branch="main",
+            status="running",
+            owner_id="dev-user",
+        )
+
+        resp = await client.post(
+            "/api/v1/wikis/test-wiki/incremental-refresh",
+            json=body,
+        )
+        assert resp.status_code == 409, resp.text
+        # The in-flight invocation_id is surfaced so the caller can
+        # subscribe to its SSE stream.
+        assert resp.headers["X-Incremental-Invocation-Id"] == "in-flight-fake"
+
+    @pytest.mark.asyncio
+    async def test_invocation_status_flips_terminal_after_run(
+        self, client_and_setup,
+    ) -> None:
+        """C1 regression test: after the background ``_run()`` completes,
+        ``invocation.status`` must transition off ``"running"``. Without
+        this, the widened idempotency guard would 409-lock the wiki
+        forever — every subsequent refresh (or full generate) would see
+        the phantom ``"running"`` entry from a prior completed run.
+        """
+        client, app = client_and_setup
+        body = {
+            "parsed_nodes": [
+                {
+                    "node_id": "sym-moved",
+                    "content_hash": compute_content_hash("def moved(): pass"),
+                    "rel_path": "new_path.py",
+                },
+            ],
+        }
+        resp = await client.post(
+            "/api/v1/wikis/test-wiki/incremental-refresh", json=body,
+        )
+        assert resp.status_code == 202
+        invocation_id = resp.json()["invocation_id"]
+
+        # Wait for the background task to complete. The fixture's
+        # WikiService stashes the task in self._tasks; awaiting it
+        # gives us the deterministic "run finished" signal.
+        service = app.state.wiki_service
+        task = service._tasks.get(invocation_id)
+        assert task is not None
+        await task
+
+        # Status must be terminal — not "running".
+        invocation = service._invocations[invocation_id]
+        assert invocation.status in {"complete", "failed"}, (
+            f"expected terminal status, got {invocation.status!r}"
+        )
+
+        # And a subsequent refresh must NOT be 409'd by the completed entry.
+        resp2 = await client.post(
+            "/api/v1/wikis/test-wiki/incremental-refresh", json=body,
+        )
+        assert resp2.status_code == 202, resp2.text
+
+    @pytest.mark.asyncio
+    async def test_409_when_full_generate_in_progress(
+        self, client_and_setup,
+    ) -> None:
+        """#140 follow-up: incremental refresh must also reject when a
+        full ``generate()`` is mid-flight on the same wiki — both write
+        to the same .wiki.db and an incremental run during a full regen
+        would race the content_hash updates."""
+        client, app = client_and_setup
+        body = {
+            "parsed_nodes": [
+                {
+                    "node_id": "sym-moved",
+                    "content_hash": compute_content_hash("def moved(): pass"),
+                    "rel_path": "new_path.py",
+                },
+            ],
+        }
+        from app.models.invocation import Invocation
+
+        service = app.state.wiki_service
+        service._invocations["full-regen-fake"] = Invocation(
+            id="full-regen-fake",
+            wiki_id="test-wiki",
+            repo_url="https://github.com/example/widgets",
+            branch="main",
+            status="generating",  # full generate() uses this status
+            owner_id="dev-user",
+        )
+
+        resp = await client.post(
+            "/api/v1/wikis/test-wiki/incremental-refresh",
+            json=body,
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.headers["X-Incremental-Invocation-Id"] == "full-regen-fake"
+
+    @pytest.mark.asyncio
     async def test_422_when_payload_exceeds_cap(self, client_and_setup) -> None:
         client, _ = client_and_setup
         oversized = [

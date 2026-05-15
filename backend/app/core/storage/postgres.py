@@ -439,6 +439,48 @@ class PostgresWikiStorage:
                         ALTER TABLE {schema}.wiki_pages
                             ADD COLUMN page_spec_json TEXT;
                     END IF;
+                    -- #138: validate JSON well-formedness at write time
+                    -- so corruption surfaces during the upsert instead
+                    -- of when structural regen tries to deserialize.
+                    -- Idempotent: only fires when the constraint is missing.
+                    --
+                    -- ``NOT VALID`` adds the constraint without scanning
+                    -- existing rows — new INSERTs/UPDATEs are validated
+                    -- but legacy corrupt rows (if any) stay accessible.
+                    -- This is the safer migration default: a botched
+                    -- earlier write should not block the deploy. After
+                    -- a clean-up run, an operator can promote it with
+                    --   ALTER TABLE … VALIDATE CONSTRAINT …;
+                    -- to gain the existing-row guarantee.
+                    --
+                    -- The EXCEPTION block stays as a defensive net for
+                    -- any other DDL-time failure (privileges, locked
+                    -- table) — it RAISEs WARNING (not NOTICE) so the
+                    -- message hits server logs by default + most
+                    -- driver-side handlers (psycopg2 conn.notices /
+                    -- psycopg3 notice handlers). NOTICE is below the
+                    -- default log_min_messages threshold and gets
+                    -- silently swallowed in most deploy configurations.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'wiki_pages_page_spec_json_chk'
+                          AND connamespace = '{schema}'::regnamespace
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE {schema}.wiki_pages
+                                ADD CONSTRAINT wiki_pages_page_spec_json_chk
+                                CHECK (page_spec_json IS NULL
+                                       OR (page_spec_json::json IS NOT NULL))
+                                NOT VALID;
+                        EXCEPTION WHEN undefined_table THEN
+                            -- Table genuinely missing; first-run init
+                            -- handles the column + constraint via the
+                            -- main DDL path. Safe to skip.
+                            NULL;
+                        WHEN OTHERS THEN
+                            RAISE WARNING 'wiki_pages_page_spec_json_chk migration skipped: %', SQLERRM;
+                        END;
+                    END IF;
                     -- page tables / CHECK constraints
                     IF NOT EXISTS (
                         SELECT 1 FROM pg_constraint
@@ -2276,6 +2318,19 @@ class PostgresWikiStorage:
                 {"wid": wiki_id},
             )
         return result.rowcount or 0
+
+    def delete_wiki_page(self, page_id: str) -> bool:
+        # FK with ON DELETE CASCADE on page_symbols.page_id cleans up
+        # the reverse index in the same transaction. Idempotent: missing
+        # rows return False instead of raising.
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    f"DELETE FROM {self._schema}.wiki_pages WHERE page_id = :pid"
+                ),
+                {"pid": page_id},
+            )
+        return bool(result.rowcount)
 
     def record_page_symbols(
         self,

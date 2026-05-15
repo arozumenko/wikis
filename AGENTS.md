@@ -397,3 +397,55 @@ All work via feature branches + PRs — no direct commits to `main`.
 - **tree-sitter-language-pack pinned at 0.9.1**: version-locked for parser compatibility
 - **Swagger UI**: `http://localhost:8000/docs` when backend is running
 - **Admin default credentials**: `admin@wikis.dev` / `changeme123` — change immediately
+
+---
+
+## Incremental wiki regeneration (#116)
+
+`POST /api/v1/wikis/{wiki_id}/incremental-refresh` takes a freshly-parsed
+node payload (same shape as `/diff`) and dispatches affected pages through
+three regimes:
+
+| Regime | Trigger | Action | LLM cost |
+|---|---|---|---|
+| **trivial** | only `MOVED` changes | regex rewrites `<code_context path="...">` | 0 |
+| **edit** | only `MODIFIED` changes | surgical LLM patch with quality gate | ~10–30% of full page |
+| **structural** | `ADDED`/`DELETED` or primary-symbol-deleted | full single-page regen via agent | full page |
+| **deleted** (#141) | all of a page's symbols deleted | drop the page row + artifact | 0 |
+
+Progress streams over SSE: `page_unchanged`, `page_patched`, `page_edited`,
+`page_regenerated`, `page_deleted`, `incremental_summary`. The SPA banner
+(`IncrementalRefreshBanner.tsx`) renders the regime counts.
+
+### Migration note: first run after deploy
+
+The incremental machinery (PRs #126–#143) introduced two new columns whose
+NULL state forces extra work on the first deployment:
+
+- **`repo_nodes.content_hash`** — sha256 of normalized source_text. NULL on
+  pre-PR1 rows. The change detector treats `NULL` as "hash unknown, assume
+  modified", so the first incremental run after deploy marks every
+  pre-existing node as modified. One-time cost; subsequent runs use the
+  populated hashes.
+
+- **`repo_nodes.embedding_content_hash`** — snapshot at last embed time.
+  NULL on pre-PR4 rows. `populate_embeddings` skips nodes whose
+  `embedding_content_hash` equals their `content_hash`; NULL forces re-embed.
+  First post-deploy embedding pass re-embeds everything once and stamps the
+  column, after which subsequent runs reuse.
+
+### Backfill query (optional, for operators)
+
+To shortcut the first-run re-embed cost on a large wiki, a one-off backfill
+sets `content_hash` for any row whose `source_text` is non-empty. The
+storage layer auto-hashes on next upsert, so any path that touches each
+file (full `/refresh`, incremental refresh, or this query) lands the hash:
+
+```sql
+-- SQLite. content_hash := sha256(normalize_for_hash(source_text))
+-- python -c "from app.core.storage.incremental import compute_content_hash; …"
+-- (run from Python so the normalization rules stay in one place).
+```
+
+Operators typically just trigger one `/refresh` after deploy and let the
+storage layer's auto-hash populate everything in one pass.

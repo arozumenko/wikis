@@ -65,6 +65,20 @@ class TestDiffRatio:
         # Disjoint token sets → max distance.
         assert compute_diff_ratio("foo bar", "") == 1.0
 
+    def test_case_only_difference_yields_zero(self) -> None:
+        # #135: case-normalize tokens so editorial casing tweaks
+        # ("API" → "api") don't inflate the diff ratio when the
+        # underlying content is the same.
+        assert compute_diff_ratio("The API Service", "the api service") == 0.0
+
+    def test_case_normalize_applies_per_token(self) -> None:
+        # Mixed case: only the disjoint token contributes to distance.
+        # Old set {foo, bar}; new set {foo, baz} → |∩|=1 |∪|=3 → 2/3.
+        assert (
+            abs(compute_diff_ratio("Foo BAR", "foo BAZ") - (2 / 3))
+            < 1e-9
+        )
+
 
 # ---------------------------------------------------------------------------
 # PagePatcher quality gate

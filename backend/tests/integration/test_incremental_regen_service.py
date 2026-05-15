@@ -345,9 +345,11 @@ class TestIncrementalRegenServiceE2E:
         # Original body unchanged (didn't write rejected output).
         assert page_bodies["page-edit"] == original_body
 
-    def test_structural_regime_for_deleted_primary_symbol(self, fixture) -> None:
-        # sym-deleted is omitted from parsed → DELETED change → primary-symbol
-        # override routes page-struct to structural.
+    def test_cluster_vanished_routes_to_deleted_regime(self, fixture) -> None:
+        # sym-deleted is omitted from parsed → DELETED change. Per #141,
+        # because page-struct cites *only* sym-deleted (no other
+        # symbols), the entire cluster has vanished. Routes to the
+        # DELETED regime (drop the page), not structural (regenerate).
         page_bodies = {
             "page-trivial": "x",
             "page-edit": "x",
@@ -365,8 +367,58 @@ class TestIncrementalRegenServiceE2E:
 
         stats = svc.run(parsed)
 
-        assert stats.structural_regenerated == 1
-        assert "page-struct" in struct_log
+        # New behavior (#141): cluster vanished → DELETED, not structural.
+        assert stats.deleted == 1
+        assert stats.deleted_failed == 0
+        assert stats.structural_regenerated == 0
+        assert "page-struct" not in struct_log
+        # The body got wiped (cosmetic backup signal) AND the row is
+        # gone from storage. Production wiring uses
+        # storage.delete_wiki_page which FK CASCADEs to page_symbols.
+        assert page_bodies["page-struct"] == ""
+        assert fixture.get_wiki_page("page-struct") is None
+        assert fixture.get_pages_citing_node("sym-deleted") == []
+
+    def test_deleted_regime_idempotent_when_row_already_gone(
+        self, fixture,
+    ) -> None:
+        """I3: if the wiki_pages row was already removed (e.g. by an
+        earlier partial-failure run), the dispatcher must NOT bump
+        ``stats.deleted`` or emit a ``page_deleted`` event for a non-
+        event. ``delete_wiki_page`` returns False; dispatcher no-ops.
+        """
+        # Manually delete the page row up-front so the regime's call
+        # to delete_wiki_page returns False instead of True.
+        fixture.delete_wiki_page("page-struct")
+        assert fixture.get_wiki_page("page-struct") is None
+
+        page_bodies = {
+            "page-trivial": "x",
+            "page-edit": "x",
+            "page-struct": "x",
+        }
+        parsed = [
+            _parsed("sym-moved", "def moved(): pass", "old_path.py"),
+            _parsed("sym-modified", "def modify_me(): pass"),
+            _parsed("sym-bystander", "def b(): pass"),
+            # sym-deleted absent → cluster vanished for page-struct
+        ]
+        events: list[tuple[str, dict]] = []
+
+        svc = IncrementalRegenService(
+            storage=fixture,
+            page_patcher=PagePatcher(_StubLLM("UNUSED")),
+            read_page_body=lambda pid: page_bodies.get(pid),
+            write_page_body=lambda pid, body: page_bodies.__setitem__(pid, body),
+            structural_handler=lambda page: None,
+            progress_callback=lambda name, payload: events.append((name, payload)),
+        )
+        stats = svc.run(parsed)
+
+        # Row was already gone — no stats bump, no SSE event.
+        assert stats.deleted == 0
+        assert stats.deleted_failed == 0
+        assert not any(name == "page_deleted" for name, _ in events)
 
     def test_progress_callback_emits_per_page_and_summary_events(
         self, fixture,
@@ -416,10 +468,12 @@ class TestIncrementalRegenServiceE2E:
         ]
         stats = svc.run(parsed)
 
-        # Order: unchanged (0 here) → trivial → edit → structural → summary.
+        # Order: unchanged (0 here) → trivial → edit → structural → deleted → summary.
+        # In this fixture page-struct cites only sym-deleted → cluster
+        # vanished (#141) → DELETED regime, not STRUCTURAL.
         names = [n for n, _ in events]
         assert names == [
-            "page_patched", "page_edited", "page_regenerated",
+            "page_patched", "page_edited", "page_deleted",
             "incremental_summary",
         ]
 
@@ -428,12 +482,7 @@ class TestIncrementalRegenServiceE2E:
         assert summary_payload["stats"]["total_pages"] == stats.total_pages
         assert summary_payload["stats"]["trivial_patched"] == 1
         assert summary_payload["stats"]["edit_applied"] == 1
-        assert summary_payload["stats"]["structural_regenerated"] == 1
-
-        # page_regenerated event carries demoted_from_edit=False — this
-        # page was a primary-symbol-deleted override, not an edit demotion.
-        regen_payload = events[2][1]
-        assert regen_payload["demoted_from_edit"] is False
+        assert summary_payload["stats"]["deleted"] == 1
 
     def test_progress_callback_marks_quality_gate_demotion(self, fixture) -> None:
         """When the surgical quality gate rejects, the page is demoted
@@ -561,7 +610,15 @@ class TestIncrementalRegenServiceE2E:
 
     def test_structural_handler_failure_is_counted_not_raised(self, fixture) -> None:
         # A raising structural handler must not bubble; it counts in
-        # structural_failed and the rest of the run continues.
+        # structural_failed and the rest of the run continues. To
+        # exercise this we need a page that lands in STRUCTURAL (not
+        # DELETED) — give page-struct two cited symbols so deleting
+        # one still leaves a survivor → STRUCTURAL.
+        fixture.record_page_symbols(
+            "page-struct",
+            [("sym-deleted", "primary"), ("sym-bystander", "related")],
+        )
+
         def _raise(page):
             raise RuntimeError("simulated handler crash")
 
@@ -570,6 +627,9 @@ class TestIncrementalRegenServiceE2E:
 
         def _write(pid: str, body: str) -> None:
             pass
+
+        from app.core.agents.page_patcher import PagePatcher
+        from app.services.incremental_regen_service import IncrementalRegenService
 
         svc = IncrementalRegenService(
             storage=fixture,
@@ -582,7 +642,8 @@ class TestIncrementalRegenServiceE2E:
             _parsed("sym-moved", "def moved(): pass", "old_path.py"),
             _parsed("sym-modified", "def modify_me(): pass"),
             _parsed("sym-bystander", "def b(): pass"),
-            # sym-deleted absent → structural
+            # sym-deleted absent → DELETED on the primary, but bystander
+            # survives → STRUCTURAL not DELETED
         ]
         stats = svc.run(parsed)
         assert stats.structural_failed == 1

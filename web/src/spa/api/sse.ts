@@ -190,6 +190,10 @@ export interface IncrementalRegenStats {
   edit_demoted_to_structural: number;
   structural_regenerated: number;
   structural_failed: number;
+  /** #141: pages whose entire cluster vanished. */
+  deleted: number;
+  /** #134: per-page reasons captured from the StructuralHandler. */
+  structural_failure_reasons: string[];
   avg_diff_ratio: number;
 }
 

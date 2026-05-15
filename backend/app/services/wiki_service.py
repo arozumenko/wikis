@@ -21,6 +21,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class IncrementalRefreshInProgressError(Exception):
+    """Raised by :meth:`WikiService.incremental_refresh` when another
+    incremental refresh is already running for the same wiki_id.
+
+    #140 idempotency guard: two concurrent runs against the same
+    ``.wiki.db`` race each other's content-hash updates and may produce
+    inconsistent state. The route translates this into a 409.
+    """
+
+    def __init__(self, wiki_id: str, in_progress_invocation_id: str) -> None:
+        self.wiki_id = wiki_id
+        self.in_progress_invocation_id = in_progress_invocation_id
+        super().__init__(
+            f"Incremental refresh already in progress for wiki {wiki_id} "
+            f"(invocation {in_progress_invocation_id})"
+        )
+
+
 class WikiService:
     """Orchestrates wiki generation from repository analysis."""
 
@@ -568,6 +586,43 @@ class WikiService:
         if wiki_record is None:
             return None
 
+        # #140: idempotency guard. Two concurrent runs on the same wiki
+        # race each other's content_hash updates + the trivial-patcher's
+        # in-memory page_bodies dicts diverge. Reject the second caller
+        # with the in-flight invocation_id so they can join the existing
+        # SSE stream instead of spawning a parallel run.
+        #
+        # Critical: construct + register the invocation BEFORE any
+        # awaits so two callers racing through this function can't both
+        # pass the check. ``status == "running"`` covers incremental
+        # refreshes; ``"generating"`` covers a full ``generate()`` on
+        # the same wiki — both write to the same ``.wiki.db`` and would
+        # corrupt each other's content_hash updates.
+        _BLOCKING_STATUSES = {"running", "generating"}
+        for inv in self._invocations.values():
+            if (
+                inv.wiki_id == wiki_id
+                and inv.status in _BLOCKING_STATUSES
+                and inv.id != ""
+            ):
+                raise IncrementalRefreshInProgressError(wiki_id, inv.id)
+
+        # Reserve the invocation slot atomically (no awaits between the
+        # guard check and this assignment) so a second caller racing
+        # through the check now hits a registered "running" entry and
+        # gets a 409. If the early-out branches below (missing cache key
+        # / db file) fire, we pop the reservation back out before
+        # returning None.
+        invocation = Invocation(
+            id=str(uuid4()),
+            wiki_id=wiki_id,
+            repo_url=wiki_record.repo_url,
+            branch=wiki_record.branch,
+            status="running",
+            owner_id=owner_id,
+        )
+        self._invocations[invocation.id] = invocation
+
         from pathlib import Path as _Path
 
         from app.core.agents.page_patcher import PagePatcher
@@ -582,9 +637,11 @@ class WikiService:
             self.settings.cache_dir, wiki_record.repo_url, wiki_record.branch,
         )
         if not cache_key:
+            self._invocations.pop(invocation.id, None)
             return None
         db_path = _Path(self.settings.cache_dir) / f"{cache_key}.wiki.db"
         if not db_path.exists():
+            self._invocations.pop(invocation.id, None)
             return None
 
         # Preload every page body into an in-memory dict so the
@@ -612,18 +669,6 @@ class WikiService:
                 artifact_keys[page_id] = artifact_key
             except FileNotFoundError:
                 continue
-
-        # Create invocation + start a background task so the caller can
-        # subscribe to SSE events immediately while the orchestrator runs.
-        invocation = Invocation(
-            id=str(uuid4()),
-            wiki_id=wiki_id,
-            repo_url=wiki_record.repo_url,
-            branch=wiki_record.branch,
-            status="running",
-            owner_id=owner_id,
-        )
-        self._invocations[invocation.id] = invocation
         # Persist immediately so a process restart between this 202 and
         # task completion doesn't strand the SSE stream — late-connecting
         # clients can still reconnect via Last-Event-ID + replay.
@@ -641,15 +686,18 @@ class WikiService:
             page_bodies[pid] = body
             modified_bodies[pid] = body
 
-        def _stub_structural(page) -> bool:
+        def _stub_structural(page) -> str:
             # Fallback when agent construction fails. Logged at WARNING
             # so partial-feature regressions show up in production logs.
+            # Returning a reason string (per #134's new contract) lets
+            # the orchestrator's structural_failure_reasons telemetry
+            # capture *why* the fallback fired.
             logger.warning(
                 "[incremental_refresh] structural regen unavailable for "
                 "page %s (agent construction failed earlier in the run)",
                 page.page_id,
             )
-            return False
+            return "agent construction unavailable for this run"
 
         # Page-event builders keyed by event_name. Each takes
         # (invocation_id, page_id, page_title, **extras). The summary
@@ -660,6 +708,8 @@ class WikiService:
             "page_patched": events.page_patched,
             "page_edited": events.page_edited,
             "page_regenerated": events.page_regenerated,
+            # #141: page_deleted now wired into the dispatcher.
+            "page_deleted": events.page_deleted,
         }
 
         def _emit(event_name: str, payload: dict[str, Any]) -> None:
@@ -709,6 +759,7 @@ class WikiService:
                         # The orchestrator unconditionally constructs a
                         # PagePatcher path; without an LLM we can't run
                         # the edit regime. Fail the run loudly here.
+                        invocation.status = "failed"
                         await invocation.emit(events.task_status(
                             invocation.id, "failed",
                             "LLM unavailable — incremental refresh requires LLM",
@@ -795,11 +846,20 @@ class WikiService:
                             pid, exc,
                         )
 
+                # Critical: flip the in-memory status off "running" BEFORE
+                # the persist in the finally block. Without this, the
+                # idempotency guard at the top of incremental_refresh
+                # would 409-lock the wiki forever — every subsequent
+                # refresh (and full generate, since the guard widened to
+                # include "generating") sees this phantom "running"
+                # entry. Mirrors _run_generation's terminal-state writes.
+                invocation.status = "complete"
                 await invocation.emit(events.task_status(
                     invocation.id, "completed",
                     "Incremental refresh complete",
                 ))
             except Exception as exc:  # noqa: BLE001
+                invocation.status = "failed"
                 logger.exception(
                     "[incremental_refresh] run failed for wiki %s", wiki_id,
                 )
