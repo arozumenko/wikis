@@ -1,0 +1,435 @@
+"""Incremental-regen orchestrator for #116 PR 3.
+
+This service ties together the four PR 1–4 building blocks:
+
+* PR 1 — ``wiki_pages`` + ``page_symbols`` (the reverse index).
+* PR 2 — :class:`ChangeDetector` (what changed, which pages it touches).
+* PR 3 — regime classifier + trivial patcher + surgical :class:`PagePatcher`.
+* PR 4 — cluster ID stability + embedding reuse + ``apply_incremental_node_writes``.
+
+Dispatch flow:
+
+1. Run :class:`ChangeDetector` against the pre-upsert storage state.
+2. Classify with :func:`classify_pages` into a :class:`RegimePlan`.
+3. Snapshot pre-upsert ``source_text`` for the nodes referenced by
+   edit-regime pages only — keeps the lookup small enough that it
+   stays under SQLite's ``IN`` clause bind-variable limit on large
+   repos.
+4. Apply the parsed-node batch via ``apply_incremental_node_writes``
+   (single call → upsert + FTS refresh bundled per issue #131). After
+   this the storage handle reflects the new repository state.
+5. Per regime:
+   - ``unchanged`` → no-op.
+   - ``trivial`` → :func:`patch_trivial_page`, persist body, update
+     ``wiki_pages.content_hash``.
+   - ``edit`` → pre-rewrite moved paths via :func:`patch_trivial_page`
+     so the LLM doesn't have to (regex job, not prose-edit), then run
+     :class:`PagePatcher` on the resulting body. Demote to
+     ``structural`` if the quality gate rejects.
+   - ``structural`` → delegate to the injected ``structural_handler``
+     callback (production wires this to the existing wiki-generation
+     agent; tests can stub it).
+6. Return :class:`IncrementalRegenStats` for telemetry (PR 5 surfaces
+   this as SSE events + UI banner).
+
+The orchestrator owns no LLM and no artifact-storage handle directly —
+callers inject :class:`PagePatcher` (which owns the LLM) and the
+page-content read/write callbacks. Keeps PR 3 unit-testable without
+spinning up the full :class:`OptimizedWikiGenerationAgent`.
+
+The snapshot step (3) lives between classify and upsert because:
+- After upsert, storage holds new state, so the surgical patcher's
+  "before" content would be lost.
+- Before classify, we don't know which edit-regime pages need
+  snapshotting, so scoping to that set requires the plan first.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from app.core.agents.page_patcher import PagePatcher, PatchResult, SymbolDiff
+from app.core.storage.protocol import WikiStorageProtocol
+from app.services.change_detector import (
+    AffectedPage,
+    ChangeDetector,
+    ChangeKind,
+    ChangeSet,
+    NodeChange,
+)
+from app.services.incremental_regen import (
+    PageRegime,
+    Regime,
+    RegimePlan,
+    classify_pages,
+)
+from app.services.trivial_patcher import patch_trivial_page  # noqa: F401 — used in _dispatch_edit
+
+logger = logging.getLogger(__name__)
+
+
+# Callbacks the orchestrator depends on. Kept as type aliases at module
+# scope so tests can pass stub functions inline.
+
+#: Returns the current markdown body for a page_id, or ``None`` if missing.
+PageBodyReader = Callable[[str], str | None]
+
+#: Writes the new markdown body for a page_id. Production = artifact storage.
+PageBodyWriter = Callable[[str, str], None]
+
+#: Handles structural-regime regen for one page. Returns True if the page
+#: was successfully regenerated; False to mark as failed in the stats.
+StructuralHandler = Callable[[PageRegime], bool]
+
+
+@dataclass
+class IncrementalRegenStats:
+    """Per-run summary surfaced to operators + PR 5 telemetry.
+
+    PR 5's SSE banner reads ``total_pages`` to render "N pages
+    processed" and the per-regime counts for the breakdown. The
+    ``avg_diff_ratio`` is for tuning :data:`DEFAULT_DIFF_THRESHOLD`
+    empirically once telemetry is in production.
+    """
+
+    total_pages: int = 0
+    unchanged: int = 0
+    trivial_patched: int = 0
+    edit_applied: int = 0
+    edit_demoted_to_structural: int = 0
+    structural_regenerated: int = 0
+    structural_failed: int = 0
+    diff_ratios: list[float] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Telemetry-friendly snapshot."""
+        return {
+            "total_pages": self.total_pages,
+            "unchanged": self.unchanged,
+            "trivial_patched": self.trivial_patched,
+            "edit_applied": self.edit_applied,
+            "edit_demoted_to_structural": self.edit_demoted_to_structural,
+            "structural_regenerated": self.structural_regenerated,
+            "structural_failed": self.structural_failed,
+            "avg_diff_ratio": (
+                sum(self.diff_ratios) / len(self.diff_ratios)
+                if self.diff_ratios
+                else 0.0
+            ),
+        }
+
+
+class IncrementalRegenService:
+    """One-shot orchestrator. Construct per refresh; throw away after."""
+
+    def __init__(
+        self,
+        storage: WikiStorageProtocol,
+        page_patcher: PagePatcher,
+        *,
+        read_page_body: PageBodyReader,
+        write_page_body: PageBodyWriter,
+        structural_handler: StructuralHandler,
+    ) -> None:
+        self._storage = storage
+        self._patcher = page_patcher
+        self._read_page = read_page_body
+        self._write_page = write_page_body
+        self._structural_handler = structural_handler
+
+    def run(
+        self,
+        parsed_nodes: list[dict[str, Any]],
+    ) -> IncrementalRegenStats:
+        """Execute one incremental regen pass.
+
+        Args:
+            parsed_nodes: freshly parsed nodes (same shape as ``upsert_nodes_batch``
+                input). Must include ``node_id``, ``content_hash``,
+                ``rel_path``, ``source_text`` for everything the
+                surgical patcher might need to diff.
+
+        Returns:
+            :class:`IncrementalRegenStats` with per-regime counts and
+            the avg diff_ratio (for tuning the quality gate over time).
+        """
+        # Step 1: detect changes (storage still holds the pre-upsert state).
+        detector = ChangeDetector(self._storage)
+        change_set = detector.detect_changes(parsed_nodes)
+        affected = detector.affected_pages(change_set)
+
+        # Step 2: classify into regime buckets. classify_pages reads
+        # wiki_pages.primary_symbol_id for the deleted-primary override;
+        # still the pre-upsert state at this point.
+        plan = classify_pages(change_set, affected, self._storage)
+
+        # Step 3: snapshot pre-upsert source_text *only* for nodes
+        # referenced by edit-regime pages. Scoping to that set keeps
+        # the lookup well below SQLite's IN-clause bind-variable
+        # limit (default 999) even on large repos.
+        edit_node_ids = self._collect_edit_node_ids(plan)
+        old_node_snapshot = self._snapshot_old_state(edit_node_ids)
+
+        # Step 4: persist the new node state — single bundled call that
+        # also refreshes FTS (#131). After this the storage handle
+        # reflects the new repository state.
+        self._storage.apply_incremental_node_writes(parsed_nodes)
+
+        # Build a lookup of new parsed-node state for the dispatcher.
+        new_by_id: dict[str, dict[str, Any]] = {
+            n["node_id"]: n for n in parsed_nodes if n.get("node_id")
+        }
+
+        stats = IncrementalRegenStats(total_pages=plan.total)
+        stats.unchanged = len(plan.unchanged)
+
+        # Step 5: per-regime dispatch.
+        for page in plan.trivial:
+            self._dispatch_trivial(page, stats)
+
+        for page in plan.edit:
+            self._dispatch_edit(
+                page,
+                old_node_snapshot=old_node_snapshot,
+                new_by_id=new_by_id,
+                stats=stats,
+            )
+
+        for page in plan.structural:
+            self._dispatch_structural(page, stats)
+
+        logger.info(
+            "[incremental_regen_service] run complete: %s",
+            stats.as_dict(),
+        )
+        return stats
+
+    # ------------------------------------------------------------------
+    # dispatch helpers
+    # ------------------------------------------------------------------
+
+    def _dispatch_trivial(
+        self, page: PageRegime, stats: IncrementalRegenStats,
+    ) -> None:
+        body = self._read_page(page.page_id)
+        if body is None:
+            logger.warning(
+                "[incremental_regen_service] trivial page %s body missing — "
+                "demoting to structural",
+                page.page_id,
+            )
+            self._dispatch_structural(page, stats)
+            return
+
+        patch = patch_trivial_page(page.page_id, body, page.changes)
+        if patch.paths_rewritten:
+            self._write_page(page.page_id, patch.new_content)
+        # Update the page row's content_hash so future change-detection
+        # comparisons see the new body. Title / cluster / etc unchanged.
+        self._update_page_content_hash(page.page_id, patch.new_content_hash)
+        stats.trivial_patched += 1
+
+    def _dispatch_edit(
+        self,
+        page: PageRegime,
+        *,
+        old_node_snapshot: Mapping[str, dict[str, Any]],
+        new_by_id: Mapping[str, dict[str, Any]],
+        stats: IncrementalRegenStats,
+    ) -> None:
+        body = self._read_page(page.page_id)
+        if body is None:
+            logger.warning(
+                "[incremental_regen_service] edit page %s body missing — "
+                "demoting to structural",
+                page.page_id,
+            )
+            self._dispatch_structural(page, stats)
+            return
+
+        # Pre-rewrite moved paths deterministically before invoking the
+        # LLM. Path swaps are a mechanical regex job — outsourcing them
+        # to the LLM wastes context, risks errors, and leaks
+        # implementation details into the prompt. After this, the LLM
+        # sees a clean body and focuses on prose for MODIFIED symbols.
+        trivial = patch_trivial_page(page.page_id, body, page.changes)
+        body = trivial.new_content
+
+        symbol_diffs, _moved_paths = _build_diff_inputs(
+            page.changes, old_node_snapshot, new_by_id,
+        )
+
+        page_row = self._storage.get_wiki_page(page.page_id) or {}
+        result = self._patcher.patch_page(
+            page_id=page.page_id,
+            page_title=page_row.get("title", ""),
+            primary_symbol_id=page_row.get("primary_symbol_id"),
+            current_content=body,
+            symbol_diffs=symbol_diffs,
+            # Paths already rewritten by trivial_patcher above —
+            # don't ask the LLM to do it again.
+            moved_paths={},
+        )
+        stats.diff_ratios.append(result.diff_ratio)
+
+        if result.accepted:
+            self._write_page(page.page_id, result.new_content)
+            self._update_page_content_hash(page.page_id, result.new_content_hash)
+            stats.edit_applied += 1
+            return
+
+        # Quality gate rejected — fall back to structural for this page.
+        logger.info(
+            "[incremental_regen_service] page %s demoted to structural: %s",
+            page.page_id, result.reason,
+        )
+        stats.edit_demoted_to_structural += 1
+        self._dispatch_structural(page, stats)
+
+    def _dispatch_structural(
+        self, page: PageRegime, stats: IncrementalRegenStats,
+    ) -> None:
+        try:
+            ok = self._structural_handler(page)
+        except Exception as exc:  # noqa: BLE001 — never crash the whole run
+            logger.warning(
+                "[incremental_regen_service] structural handler raised on "
+                "page %s: %s",
+                page.page_id, exc,
+            )
+            stats.structural_failed += 1
+            return
+
+        if ok:
+            stats.structural_regenerated += 1
+        else:
+            stats.structural_failed += 1
+
+    # ------------------------------------------------------------------
+    # internals
+    # ------------------------------------------------------------------
+
+    def _collect_edit_node_ids(self, plan: RegimePlan) -> list[str]:
+        """Gather every MODIFIED node_id referenced by edit-regime pages.
+
+        Bounded by the change set rather than the full parsed batch.
+        Even on large repos a single regen typically touches a handful
+        of pages with a handful of modified symbols each, so this stays
+        well within SQLite's bind-variable limit.
+        """
+        seen: set[str] = set()
+        for page in plan.edit:
+            for change in page.changes:
+                if change.kind is ChangeKind.MODIFIED and change.node_id:
+                    seen.add(change.node_id)
+        return sorted(seen)
+
+    def _snapshot_old_state(
+        self, node_ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Read pre-upsert ``source_text`` for the given node_ids.
+
+        Caller is responsible for scoping the input to the set that
+        actually needs snapshotting (edit-regime nodes only) so the
+        underlying ``get_nodes_by_ids`` IN-clause stays under the
+        SQLite bind-variable limit.
+
+        Fails soft: on storage error returns an empty dict and warns,
+        so the surgical patcher proceeds with empty "before" content
+        rather than crashing the entire regen.
+        """
+        if not node_ids:
+            return {}
+        try:
+            rows = self._storage.get_nodes_by_ids(node_ids)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[incremental_regen_service] could not snapshot old nodes; "
+                "surgical edits will see empty 'before' content: %s",
+                exc,
+            )
+            return {}
+        return {row["node_id"]: dict(row) for row in rows if row.get("node_id")}
+
+    def _update_page_content_hash(self, page_id: str, new_hash: str) -> None:
+        """Update only ``content_hash`` on an existing ``wiki_pages`` row.
+
+        Reuses ``upsert_wiki_page`` for simplicity — pulls the full row,
+        overlays the new hash, writes back.
+        """
+        row = self._storage.get_wiki_page(page_id)
+        if row is None:
+            return
+        row["content_hash"] = new_hash
+        self._storage.upsert_wiki_page(row)
+
+
+# ---------------------------------------------------------------------------
+# Diff input builder — module-scope for testability
+# ---------------------------------------------------------------------------
+
+
+def _build_diff_inputs(
+    changes: Iterable[NodeChange],
+    old_node_snapshot: Mapping[str, dict[str, Any]],
+    new_by_id: Mapping[str, dict[str, Any]],
+) -> tuple[list[SymbolDiff], dict[str, str]]:
+    """Turn the change set into the patcher's ``symbol_diffs`` +
+    ``moved_paths`` inputs.
+
+    Empty old/new source is tolerated — the patcher's prompt handles
+    "(none)" gracefully. Move-only changes contribute paths but no
+    SymbolDiff entries (their source is unchanged).
+    """
+    symbol_diffs: list[SymbolDiff] = []
+    moved_paths: dict[str, str] = {}
+
+    for change in changes:
+        if change.kind is ChangeKind.MOVED:
+            if change.old_path and change.new_path:
+                moved_paths[change.old_path] = change.new_path
+            continue
+        if change.kind is not ChangeKind.MODIFIED:
+            # ADDED / DELETED shouldn't reach here — the classifier
+            # routes those to structural — but defensively skip.
+            continue
+        old_row = old_node_snapshot.get(change.node_id, {})
+        new_row = new_by_id.get(change.node_id, {})
+        symbol_diffs.append(
+            SymbolDiff(
+                symbol_name=old_row.get("symbol_name")
+                or new_row.get("symbol_name")
+                or change.node_id,
+                node_id=change.node_id,
+                old_source=old_row.get("source_text", ""),
+                new_source=new_row.get("source_text", ""),
+                signature_change=_signature_diff(old_row, new_row),
+            )
+        )
+
+    return symbol_diffs, moved_paths
+
+
+_SIGNATURE_FIELD_CAP = 128
+
+
+def _signature_diff(old: Mapping[str, Any], new: Mapping[str, Any]) -> str | None:
+    """Short human-readable note about signature shape changes, or None.
+
+    Each captured field is truncated to ``_SIGNATURE_FIELD_CAP`` chars
+    before ``repr()`` so a function with a weirdly large default value
+    (e.g. a giant string literal) can't produce a malformed prompt
+    block that confuses the LLM.
+    """
+    fragments = []
+    for field_name in ("signature", "parameters", "return_type"):
+        o = (old.get(field_name) or "").strip()[:_SIGNATURE_FIELD_CAP]
+        n = (new.get(field_name) or "").strip()[:_SIGNATURE_FIELD_CAP]
+        if o != n:
+            fragments.append(f"{field_name}: {o!r} → {n!r}")
+    if not fragments:
+        return None
+    return "; ".join(fragments)

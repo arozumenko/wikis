@@ -749,6 +749,19 @@ class PostgresWikiStorage:
         can stay backend-agnostic."""
         return None
 
+    def apply_incremental_node_writes(self, nodes: list[dict[str, Any]]) -> None:
+        """Bundle ``upsert_nodes_batch`` + ``refresh_fts_index``.
+
+        Postgres keeps FTS in sync via trigger, so ``refresh_fts_index``
+        is a no-op here — but we still call it through the bundle for
+        consistency with the SQLite path and so PR 3's incremental
+        writer can stay backend-agnostic.
+        """
+        if not nodes:
+            return
+        self.upsert_nodes_batch(nodes)
+        self.refresh_fts_index()
+
     def fetch_indexed_node_meta(self) -> dict[str, dict[str, str | None]]:
         with self._engine.connect() as conn:
             rows = conn.execute(

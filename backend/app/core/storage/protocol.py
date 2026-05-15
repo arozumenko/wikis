@@ -130,9 +130,20 @@ class WikiStorageProtocol(Protocol):
         Postgres uses a BEFORE INSERT OR UPDATE trigger so its FTS column
         stays in sync automatically — this method is a no-op on Postgres.
 
-        Any [#116] PR 3+ incremental write path that doesn't go through
-        ``from_networkx`` should call this once after the upsert batch so
-        downstream search reflects the change.
+        Prefer :meth:`apply_incremental_node_writes` when you have an
+        explicit batch — it bundles the upsert + refresh so callers
+        cannot leave FTS stale.
+        """
+        ...
+
+    def apply_incremental_node_writes(self, nodes: list[dict[str, Any]]) -> None:
+        """Upsert a batch of nodes and refresh the FTS index in one call.
+
+        Closes the "did the author remember to call refresh_fts_index?"
+        footgun flagged by issue #131. Callers in [#116] PR 3+ should use
+        this for any partial node upsert path (the full ``from_networkx``
+        flow already rebuilds FTS as its last step, so it doesn't need
+        this).
         """
         ...
 
