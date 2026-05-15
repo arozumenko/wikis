@@ -137,6 +137,11 @@ CREATE TABLE IF NOT EXISTS repo_nodes (
     -- Change detection (#116 incremental regen)
     -- sha256 hex of normalize(source_text); NULL for pre-incremental rows
     content_hash    TEXT DEFAULT NULL,
+    -- #116 PR 4: snapshot of content_hash at the time this node was last
+    -- embedded into repo_vec. populate_embeddings skips nodes whose
+    -- content_hash matches this value. NULL = never embedded (or pre-PR4
+    -- row — force re-embed once after deploy).
+    embedding_content_hash TEXT DEFAULT NULL,
 
     -- Classification
     is_architectural INTEGER DEFAULT 0,
@@ -492,6 +497,19 @@ class UnifiedWikiDB:
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nodes_hash "
                 "ON repo_nodes(content_hash) WHERE content_hash IS NOT NULL"
+            )
+            self.conn.commit()
+
+        # #116 PR 4: embedding_content_hash for skip-if-unchanged in
+        # populate_embeddings. Existing rows stay NULL → re-embedded once
+        # on next populate_embeddings call, then stamped.
+        if "embedding_content_hash" not in cols:
+            logger.info(
+                "Migrating schema: adding embedding_content_hash to repo_nodes"
+            )
+            cur.execute(
+                "ALTER TABLE repo_nodes "
+                "ADD COLUMN embedding_content_hash TEXT DEFAULT NULL"
             )
             self.conn.commit()
 
@@ -888,6 +906,16 @@ class UnifiedWikiDB:
         self.conn.commit()
         logger.debug("FTS5 index rebuilt (%d rows)", self.node_count())
 
+    def refresh_fts_index(self) -> None:
+        """Public alias for ``_populate_fts5`` — see protocol docstring.
+
+        Required by #116 PR 3+ after any incremental upsert path that
+        doesn't go through ``from_networkx`` (which already rebuilds FTS
+        as its last step). Cheap: a full rebuild of even thousands of
+        nodes runs in milliseconds.
+        """
+        self._populate_fts5()
+
     def search_fts5(
         self,
         query: str,
@@ -1022,17 +1050,36 @@ class UnifiedWikiDB:
         # SQLite trim() only strips spaces; use explicit whitespace chars
         _ws = " ' ' || char(9) || char(10) || char(13) "
         arch_filter = " AND is_architectural = 1" if architectural_only else ""
+        # #116 PR 4: skip nodes whose embedding is already up-to-date.
+        # A node is "fresh" iff embedding_content_hash equals content_hash.
+        # Anything else (NULL embedding_content_hash, NULL content_hash, or
+        # mismatched hashes) is re-embedded. content_hash is NULL only for
+        # pre-PR1 rows that haven't been re-upserted; those will be re-hashed
+        # and then re-embedded the next time their file is parsed.
+        skip_filter = (
+            " AND ("
+            "embedding_content_hash IS NULL "
+            "OR content_hash IS NULL "
+            "OR embedding_content_hash != content_hash"
+            ")"
+        )
         rows = self.conn.execute(
-            "SELECT node_id, source_text FROM repo_nodes "  # noqa: S608 — internal whitespace-trim query, _ws is a hardcoded SQLite expression
+            "SELECT node_id, source_text, content_hash FROM repo_nodes "  # noqa: S608 — internal whitespace-trim query, _ws is a hardcoded SQLite expression
             f"WHERE source_text IS NOT NULL AND length(trim(source_text, {_ws})) > 0"
             + arch_filter
+            + skip_filter
         ).fetchall()
 
-        batches: list[tuple[int, list[str], list[str]]] = []
+        batches: list[tuple[int, list[str], list[str], list[str | None]]] = []
         for i in range(0, len(rows), batch_size):
             batch = rows[i : i + batch_size]
             batches.append(
-                (i, [r["node_id"] for r in batch], [r["source_text"] for r in batch])
+                (
+                    i,
+                    [r["node_id"] for r in batch],
+                    [r["source_text"] for r in batch],
+                    [r["content_hash"] for r in batch],
+                )
             )
 
         total = 0
@@ -1048,7 +1095,12 @@ class UnifiedWikiDB:
             len(rows), n_batches, batch_size, max_workers,
         )
 
-        def _embed_one(idx: int, node_ids: list[str], texts: list[str]):
+        def _embed_one(
+            idx: int,
+            node_ids: list[str],
+            texts: list[str],
+            hashes: list[str | None],
+        ):
             try:
                 vectors = embedding_fn(texts)
             except Exception as exc:
@@ -1057,24 +1109,40 @@ class UnifiedWikiDB:
                     idx, idx + len(node_ids), exc,
                 )
                 return None
-            return list(zip(node_ids, vectors, strict=True))
+            return (
+                list(zip(node_ids, vectors, strict=True)),
+                list(zip(node_ids, hashes, strict=True)),
+            )
+
+        def _stamp_embedding_hashes(pairs: list[tuple[str, str | None]]) -> None:
+            """Persist the content_hash snapshot so the next regen skips
+            these nodes when their source is unchanged. Pre-PR1 rows with
+            NULL content_hash get NULL stamped — they'll be re-embedded
+            once after their next upsert backfills the hash."""
+            self.conn.executemany(
+                "UPDATE repo_nodes SET embedding_content_hash = ? "
+                "WHERE node_id = ?",
+                [(content_hash, node_id) for node_id, content_hash in pairs],
+            )
 
         completed_batches = 0
         if max_workers > 1 and len(batches) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = [
-                    pool.submit(_embed_one, idx, nids, texts)
-                    for idx, nids, texts in batches
+                    pool.submit(_embed_one, idx, nids, texts, hashes)
+                    for idx, nids, texts, hashes in batches
                 ]
                 for fut in as_completed(futures):
-                    pairs = fut.result()
-                    if pairs:
+                    result = fut.result()
+                    if result:
+                        vector_pairs, hash_pairs = result
                         # sqlite writes are not thread-safe — guarded by GIL
                         # and our connection runs in a single process; the
                         # write here is ok because executemany serialises.
-                        self.upsert_embeddings_batch(pairs)
-                        total += len(pairs)
+                        self.upsert_embeddings_batch(vector_pairs)
+                        _stamp_embedding_hashes(hash_pairs)
+                        total += len(vector_pairs)
                     completed_batches += 1
                     if completed_batches % log_every == 0:
                         elapsed = time.time() - t_start
@@ -1085,11 +1153,13 @@ class UnifiedWikiDB:
                             completed_batches, n_batches, total, rate,
                         )
         else:
-            for idx, nids, texts in batches:
-                pairs = _embed_one(idx, nids, texts)
-                if pairs:
-                    self.upsert_embeddings_batch(pairs)
-                    total += len(pairs)
+            for idx, nids, texts, hashes in batches:
+                result = _embed_one(idx, nids, texts, hashes)
+                if result:
+                    vector_pairs, hash_pairs = result
+                    self.upsert_embeddings_batch(vector_pairs)
+                    _stamp_embedding_hashes(hash_pairs)
+                    total += len(vector_pairs)
                 completed_batches += 1
                 if completed_batches % log_every == 0:
                     elapsed = time.time() - t_start

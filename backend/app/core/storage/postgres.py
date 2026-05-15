@@ -138,6 +138,9 @@ def _define_tables(
         Column("return_type", Text, server_default=""),
         # #116 incremental regen: sha256 hex of normalize(source_text)
         Column("content_hash", Text),
+        # #116 PR 4: snapshot of content_hash at last embedding; lets
+        # populate_embeddings skip nodes whose source is unchanged.
+        Column("embedding_content_hash", Text),
         Column("is_architectural", Integer, server_default="0"),
         Column("is_doc", Integer, server_default="0"),
         Column("is_test", Integer, server_default="0"),
@@ -400,6 +403,15 @@ class PostgresWikiStorage:
                           AND column_name = 'content_hash'
                     ) THEN
                         ALTER TABLE {schema}.repo_nodes ADD COLUMN content_hash TEXT;
+                    END IF;
+                    -- #116 PR 4: embedding_content_hash for skip-if-unchanged.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_nodes'
+                          AND column_name = 'embedding_content_hash'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_nodes
+                            ADD COLUMN embedding_content_hash TEXT;
                     END IF;
                     -- #116 PR 2 prep: last_indexed_commit on wiki_pages.
                     IF EXISTS (
@@ -730,6 +742,13 @@ class PostgresWikiStorage:
                 text(f"SELECT count(*) FROM {self._schema}.repo_nodes"),
             ).scalar() or 0
 
+    def refresh_fts_index(self) -> None:
+        """No-op on Postgres — the BEFORE INSERT OR UPDATE trigger set up
+        by ``_create_fts_infrastructure`` keeps ``fts_doc`` in sync on
+        every row write. Implemented to satisfy the protocol so callers
+        can stay backend-agnostic."""
+        return None
+
     def fetch_indexed_node_meta(self) -> dict[str, dict[str, str | None]]:
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -956,18 +975,49 @@ class PostgresWikiStorage:
     ) -> None:
         if not self._vec_available or not embeddings or self._vec_table is None:
             return
-
-        rows = [{"nid": nid, "emb": str(vec)} for nid, vec in embeddings]
-
         with self._engine.begin() as conn:
-            conn.execute(
-                text(
-                    f"INSERT INTO {self._schema}.repo_vec (node_id, embedding) "
-                    "VALUES (:nid, :emb) "
-                    "ON CONFLICT (node_id) DO UPDATE SET embedding = EXCLUDED.embedding"
-                ),
-                rows,
-            )
+            self._upsert_embeddings_in_conn(conn, embeddings)
+
+    def _upsert_embeddings_in_conn(
+        self,
+        conn,
+        embeddings: list[tuple[str, list[float]]],
+    ) -> None:
+        """Execute the vector upsert on an existing connection. Pairs with
+        ``_stamp_embedding_hashes_in_conn`` for atomic combined writes."""
+        if not embeddings:
+            return
+        rows = [{"nid": nid, "emb": str(vec)} for nid, vec in embeddings]
+        conn.execute(
+            text(
+                f"INSERT INTO {self._schema}.repo_vec (node_id, embedding) "
+                "VALUES (:nid, :emb) "
+                "ON CONFLICT (node_id) DO UPDATE SET embedding = EXCLUDED.embedding"
+            ),
+            rows,
+        )
+
+    def _stamp_embedding_hashes_in_conn(
+        self,
+        conn,
+        pairs: list[tuple[str, str | None]],
+    ) -> None:
+        """Persist content_hash snapshots on an existing connection.
+
+        Paired with ``_upsert_embeddings_in_conn`` inside one
+        ``engine.begin()`` block so a partial failure rolls both back.
+        Without this pairing, a stamp failure after a successful vector
+        upsert would force a wasteful re-embed on the next regen.
+        """
+        if not pairs:
+            return
+        conn.execute(
+            text(
+                f"UPDATE {self._schema}.repo_nodes "
+                "SET embedding_content_hash = :h WHERE node_id = :nid"
+            ),
+            [{"nid": nid, "h": h} for nid, h in pairs],
+        )
 
     def populate_embeddings(
         self,
@@ -989,18 +1039,27 @@ class PostgresWikiStorage:
                 max_workers = 1
 
         with self._engine.connect() as conn:
-            # Fetch all nodes; use source_text with fallback to
-            # docstring / symbol_name so that nodes with empty
+            # Fetch nodes that need (re-)embedding; use source_text with
+            # fallback to docstring / symbol_name so that nodes with empty
             # source_text still get an embedding vector.
-            arch_filter = " WHERE is_architectural = 1" if architectural_only else ""
+            #
+            # #116 PR 4: skip nodes whose embedding is already up-to-date
+            # (embedding_content_hash matches the current content_hash).
+            arch_filter = " AND is_architectural = 1" if architectural_only else ""
             rows = conn.execute(
                 text(
-                    f"SELECT node_id, source_text, docstring, symbol_name "
-                    f"FROM {self._schema}.repo_nodes" + arch_filter
+                    f"SELECT node_id, source_text, docstring, symbol_name, content_hash "
+                    f"FROM {self._schema}.repo_nodes "
+                    "WHERE ("
+                    "embedding_content_hash IS NULL "
+                    "OR content_hash IS NULL "
+                    "OR embedding_content_hash IS DISTINCT FROM content_hash"
+                    ")"
+                    + arch_filter
                 ),
             ).fetchall()
 
-        embeddable: list[tuple[str, str]] = []
+        embeddable: list[tuple[str, str, str | None]] = []
         for r in rows:
             txt = (r[1] or "").strip()
             if not txt:
@@ -1008,12 +1067,19 @@ class PostgresWikiStorage:
             if not txt:
                 txt = (r[3] or "").strip()  # symbol_name
             if txt:
-                embeddable.append((r[0], txt))
+                embeddable.append((r[0], txt, r[4]))  # node_id, text, content_hash
 
-        batches: list[tuple[int, list[str], list[str]]] = []
+        batches: list[tuple[int, list[str], list[str], list[str | None]]] = []
         for i in range(0, len(embeddable), batch_size):
             batch = embeddable[i: i + batch_size]
-            batches.append((i, [nid for nid, _ in batch], [t for _, t in batch]))
+            batches.append(
+                (
+                    i,
+                    [nid for nid, _, _ in batch],
+                    [t for _, t, _ in batch],
+                    [h for _, _, h in batch],
+                )
+            )
 
         total = 0
         n_batches = len(batches)
@@ -1025,7 +1091,12 @@ class PostgresWikiStorage:
             len(embeddable), n_batches, batch_size, max_workers,
         )
 
-        def _embed_one(idx: int, node_ids: list[str], texts: list[str]):
+        def _embed_one(
+            idx: int,
+            node_ids: list[str],
+            texts: list[str],
+            hashes: list[str | None],
+        ):
             try:
                 vectors = embedding_fn(texts)
             except Exception as exc:
@@ -1034,21 +1105,42 @@ class PostgresWikiStorage:
                     idx, idx + len(node_ids), exc,
                 )
                 return None
-            return list(zip(node_ids, vectors, strict=True))
+            return (
+                list(zip(node_ids, vectors, strict=True)),
+                list(zip(node_ids, hashes, strict=True)),
+            )
+
+        def _flush_batch(
+            vector_pairs: list[tuple[str, list[float]]],
+            hash_pairs: list[tuple[str, str | None]],
+        ) -> None:
+            """Atomic vector upsert + content-hash stamp in one transaction.
+
+            A partial failure (network blip between the two SQL statements)
+            would otherwise leave vectors written with a stale
+            embedding_content_hash, forcing a redundant re-embed next
+            regen.
+            """
+            if not vector_pairs and not hash_pairs:
+                return
+            with self._engine.begin() as conn:
+                self._upsert_embeddings_in_conn(conn, vector_pairs)
+                self._stamp_embedding_hashes_in_conn(conn, hash_pairs)
 
         completed_batches = 0
         if max_workers > 1 and len(batches) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = [
-                    pool.submit(_embed_one, idx, nids, texts)
-                    for idx, nids, texts in batches
+                    pool.submit(_embed_one, idx, nids, texts, hashes)
+                    for idx, nids, texts, hashes in batches
                 ]
                 for fut in as_completed(futures):
-                    pairs = fut.result()
-                    if pairs:
-                        self.upsert_embeddings_batch(pairs)
-                        total += len(pairs)
+                    result = fut.result()
+                    if result:
+                        vector_pairs, hash_pairs = result
+                        _flush_batch(vector_pairs, hash_pairs)
+                        total += len(vector_pairs)
                     completed_batches += 1
                     if completed_batches % log_every == 0:
                         elapsed = time.time() - t_start
@@ -1059,11 +1151,12 @@ class PostgresWikiStorage:
                             completed_batches, n_batches, total, rate,
                         )
         else:
-            for idx, nids, texts in batches:
-                pairs = _embed_one(idx, nids, texts)
-                if pairs:
-                    self.upsert_embeddings_batch(pairs)
-                    total += len(pairs)
+            for idx, nids, texts, hashes in batches:
+                result = _embed_one(idx, nids, texts, hashes)
+                if result:
+                    vector_pairs, hash_pairs = result
+                    _flush_batch(vector_pairs, hash_pairs)
+                    total += len(vector_pairs)
                 completed_batches += 1
                 if completed_batches % log_every == 0:
                     elapsed = time.time() - t_start
