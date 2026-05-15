@@ -56,6 +56,31 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _warn_if_truncated(rows: list[Any], limit: int | None, method: str, **ctx: Any) -> None:
+    """Log a WARNING when *rows* count equals the active *limit*.
+
+    The protocol's bounded fetchers (``get_architectural_nodes``,
+    ``get_nodes_by_cluster``, ``get_architectural_node_ids``,
+    ``get_all_edges``) silently truncate when the row count hits the cap.
+    On large repos this can corrupt downstream graph reconstruction
+    (PageRank, coverage analysis).  This helper makes the boundary visible
+    in operator logs without changing behaviour.
+
+    Callers that need *all* rows should pass ``limit=None``.
+    """
+    if limit is None:
+        return
+    if len(rows) >= limit:
+        ctx_str = ", ".join(f"{k}={v}" for k, v in ctx.items() if v is not None)
+        suffix = f" ({ctx_str})" if ctx_str else ""
+        logger.warning(
+            "[STORAGE] %s hit row cap (limit=%d)%s; result is likely truncated. "
+            "Pass limit=None when full coverage is required.",
+            method, limit, suffix,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Always enabled (no feature flag)
 # ---------------------------------------------------------------------------
@@ -556,27 +581,42 @@ class UnifiedWikiDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_nodes_by_cluster(self, macro: int, micro: int | None = None, limit: int = 1000) -> list[dict[str, Any]]:
-        """Get all nodes in a macro (optionally micro) cluster."""
+    def get_nodes_by_cluster(self, macro: int, micro: int | None = None, limit: int | None = 1000) -> list[dict[str, Any]]:
+        """Get all nodes in a macro (optionally micro) cluster.
+
+        Pass ``limit=None`` to disable the row cap.
+        """
         if micro is not None:
+            base_sql = "SELECT * FROM repo_nodes WHERE macro_cluster = ? AND micro_cluster = ?"
+            params: tuple[Any, ...] = (macro, micro)
+        else:
+            base_sql = "SELECT * FROM repo_nodes WHERE macro_cluster = ?"
+            params = (macro,)
+        if limit is not None:
+            rows = self.conn.execute(base_sql + " LIMIT ?", (*params, limit)).fetchall()
+        else:
+            rows = self.conn.execute(base_sql, params).fetchall()
+        result = [dict(r) for r in rows]
+        _warn_if_truncated(result, limit, "get_nodes_by_cluster", macro=macro, micro=micro)
+        return result
+
+    def get_architectural_nodes(self, limit: int | None = 5000) -> list[dict[str, Any]]:
+        """Get all architectural-level nodes (classes, functions, etc.).
+
+        Pass ``limit=None`` to disable the row cap.
+        """
+        if limit is not None:
             rows = self.conn.execute(
-                "SELECT * FROM repo_nodes WHERE macro_cluster = ? AND micro_cluster = ? LIMIT ?",
-                (macro, micro, limit),
+                "SELECT * FROM repo_nodes WHERE is_architectural = 1 LIMIT ?",
+                (limit,),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT * FROM repo_nodes WHERE macro_cluster = ? LIMIT ?",
-                (macro, limit),
+                "SELECT * FROM repo_nodes WHERE is_architectural = 1",
             ).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_architectural_nodes(self, limit: int = 5000) -> list[dict[str, Any]]:
-        """Get all architectural-level nodes (classes, functions, etc.)."""
-        rows = self.conn.execute(
-            "SELECT * FROM repo_nodes WHERE is_architectural = 1 LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        result = [dict(r) for r in rows]
+        _warn_if_truncated(result, limit, "get_architectural_nodes")
+        return result
 
     def node_count(self) -> int:
         return self.conn.execute("SELECT count(*) FROM repo_nodes").fetchone()[0]
@@ -1684,27 +1724,45 @@ class UnifiedWikiDB:
     def get_architectural_node_ids(
         self,
         exclude_tests: bool = False,
-        limit: int = 10_000,
+        limit: int | None = 10_000,
     ) -> list[str]:
-        """Return node_ids of all architectural nodes (lightweight projection)."""
+        """Return node_ids of all architectural nodes (lightweight projection).
+
+        Pass ``limit=None`` to disable the row cap.
+        """
         sql = "SELECT node_id FROM repo_nodes WHERE is_architectural = 1"
         if exclude_tests:
             sql += " AND is_test = 0"
-        sql += " LIMIT ?"
-        rows = self.conn.execute(sql, (limit,)).fetchall()
-        return [r[0] for r in rows]
+        if limit is not None:
+            rows = self.conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
+        else:
+            rows = self.conn.execute(sql).fetchall()
+        result = [r[0] for r in rows]
+        _warn_if_truncated(result, limit, "get_architectural_node_ids", exclude_tests=exclude_tests)
+        return result
 
     def get_all_edges(
         self,
-        limit: int = 500_000,
+        limit: int | None = 500_000,
     ) -> list[dict[str, Any]]:
-        """Return all edge rows (bounded by *limit* to guard against OOM)."""
-        rows = self.conn.execute(
-            "SELECT source_id, target_id, rel_type, weight "
-            "FROM repo_edges LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        """Return all edge rows (bounded by *limit* to guard against OOM).
+
+        Pass ``limit=None`` to disable the row cap.
+        """
+        if limit is not None:
+            rows = self.conn.execute(
+                "SELECT source_id, target_id, rel_type, weight "
+                "FROM repo_edges LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT source_id, target_id, rel_type, weight "
+                "FROM repo_edges",
+            ).fetchall()
+        result = [dict(r) for r in rows]
+        _warn_if_truncated(result, limit, "get_all_edges")
+        return result
 
     # ── Language detection ───────────────────────────────────────────
 

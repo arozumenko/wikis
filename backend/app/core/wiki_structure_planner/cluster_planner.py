@@ -1110,14 +1110,17 @@ class ClusterStructurePlanner:
 
         G = nx.MultiDiGraph()
 
-        # Add all architectural nodes (excluding test nodes when flag is on)
+        # Add all architectural nodes (excluding test nodes when flag is on).
+        # ``limit=None`` matches the original raw-SQL behaviour and avoids
+        # silently truncating large repos.
         for node_id in self.db.get_architectural_node_ids(
-            exclude_tests=self._exclude_tests
+            exclude_tests=self._exclude_tests,
+            limit=None,
         ):
             G.add_node(node_id)
 
-        # Add all edges with weights
-        for row in self.db.get_all_edges():
+        # Add all edges with weights.  Same rationale for ``limit=None``.
+        for row in self.db.get_all_edges(limit=None):
             src, tgt = row["source_id"], row["target_id"]
             if src in G and tgt in G:
                 G.add_edge(

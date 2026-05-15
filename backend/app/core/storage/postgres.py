@@ -49,6 +49,24 @@ from sqlalchemy.engine import Engine
 logger = logging.getLogger(__name__)
 
 
+def _warn_if_truncated(rows: list[Any], limit: int | None, method: str, **ctx: Any) -> None:
+    """Log a WARNING when *rows* count equals the active *limit*.
+
+    See ``sqlite.py`` for the rationale.  Callers that need *all* rows
+    should pass ``limit=None``.
+    """
+    if limit is None:
+        return
+    if len(rows) >= limit:
+        ctx_str = ", ".join(f"{k}={v}" for k, v in ctx.items() if v is not None)
+        suffix = f" ({ctx_str})" if ctx_str else ""
+        logger.warning(
+            "[STORAGE] %s hit row cap (limit=%d)%s; result is likely truncated. "
+            "Pass limit=None when full coverage is required.",
+            method, limit, suffix,
+        )
+
+
 # ---------------------------------------------------------------------------
 # pgvector availability
 # ---------------------------------------------------------------------------
@@ -529,31 +547,45 @@ class PostgresWikiStorage:
             return [self._row_to_dict(r) for r in rows]
 
     def get_nodes_by_cluster(
-        self, macro: int, micro: int | None = None, limit: int = 1000,
+        self, macro: int, micro: int | None = None, limit: int | None = 1000,
     ) -> list[dict[str, Any]]:
+        """Pass ``limit=None`` to disable the row cap."""
         with self._engine.connect() as conn:
             if micro is not None:
+                base_sql = (
+                    f"SELECT * FROM {self._schema}.repo_nodes "
+                    "WHERE macro_cluster = :macro AND micro_cluster = :micro"
+                )
+                params: dict[str, Any] = {"macro": macro, "micro": micro}
+            else:
+                base_sql = (
+                    f"SELECT * FROM {self._schema}.repo_nodes WHERE macro_cluster = :macro"
+                )
+                params = {"macro": macro}
+            if limit is not None:
+                params["lim"] = limit
+                rows = conn.execute(text(base_sql + " LIMIT :lim"), params).fetchall()
+            else:
+                rows = conn.execute(text(base_sql), params).fetchall()
+            result = [self._row_to_dict(r) for r in rows]
+            _warn_if_truncated(result, limit, "get_nodes_by_cluster", macro=macro, micro=micro)
+            return result
+
+    def get_architectural_nodes(self, limit: int | None = 5000) -> list[dict[str, Any]]:
+        """Pass ``limit=None`` to disable the row cap."""
+        with self._engine.connect() as conn:
+            if limit is not None:
                 rows = conn.execute(
-                    text(
-                        f"SELECT * FROM {self._schema}.repo_nodes "
-                        "WHERE macro_cluster = :macro AND micro_cluster = :micro LIMIT :lim"
-                    ),
-                    {"macro": macro, "micro": micro, "lim": limit},
+                    text(f"SELECT * FROM {self._schema}.repo_nodes WHERE is_architectural = 1 LIMIT :lim"),
+                    {"lim": limit},
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    text(f"SELECT * FROM {self._schema}.repo_nodes WHERE macro_cluster = :macro LIMIT :lim"),
-                    {"macro": macro, "lim": limit},
+                    text(f"SELECT * FROM {self._schema}.repo_nodes WHERE is_architectural = 1"),
                 ).fetchall()
-            return [self._row_to_dict(r) for r in rows]
-
-    def get_architectural_nodes(self, limit: int = 5000) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                text(f"SELECT * FROM {self._schema}.repo_nodes WHERE is_architectural = 1 LIMIT :lim"),
-                {"lim": limit},
-            ).fetchall()
-            return [self._row_to_dict(r) for r in rows]
+            result = [self._row_to_dict(r) for r in rows]
+            _warn_if_truncated(result, limit, "get_architectural_nodes")
+            return result
 
     def get_all_nodes(self) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
@@ -1624,34 +1656,50 @@ class PostgresWikiStorage:
     def get_architectural_node_ids(
         self,
         exclude_tests: bool = False,
-        limit: int = 10_000,
+        limit: int | None = 10_000,
     ) -> list[str]:
-        """Return node_ids of all architectural nodes (lightweight projection)."""
+        """Return node_ids of all architectural nodes (lightweight projection).
+
+        Pass ``limit=None`` to disable the row cap.
+        """
         sql = f"SELECT node_id FROM {self._nodes} WHERE is_architectural = 1"
         if exclude_tests:
             sql += " AND is_test = 0"
-        sql += " LIMIT :limit"
         with self._engine.connect() as conn:
-            rows = conn.execute(text(sql), {"limit": limit}).fetchall()
-        return [r[0] for r in rows]
+            if limit is not None:
+                rows = conn.execute(
+                    text(sql + " LIMIT :limit"), {"limit": limit},
+                ).fetchall()
+            else:
+                rows = conn.execute(text(sql)).fetchall()
+        result = [r[0] for r in rows]
+        _warn_if_truncated(result, limit, "get_architectural_node_ids", exclude_tests=exclude_tests)
+        return result
 
     def get_all_edges(
         self,
-        limit: int = 500_000,
+        limit: int | None = 500_000,
     ) -> list[dict[str, Any]]:
-        """Return all edge rows (bounded by *limit* to guard against OOM)."""
+        """Return all edge rows (bounded by *limit* to guard against OOM).
+
+        Pass ``limit=None`` to disable the row cap.
+        """
+        base_sql = (
+            f"SELECT source_id, target_id, rel_type, weight FROM {self._edges}"
+        )
         with self._engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    f"SELECT source_id, target_id, rel_type, weight "
-                    f"FROM {self._edges} LIMIT :limit"
-                ),
-                {"limit": limit},
-            ).fetchall()
-        return [
+            if limit is not None:
+                rows = conn.execute(
+                    text(base_sql + " LIMIT :limit"), {"limit": limit},
+                ).fetchall()
+            else:
+                rows = conn.execute(text(base_sql)).fetchall()
+        result = [
             {"source_id": r[0], "target_id": r[1], "rel_type": r[2], "weight": r[3]}
             for r in rows
         ]
+        _warn_if_truncated(result, limit, "get_all_edges")
+        return result
 
     # ── Language detection ───────────────────────────────────────────
 

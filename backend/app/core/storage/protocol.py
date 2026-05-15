@@ -96,13 +96,22 @@ class WikiStorageProtocol(Protocol):
         ...
 
     def get_nodes_by_cluster(
-        self, macro: int, micro: int | None = None, limit: int = 1000,
+        self, macro: int, micro: int | None = None, limit: int | None = 1000,
     ) -> list[dict[str, Any]]:
-        """Get all nodes in a macro (optionally micro) cluster."""
+        """Get all nodes in a macro (optionally micro) cluster.
+
+        Pass ``limit=None`` to disable the row cap (matches pre-protocol
+        raw SQL behaviour where the caller expected every row).
+        """
         ...
 
-    def get_architectural_nodes(self, limit: int = 5000) -> list[dict[str, Any]]:
-        """Get all nodes flagged ``is_architectural = 1``."""
+    def get_architectural_nodes(
+        self, limit: int | None = 5000,
+    ) -> list[dict[str, Any]]:
+        """Get all nodes flagged ``is_architectural = 1``.
+
+        Pass ``limit=None`` to disable the row cap.
+        """
         ...
 
     def get_all_nodes(self) -> list[dict[str, Any]]:
@@ -432,25 +441,27 @@ class WikiStorageProtocol(Protocol):
     def get_architectural_node_ids(
         self,
         exclude_tests: bool = False,
-        limit: int = 10_000,
+        limit: int | None = 10_000,
     ) -> list[str]:
         """Return ``node_id`` values for all architectural nodes.
 
         Lightweight projection used when only IDs are needed (e.g. populating
         a NetworkX graph for PageRank).  When *exclude_tests* is True, rows
-        with ``is_test = 1`` are skipped.
+        with ``is_test = 1`` are skipped.  Pass ``limit=None`` to disable
+        the row cap.
         """
         ...
 
     def get_all_edges(
         self,
-        limit: int = 500_000,
+        limit: int | None = 500_000,
     ) -> list[dict[str, Any]]:
         """Return all edge rows with at minimum ``source_id``, ``target_id``,
         ``rel_type``, ``weight``.
 
         Used for bulk graph reconstruction (PageRank, topology analysis).
-        The *limit* parameter guards against OOM on very large repos.
+        The *limit* parameter guards against OOM on very large repos; pass
+        ``None`` to disable.
         """
         ...
 
