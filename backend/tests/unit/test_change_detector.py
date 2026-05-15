@@ -216,6 +216,55 @@ def _seed_page(db: UnifiedWikiDB, page_id: str, symbols: list[tuple[str, str]]) 
     )
 
 
+class TestAffectedPageMaxKind:
+    """PR 3's three-regime classifier reads .max_kind off each affected
+    page to decide trivial / edit / structural routing — see severity
+    ordering at the top of the module."""
+
+    def test_returns_none_when_no_changes(self) -> None:
+        # Invariant violation in practice, but the helper must be safe.
+        from app.services.change_detector import AffectedPage
+
+        assert AffectedPage(page_id="p1", changes=[]).max_kind is None
+
+    def test_single_change_returns_its_kind(self) -> None:
+        from app.services.change_detector import AffectedPage
+
+        page = AffectedPage(
+            page_id="p1",
+            changes=[NodeChange(kind=ChangeKind.MODIFIED, node_id="a")],
+        )
+        assert page.max_kind == ChangeKind.MODIFIED
+
+    def test_picks_highest_severity_when_multiple(self) -> None:
+        # Severity: MOVED < MODIFIED < ADDED < DELETED.
+        from app.services.change_detector import AffectedPage
+
+        page = AffectedPage(
+            page_id="p1",
+            changes=[
+                NodeChange(kind=ChangeKind.MOVED, node_id="a"),
+                NodeChange(kind=ChangeKind.DELETED, node_id="b"),
+                NodeChange(kind=ChangeKind.MODIFIED, node_id="c"),
+            ],
+        )
+        # DELETED wins.
+        assert page.max_kind == ChangeKind.DELETED
+
+    def test_moved_only_yields_moved(self) -> None:
+        # PR 3 routes MOVED-only pages to the no-LLM trivial regime.
+        from app.services.change_detector import AffectedPage
+
+        page = AffectedPage(
+            page_id="p1",
+            changes=[
+                NodeChange(kind=ChangeKind.MOVED, node_id="a"),
+                NodeChange(kind=ChangeKind.MOVED, node_id="b"),
+            ],
+        )
+        assert page.max_kind == ChangeKind.MOVED
+
+
 class TestAffectedPages:
     def test_empty_change_set_returns_empty(
         self, detector: ChangeDetector,

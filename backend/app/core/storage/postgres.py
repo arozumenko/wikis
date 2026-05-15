@@ -730,12 +730,18 @@ class PostgresWikiStorage:
                 text(f"SELECT count(*) FROM {self._schema}.repo_nodes"),
             ).scalar() or 0
 
-    def fetch_indexed_node_hashes(self) -> dict[str, str | None]:
+    def fetch_indexed_node_meta(self) -> dict[str, dict[str, str | None]]:
         with self._engine.connect() as conn:
             rows = conn.execute(
-                text(f"SELECT node_id, content_hash FROM {self._schema}.repo_nodes"),
+                text(
+                    f"SELECT node_id, content_hash, rel_path "
+                    f"FROM {self._schema}.repo_nodes"
+                ),
             ).fetchall()
-        return {row[0]: row[1] for row in rows}
+        return {
+            row[0]: {"content_hash": row[1], "rel_path": row[2] or ""}
+            for row in rows
+        }
 
     # ==================================================================
     # EDGE operations

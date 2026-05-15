@@ -354,9 +354,14 @@ class ParsedNodeInput(BaseModel):
 class DiffWikiRequest(BaseModel):
     """Body for ``POST /wikis/{wiki_id}/diff`` — supply the freshly parsed
     nodes; the server diffs them against the indexed snapshot.
+
+    Capped at 50 000 nodes per request to bound the cost of the per-node
+    reverse-index lookup. The largest repos in our corpus parse to ~30k
+    architectural nodes; 50k gives ~1.5x headroom before PR 3 swaps in the
+    batched ``get_pages_citing_nodes`` query.
     """
 
-    parsed_nodes: list[ParsedNodeInput]
+    parsed_nodes: list[ParsedNodeInput] = Field(default_factory=list, max_length=50_000)
 
 
 class NodeChangeResponse(BaseModel):

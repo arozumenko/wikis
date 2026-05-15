@@ -231,6 +231,97 @@ class TestDiffEndpoint:
         assert page["anchor_slug"] == "authentication"
 
     @pytest.mark.asyncio
+    async def test_403_when_caller_is_not_owner(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """The diff response leaks content_hash + node_id internals — only
+        the wiki owner may call it, even if the wiki is shared-visibility.
+        """
+        monkeypatch.setenv("AUTH_ENABLED", "true")  # turn on real auth
+        monkeypatch.setenv("LLM_API_KEY", "test-key")
+        monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+        _seed_unified_db(
+            tmp_path / "cache",
+            cache_key="testkey",
+            repo_url="https://github.com/example/widgets",
+            branch="main",
+        )
+
+        engine = create_async_engine(
+            "sqlite+aiosqlite://", connect_args={"check_same_thread": False}
+        )
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        sf = async_sessionmaker(engine, expire_on_commit=False)
+        # Wiki owned by *another* user; visibility shared so get_wiki returns it.
+        async with sf() as session, session.begin():
+            session.add(
+                WikiRecord(
+                    id="test-wiki",
+                    owner_id="other-user",
+                    repo_url="https://github.com/example/widgets",
+                    branch="main",
+                    title="Test Wiki",
+                    page_count=1,
+                    status="complete",
+                    visibility="shared",
+                )
+            )
+
+        app = create_app()
+        async with app.router.lifespan_context(app):
+            app.state.settings.cache_dir = str(tmp_path / "cache")
+            storage = LocalArtifactStorage(str(tmp_path / "artifacts"))
+            app.state.storage = storage
+            app.state.wiki_management = WikiManagementService(storage, sf)
+            app.state.session_factory = sf
+
+            # Stub get_current_user → returns a different user than owner.
+            from app.auth import get_current_user
+            from app.auth import CurrentUser
+
+            async def _fake_user():
+                return CurrentUser(id="dev-user", email="dev@example.com")
+            app.dependency_overrides[get_current_user] = _fake_user
+
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.post(
+                    "/api/v1/wikis/test-wiki/diff",
+                    json={"parsed_nodes": []},
+                )
+                assert resp.status_code == 403, resp.text
+                assert "owner" in resp.json().get("detail", "").lower()
+        await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_404_when_wiki_db_file_deleted(self, client_and_db) -> None:
+        """cache_index entry can survive the .wiki.db file being deleted
+        out-of-band — endpoint must return 404, not crash with 500."""
+        client, db_path = client_and_db
+        db_path.unlink()  # remove the .wiki.db file but leave cache_index.json
+        resp = await client.post(
+            "/api/v1/wikis/test-wiki/diff",
+            json={"parsed_nodes": []},
+        )
+        assert resp.status_code == 404
+        assert "missing" in resp.json().get("detail", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_422_when_payload_exceeds_size_cap(self, client_and_db) -> None:
+        """parsed_nodes is capped at 50_000 items to bound the reverse-index
+        N+1 cost. Over-cap requests should fail Pydantic validation cleanly."""
+        client, _ = client_and_db
+        oversized = [
+            {"node_id": f"n{i}", "content_hash": "x", "rel_path": "x.py"}
+            for i in range(50_001)
+        ]
+        resp = await client.post(
+            "/api/v1/wikis/test-wiki/diff",
+            json={"parsed_nodes": oversized},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
     async def test_404_when_wiki_unknown(self, client_and_db) -> None:
         client, _ = client_and_db
         resp = await client.post(

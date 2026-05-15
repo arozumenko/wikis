@@ -852,15 +852,21 @@ async def diff_wiki(
     Read-only: no parsing, no LLM, no writes. PR 3 will wire the actual
     re-parse loop on top of this primitive.
     """
-    from app.core.storage import open_storage, repo_id_from_path
+    from app.core.storage import open_storage
     from app.services.change_detector import ChangeDetector
     from app.services.wiki_management import _derive_cache_key
 
-    # Auth check
+    # Auth check — wiki must exist AND caller must be the owner. The diff
+    # surface exposes content_hash + node_id internals; that's an
+    # implementation detail of the repo, not shareable user data, so we
+    # don't honor the wiki's shared-visibility flag for this endpoint
+    # (unlike /search). Mirrors the /refresh guard.
     user_id = user.id if user else None
     wiki = await management.get_wiki(wiki_id, user_id=user_id)
     if wiki is None:
         raise HTTPException(404, f"Wiki not found: {wiki_id}")
+    if wiki.owner_id and wiki.owner_id != user_id:
+        raise HTTPException(403, "Only the wiki owner can diff the index")
 
     settings = request.app.state.settings
 
@@ -875,6 +881,14 @@ async def diff_wiki(
     from pathlib import Path as _Path
 
     db_path = _Path(settings.cache_dir) / f"{cache_key}.wiki.db"
+    # cache_index entry can survive the underlying file being deleted
+    # (manual cleanup, full disk, etc.). Treat that as the same 404 as
+    # "no cache_index entry" rather than crashing with 500 in open_storage.
+    if not db_path.exists():
+        raise HTTPException(
+            404,
+            f"Unified DB file missing at {db_path.name} — index may be stale or evicted",
+        )
     storage = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
 
     try:

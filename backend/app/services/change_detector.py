@@ -101,6 +101,17 @@ class ChangeSet:
         return len(self.added) + len(self.modified) + len(self.deleted) + len(self.moved)
 
 
+# Severity ordering used by ``AffectedPage.max_kind`` — exposed at module
+# scope so PR 3's regime classifier can reuse the same ranks without
+# duplicating the table. Higher number = more severe → more regen work.
+_CHANGE_KIND_SEVERITY: dict[ChangeKind, int] = {
+    ChangeKind.MOVED: 0,
+    ChangeKind.MODIFIED: 1,
+    ChangeKind.ADDED: 2,
+    ChangeKind.DELETED: 3,
+}
+
+
 @dataclass
 class AffectedPage:
     """One wiki page touched by the change set.
@@ -112,6 +123,23 @@ class AffectedPage:
 
     page_id: str
     changes: list[NodeChange] = field(default_factory=list)
+
+    @property
+    def max_kind(self) -> ChangeKind | None:
+        """The highest-severity change kind touching this page.
+
+        PR 3's three-regime classifier uses this to route: ``MOVED`` →
+        trivial (no LLM); ``MODIFIED`` → edit; ``ADDED``/``DELETED`` →
+        structural. Returns ``None`` if the page has no changes (an
+        invariant violation — pages with empty ``changes`` shouldn't be
+        in the affected-pages list).
+        """
+        if not self.changes:
+            return None
+        return max(
+            self.changes,
+            key=lambda c: _CHANGE_KIND_SEVERITY[c.kind],
+        ).kind
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +178,11 @@ class ChangeDetector:
             A :class:`ChangeSet` populated with one :class:`NodeChange` per
             differing node. Unchanged nodes are not represented.
         """
-        old_hashes = self._storage.fetch_indexed_node_hashes()
-        old_paths = self._fetch_indexed_paths(old_hashes.keys())
+        # Single full-table scan returns hash + path together — avoids a
+        # second ``WHERE node_id IN (...)`` query that would hit SQLite's
+        # ``SQLITE_MAX_VARIABLE_NUMBER`` limit on wikis with thousands of
+        # indexed nodes.
+        old_meta = self._storage.fetch_indexed_node_meta()
 
         # Index the parsed input by node_id for O(1) lookup. We deliberately
         # don't materialise content_text here — only hash + path are needed
@@ -170,7 +201,7 @@ class ChangeDetector:
 
         # Pass 1: traverse parsed_index, classify each node against the old state.
         for node_id, (new_hash, new_path) in parsed_index.items():
-            if node_id not in old_hashes:
+            if node_id not in old_meta:
                 result.added.append(
                     NodeChange(
                         kind=ChangeKind.ADDED,
@@ -180,8 +211,9 @@ class ChangeDetector:
                     )
                 )
                 continue
-            old_hash = old_hashes[node_id]
-            old_path = old_paths.get(node_id, "")
+            old = old_meta[node_id]
+            old_hash = old["content_hash"]
+            old_path = old["rel_path"] or ""
             if old_hash is None:
                 # Pre-#116 row with no recorded hash. We can't tell whether
                 # source changed — assume modified to keep correctness.
@@ -221,16 +253,16 @@ class ChangeDetector:
                 )
             )
 
-        # Pass 2: anything in old_hashes but not in parsed_index is deleted.
-        for node_id, old_hash in old_hashes.items():
+        # Pass 2: anything in old_meta but not in parsed_index is deleted.
+        for node_id, old in old_meta.items():
             if node_id in parsed_index:
                 continue
             result.deleted.append(
                 NodeChange(
                     kind=ChangeKind.DELETED,
                     node_id=node_id,
-                    old_hash=old_hash,
-                    old_path=old_paths.get(node_id, ""),
+                    old_hash=old["content_hash"],
+                    old_path=old["rel_path"] or "",
                 )
             )
 
@@ -270,18 +302,3 @@ class ChangeDetector:
             for page_id, changes in sorted(page_to_changes.items())
         ]
 
-    # ------------------------------------------------------------------
-    # internals
-    # ------------------------------------------------------------------
-
-    def _fetch_indexed_paths(self, node_ids: Iterable[str]) -> dict[str, str]:
-        """Look up ``rel_path`` for the given node_ids via the storage protocol.
-
-        Single batch call (``get_nodes_by_ids``) so this stays O(1)-ish
-        regardless of node count.
-        """
-        ids = list(node_ids)
-        if not ids:
-            return {}
-        rows = self._storage.get_nodes_by_ids(ids)
-        return {row["node_id"]: row.get("rel_path", "") for row in rows if row.get("node_id")}
