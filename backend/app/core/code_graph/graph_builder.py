@@ -409,21 +409,29 @@ class EnhancedUnifiedGraphBuilder:
         # regex ``basic_languages`` path; PHP and Lua have NO fallback
         # and disappear entirely. Operators need the loud signal so
         # they can react (typically: missing tree-sitter grammar wheel).
+        #
+        # The lost-language list is a **literal** rather than imported
+        # from ``lang_configs`` — if the failure mode is an ImportError
+        # on the lang_configs package itself (e.g. a missing grammar
+        # raising at module load), a second import in the except branch
+        # would re-trigger the same failure and silently suppress the
+        # diagnostic we're trying to emit. Code-review R2 caught this
+        # as the load-bearing CR5 issue: the very failure mode CR5 was
+        # designed to surface was the one most likely to suppress its
+        # own log line.
+        _BASIC_VISITOR_LANGS = ("ruby", "php", "kotlin", "scala", "lua")
         try:
             from ..parsers.lang_configs import build_basic_parsers as _build_basic
 
             self.rich_parsers.update(_build_basic())
         except Exception as exc:  # noqa: BLE001
-            from ..parsers.lang_configs import KOTLIN, LUA, PHP, RUBY, SCALA
-
-            lost = [cfg.name for cfg in (RUBY, PHP, KOTLIN, SCALA, LUA)]
             logger.error(
                 "[graph_builder] basic-visitor parsers FAILED to "
                 "initialise (%s) — the following languages will not "
                 "be parsed via tree-sitter: %s. Ruby/Kotlin/Scala fall "
                 "back to the regex code_splitter path; PHP and Lua "
                 "have no fallback and will be skipped entirely.",
-                exc, lost,
+                exc, list(_BASIC_VISITOR_LANGS),
             )
         
         # Configuration
@@ -1709,16 +1717,23 @@ class EnhancedUnifiedGraphBuilder:
                 
                 # #119 — Map the Relationship.confidence float to the
                 # storage layer's confidence enum (``EXTRACTED`` /
-                # ``INFERRED``). The deep parsers leave confidence at
-                # the dataclass default 1.0 → ``EXTRACTED``. The basic
-                # visitor parser emits 0.6 on name-only CALLS edges →
-                # ``INFERRED``. The 0.8 threshold matches the existing
-                # python parser's "indirect call" tier. Without this
-                # mapping the float annotation was being silently
-                # dropped at the storage boundary (Rio R3).
+                # ``INFERRED``). The basic visitor parser emits 0.6 on
+                # name-only CALLS edges → ``INFERRED``. The deep
+                # parsers emit ≥ 0.7 across the board (verified across
+                # python/go/java/csharp/javascript/rust/cpp/typescript).
+                #
+                # Threshold ``< 0.7`` keeps every existing deep-parser
+                # edge at its prior storage value (the storage backends
+                # default missing-confidence-key writes to ``EXTRACTED``,
+                # see sqlite.py:847 and postgres.py:882). Without this
+                # threshold tuning, python_parser's pre-existing
+                # 0.7-tier edges (3 callsites, plus a conditional
+                # branch) would silently reclassify to INFERRED —
+                # which Rio's R2 review caught as a regression in the
+                # first fixup pass (Rio R3, second-round review).
                 rel_confidence = getattr(relationship, 'confidence', 1.0)
                 confidence_str = (
-                    'INFERRED' if rel_confidence < 0.8 else 'EXTRACTED'
+                    'INFERRED' if rel_confidence < 0.7 else 'EXTRACTED'
                 )
 
                 # Collect edge for bulk addition
