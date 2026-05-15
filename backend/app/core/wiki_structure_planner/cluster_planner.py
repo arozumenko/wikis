@@ -730,6 +730,16 @@ class ClusterStructurePlanner:
             target_folders = self._node_ids_to_folders(node_ids)
             target_docs = self._node_ids_to_doc_paths(node_ids)
 
+            # #116: primary symbol = PageRank champion; falls back to the
+            # first deterministically-ordered cluster member when PageRank
+            # produced no central. Feeds compute_page_id, so stability of
+            # this value across runs is what makes wikilinks survive regen.
+            primary_symbol_id = (
+                central_ids[0]
+                if central_ids
+                else (node_ids[0] if node_ids else None)
+            )
+
             pages.append(PageSpec(
                 page_name=page_name,
                 page_order=page_order,
@@ -746,6 +756,7 @@ class ClusterStructurePlanner:
                     "section_id": macro_id,
                     "page_id": micro_id,
                     "cluster_node_ids": list(node_ids),
+                    "primary_symbol_id": primary_symbol_id,
                 },
             ))
             page_order += 1
@@ -893,6 +904,12 @@ class ClusterStructurePlanner:
             target_folders = self._node_ids_to_folders(node_ids)
             target_docs = self._node_ids_to_doc_paths(node_ids)
 
+            primary_symbol_id = (
+                central_ids[0]
+                if central_ids
+                else (node_ids[0] if node_ids else None)
+            )
+
             pages.append(PageSpec(
                 page_name=page_name,
                 page_order=page_order,
@@ -909,6 +926,7 @@ class ClusterStructurePlanner:
                     "section_id": macro_id,
                     "page_id": micro_id,
                     "cluster_node_ids": list(node_ids),
+                    "primary_symbol_id": primary_symbol_id,
                 },
             ))
             page_order += 1
@@ -1284,6 +1302,12 @@ class ClusterStructurePlanner:
             target_symbols = self._node_ids_to_symbol_names(central_ids)
             key_files = self._node_ids_to_paths(node_ids)
 
+            primary_symbol_id = (
+                central_ids[0]
+                if central_ids
+                else (node_ids[0] if node_ids else None)
+            )
+
             pages.append(PageSpec(
                 page_name=f"{section_name} — Page {micro_id}",
                 page_order=page_order,
@@ -1300,6 +1324,7 @@ class ClusterStructurePlanner:
                     "section_id": macro_id,
                     "page_id": micro_id,
                     "cluster_node_ids": list(node_ids),
+                    "primary_symbol_id": primary_symbol_id,
                 },
             ))
             page_order += 1

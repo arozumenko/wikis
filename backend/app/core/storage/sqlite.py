@@ -57,6 +57,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 from ._helpers import warn_if_truncated as _shared_warn_if_truncated  # noqa: E402
+from .incremental import compute_content_hash  # noqa: E402
 
 
 def _warn_if_truncated(rows: list[Any], limit: int | None, method: str, **ctx: Any) -> None:
@@ -133,6 +134,10 @@ CREATE TABLE IF NOT EXISTS repo_nodes (
     parameters      TEXT DEFAULT '',
     return_type     TEXT DEFAULT '',
 
+    -- Change detection (#116 incremental regen)
+    -- sha256 hex of normalize(source_text); NULL for pre-incremental rows
+    content_hash    TEXT DEFAULT NULL,
+
     -- Classification
     is_architectural INTEGER DEFAULT 0,
     is_doc           INTEGER DEFAULT 0,
@@ -161,6 +166,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_micro      ON repo_nodes(macro_cluster, mic
 CREATE INDEX IF NOT EXISTS idx_nodes_arch       ON repo_nodes(is_architectural) WHERE is_architectural = 1;
 CREATE INDEX IF NOT EXISTS idx_nodes_hub        ON repo_nodes(is_hub) WHERE is_hub = 1;
 CREATE INDEX IF NOT EXISTS idx_nodes_test       ON repo_nodes(is_test) WHERE is_test = 1;
+CREATE INDEX IF NOT EXISTS idx_nodes_hash       ON repo_nodes(content_hash) WHERE content_hash IS NOT NULL;
 """
 
 _SCHEMA_EDGES = """
@@ -228,6 +234,67 @@ CREATE TABLE IF NOT EXISTS wiki_meta (
     key    TEXT PRIMARY KEY,
     value  TEXT
 );
+"""
+
+# ---------------------------------------------------------------------------
+# #116 incremental regen — wiki page registry + source→page reverse index.
+#
+# These tables persist what was previously only an in-memory plan + an
+# artifact-storage .md file. They land additively in PR 1 with no behavior
+# change; PR 2+ read from them to drive change detection and three-regime
+# diff routing.
+#
+# id_scheme distinguishes:
+#   'legacy'     — pre-#116 wikis whose page_id is "{section_idx}#{page_idx}"
+#   'stable_v1'  — page_id is sha256(wiki_id|macro|micro|primary_symbol|title)[:16]
+# ---------------------------------------------------------------------------
+_SCHEMA_WIKI_PAGES = """
+CREATE TABLE IF NOT EXISTS wiki_pages (
+    page_id            TEXT PRIMARY KEY,
+    wiki_id            TEXT NOT NULL,
+    id_scheme          TEXT NOT NULL DEFAULT 'stable_v1'
+                       CHECK (id_scheme IN ('legacy','stable_v1')),
+    title              TEXT NOT NULL DEFAULT '',
+    anchor_slug        TEXT NOT NULL DEFAULT '',
+    content_hash       TEXT DEFAULT NULL,
+    macro_cluster      INTEGER DEFAULT NULL,
+    micro_cluster      INTEGER DEFAULT NULL,
+    primary_symbol_id  TEXT DEFAULT NULL,
+    section_index      INTEGER DEFAULT 0,
+    page_index         INTEGER DEFAULT 0,
+    -- #116 PR 2: git rev / source-state identifier for the repo snapshot
+    -- this page was generated against. Lets change detection fast-exit on
+    -- "repo unchanged since last regen" without diffing every node.
+    last_indexed_commit TEXT DEFAULT NULL,
+    generated_at       TEXT DEFAULT (datetime('now'))
+);
+"""
+
+_SCHEMA_WIKI_PAGES_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_pages_wiki        ON wiki_pages(wiki_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_slug ON wiki_pages(wiki_id, anchor_slug);
+CREATE INDEX IF NOT EXISTS idx_pages_primary     ON wiki_pages(primary_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_pages_cluster     ON wiki_pages(macro_cluster, micro_cluster);
+"""
+
+# Source→page reverse index. citation_kind:
+#   'primary'    — the symbol the page is "about" (1 per page, from planner)
+#   'referenced' — symbol cited in the rendered body (<code_context path=...>)
+#   'related'    — cluster member not cited (still belongs to the page's scope)
+_SCHEMA_PAGE_SYMBOLS = """
+CREATE TABLE IF NOT EXISTS page_symbols (
+    page_id       TEXT NOT NULL,
+    node_id       TEXT NOT NULL,
+    citation_kind TEXT NOT NULL
+                  CHECK (citation_kind IN ('primary','referenced','related')),
+    PRIMARY KEY (page_id, node_id, citation_kind),
+    FOREIGN KEY (page_id) REFERENCES wiki_pages(page_id) ON DELETE CASCADE
+);
+"""
+
+_SCHEMA_PAGE_SYMBOLS_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_page_symbols_node ON page_symbols(node_id);
+CREATE INDEX IF NOT EXISTS idx_page_symbols_kind ON page_symbols(citation_kind);
 """
 
 # sqlite-vec table — created only when the extension is available
@@ -379,6 +446,10 @@ class UnifiedWikiDB:
         cur.executescript(_SCHEMA_EDGES_INDEXES)
         cur.executescript(_SCHEMA_FTS5)
         cur.executescript(_SCHEMA_META)
+        cur.executescript(_SCHEMA_WIKI_PAGES)
+        cur.executescript(_SCHEMA_WIKI_PAGES_INDEXES)
+        cur.executescript(_SCHEMA_PAGE_SYMBOLS)
+        cur.executescript(_SCHEMA_PAGE_SYMBOLS_INDEXES)
 
         if self._vec_available:
             try:
@@ -412,6 +483,33 @@ class UnifiedWikiDB:
             cur.execute("ALTER TABLE repo_nodes ADD COLUMN is_test INTEGER DEFAULT 0")
             self.conn.commit()
             self._backfill_is_test()
+
+        # #116 incremental regen: content_hash for change detection.
+        # Existing rows stay NULL; backfilled lazily on next reindex of that file.
+        if "content_hash" not in cols:
+            logger.info("Migrating schema: adding content_hash column to repo_nodes")
+            cur.execute("ALTER TABLE repo_nodes ADD COLUMN content_hash TEXT DEFAULT NULL")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_hash "
+                "ON repo_nodes(content_hash) WHERE content_hash IS NOT NULL"
+            )
+            self.conn.commit()
+
+        # #116 PR 2 prep: last_indexed_commit on wiki_pages for fast-exit
+        # change detection. Idempotent — only fires on legacy schemas that
+        # have wiki_pages but lack this column.
+        if "wiki_pages" in tables:
+            page_cols = {
+                row[1] for row in cur.execute("PRAGMA table_info(wiki_pages)")
+            }
+            if "last_indexed_commit" not in page_cols:
+                logger.info(
+                    "Migrating schema: adding last_indexed_commit to wiki_pages"
+                )
+                cur.execute(
+                    "ALTER TABLE wiki_pages ADD COLUMN last_indexed_commit TEXT DEFAULT NULL"
+                )
+                self.conn.commit()
 
         # §11.6 / B1: edge confidence column. ALTER TABLE in sqlite cannot
         # add a CHECK constraint after the fact, but the default + the
@@ -485,6 +583,7 @@ class UnifiedWikiDB:
             start_line, end_line,
             symbol_name, symbol_type, parent_symbol, analysis_level,
             source_text, docstring, signature, parameters, return_type,
+            content_hash,
             is_architectural, is_doc, is_test, chunk_type,
             macro_cluster, micro_cluster, is_hub, hub_assignment
         ) VALUES (
@@ -492,6 +591,7 @@ class UnifiedWikiDB:
             :start_line, :end_line,
             :symbol_name, :symbol_type, :parent_symbol, :analysis_level,
             :source_text, :docstring, :signature, :parameters, :return_type,
+            :content_hash,
             :is_architectural, :is_doc, :is_test, :chunk_type,
             :macro_cluster, :micro_cluster, :is_hub, :hub_assignment
         )
@@ -525,6 +625,11 @@ class UnifiedWikiDB:
             if isinstance(params, (list, tuple)):
                 params = json.dumps(params)
 
+            source_text = n.get("source_text", "")
+            content_hash = n.get("content_hash")
+            if content_hash is None and source_text:
+                content_hash = compute_content_hash(source_text)
+
             rows.append(
                 {
                     "node_id": n["node_id"],
@@ -537,11 +642,12 @@ class UnifiedWikiDB:
                     "symbol_type": symbol_type,
                     "parent_symbol": n.get("parent_symbol"),
                     "analysis_level": n.get("analysis_level", "comprehensive"),
-                    "source_text": n.get("source_text", ""),
+                    "source_text": source_text,
                     "docstring": n.get("docstring", ""),
                     "signature": n.get("signature", ""),
                     "parameters": params,
                     "return_type": n.get("return_type", ""),
+                    "content_hash": content_hash,
                     "is_architectural": is_arch,
                     "is_doc": is_doc,
                     "is_test": is_test,
@@ -1705,6 +1811,11 @@ class UnifiedWikiDB:
         )
         if exclude_tests:
             sql += " AND is_test = 0"
+        # #116: deterministic order is load-bearing — the planner's
+        # cluster_node_ids list feeds compute_page_id via primary_symbol_id.
+        # Without ORDER BY the row order is undefined → page IDs shift on
+        # every regen, defeating the stable-ID scheme.
+        sql += " ORDER BY macro_cluster, micro_cluster, node_id"
         rows = self.conn.execute(sql).fetchall()
         return [dict(r) for r in rows]
 
@@ -1945,6 +2056,189 @@ class UnifiedWikiDB:
             "by_symbol_type": [dict(r) for r in sym_rows],
             "by_file": [dict(r) for r in file_rows],
         }
+
+    # ══════════════════════════════════════════════════════════════════
+    # WIKI PAGES + source→page reverse index (#116 incremental regen)
+    # ══════════════════════════════════════════════════════════════════
+
+    _WIKI_PAGE_COLUMNS = (
+        "page_id",
+        "wiki_id",
+        "id_scheme",
+        "title",
+        "anchor_slug",
+        "content_hash",
+        "macro_cluster",
+        "micro_cluster",
+        "primary_symbol_id",
+        "section_index",
+        "page_index",
+        "last_indexed_commit",
+        "generated_at",
+    )
+
+    def upsert_wiki_page(self, page: dict[str, Any]) -> None:
+        self._upsert_wiki_page_no_commit(page)
+        self.conn.commit()
+
+    def _upsert_wiki_page_no_commit(self, page: dict[str, Any]) -> None:
+        """Execute the upsert without committing. Lets
+        ``upsert_wiki_page_with_symbols`` group two writes in one transaction.
+        """
+        if "page_id" not in page or "wiki_id" not in page:
+            raise ValueError("upsert_wiki_page: 'page_id' and 'wiki_id' are required")
+        row = {
+            "page_id": page["page_id"],
+            "wiki_id": page["wiki_id"],
+            "id_scheme": page.get("id_scheme", "stable_v1"),
+            "title": page.get("title", ""),
+            "anchor_slug": page.get("anchor_slug", ""),
+            "content_hash": page.get("content_hash"),
+            "macro_cluster": page.get("macro_cluster"),
+            "micro_cluster": page.get("micro_cluster"),
+            "primary_symbol_id": page.get("primary_symbol_id"),
+            "section_index": page.get("section_index", 0),
+            "page_index": page.get("page_index", 0),
+            "last_indexed_commit": page.get("last_indexed_commit"),
+            "generated_at": page.get("generated_at"),
+        }
+        cols = ", ".join(self._WIKI_PAGE_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in self._WIKI_PAGE_COLUMNS)
+        # Native UPSERT keyed on the PRIMARY KEY. Using INSERT OR REPLACE
+        # would resolve a slug-uniqueness conflict by silently deleting the
+        # other page — we want that to bubble up as IntegrityError so
+        # callers learn to resolve slug collisions with compute_anchor_slug.
+        update_set = ", ".join(
+            f"{c} = excluded.{c}" for c in self._WIKI_PAGE_COLUMNS if c != "page_id"
+        )
+        self.conn.execute(
+            f"INSERT INTO wiki_pages ({cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT(page_id) DO UPDATE SET {update_set}",
+            row,
+        )
+
+    def get_wiki_page(self, page_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id = ?", (page_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_wiki_pages(self, wiki_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM wiki_pages WHERE wiki_id = ? "
+            "ORDER BY section_index ASC, page_index ASC",
+            (wiki_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_wiki_pages_by_cluster(
+        self,
+        wiki_id: str,
+        macro_cluster: int,
+        micro_cluster: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if micro_cluster is None:
+            rows = self.conn.execute(
+                "SELECT * FROM wiki_pages "
+                "WHERE wiki_id = ? AND macro_cluster = ? "
+                "ORDER BY section_index ASC, page_index ASC",
+                (wiki_id, macro_cluster),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM wiki_pages "
+                "WHERE wiki_id = ? AND macro_cluster = ? AND micro_cluster = ? "
+                "ORDER BY section_index ASC, page_index ASC",
+                (wiki_id, macro_cluster, micro_cluster),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_wiki_pages(self, wiki_id: str) -> int:
+        cur = self.conn.execute("DELETE FROM wiki_pages WHERE wiki_id = ?", (wiki_id,))
+        self.conn.commit()
+        return cur.rowcount or 0
+
+    def record_page_symbols(
+        self,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        self._record_page_symbols_no_commit(page_id, symbols, replace=replace)
+        self.conn.commit()
+
+    def _record_page_symbols_no_commit(
+        self,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool,
+    ) -> None:
+        """Execute the symbol writes without committing. Pairs with
+        ``_upsert_wiki_page_no_commit`` for atomic combined writes.
+        """
+        if replace:
+            self.conn.execute("DELETE FROM page_symbols WHERE page_id = ?", (page_id,))
+        if symbols:
+            # ON CONFLICT DO NOTHING scopes the ignore to PK collisions only.
+            # Using INSERT OR IGNORE would silently swallow CHECK violations
+            # (e.g. invalid citation_kind) and corrupt the reverse index.
+            self.conn.executemany(
+                "INSERT INTO page_symbols (page_id, node_id, citation_kind) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (page_id, node_id, citation_kind) DO NOTHING",
+                [(page_id, node_id, kind) for node_id, kind in symbols],
+            )
+
+    def upsert_wiki_page_with_symbols(
+        self,
+        page: dict[str, Any],
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Single-transaction upsert of the page row + its symbol rows.
+
+        On any failure between the two writes we ROLLBACK so callers don't
+        end up with a wiki_pages row whose absent citations are
+        indistinguishable from "page has nothing to cite."
+        """
+        try:
+            self._upsert_wiki_page_no_commit(page)
+            self._record_page_symbols_no_commit(
+                page["page_id"], symbols, replace=replace,
+            )
+            self.conn.commit()
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:  # noqa: S110 — best-effort rollback
+                pass
+            raise
+
+    def get_pages_citing_node(self, node_id: str) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT page_id FROM page_symbols WHERE node_id = ?",
+            (node_id,),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_page_symbols(
+        self, page_id: str, citation_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if citation_kind is None:
+            rows = self.conn.execute(
+                "SELECT node_id, citation_kind FROM page_symbols WHERE page_id = ?",
+                (page_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT node_id, citation_kind FROM page_symbols "
+                "WHERE page_id = ? AND citation_kind = ?",
+                (page_id, citation_kind),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # Canonical storage-backend name.

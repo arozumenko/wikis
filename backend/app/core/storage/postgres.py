@@ -31,6 +31,7 @@ import networkx as nx
 from sqlalchemy import (
     Column,
     Float,
+    ForeignKeyConstraint,
     Index,
     Integer,
     MetaData,
@@ -49,6 +50,7 @@ from sqlalchemy.engine import Engine
 logger = logging.getLogger(__name__)
 
 from ._helpers import warn_if_truncated as _shared_warn_if_truncated  # noqa: E402
+from .incremental import compute_content_hash  # noqa: E402
 
 
 def _warn_if_truncated(rows: list[Any], limit: int | None, method: str, **ctx: Any) -> None:
@@ -112,8 +114,9 @@ def _define_tables(
     schema: str | None,
     embedding_dim: int,
     vec_available: bool,
-) -> tuple[Table, Table, Table, Table | None]:
-    """Define SQLAlchemy Table objects for nodes, edges, metadata, and optionally vectors."""
+) -> tuple[Table, Table, Table, Table | None, Table, Table]:
+    """Define SQLAlchemy Table objects for nodes, edges, metadata, vectors,
+    wiki_pages, and page_symbols."""
 
     nodes = Table(
         "repo_nodes",
@@ -133,6 +136,8 @@ def _define_tables(
         Column("signature", Text, server_default=""),
         Column("parameters", Text, server_default=""),
         Column("return_type", Text, server_default=""),
+        # #116 incremental regen: sha256 hex of normalize(source_text)
+        Column("content_hash", Text),
         Column("is_architectural", Integer, server_default="0"),
         Column("is_doc", Integer, server_default="0"),
         Column("is_test", Integer, server_default="0"),
@@ -184,7 +189,47 @@ def _define_tables(
             schema=schema,
         )
 
-    return nodes, edges, meta, vec_table
+    # #116 incremental regen — wiki page registry + source→page reverse index.
+    # See the matching DDL comment block in storage/sqlite.py for semantics.
+    wiki_pages = Table(
+        "wiki_pages",
+        metadata,
+        Column("page_id", Text, primary_key=True),
+        Column("wiki_id", Text, nullable=False),
+        Column("id_scheme", Text, nullable=False, server_default="stable_v1"),
+        Column("title", Text, nullable=False, server_default=""),
+        Column("anchor_slug", Text, nullable=False, server_default=""),
+        Column("content_hash", Text),
+        Column("macro_cluster", Integer),
+        Column("micro_cluster", Integer),
+        Column("primary_symbol_id", Text),
+        Column("section_index", Integer, server_default="0"),
+        Column("page_index", Integer, server_default="0"),
+        # #116 PR 2: git rev / source-state identifier for the repo snapshot
+        # this page was generated against. Fast-exit on "repo unchanged".
+        Column("last_indexed_commit", Text),
+        Column("generated_at", Text),
+        schema=schema,
+    )
+
+    # Match SQLite: FK to wiki_pages with ON DELETE CASCADE so
+    # delete_wiki_pages cleans up the reverse index automatically. Without
+    # this, dropping a wiki on Postgres leaves orphan page_symbols rows.
+    page_symbols = Table(
+        "page_symbols",
+        metadata,
+        Column("page_id", Text, primary_key=True),
+        Column("node_id", Text, primary_key=True),
+        Column("citation_kind", Text, primary_key=True),
+        ForeignKeyConstraint(
+            ["page_id"],
+            [f"{schema}.wiki_pages.page_id"] if schema else ["wiki_pages.page_id"],
+            ondelete="CASCADE",
+        ),
+        schema=schema,
+    )
+
+    return nodes, edges, meta, vec_table, wiki_pages, page_symbols
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -229,7 +274,14 @@ class PostgresWikiStorage:
         self._vec_available = _PGVECTOR_AVAILABLE
         self._sa_meta = MetaData()
 
-        self._nodes, self._edges, self._meta_table, self._vec_table = _define_tables(
+        (
+            self._nodes,
+            self._edges,
+            self._meta_table,
+            self._vec_table,
+            self._wiki_pages,
+            self._page_symbols,
+        ) = _define_tables(
             self._sa_meta, self._schema, embedding_dim, self._vec_available,
         )
 
@@ -336,6 +388,78 @@ class PostgresWikiStorage:
                     END IF;
                 END $$;
             """))
+
+            # #116 incremental regen — backfill content_hash + page tables
+            # on legacy schemas. New schemas already have these via create_all.
+            conn.execute(text(f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_nodes'
+                          AND column_name = 'content_hash'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_nodes ADD COLUMN content_hash TEXT;
+                    END IF;
+                    -- #116 PR 2 prep: last_indexed_commit on wiki_pages.
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = '{schema}' AND table_name = 'wiki_pages'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'wiki_pages'
+                          AND column_name = 'last_indexed_commit'
+                    ) THEN
+                        ALTER TABLE {schema}.wiki_pages
+                            ADD COLUMN last_indexed_commit TEXT;
+                    END IF;
+                    -- page tables / CHECK constraints
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'wiki_pages_id_scheme_chk'
+                          AND connamespace = '{schema}'::regnamespace
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE {schema}.wiki_pages
+                                ADD CONSTRAINT wiki_pages_id_scheme_chk
+                                CHECK (id_scheme IN ('legacy','stable_v1'));
+                        EXCEPTION WHEN undefined_table THEN
+                            -- create_all() not yet run (shouldn't happen, but safe)
+                            NULL;
+                        END;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'page_symbols_kind_chk'
+                          AND connamespace = '{schema}'::regnamespace
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE {schema}.page_symbols
+                                ADD CONSTRAINT page_symbols_kind_chk
+                                CHECK (citation_kind IN ('primary','referenced','related'));
+                        EXCEPTION WHEN undefined_table THEN
+                            NULL;
+                        END;
+                    END IF;
+                    -- #116: FK with ON DELETE CASCADE so delete_wiki_pages
+                    -- cleans up the page_symbols reverse index. Idempotent.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'page_symbols_page_id_fkey'
+                          AND connamespace = '{schema}'::regnamespace
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE {schema}.page_symbols
+                                ADD CONSTRAINT page_symbols_page_id_fkey
+                                FOREIGN KEY (page_id)
+                                REFERENCES {schema}.wiki_pages(page_id)
+                                ON DELETE CASCADE;
+                        EXCEPTION WHEN undefined_table THEN
+                            NULL;
+                        END;
+                    END IF;
+                END $$;
+            """))
         indexes = [
             f"CREATE INDEX IF NOT EXISTS idx_nodes_path ON {schema}.repo_nodes(rel_path)",
             f"CREATE INDEX IF NOT EXISTS idx_nodes_name ON {schema}.repo_nodes(symbol_name)",
@@ -347,12 +471,20 @@ class PostgresWikiStorage:
             f"CREATE INDEX IF NOT EXISTS idx_nodes_arch ON {schema}.repo_nodes(is_architectural) WHERE is_architectural = 1",
             f"CREATE INDEX IF NOT EXISTS idx_nodes_hub ON {schema}.repo_nodes(is_hub) WHERE is_hub = 1",
             f"CREATE INDEX IF NOT EXISTS idx_nodes_test ON {schema}.repo_nodes(is_test) WHERE is_test = 1",
+            f"CREATE INDEX IF NOT EXISTS idx_nodes_hash ON {schema}.repo_nodes(content_hash) WHERE content_hash IS NOT NULL",
             f"CREATE INDEX IF NOT EXISTS idx_edges_source ON {schema}.repo_edges(source_id)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_target ON {schema}.repo_edges(target_id)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_type ON {schema}.repo_edges(rel_type)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_class ON {schema}.repo_edges(edge_class)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_weight ON {schema}.repo_edges(weight)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_confidence ON {schema}.repo_edges(confidence)",
+            # #116 wiki_pages + page_symbols
+            f"CREATE INDEX IF NOT EXISTS idx_pages_wiki ON {schema}.wiki_pages(wiki_id)",
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_slug ON {schema}.wiki_pages(wiki_id, anchor_slug)",
+            f"CREATE INDEX IF NOT EXISTS idx_pages_primary ON {schema}.wiki_pages(primary_symbol_id)",
+            f"CREATE INDEX IF NOT EXISTS idx_pages_cluster ON {schema}.wiki_pages(macro_cluster, micro_cluster)",
+            f"CREATE INDEX IF NOT EXISTS idx_page_symbols_node ON {schema}.page_symbols(node_id)",
+            f"CREATE INDEX IF NOT EXISTS idx_page_symbols_kind ON {schema}.page_symbols(citation_kind)",
         ]
         with self._engine.begin() as conn:
             for ddl in indexes:
@@ -455,6 +587,10 @@ class PostgresWikiStorage:
             params = json.dumps(params)
 
         _s = self._strip_nul
+        source_text = _s(n.get("source_text", ""))
+        content_hash = n.get("content_hash")
+        if content_hash is None and source_text:
+            content_hash = compute_content_hash(source_text)
         return {
             "node_id": _s(n["node_id"]),
             "rel_path": _s(rel_path),
@@ -466,11 +602,12 @@ class PostgresWikiStorage:
             "symbol_type": _s(symbol_type),
             "parent_symbol": _s(n.get("parent_symbol")),
             "analysis_level": _s(n.get("analysis_level", "comprehensive")),
-            "source_text": _s(n.get("source_text", "")),
+            "source_text": source_text,
             "docstring": _s(n.get("docstring", "")),
             "signature": _s(n.get("signature", "")),
             "parameters": _s(params),
             "return_type": _s(n.get("return_type", "")),
+            "content_hash": content_hash,
             "is_architectural": is_arch,
             "is_doc": is_doc,
             "is_test": is_test,
@@ -1639,6 +1776,9 @@ class PostgresWikiStorage:
         )
         if exclude_tests:
             sql += " AND is_test = 0"
+        # #116: deterministic order — see sqlite.py:get_clustered_architectural_nodes
+        # for the reasoning. Page IDs depend on cluster_node_ids[0] stability.
+        sql += " ORDER BY macro_cluster, micro_cluster, node_id"
         with self._engine.connect() as conn:
             rows = conn.execute(text(sql)).fetchall()
         return [
@@ -1884,3 +2024,221 @@ class PostgresWikiStorage:
             "by_symbol_type": [dict(r) for r in sym_rows],
             "by_file": [dict(r) for r in file_rows],
         }
+
+    # ==================================================================
+    # WIKI PAGES + source→page reverse index (#116 incremental regen)
+    # ==================================================================
+
+    _WIKI_PAGE_COLUMNS = (
+        "page_id",
+        "wiki_id",
+        "id_scheme",
+        "title",
+        "anchor_slug",
+        "content_hash",
+        "macro_cluster",
+        "micro_cluster",
+        "primary_symbol_id",
+        "section_index",
+        "page_index",
+        "last_indexed_commit",
+        "generated_at",
+    )
+
+    def upsert_wiki_page(self, page: dict[str, Any]) -> None:
+        with self._engine.begin() as conn:
+            self._upsert_wiki_page_in_conn(conn, page)
+
+    def _upsert_wiki_page_in_conn(self, conn, page: dict[str, Any]) -> None:
+        """Execute the upsert on an existing connection (no transaction
+        management). Lets ``upsert_wiki_page_with_symbols`` group two writes
+        in a single transaction.
+        """
+        if "page_id" not in page or "wiki_id" not in page:
+            raise ValueError("upsert_wiki_page: 'page_id' and 'wiki_id' are required")
+        _s = self._strip_nul
+        row = {
+            "page_id": _s(page["page_id"]),
+            "wiki_id": _s(page["wiki_id"]),
+            "id_scheme": _s(page.get("id_scheme", "stable_v1")),
+            "title": _s(page.get("title", "")),
+            "anchor_slug": _s(page.get("anchor_slug", "")),
+            "content_hash": _s(page.get("content_hash")),
+            "macro_cluster": page.get("macro_cluster"),
+            "micro_cluster": page.get("micro_cluster"),
+            "primary_symbol_id": _s(page.get("primary_symbol_id")),
+            "section_index": page.get("section_index", 0),
+            "page_index": page.get("page_index", 0),
+            "last_indexed_commit": _s(page.get("last_indexed_commit")),
+            "generated_at": _s(page.get("generated_at")),
+        }
+        cols = ", ".join(self._WIKI_PAGE_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in self._WIKI_PAGE_COLUMNS)
+        update_set = ", ".join(
+            f"{c} = EXCLUDED.{c}" for c in self._WIKI_PAGE_COLUMNS if c != "page_id"
+        )
+        sql = text(
+            f"INSERT INTO {self._schema}.wiki_pages ({cols}) "
+            f"VALUES ({placeholders}) "
+            f"ON CONFLICT (page_id) DO UPDATE SET {update_set}"
+        )
+        conn.execute(sql, row)
+
+    def get_wiki_page(self, page_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text(f"SELECT * FROM {self._schema}.wiki_pages WHERE page_id = :pid"),
+                {"pid": page_id},
+            ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def get_wiki_pages(self, wiki_id: str) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT * FROM {self._schema}.wiki_pages "
+                    "WHERE wiki_id = :wid "
+                    "ORDER BY section_index ASC, page_index ASC"
+                ),
+                {"wid": wiki_id},
+            ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_wiki_pages_by_cluster(
+        self,
+        wiki_id: str,
+        macro_cluster: int,
+        micro_cluster: int | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            if micro_cluster is None:
+                rows = conn.execute(
+                    text(
+                        f"SELECT * FROM {self._schema}.wiki_pages "
+                        "WHERE wiki_id = :wid AND macro_cluster = :macro "
+                        "ORDER BY section_index ASC, page_index ASC"
+                    ),
+                    {"wid": wiki_id, "macro": macro_cluster},
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text(
+                        f"SELECT * FROM {self._schema}.wiki_pages "
+                        "WHERE wiki_id = :wid AND macro_cluster = :macro "
+                        "AND micro_cluster = :micro "
+                        "ORDER BY section_index ASC, page_index ASC"
+                    ),
+                    {"wid": wiki_id, "macro": macro_cluster, "micro": micro_cluster},
+                ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def delete_wiki_pages(self, wiki_id: str) -> int:
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    f"DELETE FROM {self._schema}.wiki_pages WHERE wiki_id = :wid"
+                ),
+                {"wid": wiki_id},
+            )
+        return result.rowcount or 0
+
+    def record_page_symbols(
+        self,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        with self._engine.begin() as conn:
+            self._record_page_symbols_in_conn(conn, page_id, symbols, replace=replace)
+
+    def _record_page_symbols_in_conn(
+        self,
+        conn,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool,
+    ) -> None:
+        """Execute the symbol writes on an existing connection. Pairs with
+        ``_upsert_wiki_page_in_conn`` for atomic combined writes.
+        """
+        _s = self._strip_nul
+        if replace:
+            conn.execute(
+                text(
+                    f"DELETE FROM {self._schema}.page_symbols "
+                    "WHERE page_id = :pid"
+                ),
+                {"pid": page_id},
+            )
+        if symbols:
+            rows = [
+                {
+                    "page_id": _s(page_id),
+                    "node_id": _s(node_id),
+                    "citation_kind": _s(kind),
+                }
+                for node_id, kind in symbols
+            ]
+            conn.execute(
+                text(
+                    f"INSERT INTO {self._schema}.page_symbols "
+                    "(page_id, node_id, citation_kind) "
+                    "VALUES (:page_id, :node_id, :citation_kind) "
+                    "ON CONFLICT (page_id, node_id, citation_kind) DO NOTHING"
+                ),
+                rows,
+            )
+
+    def upsert_wiki_page_with_symbols(
+        self,
+        page: dict[str, Any],
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Single-transaction upsert of the page row + its symbol rows.
+
+        ``self._engine.begin()`` provides the transaction boundary; if
+        either write raises, SQLAlchemy rolls back automatically.
+        """
+        with self._engine.begin() as conn:
+            self._upsert_wiki_page_in_conn(conn, page)
+            self._record_page_symbols_in_conn(
+                conn, page["page_id"], symbols, replace=replace,
+            )
+
+    def get_pages_citing_node(self, node_id: str) -> list[str]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT DISTINCT page_id FROM {self._schema}.page_symbols "
+                    "WHERE node_id = :nid"
+                ),
+                {"nid": node_id},
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_page_symbols(
+        self, page_id: str, citation_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            if citation_kind is None:
+                rows = conn.execute(
+                    text(
+                        f"SELECT node_id, citation_kind "
+                        f"FROM {self._schema}.page_symbols WHERE page_id = :pid"
+                    ),
+                    {"pid": page_id},
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text(
+                        f"SELECT node_id, citation_kind "
+                        f"FROM {self._schema}.page_symbols "
+                        "WHERE page_id = :pid AND citation_kind = :kind"
+                    ),
+                    {"pid": page_id, "kind": citation_kind},
+                ).fetchall()
+        return [self._row_to_dict(r) for r in rows]

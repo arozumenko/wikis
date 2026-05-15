@@ -207,6 +207,10 @@ class PageGenerationState(DictAccessMixin, BaseModel):
     page_spec: PageSpec | None = None
     batch_id: str = ""
     repository_context: str = ""
+    # #116 incremental regen: opaque dict the dispatcher fills with the
+    # inputs needed to persist a `wiki_pages` row + `page_symbols` rows
+    # after generation. Schema is owned by OptimizedWikiGenerationAgent.
+    page_persist: dict[str, Any] = Field(default_factory=dict)
 
 
 class QualityAssessmentState(DictAccessMixin, BaseModel):

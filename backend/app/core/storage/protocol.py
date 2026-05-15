@@ -536,3 +536,106 @@ class WikiStorageProtocol(Protocol):
             }
         """
         ...
+
+    # ==================================================================
+    # WIKI PAGES + source→page reverse index (#116 incremental regen)
+    # ==================================================================
+
+    def upsert_wiki_page(self, page: dict[str, Any]) -> None:
+        """Insert or replace a row in ``wiki_pages``.
+
+        ``page`` must include ``page_id`` and ``wiki_id``. All other columns
+        (``id_scheme``, ``title``, ``anchor_slug``, ``content_hash``,
+        ``macro_cluster``, ``micro_cluster``, ``primary_symbol_id``,
+        ``section_index``, ``page_index``, ``generated_at``) are optional and
+        fall back to schema defaults when omitted.
+        """
+        ...
+
+    def get_wiki_page(self, page_id: str) -> dict[str, Any] | None:
+        """Fetch one page row by its ``page_id``. Returns None if missing."""
+        ...
+
+    def get_wiki_pages(self, wiki_id: str) -> list[dict[str, Any]]:
+        """Return all page rows for a wiki, in (section_index, page_index) order."""
+        ...
+
+    def get_wiki_pages_by_cluster(
+        self,
+        wiki_id: str,
+        macro_cluster: int,
+        micro_cluster: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return page rows for a (macro, micro) cluster within a wiki.
+
+        Used by [#116] PR 2/3 to find pages affected by a cluster-level
+        change. When ``micro_cluster`` is None, every page in the macro
+        cluster is returned regardless of micro.
+        """
+        ...
+
+    def delete_wiki_pages(self, wiki_id: str) -> int:
+        """Remove all rows for a wiki from ``wiki_pages`` (cascades to
+        ``page_symbols``). Returns the number of rows deleted.
+        """
+        ...
+
+    def record_page_symbols(
+        self,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Persist the source→page reverse index for one page.
+
+        Args:
+            page_id: the wiki page these symbols belong to.
+            symbols: list of ``(node_id, citation_kind)`` tuples where
+                citation_kind is ``'primary'``, ``'referenced'``, or
+                ``'related'``.
+            replace: when True (default), all existing rows for ``page_id``
+                are deleted before inserting the new set — this is the
+                desired behaviour after a regen. When False, rows are
+                appended via INSERT OR IGNORE / ON CONFLICT DO NOTHING.
+        """
+        ...
+
+    def upsert_wiki_page_with_symbols(
+        self,
+        page: dict[str, Any],
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Atomically upsert a ``wiki_pages`` row and its ``page_symbols`` rows.
+
+        Equivalent to calling ``upsert_wiki_page(page)`` followed by
+        ``record_page_symbols(page['page_id'], symbols, replace=replace)``
+        inside a single transaction. If any step raises, both writes roll
+        back together so callers never observe a page with stale (or
+        missing) citations.
+
+        Used by the wiki generation agent's per-page persistence hook,
+        where partial writes would leave an orphaned page row whose
+        absence of citation entries is indistinguishable from a page that
+        legitimately cites nothing.
+        """
+        ...
+
+    def get_pages_citing_node(self, node_id: str) -> list[str]:
+        """Return the ``page_id``s of every page that cites ``node_id``.
+
+        Used by [#116] change detection to find which pages need regen
+        when an underlying symbol changes.
+        """
+        ...
+
+    def get_page_symbols(
+        self, page_id: str, citation_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return rows for one page: ``[{node_id, citation_kind}, ...]``.
+
+        When ``citation_kind`` is supplied, only that kind is returned.
+        """
+        ...
