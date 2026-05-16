@@ -338,3 +338,110 @@ class TestWikiServiceRoutes:
         ):
             resp = await c.delete("/api/v1/invocations/inv-1")
             assert resp.status_code == 404
+
+
+class TestLoadPersistedInvocationsOrphanSweep:
+    """#146 Gap 1: ``load_persisted_invocations`` must flip ALL orphaned
+    non-terminal statuses (``"generating"`` AND ``"running"``) to
+    ``"failed"`` on startup. Before the fix, only ``"generating"`` was
+    swept — leaving stranded incremental refreshes to 409-lock the
+    wiki on the next request after a server restart.
+    """
+
+    @pytest.mark.asyncio
+    async def test_running_status_swept_on_load(self, storage) -> None:
+        # Pre-seed the persistence layer with a stranded "running"
+        # invocation (no live task — simulates a server restart
+        # mid-incremental-refresh).
+        import json as _json
+
+        from datetime import datetime, timedelta
+
+            # Use a created_at slightly in the past so the test doesn't
+        # depend on clock skew.
+        seeded = {
+            "stranded-inv-1": {
+                "id": "stranded-inv-1",
+                "wiki_id": "wiki-A",
+                "repo_url": "https://github.com/x/y",
+                "branch": "main",
+                "owner_id": "u1",
+                "status": "running",
+                "created_at": (datetime.now() - timedelta(minutes=10)).isoformat(),
+            },
+            "stranded-inv-2": {
+                "id": "stranded-inv-2",
+                "wiki_id": "wiki-B",
+                "repo_url": "https://github.com/x/y",
+                "branch": "main",
+                "owner_id": "u1",
+                "status": "generating",
+                "created_at": (datetime.now() - timedelta(minutes=10)).isoformat(),
+            },
+        }
+        raw = _json.dumps(seeded).encode("utf-8")
+        await storage.upload(
+            WikiService.INVOCATIONS_BUCKET,
+            WikiService.INVOCATIONS_KEY,
+            raw,
+        )
+
+        service = WikiService(_settings(), storage)
+        await service.load_persisted_invocations()
+
+        # Both stranded entries flipped to "failed". Pre-fix, only the
+        # "generating" one would have been swept; "running" would have
+        # silently stayed in-flight and 409-locked the wiki.
+        for inv_id in ("stranded-inv-1", "stranded-inv-2"):
+            assert inv_id in service._invocations
+            inv = service._invocations[inv_id]
+            assert inv.status == "failed", (
+                f"{inv_id} still {inv.status!r} after sweep"
+            )
+            assert inv.completed_at is not None
+            assert "Server restarted" in (inv.error or "")
+
+    @pytest.mark.asyncio
+    async def test_terminal_statuses_not_touched_on_load(self, storage) -> None:
+        """Already-terminal statuses must NOT be flipped — they're
+        legitimate prior-run records that the cleanup-purge can later
+        reclaim. Without this guard, the sweep would clobber the
+        history of completed runs."""
+        import json as _json
+
+        from datetime import datetime
+
+        seeded = {
+            "done-inv": {
+                "id": "done-inv",
+                "wiki_id": "wiki-C",
+                "repo_url": "https://github.com/x/y",
+                "branch": "main",
+                "owner_id": "u1",
+                "status": "complete",
+                "created_at": datetime.now().isoformat(),
+                "completed_at": datetime.now().isoformat(),
+            },
+            "failed-inv": {
+                "id": "failed-inv",
+                "wiki_id": "wiki-D",
+                "repo_url": "https://github.com/x/y",
+                "branch": "main",
+                "owner_id": "u1",
+                "status": "failed",
+                "created_at": datetime.now().isoformat(),
+                "completed_at": datetime.now().isoformat(),
+            },
+        }
+        raw = _json.dumps(seeded).encode("utf-8")
+        await storage.upload(
+            WikiService.INVOCATIONS_BUCKET,
+            WikiService.INVOCATIONS_KEY,
+            raw,
+        )
+
+        service = WikiService(_settings(), storage)
+        await service.load_persisted_invocations()
+
+        assert service._invocations["done-inv"].status == "complete"
+        assert service._invocations["failed-inv"].status == "failed"

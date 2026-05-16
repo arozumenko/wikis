@@ -76,9 +76,20 @@ class WikiService:
             for inv_id, inv_data in raw.items():
                 try:
                     inv = Invocation(**inv_data)
-                    if inv.status == "generating":
+                    # #146: any non-terminal status from a previous
+                    # process lifetime is by definition orphaned —
+                    # the task that was driving it is gone. Without
+                    # flipping these to "failed" the idempotency
+                    # guards (PR #144) see phantom in-flight entries
+                    # and 409-lock the wiki on the next request.
+                    # ``"generating"`` = full regen, ``"running"`` =
+                    # incremental refresh.
+                    if inv.status in ("generating", "running"):
+                        prior_status = inv.status
                         inv.status = "failed"
-                        inv.error = "Server restarted during generation"
+                        inv.error = (
+                            f"Server restarted during {prior_status}"
+                        )
                         inv.completed_at = datetime.now()
                     self._invocations[inv_id] = inv
                 except Exception:  # noqa: S110
@@ -760,6 +771,7 @@ class WikiService:
                         # PagePatcher path; without an LLM we can't run
                         # the edit regime. Fail the run loudly here.
                         invocation.status = "failed"
+                        invocation.completed_at = datetime.now()
                         await invocation.emit(events.task_status(
                             invocation.id, "failed",
                             "LLM unavailable — incremental refresh requires LLM",
@@ -853,13 +865,19 @@ class WikiService:
                 # refresh (and full generate, since the guard widened to
                 # include "generating") sees this phantom "running"
                 # entry. Mirrors _run_generation's terminal-state writes.
+                # #146: also set ``completed_at`` so the periodic
+                # ``_cleanup_old_invocations`` purge can reclaim memory
+                # for completed runs (without it the dict grows
+                # monotonically until process restart).
                 invocation.status = "complete"
+                invocation.completed_at = datetime.now()
                 await invocation.emit(events.task_status(
                     invocation.id, "completed",
                     "Incremental refresh complete",
                 ))
             except Exception as exc:  # noqa: BLE001
                 invocation.status = "failed"
+                invocation.completed_at = datetime.now()
                 logger.exception(
                     "[incremental_refresh] run failed for wiki %s", wiki_id,
                 )
