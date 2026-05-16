@@ -2391,23 +2391,36 @@ class UnifiedWikiDB:
     def _fetch_cluster_contexts(
         self, clusters: set[int], depth: int,
     ) -> dict[int, set[str]]:
-        """One indexed bulk query, return per-cluster folder-prefix
-        sets. Avoids the N+1 round-trip pattern an earlier draft had
-        when each cluster was fetched individually."""
-        if not clusters:
-            return {}
-        placeholders = ",".join("?" * len(clusters))
-        rows = self.conn.execute(
-            f"SELECT macro_cluster, rel_path FROM repo_nodes "  # noqa: S608
-            f"WHERE macro_cluster IN ({placeholders}) "
-            f"  AND rel_path IS NOT NULL AND rel_path != ''",
-            tuple(clusters),
-        ).fetchall()
+        """Bulk-fetch per-cluster folder-prefix sets.
+
+        Avoids the N+1 round-trip pattern an earlier draft had when
+        each cluster was fetched individually. Chunked at
+        ``_BFS_FRONTIER_CHUNK`` (500) so the ``IN (?, ?, …)``
+        placeholder count stays comfortably under SQLite's default
+        ``SQLITE_LIMIT_VARIABLE_NUMBER`` of 999 — caller-side
+        ``top_n`` caps make this academic today (≤ ~200 distinct
+        clusters), but chunking costs nothing and eliminates the
+        class of failure.
+        """
         contexts: dict[int, set[str]] = {c: set() for c in clusters}
-        for row in rows:
-            prefix = self._path_prefix(row["rel_path"], depth)
-            if prefix:
-                contexts[int(row["macro_cluster"])].add(prefix)
+        if not clusters:
+            return contexts
+        cluster_list = list(clusters)
+        for chunk_start in range(0, len(cluster_list), self._BFS_FRONTIER_CHUNK):
+            chunk = cluster_list[chunk_start : chunk_start + self._BFS_FRONTIER_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                # Cluster IDs are integer bound parameters; only the
+                # placeholder shape (?, ?, …) is templated.
+                f"SELECT macro_cluster, rel_path FROM repo_nodes "  # noqa: S608
+                f"WHERE macro_cluster IN ({placeholders}) "
+                f"  AND rel_path IS NOT NULL AND rel_path != ''",
+                tuple(chunk),
+            ).fetchall()
+            for row in rows:
+                prefix = self._path_prefix(row["rel_path"], depth)
+                if prefix:
+                    contexts[int(row["macro_cluster"])].add(prefix)
         return contexts
 
     def compute_surprising_connections(
