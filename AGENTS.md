@@ -395,8 +395,17 @@ Every edge in `repo_edges` carries a `confidence` label that propagates from the
 - **`SourceReference.confidence`** — optional field on citation responses. Default `None`; carries the underlying graph edge's confidence label when the retrieval path surfaced it. Propagated from cached QA records and live agent event streams in `ask_service` + `research_service`.
 
 **Surfaced as of #120 Phase 2** (#157):
-- `min_confidence` parameter on `ask_codebase` / `ask_project` MCP tools + `AskRequest` Pydantic model + `AskConfig` dataclass. Threads through to `UnifiedRetriever._get_expansion_neighbors` which drops edges below the threshold during graph expansion. `None` keeps the legacy "include all" behavior; `"EXTRACTED"` is the strictest (only direct parser observations); `"INFERRED"` allows name-only resolution edges too. Case-insensitive; missing edge labels default to EXTRACTED (legacy-row compat).
-- `SourceReference.confidence` now actually populates: the strongest-rank edge confidence reaching a candidate flows through the retriever → `Document.metadata["confidence"]` → agent source dict → `SourceReference.confidence`. Seed nodes (FTS/vector hits with no incoming edge) still have `None` because they weren't reached via an edge.
+- `min_confidence` parameter on `ask_codebase` / `ask_project` MCP tools + `AskRequest` Pydantic model + `AskConfig` dataclass. Pydantic validator normalises case and rejects typos with a 422 (so unknown values can't silently behave like "no filter"). Two filter-application points share the rank-comparison helper in `app.core.confidence_filter`:
+  - **`UnifiedRetriever._get_expansion_neighbors`** filters edges during SQL-backed graph expansion in `search_repository`.
+  - **`GraphQueryService.get_relationships`** filters edges during the live agent path's NetworkX traversal. Used by the `get_relationships_tool` / `get_symbol_relationships` agent tools via `resolve_and_traverse`. This is the production path that the MCP `ask_codebase` request reaches.
+- `None` keeps the legacy "include all" behavior; `"EXTRACTED"` is the strictest (only direct parser observations); `"INFERRED"` allows name-only resolution edges too; `"AMBIGUOUS"` would also include reserved multi-target candidates. Case-insensitive; missing edge labels default to `EXTRACTED` (legacy-row compat — PR #150 wired the storage default).
+- **Frontier advances through dropped edges**: a low-confidence edge at depth 1 doesn't block visibility of higher-confidence edges at depth 2+. The filter rejects the edge from the result set but still enqueues its target for further traversal.
+
+**Not yet surfaced** (#120 Phase 3, tracked separately):
+- `SourceReference.confidence` is plumbed end-to-end via the cache path (when a prior recording had `confidence` in its `sources_json`), but live agent runs don't currently construct sources from retrieved `Document` metadata — the agent emits `answer` + `steps` only. Closing that gap requires the agent to extract structured sources from its tool outputs, which is its own scope.
+- `search_wiki` MCP tool's `min_confidence` param — the wikilink graph (`WikiPageIndex`) is in-memory and has no confidence column, so the filter would be a no-op there.
+- `search_graph` agent tool uses `_format_neighbors` (direct NetworkX walk) rather than `GraphQueryService` — bypasses the filter today. Smaller follow-up.
+- SPA citation chips rendering with confidence indicator — `CitationChips.tsx` / `SourceCitations.tsx` exist but aren't wired into any page; needs the SSE-source-collection-to-render pipeline plumbed end-to-end first.
 
 **Not yet surfaced** (#120 Phase 3, tracked separately):
 - `search_wiki` MCP tool's `min_confidence` param — the wikilink graph (`WikiPageIndex`) is in-memory and has no confidence column, so the filter would be a no-op there. Deferred until the wikilink graph either gains a confidence dimension or the MCP tool delegates to repo_edges-based search.

@@ -52,34 +52,14 @@ VEC_POOL = 30
 MAX_EXPANSION_HOPS = 1
 MAX_EXPANSION_NEIGHBORS = 15
 
-# #120/#157: confidence-rank ordering. Higher rank == stronger signal.
-# ``EXTRACTED`` is the parser's explicit observation, ``INFERRED`` is
-# name-only resolution, ``AMBIGUOUS`` is reserved for multi-target
-# cases (no callsites today). ``min_confidence`` is the **minimum
-# acceptable** label — an edge passes the filter when its label's
-# rank is >= the threshold's rank.
-_CONFIDENCE_RANK: dict[str, int] = {
-    "EXTRACTED": 3,
-    "INFERRED": 2,
-    "AMBIGUOUS": 1,
-}
-
-
-def _edge_passes_confidence(edge: dict, min_confidence: str | None) -> bool:
-    """``True`` when ``edge`` meets the ``min_confidence`` floor.
-
-    ``min_confidence is None`` disables filtering (legacy behavior).
-    Missing / unknown labels on the edge are treated as ``EXTRACTED``
-    because that's the storage layer's default and the previous PR
-    that wired the mapping (#150) guarantees this for newly-written
-    edges. Legacy rows with NULL confidence (pre-#150 dbs) also
-    coalesce here, so they continue to surface at the EXTRACTED tier.
-    """
-    if min_confidence is None:
-        return True
-    edge_label = (edge.get("confidence") or "EXTRACTED").upper()
-    threshold = min_confidence.upper()
-    return _CONFIDENCE_RANK.get(edge_label, 0) >= _CONFIDENCE_RANK.get(threshold, 0)
+# #120/#157: shared confidence-rank helpers + filter live in
+# ``app.core.confidence_filter`` so both this module and
+# ``GraphQueryService.get_relationships`` (the live agent path) can
+# use the same rank ordering + default-to-EXTRACTED semantics.
+from app.core.confidence_filter import (  # noqa: E402
+    CONFIDENCE_RANK as _CONFIDENCE_RANK,
+    edge_passes_confidence as _edge_passes_confidence,
+)
 MAX_EXPANDED_DOCS = 150
 
 # Documentation symbol types — single source of truth from constants.py.

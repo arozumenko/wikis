@@ -112,7 +112,30 @@ class AskRequest(BaseModel):
     # observations; ``"INFERRED"`` includes name-only resolution
     # edges too; ``"AMBIGUOUS"`` would also include reserved
     # multi-target candidates (no callsites today).
+    #
+    # Validator rejects typos so MCP clients passing ``"extrcted"``
+    # or similar see a 422 instead of silently getting unfiltered
+    # results (the rank lookup would return 0 for unknown keys and
+    # admit every edge — code-review I1).
     min_confidence: str | None = None
+
+    @model_validator(mode="after")
+    def _normalise_min_confidence(self) -> "AskRequest":
+        if self.min_confidence is None:
+            return self
+        # Lazy import to keep the model module dependency-light.
+        from app.core.confidence_filter import ACCEPTED_CONFIDENCE_LEVELS
+
+        normalized = self.min_confidence.upper()
+        if normalized not in ACCEPTED_CONFIDENCE_LEVELS:
+            raise ValueError(
+                f"min_confidence must be one of "
+                f"{sorted(ACCEPTED_CONFIDENCE_LEVELS)!r} (case-insensitive); "
+                f"got {self.min_confidence!r}"
+            )
+        # Always store uppercase so downstream comparisons are stable.
+        self.min_confidence = normalized
+        return self
 
     @model_validator(mode="after")
     def _require_target(self) -> "AskRequest":

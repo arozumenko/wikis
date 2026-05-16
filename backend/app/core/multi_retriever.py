@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -41,18 +42,31 @@ class MultiWikiRetrieverStack:
         async def retrieve_one(wiki_id: str, stack: Any) -> list:
             try:
                 # WikiRetrieverStack.search_repository is sync — run in thread.
-                # ``min_confidence`` passes through as a kwarg via
-                # functools.partial so older stack implementations that
-                # don't accept it raise a clear TypeError instead of
-                # silently dropping the filter.
-                from functools import partial
-                call = partial(
-                    stack.search_repository,
-                    query, k,
-                    min_confidence=min_confidence,
-                ) if min_confidence is not None else partial(
-                    stack.search_repository, query, k,
-                )
+                #
+                # apply_expansion=True (default for UnifiedRetriever)
+                # is what the per-wiki retriever wants when going
+                # through the multi-wiki fan-out. The wrapper used to
+                # drop ``apply_expansion`` silently when reconstructing
+                # the call; pass it explicitly so the per-wiki retriever
+                # gets the same expansion behaviour as a direct call.
+                #
+                # ``min_confidence`` passes through as a kwarg only
+                # when set, so older stacks that don't accept it
+                # continue to work for the default no-filter case.
+                # Newer stacks see the kwarg and apply the filter.
+                if min_confidence is not None:
+                    call = partial(
+                        stack.search_repository,
+                        query, k,
+                        apply_expansion=True,
+                        min_confidence=min_confidence,
+                    )
+                else:
+                    call = partial(
+                        stack.search_repository,
+                        query, k,
+                        apply_expansion=True,
+                    )
                 docs = await asyncio.to_thread(call)
                 for doc in docs:
                     doc.metadata["source_wiki_id"] = wiki_id

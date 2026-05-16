@@ -287,3 +287,153 @@ def test_ask_request_min_confidence_field_round_trips() -> None:
     # Backward compat — old callers don't pass it.
     req2 = AskRequest(wiki_id="w1", question="hi")
     assert req2.min_confidence is None
+
+
+def test_ask_request_validator_normalises_case() -> None:
+    """Lowercase input from MCP/HTTP clients is accepted and
+    normalised to upper-case so downstream comparisons (the rank
+    lookup) work against the canonical labels."""
+    from app.models.api import AskRequest
+
+    req = AskRequest(
+        wiki_id="w1", question="hi", min_confidence="inferred",
+    )
+    assert req.min_confidence == "INFERRED"
+
+
+def test_ask_request_validator_rejects_unknown_values() -> None:
+    """Code-review I1: a typo'd ``min_confidence`` would otherwise
+    silently behave like "no filter" because the rank lookup
+    returns 0 for unknown keys and EVERY edge has rank >= 0. The
+    Pydantic validator now rejects it with a clear 422-shaped
+    error instead."""
+    from app.models.api import AskRequest
+
+    with pytest.raises(ValueError, match="min_confidence must be one of"):
+        AskRequest(
+            wiki_id="w1", question="hi", min_confidence="extrcted",
+        )
+
+
+# ---------------------------------------------------------------------------
+# GraphQueryService.get_relationships — the live agent path
+# ---------------------------------------------------------------------------
+
+
+def _make_nx_graph_with_confidence_edges():
+    """Build a NetworkX MultiDiGraph with edges carrying confidence
+    labels — matches the shape ``_add_relationships_bulk`` writes
+    (PR #150) and what ``GraphQueryService.get_relationships`` reads."""
+    import networkx as nx
+
+    g = nx.MultiDiGraph()
+    g.add_node("root", symbol_name="Root", symbol_type="class")
+    g.add_node("ext", symbol_name="ExternalSym", symbol_type="class")
+    g.add_node("inf", symbol_name="InferredSym", symbol_type="class")
+    g.add_node("amb", symbol_name="AmbiguousSym", symbol_type="class")
+    # Three outgoing edges, each at a different confidence tier.
+    g.add_edge("root", "ext", relationship_type="calls", confidence="EXTRACTED")
+    g.add_edge("root", "inf", relationship_type="calls", confidence="INFERRED")
+    g.add_edge("root", "amb", relationship_type="calls", confidence="AMBIGUOUS")
+    return g
+
+
+class TestGraphQueryServiceFilter:
+    """Code-review C1 fix: ``min_confidence`` now actually filters
+    edges during the live agent path's NetworkX graph traversal
+    (via ``GraphQueryService.get_relationships``)."""
+
+    @pytest.fixture
+    def svc(self):
+        from app.core.code_graph.graph_query_service import GraphQueryService
+
+        graph = _make_nx_graph_with_confidence_edges()
+        return GraphQueryService(graph)
+
+    def test_no_filter_returns_all_three_tiers(self, svc) -> None:
+        rels = svc.get_relationships("root", direction="outgoing", max_depth=1)
+        targets = {r.target_name for r in rels}
+        assert targets == {"ExternalSym", "InferredSym", "AmbiguousSym"}
+
+    def test_extracted_threshold_drops_lower_tiers(self, svc) -> None:
+        rels = svc.get_relationships(
+            "root", direction="outgoing", max_depth=1,
+            min_confidence="EXTRACTED",
+        )
+        targets = {r.target_name for r in rels}
+        assert targets == {"ExternalSym"}
+
+    def test_inferred_threshold_keeps_extracted_and_inferred(self, svc) -> None:
+        rels = svc.get_relationships(
+            "root", direction="outgoing", max_depth=1,
+            min_confidence="INFERRED",
+        )
+        targets = {r.target_name for r in rels}
+        assert targets == {"ExternalSym", "InferredSym"}
+
+    def test_filter_advances_frontier_through_dropped_nodes(self) -> None:
+        """When an edge is filtered out at depth 1, the traversal
+        should still advance the frontier so deeper EXTRACTED edges
+        can be discovered. Without this, a single INFERRED edge in
+        the path would block visibility of everything beyond it."""
+        import networkx as nx
+
+        g = nx.MultiDiGraph()
+        g.add_node("a", symbol_name="A", symbol_type="class")
+        g.add_node("b", symbol_name="B", symbol_type="class")
+        g.add_node("c", symbol_name="C", symbol_type="class")
+        g.add_edge("a", "b", relationship_type="calls", confidence="INFERRED")
+        g.add_edge("b", "c", relationship_type="calls", confidence="EXTRACTED")
+
+        from app.core.code_graph.graph_query_service import GraphQueryService
+
+        svc = GraphQueryService(g)
+        rels = svc.get_relationships(
+            "a", direction="outgoing", max_depth=2,
+            min_confidence="EXTRACTED",
+        )
+        # a→b was INFERRED → dropped. b→c was EXTRACTED → kept.
+        # The traversal must have advanced through b to find c.
+        targets = {r.target_name for r in rels}
+        assert "B" not in targets
+        assert "C" in targets
+
+
+def test_resolve_and_traverse_threads_min_confidence() -> None:
+    """``resolve_and_traverse`` is a thin wrapper around
+    ``get_relationships``; it must forward ``min_confidence`` so
+    the agent tool ``get_relationships_tool`` reaches the filter.
+
+    Mocks ``resolve_symbol`` so this test focuses on the forwarding
+    contract — the underlying symbol-resolution logic has its own
+    tests elsewhere.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from app.core.code_graph.graph_query_service import GraphQueryService
+
+    g = _make_nx_graph_with_confidence_edges()
+    svc = GraphQueryService(g)
+
+    captured: dict = {}
+
+    real_get_rels = svc.get_relationships
+
+    def _spy(node_id, **kwargs):
+        captured["min_confidence"] = kwargs.get("min_confidence")
+        return real_get_rels(node_id, **kwargs)
+
+    with (
+        patch.object(svc, "resolve_symbol", return_value="root"),
+        patch.object(svc, "get_relationships", side_effect=_spy),
+    ):
+        _, rels = svc.resolve_and_traverse(
+            "Root", direction="outgoing", max_depth=1,
+            min_confidence="EXTRACTED",
+        )
+
+    # The forwarding contract: whatever value the caller passed must
+    # show up in get_relationships' kwargs.
+    assert captured["min_confidence"] == "EXTRACTED"
+    # And the filter actually took effect — only EXTRACTED edges.
+    assert {r.target_name for r in rels} == {"ExternalSym"}
