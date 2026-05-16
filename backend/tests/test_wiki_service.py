@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -353,11 +355,8 @@ class TestLoadPersistedInvocationsOrphanSweep:
         # Pre-seed the persistence layer with a stranded "running"
         # invocation (no live task — simulates a server restart
         # mid-incremental-refresh).
-        import json as _json
-
-        from datetime import datetime, timedelta
-
-            # Use a created_at slightly in the past so the test doesn't
+        #
+        # Use a created_at slightly in the past so the test doesn't
         # depend on clock skew.
         seeded = {
             "stranded-inv-1": {
@@ -379,7 +378,7 @@ class TestLoadPersistedInvocationsOrphanSweep:
                 "created_at": (datetime.now() - timedelta(minutes=10)).isoformat(),
             },
         }
-        raw = _json.dumps(seeded).encode("utf-8")
+        raw = json.dumps(seeded).encode("utf-8")
         await storage.upload(
             WikiService.INVOCATIONS_BUCKET,
             WikiService.INVOCATIONS_KEY,
@@ -407,10 +406,6 @@ class TestLoadPersistedInvocationsOrphanSweep:
         legitimate prior-run records that the cleanup-purge can later
         reclaim. Without this guard, the sweep would clobber the
         history of completed runs."""
-        import json as _json
-
-        from datetime import datetime
-
         seeded = {
             "done-inv": {
                 "id": "done-inv",
@@ -433,7 +428,7 @@ class TestLoadPersistedInvocationsOrphanSweep:
                 "completed_at": datetime.now().isoformat(),
             },
         }
-        raw = _json.dumps(seeded).encode("utf-8")
+        raw = json.dumps(seeded).encode("utf-8")
         await storage.upload(
             WikiService.INVOCATIONS_BUCKET,
             WikiService.INVOCATIONS_KEY,
