@@ -100,7 +100,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # too: clean shutdown lets the pending writes complete instead of
     # being interrupted mid-FTS-rebuild.
     try:
-        await app.state.wiki_service.shutdown()
+        await app.state.wiki_service.shutdown(
+            timeout=settings.wiki_shutdown_timeout_s,
+        )
     except Exception:  # noqa: BLE001
         logger.exception("wiki_service.shutdown raised — continuing teardown")
     await dispose_engine()

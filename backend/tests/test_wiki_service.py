@@ -632,3 +632,30 @@ class TestWikiServiceShutdown:
 
         # Clean up so pytest doesn't warn about a dangling task.
         await task
+
+    @pytest.mark.asyncio
+    async def test_lifespan_passes_configured_shutdown_timeout(
+        self, tmp_path, monkeypatch,
+    ):
+        """#165 follow-up: ``Settings.wiki_shutdown_timeout_s`` must
+        flow from env → Settings → lifespan → WikiService.shutdown.
+        Without this wiring the env knob is dead config."""
+        monkeypatch.setenv("WIKI_SHUTDOWN_TIMEOUT_S", "7")
+        monkeypatch.setenv("LLM_API_KEY", "test-key")
+        monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+
+        captured: list[float] = []
+
+        async def fake_shutdown(self, timeout: float = 30.0) -> None:
+            captured.append(timeout)
+
+        with patch.object(WikiService, "shutdown", fake_shutdown):
+            app = create_app()
+            async with app.router.lifespan_context(app):
+                pass  # Lifespan startup + teardown only — shutdown
+                # fires on context exit.
+
+        assert captured == [7.0], (
+            f"expected lifespan to forward configured timeout to "
+            f"WikiService.shutdown, got {captured}"
+        )
