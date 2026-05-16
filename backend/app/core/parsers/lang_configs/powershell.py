@@ -22,6 +22,6 @@ POWERSHELL = LanguageConfig(
     class_nodes=("class_statement",),
     function_nodes=("function_statement",),
     method_nodes=("class_method_definition",),
-    call_nodes=("invokation_expression", "invocation_expression", "command"),
+    call_nodes=("invocation_expression", "command"),
     name_node_types=("simple_name",),
 )

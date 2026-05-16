@@ -249,10 +249,29 @@ class RParser(BasicVisitorParser):
     def _r_binding_decl(
         node: "Node", source_bytes: bytes,
     ) -> "tuple[str, SymbolType, Node | None] | None":
-        # binary_operator → identifier (LHS name) + function_definition
-        # or call("setRefClass", ...) on the RHS.
+        # binary_operator → identifier (LHS name) + operator-token +
+        # function_definition / call (RHS). Rio R2 caught that R uses
+        # ``binary_operator`` for every binary expression (``<``, ``==``,
+        # ``+``, ``->``, etc.), not just assignment. Without gating on
+        # the operator-token, comparisons like ``x < some_call()`` would
+        # emit spurious declarations.
+        #
+        # Only these operators are R bindings that declare a new name:
+        # ``<-`` (standard assign), ``<<-`` (super-assign), ``=``
+        # (assignment form). ``->`` and ``->>`` (right-assign) put the
+        # name on the RIGHT side; the current LHS-name extraction would
+        # name the symbol after the function expression — out of scope
+        # for Phase 2, deferred to a future refinement.
+        _R_ASSIGN_OPS = frozenset({"<-", "<<-", "="})
+
+        # Note: only direct ``identifier`` children become LHS names.
+        # ``obj$method <- function()`` (member assignment) parses with
+        # the LHS as an ``extract_operator`` node, not an ``identifier``,
+        # so it's silently dropped at this tier — acceptable miss
+        # documented in the docstring; deep parser handles it.
         lhs_name = None
         rhs = None
+        op_text: str | None = None
         for child in node.children:
             if child.type == "identifier" and lhs_name is None:
                 lhs_name = source_bytes[child.start_byte:child.end_byte].decode(
@@ -260,7 +279,17 @@ class RParser(BasicVisitorParser):
                 ).strip()
             elif child.type in ("function_definition", "call"):
                 rhs = child
-        if lhs_name is None or rhs is None:
+            else:
+                # Anonymous-token operator child. Anything that isn't
+                # an identifier or one of the expected RHS types is a
+                # candidate operator token.
+                text = source_bytes[child.start_byte:child.end_byte].decode(
+                    "utf-8", errors="replace",
+                ).strip()
+                if text in _R_ASSIGN_OPS:
+                    op_text = text
+
+        if lhs_name is None or rhs is None or op_text is None:
             return None
         if rhs.type == "function_definition":
             body = None
@@ -294,6 +323,26 @@ class ZigParser(BasicVisitorParser):
     aren't tracked here — Zig's struct-method scoping uses the same
     FnProto node as top-level functions, and disambiguating requires
     walking the var-decl context (deferrable to a deep parser).
+
+    Known limitations (Rio R2):
+
+    * Struct detection uses a **text-prefix heuristic** on the
+      ``ErrorUnionExpr`` child's source bytes (``startswith
+      "struct"/"enum"/"union"``). This misses:
+
+      - ``const Foo = packed struct { … }`` (text starts with
+        ``packed``)
+      - ``const Foo = extern struct { … }`` (text starts with
+        ``extern``)
+      - ``const Foo = comptime blk: { break :blk struct { … }; }``
+        (text starts with ``comptime``)
+      - Error-union types wrapping a struct (``const Foo =
+        error{X}!struct {…}``)
+
+      The bare ``struct {}`` / ``enum {}`` / ``union {}`` form does
+      work, which covers the common case. A future refinement could
+      walk the RHS for any descendant ``struct``/``enum``/``union``
+      keyword token instead of prefix-matching the surface text.
     """
 
     def _visit_structural(self, node: "Node", state, parent_id: str | None) -> None:
@@ -329,11 +378,25 @@ class ZigParser(BasicVisitorParser):
                     "utf-8", errors="replace",
                 ).strip()
             elif child.type == "ErrorUnionExpr":
-                # Look for ``struct`` keyword in the expression text.
+                # Look for a ``struct``/``enum``/``union`` keyword
+                # token anywhere in the first ~80 chars of the
+                # expression. Tokenising on whitespace handles common
+                # modifier-prefixed forms (``packed struct {…}``,
+                # ``extern struct {…}``, ``comptime blk: { break :blk
+                # struct {…} }``) that a naive ``startswith`` misses
+                # (code-review I1, Rio R2).
+                #
+                # Brace-attached forms like ``struct{`` are also
+                # caught because we split on whitespace AND rstrip
+                # the open-brace before comparing.
                 text = source_bytes[child.start_byte:child.end_byte].decode(
                     "utf-8", errors="replace",
                 ).strip()
-                if text.startswith(("struct", "enum", "union")):
+                tokens = text[:80].split()
+                if any(
+                    tok.rstrip("{(,") in ("struct", "enum", "union")
+                    for tok in tokens
+                ):
                     is_struct = True
         if name is None:
             return None

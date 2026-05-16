@@ -648,6 +648,28 @@ class TestR:
     def test_positions(self, result) -> None:
         _assert_positions_populated(result)
 
+    def test_comparison_not_treated_as_binding(self, tmp_path: Path) -> None:
+        """Rio R2 regression: R uses ``binary_operator`` for every
+        binary expression (``<``, ``==``, ``+``, etc.), not just
+        assignment. Without operator-gating, ``x < some_call()`` would
+        emit ``x`` as a spurious symbol with ``some_call`` confused as
+        a function value.
+        """
+        src = tmp_path / "compare.R"
+        src.write_text(
+            "x <- 1\n"
+            "if (x < length(things)) { print('ok') }\n"
+            "result <- function() 42\n"
+        )
+        result = RParser(R).parse_file(src)
+        # ``x <- 1`` doesn't bind a function — no symbol.
+        # ``x < length(things)`` is a comparison — no symbol.
+        # ``result <- function() 42`` IS a binding — one function.
+        funcs = _names_by_type(result, SymbolType.FUNCTION)
+        assert "result" in funcs
+        # ``x`` should NOT appear as a function (would be the bug).
+        assert "x" not in funcs
+
 
 class TestZig:
     @pytest.fixture
@@ -664,6 +686,23 @@ class TestZig:
 
     def test_positions(self, result) -> None:
         _assert_positions_populated(result)
+
+    def test_packed_and_extern_struct_recognised(self, tmp_path: Path) -> None:
+        """Code-review I1 regression: modifier-prefixed structs
+        (``packed struct``, ``extern struct``, comptime blocks
+        wrapping ``struct``) used to fall through to VARIABLE because
+        the prefix check only matched bare ``struct``."""
+        src = tmp_path / "modifiers.zig"
+        src.write_text(
+            'const Packed = packed struct { x: u8, y: u8 };\n'
+            'const Extern = extern struct { ptr: ?*anyopaque };\n'
+            'const Plain  = struct { name: []const u8 };\n'
+        )
+        result = ZigParser(ZIG).parse_file(src)
+        structs = _names_by_type(result, SymbolType.STRUCT)
+        assert "Packed" in structs
+        assert "Extern" in structs
+        assert "Plain" in structs
 
 
 class TestGroovy:
