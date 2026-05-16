@@ -502,3 +502,130 @@ async def test_search_wiki_blocks_inaccessible_wiki():
         srv._wiki_management = old_mgmt
         srv._page_index_cache = old_cache
         srv._session_factory = old_session_factory
+
+
+# ---------------------------------------------------------------------------
+# #120: get_graph_stats — confidence breakdown surface
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_graph_stats_returns_storage_stats_dict():
+    """get_graph_stats opens the wiki's unified DB and returns the
+    full stats dict including the new ``confidence_breakdown``."""
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.stats.return_value = {
+        "node_count": 42,
+        "edge_count": 100,
+        "confidence_breakdown": {
+            "extracted": 80,
+            "inferred": 18,
+            "ambiguous": 2,
+        },
+        "edge_types": {"calls": 50, "imports": 30, "inheritance": 20},
+        "languages": {"python": 30, "java": 12},
+        "symbol_types": {"class": 10, "function": 32},
+        "macro_clusters": 5,
+        "hub_count": 3,
+        "vec_available": True,
+        "embedding_dim": 384,
+        "db_size_mb": 1.23,
+    }
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt = srv._wiki_management
+    old_settings = srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+
+        with (
+            patch(
+                "app.services.wiki_management._derive_cache_key",
+                return_value="cachekey-123",
+            ),
+            patch("pathlib.Path.exists", return_value=True),
+            patch(
+                "app.core.storage.open_storage",
+                return_value=fake_storage,
+            ),
+        ):
+            result = await srv.get_graph_stats(wiki_id="wiki-1")
+
+        assert result["node_count"] == 42
+        assert result["edge_count"] == 100
+        # Confidence breakdown is the headline of this PR — make sure
+        # it makes it through unmolested.
+        assert result["confidence_breakdown"] == {
+            "extracted": 80, "inferred": 18, "ambiguous": 2,
+        }
+        # Storage was opened read-only and then closed.
+        fake_storage.close.assert_called_once()
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_graph_stats_unknown_wiki_returns_error():
+    """Wiki not found in management → error string, no storage open."""
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=None)
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt = srv._wiki_management
+    old_settings = srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+
+        result = await srv.get_graph_stats(wiki_id="missing")
+        assert "error" in result
+        assert "Wiki not found" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_graph_stats_missing_cache_returns_error():
+    """Wiki record exists but no cached DB → error, no crash."""
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt = srv._wiki_management
+    old_settings = srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+
+        with patch(
+            "app.services.wiki_management._derive_cache_key",
+            return_value=None,
+        ):
+            result = await srv.get_graph_stats(wiki_id="wiki-1")
+        assert "error" in result
+        assert "no cached index" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings

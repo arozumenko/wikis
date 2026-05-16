@@ -1644,6 +1644,17 @@ class UnifiedWikiDB:
         for row in self.conn.execute("SELECT rel_type, count(*) FROM repo_edges GROUP BY rel_type"):
             edge_types[row[0]] = row[1]
 
+        # #120: confidence distribution. Always returns the three
+        # known buckets (extracted/inferred/ambiguous) even when one
+        # is zero, so MCP / UI consumers can rely on a stable shape.
+        confidence_breakdown = {"extracted": 0, "inferred": 0, "ambiguous": 0}
+        for row in self.conn.execute(
+            "SELECT confidence, count(*) FROM repo_edges GROUP BY confidence"
+        ):
+            key = (row[0] or "EXTRACTED").lower()
+            if key in confidence_breakdown:
+                confidence_breakdown[key] = row[1]
+
         # Cluster counts
         macro_count = self.conn.execute(
             "SELECT count(DISTINCT macro_cluster) FROM repo_nodes WHERE macro_cluster IS NOT NULL"
@@ -1662,6 +1673,7 @@ class UnifiedWikiDB:
             "languages": langs,
             "symbol_types": types,
             "edge_types": edge_types,
+            "confidence_breakdown": confidence_breakdown,
             "macro_clusters": macro_count,
             "hub_count": hub_count,
             "vec_available": self._vec_available,
