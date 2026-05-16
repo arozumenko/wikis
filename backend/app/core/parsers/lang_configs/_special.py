@@ -324,25 +324,30 @@ class ZigParser(BasicVisitorParser):
     FnProto node as top-level functions, and disambiguating requires
     walking the var-decl context (deferrable to a deep parser).
 
-    Known limitations (Rio R2):
+    Container-declaration detection (#153) descends the
+    ``ErrorUnionExpr`` chain looking for a direct ``ContainerDecl``
+    child of ``SuffixExpr`` at the leaf. This handles:
 
-    * Struct detection uses a **text-prefix heuristic** on the
-      ``ErrorUnionExpr`` child's source bytes (``startswith
-      "struct"/"enum"/"union"``). This misses:
+      - bare ``const X = struct {…}`` / ``enum {…}`` / ``union {…}``
+      - modifier-prefixed forms: ``packed struct``, ``extern struct``
+      - error-union wrapping: ``error{E}!struct {…}``,
+        ``error{E,F}!enum {…}``
+      - nested error-union chains (multiple ``!`` levels)
 
-      - ``const Foo = packed struct { … }`` (text starts with
-        ``packed``)
-      - ``const Foo = extern struct { … }`` (text starts with
-        ``extern``)
-      - ``const Foo = comptime blk: { break :blk struct { … }; }``
-        (text starts with ``comptime``)
-      - Error-union types wrapping a struct (``const Foo =
-        error{X}!struct {…}``)
+    Direct-child requirement on the SuffixExpr rejects struct
+    LITERALS passed as function arguments — ``const x =
+    doStuff(struct{…})`` is correctly classified as a regular
+    variable, not a container declaration.
 
-      The bare ``struct {}`` / ``enum {}`` / ``union {}`` form does
-      work, which covers the common case. A future refinement could
-      walk the RHS for any descendant ``struct``/``enum``/``union``
-      keyword token instead of prefix-matching the surface text.
+    Known limitation: comptime-block-wrapped struct expressions
+    (``const X = comptime blk: { break :blk struct {…}; };``) are
+    NOT detected as struct declarations. tree-sitter-zig parses this
+    as ``VarDecl > LabeledTypeExpr > Block > … > ErrorUnionExpr >
+    ContainerDecl``, and the descent here doesn't enter
+    ``LabeledTypeExpr``. A descent through labeled-block wrappers
+    would fix it but is deferred — the idiom is rare in practice
+    and a deep parser would handle it via proper expression
+    evaluation.
     """
 
     def _visit_structural(self, node: "Node", state, parent_id: str | None) -> None:
@@ -378,29 +383,60 @@ class ZigParser(BasicVisitorParser):
                     "utf-8", errors="replace",
                 ).strip()
             elif child.type == "ErrorUnionExpr":
-                # Look for a ``struct``/``enum``/``union`` keyword
-                # token anywhere in the first ~80 chars of the
-                # expression. Tokenising on whitespace handles common
-                # modifier-prefixed forms (``packed struct {…}``,
-                # ``extern struct {…}``, ``comptime blk: { break :blk
-                # struct {…} }``) that a naive ``startswith`` misses
-                # (code-review I1, Rio R2).
-                #
-                # Brace-attached forms like ``struct{`` are also
-                # caught because we split on whitespace AND rstrip
-                # the open-brace before comparing.
-                text = source_bytes[child.start_byte:child.end_byte].decode(
-                    "utf-8", errors="replace",
-                ).strip()
-                tokens = text[:80].split()
-                if any(
-                    tok.rstrip("{(,") in ("struct", "enum", "union")
-                    for tok in tokens
-                ):
+                # #153: structural detection — find a top-level
+                # ``ContainerDecl`` reachable through the error-union
+                # chain. Replaces the previous text-prefix heuristic
+                # which missed ``error{X}!struct {…}`` because ``!``
+                # is a mid-token separator (the docstring above
+                # honestly listed this as a known limitation).
+                # Direct-child requirement on the SuffixExpr also
+                # rejects nested struct LITERALS like
+                # ``const Foo = doStuff(struct{…})`` — the
+                # ContainerDecl exists in that tree but only as a
+                # descendant of a call expression, not directly
+                # under SuffixExpr.
+                if ZigParser._zig_is_container_decl(child):
                     is_struct = True
         if name is None:
             return None
         return (name, is_struct)
+
+    @staticmethod
+    def _zig_is_container_decl(error_union_node: "Node") -> bool:
+        """Walk an ``ErrorUnionExpr`` chain to determine if it's a
+        struct/enum/union DECLARATION (not just an expression that
+        happens to contain a struct literal nested inside).
+
+        AST shapes for supported forms:
+
+          - ``const X = struct { … }`` →
+            ``ErrorUnionExpr > SuffixExpr > ContainerDecl``
+          - ``const X = packed struct { … }`` → same shape; the
+            ``packed`` token is a child of ContainerDecl.
+          - ``const X = error{E}!struct { … }`` →
+            ``ErrorUnionExpr > [SuffixExpr (error set), !,
+            ErrorUnionExpr > SuffixExpr > ContainerDecl]``
+
+        Algorithm: descend the rightmost ``ErrorUnionExpr`` child as
+        long as one exists (follows the error-union chain), then at
+        the leaf check whether the ``SuffixExpr`` has a DIRECT
+        ``ContainerDecl`` child. The direct-child requirement is
+        what rejects nested struct literals.
+        """
+        cur = error_union_node
+        # Descend nested ErrorUnionExpr's; cap iterations as a
+        # defensive measure against weirdly-deep trees.
+        for _ in range(16):
+            nested = [c for c in cur.children if c.type == "ErrorUnionExpr"]
+            if not nested:
+                break
+            cur = nested[-1]
+        for child in cur.children:
+            if child.type == "SuffixExpr":
+                for sub in child.children:
+                    if sub.type == "ContainerDecl":
+                        return True
+        return False
 
     @staticmethod
     def _zig_fn_name(node: "Node", source_bytes: bytes) -> str | None:
