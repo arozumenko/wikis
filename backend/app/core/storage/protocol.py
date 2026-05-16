@@ -581,6 +581,68 @@ class WikiStorageProtocol(Protocol):
         """
         ...
 
+    def shortest_path(
+        self,
+        source_label: str,
+        target_label: str,
+        max_depth: int = 25,
+    ) -> dict[str, Any]:
+        """Undirected shortest path between two symbols (#121).
+
+        **Canonical entry point for undirected shortest-path queries
+        from MCP / IDE clients.** Implementations layer a Python BFS
+        with a visited set on top of a single SQL frontier-expansion
+        query per depth — frontier growth stays O(V+E) so the search
+        terminates quickly even on dense graphs at large
+        ``max_depth``.
+
+        For *directed* per-symbol traversal used by the agent loop
+        (e.g. "who calls X?"), use
+        :meth:`GraphQueryService.get_relationships` — that surface is
+        in-memory NetworkX, depth-bounded, and respects edge direction
+        and confidence filters. The two are intentionally separate so
+        each can evolve independently.
+
+        Label resolution: ``source_label`` and ``target_label`` are
+        matched against ``symbol_name`` first, then ``rel_path``;
+        within each table the lowest ``node_id`` wins. Implementations
+        also report the number of candidates so callers can detect
+        ambiguous matches.
+
+        ``max_depth`` defaults to 25 — graph diameter on production
+        codebases is typically well under 20. Callers can pass a
+        smaller value for faster responses on dense graphs.
+
+        Returns:
+            On success::
+
+                {
+                    "source": {"node_id", "symbol_name", "rel_path", "symbol_type"},
+                    "target": {<same>},
+                    "source_candidates": int,   # total labels matching source_label
+                    "target_candidates": int,   # ditto for target_label
+                    "path": [<node row>, ...],  # source first, target last
+                    "edges": [{"source_id", "target_id", "rel_type", "confidence"}, ...],
+                    "length": int,
+                }
+
+            ``source_candidates > 1`` (or ``target_candidates > 1``)
+            indicates the label was ambiguous and a different
+            resolution might yield a different path.
+
+            When either label cannot be resolved or no path is found
+            within ``max_depth``::
+
+                {"path": None, "reason": "..."}
+
+            ``reason`` is a short tag for programmatic handling:
+            ``source_not_found``, ``target_not_found``,
+            ``no_path_within_max_depth``, ``invalid_max_depth``.
+            Same-source-and-target is a success case (``length == 0``,
+            no ``reason``) so callers don't have to special-case it.
+        """
+        ...
+
     # ==================================================================
     # WIKI PAGES + source→page reverse index (#116 incremental regen)
     # ==================================================================

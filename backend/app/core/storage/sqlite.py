@@ -2182,6 +2182,193 @@ class UnifiedWikiDB:
             "by_file": [dict(r) for r in file_rows],
         }
 
+    # ── shortest_path (#121 Phase 1) ──────────────────────────────────
+    #
+    # This is the **canonical undirected shortest-path** entry point for
+    # MCP / IDE clients. It treats ``repo_edges`` as undirected and runs
+    # a layered Python BFS with a visited set so each node is expanded
+    # at most once — preventing the frontier explosion an earlier
+    # SQL-recursive-CTE draft suffered on dense graphs.
+    #
+    # For *directed* per-symbol traversal used by the LLM agent loop
+    # (e.g. "who calls X?"), see ``GraphQueryService.get_relationships``
+    # — that surface is in-memory NetworkX, depth-bounded, and respects
+    # edge direction and confidence filters.
+
+    _NODE_COLS_FOR_PATH = "node_id, symbol_name, rel_path, symbol_type"
+    _EDGE_COLS_FOR_PATH = "source_id, target_id, rel_type, confidence"
+    # SQLite's default SQLITE_LIMIT_VARIABLE_NUMBER is 999. We chunk
+    # frontier expansion below this to stay portable.
+    _BFS_FRONTIER_CHUNK = 500
+
+    def _resolve_label(self, label: str) -> tuple[dict[str, Any] | None, int]:
+        """Resolve ``label`` to a node row + total candidate count.
+
+        Returns ``(best, total_count)`` where ``best`` is the
+        ``node_id``-ASC-first row matching ``label`` and
+        ``total_count`` is how many rows matched in total. Callers can
+        flag the result as ambiguous when ``total_count > 1``.
+
+        Match strategy (first table with at least one hit wins):
+          1. Exact ``symbol_name`` match
+          2. ``rel_path`` match (file-path-as-label)
+
+        Each branch issues a ``COUNT(*)`` and a ``LIMIT 1`` query
+        rather than ``fetchall()``-ing the full match set — common
+        labels like ``__init__`` or ``main`` can match thousands of
+        rows in real codebases, and we only need the first plus the
+        cardinality.
+        """
+        for column in ("symbol_name", "rel_path"):
+            count = self.conn.execute(
+                f"SELECT COUNT(*) FROM repo_nodes WHERE {column} = ?",  # noqa: S608
+                (label,),
+            ).fetchone()[0]
+            if count:
+                row = self.conn.execute(
+                    f"SELECT {self._NODE_COLS_FOR_PATH} FROM repo_nodes "
+                    f"WHERE {column} = ? ORDER BY node_id ASC LIMIT 1",  # noqa: S608
+                    (label,),
+                ).fetchone()
+                if row is not None:
+                    return dict(row), int(count)
+        return None, 0
+
+    def _bfs_step_sqlite(
+        self,
+        *,
+        frontier: list[str],
+        tgt_id: str,
+        visited: set[str],
+        parents: dict[str, str],
+    ) -> list[str] | None:
+        """One BFS layer expansion.
+
+        Returns the next frontier list, or ``None`` once ``tgt_id`` has
+        been discovered (caller stops the outer loop on ``None``).
+        ``visited`` and ``parents`` are mutated in place.
+        """
+        frontier_set = set(frontier)
+        next_frontier: list[str] = []
+        for chunk_start in range(0, len(frontier), self._BFS_FRONTIER_CHUNK):
+            chunk = frontier[chunk_start : chunk_start + self._BFS_FRONTIER_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT source_id, target_id FROM repo_edges "
+                f"WHERE source_id IN ({placeholders}) "
+                f"   OR target_id IN ({placeholders})",  # noqa: S608
+                (*chunk, *chunk),
+            ).fetchall()
+            for row in rows:
+                a, b = row[0], row[1]
+                for parent_id, child_id in ((a, b), (b, a)):
+                    if parent_id not in frontier_set or child_id in visited:
+                        continue
+                    visited.add(child_id)
+                    parents[child_id] = parent_id
+                    next_frontier.append(child_id)
+                    if child_id == tgt_id:
+                        return None
+        return next_frontier
+
+    def shortest_path(
+        self,
+        source_label: str,
+        target_label: str,
+        max_depth: int = 25,
+    ) -> dict[str, Any]:
+        if max_depth < 1:
+            return {"path": None, "reason": "invalid_max_depth"}
+
+        source, src_candidates = self._resolve_label(source_label)
+        if source is None:
+            return {"path": None, "reason": "source_not_found"}
+        target, tgt_candidates = self._resolve_label(target_label)
+        if target is None:
+            return {"path": None, "reason": "target_not_found"}
+
+        src_id = source["node_id"]
+        tgt_id = target["node_id"]
+        if src_id == tgt_id:
+            return {
+                "source": source,
+                "target": target,
+                "source_candidates": src_candidates,
+                "target_candidates": tgt_candidates,
+                "path": [source],
+                "edges": [],
+                "length": 0,
+            }
+
+        # Layered Python BFS with a visited set. Each layer issues one
+        # SQL query (chunked if the frontier is large) to fetch every
+        # incident edge for the current frontier; we walk both
+        # directions to honour undirected semantics. Termination is
+        # O(V + E) — no frontier explosion, no LIKE-on-CSV cycle guard.
+        visited: set[str] = {src_id}
+        parents: dict[str, str] = {}
+        frontier: list[str] = [src_id]
+        found = False
+
+        for _depth in range(max_depth):
+            if not frontier:
+                break
+            next_frontier = self._bfs_step_sqlite(
+                frontier=frontier,
+                tgt_id=tgt_id,
+                visited=visited,
+                parents=parents,
+            )
+            if next_frontier is None:
+                found = True
+                break
+            frontier = next_frontier
+
+        if not found:
+            return {"path": None, "reason": "no_path_within_max_depth"}
+
+        # Reconstruct via parent map (target → … → source).
+        path_ids: list[str] = [tgt_id]
+        while path_ids[-1] != src_id:
+            path_ids.append(parents[path_ids[-1]])
+        path_ids.reverse()
+
+        # Hydrate nodes — preserve walk order.
+        node_rows = self.conn.execute(
+            f"SELECT {self._NODE_COLS_FOR_PATH} FROM repo_nodes "
+            f"WHERE node_id IN ({','.join('?' * len(path_ids))})",
+            path_ids,
+        ).fetchall()
+        node_by_id = {r["node_id"]: dict(r) for r in node_rows}
+        path_nodes = [node_by_id[nid] for nid in path_ids if nid in node_by_id]
+
+        # Edge details for each consecutive pair — direction unknown
+        # (we walked undirected); try both and prefer EXTRACTED.
+        edges: list[dict[str, Any]] = []
+        for a, b in zip(path_ids, path_ids[1:], strict=False):
+            edge_row = self.conn.execute(
+                f"SELECT {self._EDGE_COLS_FOR_PATH} FROM repo_edges "
+                "WHERE (source_id = ? AND target_id = ?) "
+                "   OR (source_id = ? AND target_id = ?) "
+                "ORDER BY CASE confidence WHEN 'EXTRACTED' THEN 0 "
+                "                         WHEN 'INFERRED'  THEN 1 "
+                "                         ELSE 2 END "
+                "LIMIT 1",
+                (a, b, b, a),
+            ).fetchone()
+            if edge_row is not None:
+                edges.append(dict(edge_row))
+
+        return {
+            "source": source,
+            "target": target,
+            "source_candidates": src_candidates,
+            "target_candidates": tgt_candidates,
+            "path": path_nodes,
+            "edges": edges,
+            "length": len(path_ids) - 1,
+        }
+
     # ══════════════════════════════════════════════════════════════════
     # WIKI PAGES + source→page reverse index (#116 incremental regen)
     # ══════════════════════════════════════════════════════════════════

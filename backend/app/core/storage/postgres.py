@@ -2218,6 +2218,169 @@ class PostgresWikiStorage:
             "by_file": [dict(r) for r in file_rows],
         }
 
+    # ── shortest_path (#121 Phase 1) ──────────────────────────────────
+    #
+    # Canonical undirected shortest-path entry point. See the sqlite
+    # backend for the architectural note; both share the layered-BFS
+    # algorithm with a visited set, just expressed in their native SQL
+    # dialect (Postgres uses ``ANY(:ids)`` instead of IN-placeholders).
+
+    _NODE_COLS_FOR_PATH = "node_id, symbol_name, rel_path, symbol_type"
+    _EDGE_COLS_FOR_PATH = "source_id, target_id, rel_type, confidence"
+
+    def _resolve_label(
+        self, conn, label: str,
+    ) -> tuple[dict[str, Any] | None, int]:
+        # Two indexed point queries — see sqlite backend for the
+        # rationale; we don't fetchall() the full match set because
+        # common labels (e.g. __init__, main) can match thousands of
+        # rows in real codebases.
+        for column in ("symbol_name", "rel_path"):
+            count = conn.execute(
+                text(f"SELECT COUNT(*) FROM {self._nodes} WHERE {column} = :label"),
+                {"label": label},
+            ).scalar() or 0
+            if count:
+                row = conn.execute(
+                    text(
+                        f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
+                        f"WHERE {column} = :label ORDER BY node_id ASC LIMIT 1"
+                    ),
+                    {"label": label},
+                ).mappings().fetchone()
+                if row is not None:
+                    return dict(row), int(count)
+        return None, 0
+
+    def _bfs_step_postgres(
+        self,
+        *,
+        conn,
+        frontier: list[str],
+        tgt_id: str,
+        visited: set[str],
+        parents: dict[str, str],
+    ) -> list[str] | None:
+        """One BFS layer expansion. Returns ``None`` once ``tgt_id`` is
+        discovered so the caller can stop without nested breaks.
+        ``visited`` and ``parents`` are mutated in place."""
+        rows = conn.execute(
+            text(
+                f"SELECT source_id, target_id FROM {self._edges} "
+                "WHERE source_id = ANY(:ids) OR target_id = ANY(:ids)"
+            ),
+            {"ids": frontier},
+        ).mappings().fetchall()
+        frontier_set = set(frontier)
+        next_frontier: list[str] = []
+        for row in rows:
+            a, b = row["source_id"], row["target_id"]
+            for parent_id, child_id in ((a, b), (b, a)):
+                if parent_id not in frontier_set or child_id in visited:
+                    continue
+                visited.add(child_id)
+                parents[child_id] = parent_id
+                next_frontier.append(child_id)
+                if child_id == tgt_id:
+                    return None
+        return next_frontier
+
+    def shortest_path(
+        self,
+        source_label: str,
+        target_label: str,
+        max_depth: int = 25,
+    ) -> dict[str, Any]:
+        if max_depth < 1:
+            return {"path": None, "reason": "invalid_max_depth"}
+
+        with self._engine.connect() as conn:
+            source, src_candidates = self._resolve_label(conn, source_label)
+            if source is None:
+                return {"path": None, "reason": "source_not_found"}
+            target, tgt_candidates = self._resolve_label(conn, target_label)
+            if target is None:
+                return {"path": None, "reason": "target_not_found"}
+
+            src_id = source["node_id"]
+            tgt_id = target["node_id"]
+            if src_id == tgt_id:
+                return {
+                    "source": source,
+                    "target": target,
+                    "source_candidates": src_candidates,
+                    "target_candidates": tgt_candidates,
+                    "path": [source],
+                    "edges": [],
+                    "length": 0,
+                }
+
+            visited: set[str] = {src_id}
+            parents: dict[str, str] = {}
+            frontier: list[str] = [src_id]
+            found = False
+
+            for _depth in range(max_depth):
+                if not frontier:
+                    break
+                next_frontier = self._bfs_step_postgres(
+                    conn=conn,
+                    frontier=frontier,
+                    tgt_id=tgt_id,
+                    visited=visited,
+                    parents=parents,
+                )
+                if next_frontier is None:
+                    found = True
+                    break
+                frontier = next_frontier
+
+            if not found:
+                return {"path": None, "reason": "no_path_within_max_depth"}
+
+            path_ids: list[str] = [tgt_id]
+            while path_ids[-1] != src_id:
+                path_ids.append(parents[path_ids[-1]])
+            path_ids.reverse()
+
+            node_rows = conn.execute(
+                text(
+                    f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
+                    "WHERE node_id = ANY(:ids)"
+                ),
+                {"ids": path_ids},
+            ).mappings().fetchall()
+            node_by_id = {r["node_id"]: dict(r) for r in node_rows}
+            path_nodes = [node_by_id[nid] for nid in path_ids if nid in node_by_id]
+
+            edges: list[dict[str, Any]] = []
+            for a, b in zip(path_ids, path_ids[1:], strict=False):
+                edge_row = conn.execute(
+                    text(
+                        f"SELECT {self._EDGE_COLS_FOR_PATH} FROM {self._edges} "
+                        "WHERE (source_id = :a AND target_id = :b) "
+                        "   OR (source_id = :b AND target_id = :a) "
+                        "ORDER BY CASE confidence "
+                        "         WHEN 'EXTRACTED' THEN 0 "
+                        "         WHEN 'INFERRED'  THEN 1 "
+                        "         ELSE 2 END "
+                        "LIMIT 1"
+                    ),
+                    {"a": a, "b": b},
+                ).mappings().fetchone()
+                if edge_row is not None:
+                    edges.append(dict(edge_row))
+
+            return {
+                "source": source,
+                "target": target,
+                "source_candidates": src_candidates,
+                "target_candidates": tgt_candidates,
+                "path": path_nodes,
+                "edges": edges,
+                "length": len(path_ids) - 1,
+            }
+
     # ==================================================================
     # WIKI PAGES + source→page reverse index (#116 incremental regen)
     # ==================================================================
