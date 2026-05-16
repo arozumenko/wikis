@@ -1694,6 +1694,23 @@ class PostgresWikiStorage:
             ):
                 edge_types[row[0]] = row[1]
 
+            # #120: confidence distribution. Always returns the three
+            # known buckets (extracted/inferred/ambiguous) even when
+            # one is zero, so MCP / UI consumers can rely on a stable
+            # shape. Mirrors the sqlite backend.
+            confidence_breakdown: dict[str, int] = {
+                "extracted": 0, "inferred": 0, "ambiguous": 0,
+            }
+            for row in conn.execute(
+                text(
+                    f"SELECT confidence, count(*) FROM {self._schema}.repo_edges "
+                    "GROUP BY confidence"
+                ),
+            ):
+                key = (row[0] or "EXTRACTED").lower()
+                if key in confidence_breakdown:
+                    confidence_breakdown[key] = row[1]
+
             macro_count = conn.execute(
                 text(
                     f"SELECT count(DISTINCT macro_cluster) FROM {self._schema}.repo_nodes "
@@ -1711,6 +1728,7 @@ class PostgresWikiStorage:
             "languages": langs,
             "symbol_types": types,
             "edge_types": edge_types,
+            "confidence_breakdown": confidence_breakdown,
             "macro_clusters": macro_count,
             "hub_count": hub_count,
             "vec_available": self._vec_available,

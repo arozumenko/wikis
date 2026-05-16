@@ -378,6 +378,26 @@ All three tiers produce the same `Symbol` / `Relationship` / `ParseResult` shape
 
 **Promotion path basic → deep**: when a language sees enough user demand to justify type inference / cross-file resolution (Ruby + PHP are the likely first candidates), write a full parser inheriting from `BaseParser` directly. The `LanguageConfig` can either retire or stay as a fallback for partial parses.
 
+### Edge Confidence Levels (#120)
+
+Every edge in `repo_edges` carries a `confidence` label that propagates from the parser's `Relationship.confidence` float through `graph_builder._add_relationships_bulk` (mapping at the storage write boundary: `< 0.7` → `"INFERRED"`, else `"EXTRACTED"`; AMBIGUOUS reserved for future per-target dedup work).
+
+| Label | When it's assigned | Trust signal |
+|-------|---------------------|--------------|
+| `EXTRACTED` | Parser observed the relationship directly. Deep parsers (Python/Java/Go/C#/JS/TS/Rust/C++) default to `confidence=1.0`; their explicit lookups like Python's `composition (is_instantiation)` at 0.9 also stay EXTRACTED. | High — graph algorithms can rely on these as-is. |
+| `INFERRED` | Name-only resolution (no type context, no cross-file disambiguation). Basic-tier visitor parsers (Ruby/PHP/Kotlin/Scala/Lua/Swift/Dart/PowerShell/Bash/Obj-C/Verilog/Fortran/Julia/Pascal/Elixir/R/Zig/Groovy) emit `confidence=0.6` for all CALLS edges. Python parser's "indirect call" tier (0.7) is the boundary case — it stays EXTRACTED because the threshold is `< 0.7`. | Medium — useful for graph topology + first-pass clustering, but UI consumers should disambiguate before quoting in user-facing answers. |
+| `AMBIGUOUS` | Reserved. No callsites today; introduced via the schema CHECK constraint for future "multiple plausible targets" handling. | Treat as `INFERRED` for any current downstream code. |
+
+**Where the label surfaces today**:
+- **Storage layer** — `repo_edges.confidence` column (TEXT NOT NULL DEFAULT 'EXTRACTED', CHECK constraint on the three values). Both SQLite + Postgres backends.
+- **`UnifiedWikiDB.stats()` / `PostgresWikiStorage.stats()`** — returns `confidence_breakdown: {extracted, inferred, ambiguous}`. Stable shape; keys always present even when zero.
+- **MCP tool `get_graph_stats(wiki_id)`** — exposes the full `stats()` dict to AI IDE clients.
+- **`SourceReference.confidence`** — optional field on citation responses. Default `None`; carries the underlying graph edge's confidence label when the retrieval path surfaced it. Propagated from cached QA records and live agent event streams in `ask_service` + `research_service`.
+
+**Not yet surfaced** (#120 Phase 2 follow-ups):
+- `min_confidence` filter param on `search_wiki`/`ask_codebase`/`ask_project` MCP tools — requires retriever-level edge filtering in `unified_retriever.py` / `multi_retriever.py` / `WikiSearchEngine`.
+- SPA citation chips rendering with confidence indicator — `CitationChips.tsx` / `SourceCitations.tsx` exist but aren't wired into any page; needs the SSE-source-collection-to-render pipeline plumbed end-to-end first.
+
 ### LLM Provider Pattern
 
 All providers implement `BaseLanguageModel` (LangChain). Add a new provider in `backend/app/services/llm_factory.py`:

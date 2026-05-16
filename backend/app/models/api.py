@@ -88,6 +88,14 @@ class SourceReference(BaseModel):
     relevance_score: float | None = None
     wiki_id: str | None = None    # None for single-wiki answers
     wiki_title: str | None = None  # Human-readable wiki title for cross-repo answers
+    # #120: edge-confidence label propagated from the underlying graph
+    # node's strongest incoming relationship. ``EXTRACTED`` (explicit
+    # parser observation) / ``INFERRED`` (name-only resolution) /
+    # ``AMBIGUOUS`` (multiple candidates). ``None`` when the citation
+    # comes from a path that doesn't surface edge confidence — e.g. a
+    # pure FTS hit with no graph linkage. Stable enum string;
+    # downstream SPA + MCP consumers filter on this.
+    confidence: str | None = None
 
 
 class AskRequest(BaseModel):

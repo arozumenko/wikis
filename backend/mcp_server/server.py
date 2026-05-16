@@ -603,6 +603,66 @@ async def search_wiki(
 
 
 @mcp.tool()
+async def get_graph_stats(wiki_id: str) -> dict[str, Any]:
+    """Return summary statistics for a wiki's underlying code graph (#120).
+
+    Surfaces the ``confidence_breakdown`` over ``repo_edges`` so AI IDE
+    clients can decide whether to trust the graph's relationship edges
+    (``EXTRACTED`` = explicit parser observation, ``INFERRED`` =
+    name-only resolution, ``AMBIGUOUS`` = multiple candidates) before
+    asking follow-up questions.
+
+    Args:
+        wiki_id: Wiki identifier from search_wikis().
+
+    Returns:
+        Dict with ``node_count``, ``edge_count``, ``confidence_breakdown``
+        (``{extracted, inferred, ambiguous}``), ``edge_types`` (rel_type
+        → count), ``symbol_types``, ``languages``, ``macro_clusters``,
+        ``hub_count``, and ``embedding_dim``. Shape is stable — keys
+        always present even when counts are zero.
+    """
+    if not _wiki_management or not _settings:
+        return {"error": "graph_stats unavailable in this deployment"}
+
+    user_id = _current_user_id.get()
+    wiki_record = await _wiki_management.get_wiki(wiki_id, user_id=user_id)
+    if wiki_record is None:
+        return {
+            "error": (
+                f"Wiki not found: {wiki_id}. Use search_wikis() to find "
+                f"available wiki IDs."
+            ),
+        }
+
+    # Resolve the per-wiki unified DB path via the same cache-key
+    # derivation that ``incremental_refresh`` uses, then open the
+    # backend-specific storage. Read-only so we don't need a lock.
+    from pathlib import Path
+
+    from app.core.storage import open_storage
+    from app.services.wiki_management import _derive_cache_key
+
+    cache_key = _derive_cache_key(
+        _settings.cache_dir, wiki_record.repo_url, wiki_record.branch,
+    )
+    if not cache_key:
+        return {"error": f"Wiki {wiki_id} has no cached index."}
+    db_path = Path(_settings.cache_dir) / f"{cache_key}.wiki.db"
+    if not db_path.exists():
+        return {"error": f"Wiki {wiki_id} has no unified DB on disk."}
+
+    storage = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
+    try:
+        return storage.stats()
+    finally:
+        try:
+            storage.close()
+        except Exception:  # noqa: S110 — best-effort close
+            pass
+
+
+@mcp.tool()
 async def get_page_neighbors(
     wiki_id: str,
     page_title: str,

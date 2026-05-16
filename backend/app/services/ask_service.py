@@ -37,6 +37,9 @@ def _parse_sources_json(raw: str | None) -> list[SourceReference]:
             symbol=s.get("symbol"),
             symbol_type=s.get("symbol_type"),
             relevance_score=s.get("relevance_score"),
+            # #120: propagate edge-confidence if the upstream
+            # cache payload includes it. None when missing.
+            confidence=s.get("confidence"),
         )
         for s in json.loads(raw)
         if isinstance(s, dict)
@@ -256,6 +259,10 @@ class AskService:
                                 symbol=s.get("symbol"),
                                 symbol_type=s.get("symbol_type") or s.get("type"),
                                 relevance_score=s.get("relevance_score"),
+                                # #120: edge-confidence string propagated
+                                # from the retriever; None when the
+                                # source path didn't carry edge metadata.
+                                confidence=s.get("confidence"),
                             )
                         )
             elif event_type in ("ask_error", "task_failed"):
