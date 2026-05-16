@@ -106,6 +106,13 @@ class AskRequest(BaseModel):
     question: str
     chat_history: list[ChatMessage] = Field(default_factory=list)
     k: int = 15  # Retrieval doc count
+    # #120/#157: minimum edge-confidence floor for graph expansion.
+    # None (default) keeps the prior behavior of including all edges
+    # regardless of label. ``"EXTRACTED"`` keeps only direct parser
+    # observations; ``"INFERRED"`` includes name-only resolution
+    # edges too; ``"AMBIGUOUS"`` would also include reserved
+    # multi-target candidates (no callsites today).
+    min_confidence: str | None = None
 
     @model_validator(mode="after")
     def _require_target(self) -> "AskRequest":

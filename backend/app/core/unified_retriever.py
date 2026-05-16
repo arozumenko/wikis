@@ -51,6 +51,35 @@ VEC_POOL = 30
 # Expansion limits
 MAX_EXPANSION_HOPS = 1
 MAX_EXPANSION_NEIGHBORS = 15
+
+# #120/#157: confidence-rank ordering. Higher rank == stronger signal.
+# ``EXTRACTED`` is the parser's explicit observation, ``INFERRED`` is
+# name-only resolution, ``AMBIGUOUS`` is reserved for multi-target
+# cases (no callsites today). ``min_confidence`` is the **minimum
+# acceptable** label — an edge passes the filter when its label's
+# rank is >= the threshold's rank.
+_CONFIDENCE_RANK: dict[str, int] = {
+    "EXTRACTED": 3,
+    "INFERRED": 2,
+    "AMBIGUOUS": 1,
+}
+
+
+def _edge_passes_confidence(edge: dict, min_confidence: str | None) -> bool:
+    """``True`` when ``edge`` meets the ``min_confidence`` floor.
+
+    ``min_confidence is None`` disables filtering (legacy behavior).
+    Missing / unknown labels on the edge are treated as ``EXTRACTED``
+    because that's the storage layer's default and the previous PR
+    that wired the mapping (#150) guarantees this for newly-written
+    edges. Legacy rows with NULL confidence (pre-#150 dbs) also
+    coalesce here, so they continue to surface at the EXTRACTED tier.
+    """
+    if min_confidence is None:
+        return True
+    edge_label = (edge.get("confidence") or "EXTRACTED").upper()
+    threshold = min_confidence.upper()
+    return _CONFIDENCE_RANK.get(edge_label, 0) >= _CONFIDENCE_RANK.get(threshold, 0)
 MAX_EXPANDED_DOCS = 150
 
 # Documentation symbol types — single source of truth from constants.py.
@@ -164,6 +193,7 @@ class UnifiedRetriever:
         apply_expansion: bool = True,
         path_prefix: str | None = None,
         cluster_id: int | None = None,
+        min_confidence: str | None = None,
     ) -> list[Document]:
         """Hybrid search + optional 1-hop graph expansion.
 
@@ -207,7 +237,9 @@ class UnifiedRetriever:
         if not apply_expansion:
             return docs
 
-        expanded = self._expand_documents(docs, cluster_id=cluster_id)
+        expanded = self._expand_documents(
+            docs, cluster_id=cluster_id, min_confidence=min_confidence,
+        )
         logger.info(
             "[UNIFIED_RETRIEVER] After expansion: %d docs (from %d initial)",
             len(expanded),
@@ -282,6 +314,7 @@ class UnifiedRetriever:
         self,
         docs: list[Document],
         cluster_id: int | None = None,
+        min_confidence: str | None = None,
     ) -> list[Document]:
         """1-hop graph expansion via SQL, filtered to architectural symbols.
 
@@ -315,7 +348,11 @@ class UnifiedRetriever:
             if not nid:
                 continue
 
-            neighbors = self._get_expansion_neighbors(nid, seen_ids, cluster_id=cluster_id)
+            neighbors = self._get_expansion_neighbors(
+                nid, seen_ids,
+                cluster_id=cluster_id,
+                min_confidence=min_confidence,
+            )
             for neighbor_node in neighbors:
                 if len(expanded) >= MAX_EXPANDED_DOCS:
                     break
@@ -328,6 +365,12 @@ class UnifiedRetriever:
                 ndoc = _node_to_document(neighbor_node)
                 ndoc.metadata["is_initially_retrieved"] = False
                 ndoc.metadata["expanded_from"] = nid
+                # #120/#157: carry the edge confidence through into
+                # Document metadata so downstream source dicts can
+                # populate SourceReference.confidence.
+                edge_conf = neighbor_node.get("_edge_confidence")
+                if edge_conf:
+                    ndoc.metadata["confidence"] = edge_conf
                 expanded.append(ndoc)
 
         return expanded
@@ -337,29 +380,55 @@ class UnifiedRetriever:
         node_id: str,
         seen_ids: set[str],
         cluster_id: int | None = None,
+        min_confidence: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Fetch 1-hop neighbours, filtered to architectural types and optionally bounded to cluster."""
-        # Outgoing edges
+        """Fetch 1-hop neighbours, filtered to architectural types and
+        optionally bounded to cluster + minimum edge confidence.
+
+        Each returned node dict carries an extra ``_edge_confidence``
+        key whose value is the strongest-rank confidence label across
+        any qualifying edge that reaches this candidate from
+        ``node_id``. Downstream callers (``_expand_documents``) attach
+        this to ``Document.metadata`` so it flows through into
+        ``SourceReference.confidence`` (#120 / #157).
+        """
         out_edges = self.db.get_edges_from(node_id)
-        # Incoming edges
         in_edges = self.db.get_edges_to(node_id)
 
-        candidate_ids: set[str] = set()
-        for e in out_edges:
-            tid = e.get("target_id", "")
-            if tid and tid not in seen_ids:
-                candidate_ids.add(tid)
-        for e in in_edges:
-            sid = e.get("source_id", "")
-            if sid and sid not in seen_ids:
-                candidate_ids.add(sid)
+        # Map candidate_id → best (highest-rank) confidence label
+        # seen on any qualifying edge. Multi-edge case: a node reached
+        # via both an EXTRACTED and an INFERRED edge keeps EXTRACTED —
+        # any high-confidence path makes the node trustworthy.
+        candidate_confidence: dict[str, str] = {}
 
-        if not candidate_ids:
+        def _record(cid: str, edge: dict) -> None:
+            if not cid or cid in seen_ids:
+                return
+            if not _edge_passes_confidence(edge, min_confidence):
+                return
+            edge_label = (edge.get("confidence") or "EXTRACTED").upper()
+            cur = candidate_confidence.get(cid)
+            if cur is None or _CONFIDENCE_RANK.get(edge_label, 0) > _CONFIDENCE_RANK.get(cur, 0):
+                candidate_confidence[cid] = edge_label
+
+        for e in out_edges:
+            _record(e.get("target_id", ""), e)
+        for e in in_edges:
+            _record(e.get("source_id", ""), e)
+
+        if not candidate_confidence:
             return []
 
-        # Fetch node metadata for candidates (batch, capped)
+        # When we have to cap the neighbour set, prefer the strongest-
+        # signal candidates first. Tie-breaking by insertion order via
+        # ``-rank`` keeps sort stable.
+        sorted_cids = sorted(
+            candidate_confidence.keys(),
+            key=lambda c: -_CONFIDENCE_RANK.get(candidate_confidence[c], 0),
+        )
+
         results = []
-        for cid in list(candidate_ids)[:MAX_EXPANSION_NEIGHBORS]:
+        for cid in sorted_cids[:MAX_EXPANSION_NEIGHBORS]:
             node = self.db.get_node(cid)
             if not node:
                 continue
@@ -369,6 +438,11 @@ class UnifiedRetriever:
             # If cluster_id is specified, only include same-cluster neighbours
             if cluster_id is not None and node.get("macro_cluster") != cluster_id:
                 continue
+            # Shallow-copy the storage dict so we don't mutate cached
+            # rows. Attach the edge confidence under a leading-
+            # underscore key so it doesn't collide with real columns.
+            node = dict(node)
+            node["_edge_confidence"] = candidate_confidence[cid]
             results.append(node)
 
         return results

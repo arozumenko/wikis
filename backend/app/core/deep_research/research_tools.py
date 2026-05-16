@@ -234,6 +234,7 @@ def create_codebase_tools(
     graph_text_index: Any = None,  # GraphTextIndex (FTS5)
     repo_path: str | None = None,  # Path to cloned repo for direct file access
     query_service: Any = None,  # Pre-built GraphQueryService or MultiGraphQueryService (projects)
+    min_confidence: str | None = None,  # #120/#157: edge-confidence floor
 ) -> list:
     """
     Create custom tools for deep research.

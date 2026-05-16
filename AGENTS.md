@@ -394,8 +394,12 @@ Every edge in `repo_edges` carries a `confidence` label that propagates from the
 - **MCP tool `get_graph_stats(wiki_id)`** — exposes the full `stats()` dict to AI IDE clients.
 - **`SourceReference.confidence`** — optional field on citation responses. Default `None`; carries the underlying graph edge's confidence label when the retrieval path surfaced it. Propagated from cached QA records and live agent event streams in `ask_service` + `research_service`.
 
-**Not yet surfaced** (#120 Phase 2 follow-ups):
-- `min_confidence` filter param on `search_wiki`/`ask_codebase`/`ask_project` MCP tools — requires retriever-level edge filtering in `unified_retriever.py` / `multi_retriever.py` / `WikiSearchEngine`.
+**Surfaced as of #120 Phase 2** (#157):
+- `min_confidence` parameter on `ask_codebase` / `ask_project` MCP tools + `AskRequest` Pydantic model + `AskConfig` dataclass. Threads through to `UnifiedRetriever._get_expansion_neighbors` which drops edges below the threshold during graph expansion. `None` keeps the legacy "include all" behavior; `"EXTRACTED"` is the strictest (only direct parser observations); `"INFERRED"` allows name-only resolution edges too. Case-insensitive; missing edge labels default to EXTRACTED (legacy-row compat).
+- `SourceReference.confidence` now actually populates: the strongest-rank edge confidence reaching a candidate flows through the retriever → `Document.metadata["confidence"]` → agent source dict → `SourceReference.confidence`. Seed nodes (FTS/vector hits with no incoming edge) still have `None` because they weren't reached via an edge.
+
+**Not yet surfaced** (#120 Phase 3, tracked separately):
+- `search_wiki` MCP tool's `min_confidence` param — the wikilink graph (`WikiPageIndex`) is in-memory and has no confidence column, so the filter would be a no-op there. Deferred until the wikilink graph either gains a confidence dimension or the MCP tool delegates to repo_edges-based search.
 - SPA citation chips rendering with confidence indicator — `CitationChips.tsx` / `SourceCitations.tsx` exist but aren't wired into any page; needs the SSE-source-collection-to-render pipeline plumbed end-to-end first.
 
 ### LLM Provider Pattern

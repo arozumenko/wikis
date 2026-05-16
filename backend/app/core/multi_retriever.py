@@ -28,15 +28,32 @@ class MultiWikiRetrieverStack:
     # Async retrieval
     # ------------------------------------------------------------------
 
-    async def aretrieve(self, query: str, k: int = 15) -> list:
+    async def aretrieve(
+        self,
+        query: str,
+        k: int = 15,
+        min_confidence: str | None = None,
+    ) -> list:
         """Parallel retrieval across all wikis with per-wiki score normalisation."""
         if not self._stacks:
             return []
 
         async def retrieve_one(wiki_id: str, stack: Any) -> list:
             try:
-                # WikiRetrieverStack.search_repository is sync — run in thread
-                docs = await asyncio.to_thread(stack.search_repository, query, k)
+                # WikiRetrieverStack.search_repository is sync — run in thread.
+                # ``min_confidence`` passes through as a kwarg via
+                # functools.partial so older stack implementations that
+                # don't accept it raise a clear TypeError instead of
+                # silently dropping the filter.
+                from functools import partial
+                call = partial(
+                    stack.search_repository,
+                    query, k,
+                    min_confidence=min_confidence,
+                ) if min_confidence is not None else partial(
+                    stack.search_repository, query, k,
+                )
+                docs = await asyncio.to_thread(call)
                 for doc in docs:
                     doc.metadata["source_wiki_id"] = wiki_id
                 return docs
@@ -69,7 +86,13 @@ class MultiWikiRetrieverStack:
     # Sync wrapper (matches WikiRetrieverStack.search_repository signature)
     # ------------------------------------------------------------------
 
-    def search_repository(self, query: str, k: int = 15, apply_expansion: bool = True) -> list:
+    def search_repository(
+        self,
+        query: str,
+        k: int = 15,
+        apply_expansion: bool = True,  # noqa: ARG002 — kept for signature parity
+        min_confidence: str | None = None,
+    ) -> list:
         """Synchronous fan-out retrieval — raises if called from a running event loop.
 
         Use aretrieve() directly in async contexts.
@@ -84,7 +107,7 @@ class MultiWikiRetrieverStack:
                 "MultiWikiRetrieverStack.search_repository() cannot be called from an async context. "
                 "Use await aretrieve() instead."
             )
-        return asyncio.run(self.aretrieve(query, k=k))
+        return asyncio.run(self.aretrieve(query, k=k, min_confidence=min_confidence))
 
     def retrieve(self, query: str, k: int = 15) -> list:
         """Sync retrieve — raises if called from a running event loop.

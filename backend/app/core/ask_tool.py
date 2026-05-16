@@ -193,6 +193,7 @@ class AskTool:
         optimize_query: bool = True,
         query_output_tokens: int = ASK_QUERY_OPTIMIZATION_OUTPUT_TOKENS,
         answer_output_tokens: int = ASK_ANSWER_OUTPUT_TOKENS,
+        min_confidence: str | None = None,
     ):
         """
         Initialize the Ask tool.
@@ -213,6 +214,9 @@ class AskTool:
         self.thinking_callback = thinking_callback or (lambda x: None)
         self.max_context_tokens = max_context_tokens
         self.optimize_query = optimize_query and repository_analysis
+        # #120/#157: per-request edge-confidence floor for graph
+        # expansion. Forwarded to the retriever on every call.
+        self.min_confidence = min_confidence
         self.query_output_tokens = query_output_tokens
         self.answer_output_tokens = answer_output_tokens
 
@@ -497,7 +501,9 @@ class AskTool:
         self._emit_thinking("retrieving", "Searching repository...", query=search_query[:100])
 
         try:
-            documents = self.retriever.search_repository(search_query, k=k)
+            documents = self.retriever.search_repository(
+                search_query, k=k, min_confidence=self.min_confidence,
+            )
         except Exception as e:
             logger.error(f"Retrieval failed: {e}")
             return AskResponse(
