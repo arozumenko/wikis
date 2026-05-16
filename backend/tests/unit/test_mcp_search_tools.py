@@ -601,8 +601,9 @@ async def test_get_graph_stats_unknown_wiki_returns_error():
 
 
 @pytest.mark.asyncio
-async def test_get_graph_stats_missing_cache_returns_error():
-    """Wiki record exists but no cached DB → error, no crash."""
+async def test_get_graph_stats_no_cache_key_returns_error():
+    """Wiki record exists but ``_derive_cache_key`` couldn't resolve a
+    cache key — repo/branch combo not in ``cache_index.json``."""
     import mcp_server.server as srv
 
     mock_mgmt = AsyncMock()
@@ -625,6 +626,45 @@ async def test_get_graph_stats_missing_cache_returns_error():
             result = await srv.get_graph_stats(wiki_id="wiki-1")
         assert "error" in result
         assert "no cached index" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_graph_stats_missing_db_file_returns_error():
+    """Rio R1 regression: the third error path. Cache key resolves
+    fine but the ``.wiki.db`` file isn't on disk (eviction, fresh
+    deploy, manual cleanup). Must return an error dict without
+    crashing on the missing file."""
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt = srv._wiki_management
+    old_settings = srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+
+        with (
+            patch(
+                "app.services.wiki_management._derive_cache_key",
+                return_value="cachekey-abc",
+            ),
+            patch("pathlib.Path.exists", return_value=False),
+        ):
+            result = await srv.get_graph_stats(wiki_id="wiki-1")
+        assert "error" in result
+        # Different message from the no-cache-key path; pinning
+        # ensures the two error reasons stay distinguishable.
+        assert "no unified DB on disk" in result["error"]
     finally:
         srv._current_user_id.reset(token)
         srv._wiki_management = old_mgmt
