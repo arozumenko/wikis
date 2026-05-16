@@ -2231,25 +2231,59 @@ class PostgresWikiStorage:
     def _resolve_label(
         self, conn, label: str,
     ) -> tuple[dict[str, Any] | None, int]:
-        rows = conn.execute(
-            text(
-                f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
-                "WHERE symbol_name = :label ORDER BY node_id ASC"
-            ),
-            {"label": label},
-        ).mappings().fetchall()
-        if rows:
-            return dict(rows[0]), len(rows)
-        rows = conn.execute(
-            text(
-                f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
-                "WHERE rel_path = :label ORDER BY node_id ASC"
-            ),
-            {"label": label},
-        ).mappings().fetchall()
-        if rows:
-            return dict(rows[0]), len(rows)
+        # Two indexed point queries — see sqlite backend for the
+        # rationale; we don't fetchall() the full match set because
+        # common labels (e.g. __init__, main) can match thousands of
+        # rows in real codebases.
+        for column in ("symbol_name", "rel_path"):
+            count = conn.execute(
+                text(f"SELECT COUNT(*) FROM {self._nodes} WHERE {column} = :label"),
+                {"label": label},
+            ).scalar() or 0
+            if count:
+                row = conn.execute(
+                    text(
+                        f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
+                        f"WHERE {column} = :label ORDER BY node_id ASC LIMIT 1"
+                    ),
+                    {"label": label},
+                ).mappings().fetchone()
+                if row is not None:
+                    return dict(row), int(count)
         return None, 0
+
+    def _bfs_step_postgres(
+        self,
+        *,
+        conn,
+        frontier: list[str],
+        tgt_id: str,
+        visited: set[str],
+        parents: dict[str, str],
+    ) -> list[str] | None:
+        """One BFS layer expansion. Returns ``None`` once ``tgt_id`` is
+        discovered so the caller can stop without nested breaks.
+        ``visited`` and ``parents`` are mutated in place."""
+        rows = conn.execute(
+            text(
+                f"SELECT source_id, target_id FROM {self._edges} "
+                "WHERE source_id = ANY(:ids) OR target_id = ANY(:ids)"
+            ),
+            {"ids": frontier},
+        ).mappings().fetchall()
+        frontier_set = set(frontier)
+        next_frontier: list[str] = []
+        for row in rows:
+            a, b = row["source_id"], row["target_id"]
+            for parent_id, child_id in ((a, b), (b, a)):
+                if parent_id not in frontier_set or child_id in visited:
+                    continue
+                visited.add(child_id)
+                parents[child_id] = parent_id
+                next_frontier.append(child_id)
+                if child_id == tgt_id:
+                    return None
+        return next_frontier
 
     def shortest_path(
         self,
@@ -2289,31 +2323,15 @@ class PostgresWikiStorage:
             for _depth in range(max_depth):
                 if not frontier:
                     break
-                rows = conn.execute(
-                    text(
-                        f"SELECT source_id, target_id FROM {self._edges} "
-                        "WHERE source_id = ANY(:ids) OR target_id = ANY(:ids)"
-                    ),
-                    {"ids": frontier},
-                ).mappings().fetchall()
-                frontier_set = set(frontier)
-                next_frontier: list[str] = []
-                for row in rows:
-                    a, b = row["source_id"], row["target_id"]
-                    for parent_id, child_id in ((a, b), (b, a)):
-                        if parent_id not in frontier_set:
-                            continue
-                        if child_id in visited:
-                            continue
-                        visited.add(child_id)
-                        parents[child_id] = parent_id
-                        next_frontier.append(child_id)
-                        if child_id == tgt_id:
-                            found = True
-                            break
-                    if found:
-                        break
-                if found:
+                next_frontier = self._bfs_step_postgres(
+                    conn=conn,
+                    frontier=frontier,
+                    tgt_id=tgt_id,
+                    visited=visited,
+                    parents=parents,
+                )
+                if next_frontier is None:
+                    found = True
                     break
                 frontier = next_frontier
 

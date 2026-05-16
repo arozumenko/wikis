@@ -2212,22 +2212,64 @@ class UnifiedWikiDB:
         Match strategy (first table with at least one hit wins):
           1. Exact ``symbol_name`` match
           2. ``rel_path`` match (file-path-as-label)
+
+        Each branch issues a ``COUNT(*)`` and a ``LIMIT 1`` query
+        rather than ``fetchall()``-ing the full match set — common
+        labels like ``__init__`` or ``main`` can match thousands of
+        rows in real codebases, and we only need the first plus the
+        cardinality.
         """
-        rows = self.conn.execute(
-            f"SELECT {self._NODE_COLS_FOR_PATH} FROM repo_nodes "
-            "WHERE symbol_name = ? ORDER BY node_id ASC",
-            (label,),
-        ).fetchall()
-        if rows:
-            return dict(rows[0]), len(rows)
-        rows = self.conn.execute(
-            f"SELECT {self._NODE_COLS_FOR_PATH} FROM repo_nodes "
-            "WHERE rel_path = ? ORDER BY node_id ASC",
-            (label,),
-        ).fetchall()
-        if rows:
-            return dict(rows[0]), len(rows)
+        for column in ("symbol_name", "rel_path"):
+            count = self.conn.execute(
+                f"SELECT COUNT(*) FROM repo_nodes WHERE {column} = ?",  # noqa: S608
+                (label,),
+            ).fetchone()[0]
+            if count:
+                row = self.conn.execute(
+                    f"SELECT {self._NODE_COLS_FOR_PATH} FROM repo_nodes "
+                    f"WHERE {column} = ? ORDER BY node_id ASC LIMIT 1",  # noqa: S608
+                    (label,),
+                ).fetchone()
+                if row is not None:
+                    return dict(row), int(count)
         return None, 0
+
+    def _bfs_step_sqlite(
+        self,
+        *,
+        frontier: list[str],
+        tgt_id: str,
+        visited: set[str],
+        parents: dict[str, str],
+    ) -> list[str] | None:
+        """One BFS layer expansion.
+
+        Returns the next frontier list, or ``None`` once ``tgt_id`` has
+        been discovered (caller stops the outer loop on ``None``).
+        ``visited`` and ``parents`` are mutated in place.
+        """
+        frontier_set = set(frontier)
+        next_frontier: list[str] = []
+        for chunk_start in range(0, len(frontier), self._BFS_FRONTIER_CHUNK):
+            chunk = frontier[chunk_start : chunk_start + self._BFS_FRONTIER_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT source_id, target_id FROM repo_edges "
+                f"WHERE source_id IN ({placeholders}) "
+                f"   OR target_id IN ({placeholders})",  # noqa: S608
+                (*chunk, *chunk),
+            ).fetchall()
+            for row in rows:
+                a, b = row[0], row[1]
+                for parent_id, child_id in ((a, b), (b, a)):
+                    if parent_id not in frontier_set or child_id in visited:
+                        continue
+                    visited.add(child_id)
+                    parents[child_id] = parent_id
+                    next_frontier.append(child_id)
+                    if child_id == tgt_id:
+                        return None
+        return next_frontier
 
     def shortest_path(
         self,
@@ -2271,36 +2313,14 @@ class UnifiedWikiDB:
         for _depth in range(max_depth):
             if not frontier:
                 break
-            next_frontier: list[str] = []
-            frontier_set = set(frontier)
-
-            for chunk_start in range(0, len(frontier), self._BFS_FRONTIER_CHUNK):
-                chunk = frontier[chunk_start : chunk_start + self._BFS_FRONTIER_CHUNK]
-                placeholders = ",".join("?" * len(chunk))
-                rows = self.conn.execute(
-                    f"SELECT source_id, target_id FROM repo_edges "
-                    f"WHERE source_id IN ({placeholders}) "
-                    f"   OR target_id IN ({placeholders})",
-                    (*chunk, *chunk),
-                ).fetchall()
-                for row in rows:
-                    a, b = row[0], row[1]
-                    for parent_id, child_id in ((a, b), (b, a)):
-                        if parent_id not in frontier_set:
-                            continue
-                        if child_id in visited:
-                            continue
-                        visited.add(child_id)
-                        parents[child_id] = parent_id
-                        next_frontier.append(child_id)
-                        if child_id == tgt_id:
-                            found = True
-                            break
-                    if found:
-                        break
-                if found:
-                    break
-            if found:
+            next_frontier = self._bfs_step_sqlite(
+                frontier=frontier,
+                tgt_id=tgt_id,
+                visited=visited,
+                parents=parents,
+            )
+            if next_frontier is None:
+                found = True
                 break
             frontier = next_frontier
 
