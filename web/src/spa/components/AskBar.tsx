@@ -200,12 +200,18 @@ export function AskBar({ onSubmit, disabled = false, repoLabel, placeholder: pla
                       aria-pressed={verifiedOnly}
                       sx={{
                         mr: 0.5,
+                        // Use `success.light` (not `success.main`) when
+                        // the preference is preserved-but-inactive so
+                        // the icon stays visibly "verified-coloured"
+                        // even though disabled. MUI's built-in
+                        // disabled opacity handles dimming for us —
+                        // stacking a manual opacity on top would drop
+                        // contrast below WCAG 1.4.11.
                         color: effectiveVerifiedOnly
                           ? 'success.main'
                           : verifiedOnly
                             ? 'success.light'
                             : 'text.secondary',
-                        opacity: verifiedOnly && !filterApplies ? 0.55 : 1,
                         '&:hover': {
                           color: effectiveVerifiedOnly ? 'success.light' : 'text.primary',
                         },
