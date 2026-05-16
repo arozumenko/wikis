@@ -1182,6 +1182,54 @@ async def _http_search_project(project_id: str, query: str, hop_depth: int, top_
         return resp.json()
 
 
+# ── Graph-native MCP resources (#121 Phase 3) ────────────────────────
+#
+# These are addressable, cacheable views over the same data exposed by
+# the graph-native tools (``get_graph_stats``, ``surprising_connections``).
+# Resources differ from tools in two ways that matter for AI IDE
+# clients:
+#   1. They have stable URIs so clients can subscribe / re-read on
+#      demand without re-discovering the tool surface.
+#   2. They are conventionally "list-and-read" rather than "call with
+#      args" — useful for pinning to a wiki and surfacing dashboards.
+#
+# ``wikis://open_questions`` from the original issue scope was
+# intentionally dropped (no backing data foundation today — would
+# require a new pipeline step). The two below cover the high-signal
+# use cases AI IDE clients have asked for.
+
+
+@mcp.resource("wikis://{wiki_id}/repo_stats")
+async def repo_stats_resource(wiki_id: str) -> dict[str, Any]:
+    """Graph statistics for a wiki, addressable by URI (#121 Phase 3).
+
+    Thin wrapper over ``get_graph_stats`` — same response shape, same
+    auth, same cache-key resolution. The resource form exists so MCP
+    clients can pin ``wikis://{wiki_id}/repo_stats`` in a dashboard /
+    sidebar without holding a tool-call slot.
+    """
+    return await get_graph_stats(wiki_id=wiki_id)
+
+
+@mcp.resource("wikis://{wiki_id}/surprising_connections")
+async def surprising_connections_resource(wiki_id: str) -> dict[str, Any]:
+    """Top surprising cross-cluster edges, addressable by URI.
+
+    Thin wrapper over the ``surprising_connections`` tool with the
+    tool's defaults (``top_n=10``, ``sample_edges_per_pair=3``,
+    ``context_depth=1``). Clients that need different parameters
+    should call the tool directly; this resource exists for the
+    common "show me what looks suspicious in this codebase" case.
+
+    Per the issue: "top surprises, refreshed on each generation" —
+    we don't cache today; each ``resources/read`` re-runs the SQL +
+    Jaccard scoring. Two indexed queries plus per-pair sample
+    hydration is cheap (<100ms on typical repos), so a TTL cache
+    isn't justified for v1.
+    """
+    return await surprising_connections(wiki_id=wiki_id)
+
+
 def main():
     """Entry point for standalone wikis-mcp CLI."""
     import sys

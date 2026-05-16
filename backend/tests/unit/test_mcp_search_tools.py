@@ -1006,3 +1006,132 @@ async def test_surprising_connections_returns_wiki_not_found():
         srv._current_user_id.reset(token)
         srv._wiki_management = old_mgmt
         srv._settings = old_settings
+
+
+# ---------------------------------------------------------------------------
+# #121 Phase 3: MCP resources — thin URI-addressable wrappers over the
+# graph-native tools. Verifies the resource templates are registered
+# with the correct URIs and that each handler delegates to its tool
+# with the wiki_id forwarded verbatim.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resources_registered_with_expected_uri_templates():
+    import mcp_server.server as srv
+
+    templates = await srv.mcp.list_resource_templates()
+    uris = {t.uriTemplate for t in templates}
+    assert "wikis://{wiki_id}/repo_stats" in uris
+    assert "wikis://{wiki_id}/surprising_connections" in uris
+
+
+@pytest.mark.asyncio
+async def test_repo_stats_resource_delegates_to_get_graph_stats():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.stats.return_value = {
+        "node_count": 7, "edge_count": 12,
+        "confidence_breakdown": {"extracted": 10, "inferred": 2, "ambiguous": 0},
+    }
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.repo_stats_resource(wiki_id="wiki-1")
+        # Resource is a thin pass-through — same shape as the tool.
+        assert result["node_count"] == 7
+        assert result["confidence_breakdown"]["extracted"] == 10
+        mock_mgmt.get_wiki.assert_awaited_once_with("wiki-1", user_id="test-user")
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_repo_stats_resource_surfaces_wiki_not_found():
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=None)
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        result = await srv.repo_stats_resource(wiki_id="missing")
+        assert "error" in result
+        assert "Wiki not found" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_resource_uses_default_args():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.compute_surprising_connections.return_value = {
+        "pairs": [], "skipped_pairs": 0,
+    }
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.surprising_connections_resource(wiki_id="wiki-1")
+        # Default parameters from the tool propagate through the
+        # resource: top_n=10, context_depth=1, sample_edges_per_pair=3.
+        fake_storage.compute_surprising_connections.assert_called_once_with(
+            top_n=10, context_depth=1, sample_edges_per_pair=3,
+        )
+        assert result == {"pairs": [], "skipped_pairs": 0}
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_resource_surfaces_wiki_not_found():
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=None)
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        result = await srv.surprising_connections_resource(wiki_id="missing")
+        assert "error" in result
+        assert "Wiki not found" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
