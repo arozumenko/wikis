@@ -704,6 +704,43 @@ class TestZig:
         assert "Extern" in structs
         assert "Plain" in structs
 
+    def test_error_union_wrapping_struct_recognised(self, tmp_path: Path) -> None:
+        """#153 regression: ``error{E}!struct {…}`` was the last form
+        the prior text-prefix heuristic missed (``!`` is a mid-token
+        separator). Structural ContainerDecl walk handles it.
+        """
+        src = tmp_path / "errunion.zig"
+        src.write_text(
+            'const SingleErr = error{X}!struct { field: u8 };\n'
+            'const MultiErr  = error{X, Y}!struct { a: u8, b: u8 };\n'
+            'const ErrEnum   = error{E}!enum { Foo, Bar };\n'
+        )
+        result = ZigParser(ZIG).parse_file(src)
+        structs = _names_by_type(result, SymbolType.STRUCT)
+        assert "SingleErr" in structs
+        assert "MultiErr" in structs
+        assert "ErrEnum" in structs
+
+    def test_nested_struct_literal_in_call_arg_not_classified(
+        self, tmp_path: Path,
+    ) -> None:
+        """The structural detection must reject struct LITERALS passed
+        as call arguments — only top-level container declarations
+        count. Otherwise ``const x = doStuff(struct{…})`` would be
+        wrongly classified as a struct declaration."""
+        src = tmp_path / "callarg.zig"
+        src.write_text(
+            'const Real    = struct { field: u8 };\n'
+            'const NotDecl = makeThing(struct { field: u8 });\n'
+        )
+        result = ZigParser(ZIG).parse_file(src)
+        structs = _names_by_type(result, SymbolType.STRUCT)
+        assert "Real" in structs
+        # NotDecl is a call expression whose argument happens to be
+        # a struct literal — NOT a struct declaration. Should be
+        # VARIABLE, not STRUCT.
+        assert "NotDecl" not in structs
+
 
 class TestGroovy:
     @pytest.fixture
