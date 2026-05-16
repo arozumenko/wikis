@@ -101,6 +101,13 @@ class WikiService:
         it before any ``await`` that could yield to a racing caller.
         """
         for inv in self._invocations.values():
+            # ``inv.id != ""`` guards against a defensive edge case:
+            # ``Invocation`` is a Pydantic model with ``id: str`` (no
+            # ``min_length`` constraint), so a malformed persisted
+            # payload could in theory deserialize with ``id=""``. We
+            # refuse to consider those as in-flight blockers — they'd
+            # always 409-lock the wiki without a usable id for the
+            # caller's response header.
             if (
                 inv.wiki_id == wiki_id
                 and inv.status in blocked_statuses

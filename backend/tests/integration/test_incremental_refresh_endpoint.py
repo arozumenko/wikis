@@ -207,7 +207,7 @@ class TestIncrementalRefreshEndpoint:
         assert resp.status_code == 409, resp.text
         # The in-flight invocation_id is surfaced so the caller can
         # subscribe to its SSE stream.
-        assert resp.headers["X-Incremental-Invocation-Id"] == "in-flight-fake"
+        assert resp.headers["X-In-Flight-Invocation-Id"] == "in-flight-fake"
 
     @pytest.mark.asyncio
     async def test_invocation_status_flips_terminal_after_run(
@@ -299,7 +299,7 @@ class TestIncrementalRefreshEndpoint:
             json=body,
         )
         assert resp.status_code == 409, resp.text
-        assert resp.headers["X-Incremental-Invocation-Id"] == "full-regen-fake"
+        assert resp.headers["X-In-Flight-Invocation-Id"] == "full-regen-fake"
 
     @pytest.mark.asyncio
     async def test_422_when_payload_exceeds_cap(self, client_and_setup) -> None:
