@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { MermaidDiagram } from './MermaidDiagram';
 import { CodeBlock } from './CodeBlock';
+import { CitationChips, type SourceRef } from './CitationChips';
 import type { Components } from 'react-markdown';
 
 function extractText(node: React.ReactNode): string {
@@ -22,9 +23,28 @@ interface AnswerViewProps {
   answer: string | null;
   loading: boolean;
   mode?: 'light' | 'dark';
+  /**
+   * Source citations from the underlying retrieval/agent run (#120
+   * Phase 3). When present, rendered as `CitationChips` below the
+   * answer markdown with per-source confidence indicators. Pass
+   * `[]` or omit to render the answer without a citation block.
+   */
+  sources?: SourceRef[];
+  /** Repository URL used to construct citation links (GitHub etc). */
+  repoUrl?: string;
+  /** Branch used to construct citation links. */
+  branch?: string;
 }
 
-export function AnswerView({ question, answer, loading, mode = 'dark' }: AnswerViewProps) {
+export function AnswerView({
+  question,
+  answer,
+  loading,
+  mode = 'dark',
+  sources,
+  repoUrl,
+  branch,
+}: AnswerViewProps) {
   const components: Components = {
     // Strip the outer <pre> that rehype-highlight wraps around <code>
     // to avoid double-card rendering (CodeBlock already provides its own <pre>)
@@ -138,6 +158,12 @@ export function AnswerView({ question, answer, loading, mode = 'dark' }: AnswerV
             />
           )}
         </Box>
+      )}
+
+      {/* Citations — only show once answer streaming completes so
+          chip order matches what the user sees in the final answer. */}
+      {answer && !loading && sources && sources.length > 0 && (
+        <CitationChips sources={sources} repoUrl={repoUrl} branch={branch} />
       )}
     </Box>
   );

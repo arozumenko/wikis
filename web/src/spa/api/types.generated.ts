@@ -212,6 +212,16 @@ export interface components {
              * @default 15
              */
             k: number;
+            /**
+             * Min Confidence
+             * Minimum edge-confidence label accepted during graph
+             * expansion (#120 Phase 2). One of `EXTRACTED`,
+             * `INFERRED`, `AMBIGUOUS`, or `null` (no filter).
+             * Manually added — keep in sync with
+             * backend/app/models/api.py::AskRequest until
+             * `npm run generate:types` runs.
+             */
+            min_confidence?: string | null;
         };
         /**
          * AskResponse
@@ -478,6 +488,18 @@ export interface components {
              * @default null
              */
             wiki_title: string | null;
+            /**
+             * Confidence
+             * Edge-confidence label (#120). EXTRACTED = direct parser
+             * observation, INFERRED = name-only resolution,
+             * AMBIGUOUS = reserved multi-target. `null` when the
+             * citation comes from a path with no edge metadata
+             * (e.g. a pure FTS hit). Manually added — keep in sync
+             * with `backend/app/models/api.py::SourceReference`
+             * until `npm run generate:types` runs.
+             * @default null
+             */
+            confidence: string | null;
         };
         /** ValidationError */
         ValidationError: {
