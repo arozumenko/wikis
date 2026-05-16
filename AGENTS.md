@@ -407,10 +407,6 @@ Every edge in `repo_edges` carries a `confidence` label that propagates from the
 - `search_graph` agent tool uses `_format_neighbors` (direct NetworkX walk) rather than `GraphQueryService` — bypasses the filter today. Smaller follow-up.
 - SPA citation chips rendering with confidence indicator — `CitationChips.tsx` / `SourceCitations.tsx` exist but aren't wired into any page; needs the SSE-source-collection-to-render pipeline plumbed end-to-end first.
 
-**Not yet surfaced** (#120 Phase 3, tracked separately):
-- `search_wiki` MCP tool's `min_confidence` param — the wikilink graph (`WikiPageIndex`) is in-memory and has no confidence column, so the filter would be a no-op there. Deferred until the wikilink graph either gains a confidence dimension or the MCP tool delegates to repo_edges-based search.
-- SPA citation chips rendering with confidence indicator — `CitationChips.tsx` / `SourceCitations.tsx` exist but aren't wired into any page; needs the SSE-source-collection-to-render pipeline plumbed end-to-end first.
-
 ### LLM Provider Pattern
 
 All providers implement `BaseLanguageModel` (LangChain). Add a new provider in `backend/app/services/llm_factory.py`:
