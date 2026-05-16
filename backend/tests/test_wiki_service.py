@@ -634,6 +634,70 @@ class TestWikiServiceShutdown:
         await task
 
     @pytest.mark.asyncio
+    async def test_cancel_invocation_refused_during_shutdown(self, service):
+        """#165 follow-up: a concurrent ``DELETE /invocations/{id}``
+        during the shutdown drain window must NOT cancel a task that
+        ``shutdown()`` is awaiting. Cancellation marks the asyncio.Task
+        done while leaving the worker thread mid-write — the exact
+        race the shutdown drain exists to prevent."""
+        async def slow():
+            await asyncio.sleep(0.2)
+
+        task = asyncio.create_task(slow())
+        service._tasks["inv-1"] = task
+        service._invocations["inv-1"] = Invocation(
+            id="inv-1",
+            wiki_id="w",
+            repo_url="https://example.invalid",
+            branch="main",
+            status="generating",
+        )
+
+        # Simulate the drain window: shutdown has started, mid-await.
+        service._shutting_down = True
+
+        cancelled = await service.cancel_invocation("inv-1")
+        assert cancelled is False
+        assert not task.cancelled()
+        assert not task.done()
+
+        # Clean up so pytest doesn't warn.
+        await task
+
+    @pytest.mark.asyncio
+    async def test_cancel_invocation_works_normally_when_not_shutting_down(
+        self, service,
+    ):
+        """The shutdown guard must not break the happy path."""
+        async def slow():
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(slow())
+        service._tasks["inv-1"] = task
+        service._invocations["inv-1"] = Invocation(
+            id="inv-1",
+            wiki_id="w",
+            repo_url="https://example.invalid",
+            branch="main",
+            status="generating",
+        )
+
+        cancelled = await service.cancel_invocation("inv-1")
+        assert cancelled is True
+        # The cancel takes effect on the next loop turn.
+        await asyncio.sleep(0)
+        assert task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_sets_shutting_down_flag(self, service):
+        """The drain-vs-cancel guard depends on this flag being set
+        before pending tasks are snapshotted — verify the
+        invariant."""
+        assert service._shutting_down is False
+        await service.shutdown(timeout=1.0)
+        assert service._shutting_down is True
+
+    @pytest.mark.asyncio
     async def test_lifespan_passes_configured_shutdown_timeout(
         self, tmp_path, monkeypatch,
     ):
