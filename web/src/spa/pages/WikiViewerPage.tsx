@@ -21,7 +21,7 @@ import { WikiPageView } from '../components/WikiPageView';
 import { OnThisPage } from '../components/OnThisPage';
 import { useRepoContext } from '../context/RepoContext';
 import { AskBar } from '../components/AskBar';
-import type { AskMode } from '../components/AskBar';
+import type { AskMode, MinConfidence } from '../components/AskBar';
 import { AnswerView } from '../components/AnswerView';
 import { AnswerHeader } from '../components/AnswerHeader';
 import { ToolCallPanel } from '../components/ToolCallPanel';
@@ -371,7 +371,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
   );
 
   const handleAsk = useCallback(
-    (question: string, mode: AskMode) => {
+    (question: string, mode: AskMode, minConfidence: MinConfidence = null) => {
       if (!wikiId) return;
 
       // Cancel any in-flight research stream
@@ -460,7 +460,17 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
       } else {
         const cancel = subscribeAskSSE(
           '/api/v1/ask',
-          { wiki_id: wikiId, question, chat_history: convHistory, k: 15 },
+          {
+            wiki_id: wikiId,
+            question,
+            chat_history: convHistory,
+            k: 15,
+            // #120 Phase 3: optional verified-only filter. Backend
+            // rejects unknown values via Pydantic validator, so we
+            // pass through whatever AskBar gave us (already
+            // canonicalised to uppercase enum) or omit when null.
+            ...(minConfidence ? { min_confidence: minConfidence } : {}),
+          },
           (event) => {
             if (event.type === 'thinking_step') {
               const e = event;
@@ -662,6 +672,9 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                         answer={turn.answer}
                         loading={turn.loading}
                         mode={mode}
+                        sources={turn.sources}
+                        repoUrl={wiki?.repo_url}
+                        branch={wiki?.branch}
                       />
                     </Box>
                   ))}

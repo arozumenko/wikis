@@ -35,7 +35,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AskBar } from '../components/AskBar';
-import type { AskMode } from '../components/AskBar';
+import type { AskMode, MinConfidence } from '../components/AskBar';
 import { AnswerHeader } from '../components/AnswerHeader';
 import { AnswerView } from '../components/AnswerView';
 import { ToolCallPanel } from '../components/ToolCallPanel';
@@ -389,7 +389,7 @@ export function ProjectPage() {
   }, [updateLastTurn]);
 
   const handleAsk = useCallback(
-    (question: string, mode: AskMode) => {
+    (question: string, mode: AskMode, minConfidence: MinConfidence = null) => {
       if (!projectId) return;
 
       cancelStreamRef.current?.();
@@ -440,7 +440,15 @@ export function ProjectPage() {
       } else {
         const cancel = subscribeAskSSE(
           '/api/v1/ask',
-          { project_id: projectId, question, chat_history: convHistory, k: 15 },
+          {
+            project_id: projectId,
+            question,
+            chat_history: convHistory,
+            k: 15,
+            // #120 Phase 3: optional verified-only filter — see
+            // WikiViewerPage for the analogous wiki-scoped call.
+            ...(minConfidence ? { min_confidence: minConfidence } : {}),
+          },
           (event) => {
             if (event.type === 'thinking_step') {
               handleThinkingStep(event as unknown as Record<string, unknown>);
@@ -520,6 +528,10 @@ export function ProjectPage() {
                     answer={turn.answer}
                     loading={turn.loading}
                     mode="dark"
+                    sources={turn.sources}
+                    /* Project spans multiple repos, so we don't have a
+                       single repo_url/branch to thread through. Chips
+                       render as non-clickable in that case. */
                   />
                 </Box>
                 {/* Code Map + Tool Calls — per turn */}

@@ -1,10 +1,20 @@
-import { Box, Chip, Typography } from '@mui/material';
+import { Box, Chip, Tooltip, Typography } from '@mui/material';
 import DescriptionIcon from '@mui/icons-material/Description';
+import VerifiedIcon from '@mui/icons-material/Verified';
+import HelpOutlineIcon from '@mui/icons-material/HelpOutline';
 
 interface SourceRef {
   file_path: string;
   line_start?: number | null;
   line_end?: number | null;
+  /**
+   * Edge-confidence label propagated from the underlying graph
+   * (#120). `EXTRACTED` = direct parser observation, `INFERRED` =
+   * name-only resolution, `AMBIGUOUS` = reserved. `null` / missing
+   * means the citation came from a path with no edge metadata
+   * (e.g. a pure FTS hit) — render without an indicator.
+   */
+  confidence?: string | null;
 }
 
 interface CitationChipsProps {
@@ -33,6 +43,50 @@ function shortPath(filePath: string): string {
   return `.../${parts.slice(-2).join('/')}`;
 }
 
+// #120 Phase 3: per-confidence rendering metadata. Keeping the
+// definitions next to the component (rather than a separate const
+// module) since they're tightly coupled to the chip's visual style.
+interface ConfidenceMeta {
+  /** MUI chip color token. */
+  color: 'success' | 'warning' | 'default';
+  /** Single short word for the label suffix. */
+  label: string;
+  /** Hover tooltip body. */
+  tooltip: string;
+  /** Optional leading icon override (otherwise we use DescriptionIcon). */
+  icon: React.ReactElement;
+}
+
+const CONFIDENCE_META: Record<string, ConfidenceMeta> = {
+  EXTRACTED: {
+    color: 'success',
+    label: 'verified',
+    tooltip:
+      'Verified: the underlying graph edge was directly observed by the parser. Highest trust signal.',
+    icon: <VerifiedIcon sx={{ fontSize: 14 }} />,
+  },
+  INFERRED: {
+    color: 'warning',
+    label: 'inferred',
+    tooltip:
+      'Inferred: the edge was resolved by name only (no type context or cross-file disambiguation). Useful but may cite the wrong target when symbol names collide.',
+    icon: <HelpOutlineIcon sx={{ fontSize: 14 }} />,
+  },
+  AMBIGUOUS: {
+    color: 'default',
+    label: 'ambiguous',
+    tooltip:
+      'Ambiguous: multiple plausible targets matched. Reserved for future use; treat similar to inferred for now.',
+    icon: <HelpOutlineIcon sx={{ fontSize: 14 }} />,
+  },
+};
+
+function metaFor(confidence?: string | null): ConfidenceMeta | null {
+  if (!confidence) return null;
+  // Backend canonicalises to uppercase; tolerate lowercase too.
+  return CONFIDENCE_META[confidence.toUpperCase()] ?? null;
+}
+
 export function CitationChips({ sources, repoUrl, branch = 'main' }: CitationChipsProps) {
   if (sources.length === 0) return null;
 
@@ -53,13 +107,16 @@ export function CitationChips({ sources, repoUrl, branch = 'main' }: CitationChi
               ? buildUrl(repoUrl, src.file_path, branch, src.line_start)
               : undefined;
 
-          return (
+          const meta = metaFor(src.confidence);
+
+          const chip = (
             <Chip
               key={i}
-              icon={<DescriptionIcon sx={{ fontSize: 14 }} />}
+              icon={meta?.icon ?? <DescriptionIcon sx={{ fontSize: 14 }} />}
               label={label}
               size="small"
               variant="outlined"
+              color={meta?.color ?? 'default'}
               component={url ? 'a' : 'span'}
               href={url}
               target="_blank"
@@ -72,6 +129,25 @@ export function CitationChips({ sources, repoUrl, branch = 'main' }: CitationChi
                 '& .MuiChip-icon': { ml: 0.5 },
               }}
             />
+          );
+
+          // Wrap in a Tooltip only when we have a confidence label
+          // to explain — keeps the bare chip behavior unchanged for
+          // citations without graph-edge confidence.
+          return meta ? (
+            <Tooltip
+              key={i}
+              title={meta.tooltip}
+              arrow
+              placement="top"
+            >
+              {/* Tooltip needs a real DOM child wrapper for the
+                  anchor element when the inner element doesn't
+                  forward refs (the Chip-as-link case). */}
+              <span style={{ display: 'inline-flex' }}>{chip}</span>
+            </Tooltip>
+          ) : (
+            chip
           );
         })}
       </Box>

@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   Box,
   IconButton,
@@ -6,34 +6,80 @@ import {
   Menu,
   MenuItem,
   TextField,
+  Tooltip,
   Typography,
 } from '@mui/material';
 import SendIcon from '@mui/icons-material/Send';
 import BoltIcon from '@mui/icons-material/Bolt';
 import SearchIcon from '@mui/icons-material/Search';
 import AccountTreeIcon from '@mui/icons-material/AccountTree';
+import VerifiedIcon from '@mui/icons-material/Verified';
+import VerifiedOutlinedIcon from '@mui/icons-material/VerifiedOutlined';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 
 export type AskMode = 'fast' | 'deep' | 'codemap';
 
+/** Backend-side minimum-edge-confidence filter (#120 Phase 2). */
+export type MinConfidence = 'EXTRACTED' | 'INFERRED' | 'AMBIGUOUS' | null;
+
 interface AskBarProps {
-  onSubmit: (question: string, mode: AskMode) => void;
+  /**
+   * Submit handler. `minConfidence` is non-null when the user has
+   * enabled the verified-only toggle (then sent as `min_confidence`
+   * on the `/api/v1/ask` request). Only honoured for `fast` mode —
+   * Deep Research / Code Map run through a different path that
+   * doesn't accept the filter yet (tracked in #120).
+   */
+  onSubmit: (question: string, mode: AskMode, minConfidence: MinConfidence) => void;
   disabled?: boolean;
   repoLabel?: string;
   placeholder?: string;
+}
+
+const VERIFIED_ONLY_STORAGE_KEY = 'wikis:askbar:verifiedOnly';
+
+function readVerifiedOnly(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem(VERIFIED_ONLY_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeVerifiedOnly(value: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(VERIFIED_ONLY_STORAGE_KEY, value ? '1' : '0');
+  } catch {
+    /* localStorage may be disabled — ignore */
+  }
 }
 
 export function AskBar({ onSubmit, disabled = false, repoLabel, placeholder: placeholderProp }: AskBarProps) {
   const [input, setInput] = useState('');
   const [mode, setMode] = useState<AskMode>('fast');
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
+  // #120 Phase 3: verified-only filter. Persist across mounts so a
+  // user who turns it on for one wiki has it on for their next ask.
+  const [verifiedOnly, setVerifiedOnly] = useState<boolean>(readVerifiedOnly);
+
+  useEffect(() => {
+    writeVerifiedOnly(verifiedOnly);
+  }, [verifiedOnly]);
+
+  // Filter currently only takes effect in `fast` mode — surface that
+  // to the user instead of silently dropping the param.
+  const filterApplies = mode === 'fast';
+  const effectiveVerifiedOnly = verifiedOnly && filterApplies;
 
   const handleSubmit = useCallback(() => {
     const question = input.trim();
     if (!question || disabled) return;
-    onSubmit(question, mode);
+    const minConfidence: MinConfidence = effectiveVerifiedOnly ? 'EXTRACTED' : null;
+    onSubmit(question, mode, minConfidence);
     setInput('');
-  }, [input, mode, disabled, onSubmit]);
+  }, [input, mode, disabled, onSubmit, effectiveVerifiedOnly]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -132,6 +178,38 @@ export function AskBar({ onSubmit, disabled = false, repoLabel, placeholder: pla
             ),
             endAdornment: (
               <InputAdornment position="end">
+                <Tooltip
+                  title={
+                    filterApplies
+                      ? verifiedOnly
+                        ? 'Verified-only: limit graph expansion to parser-observed edges (highest trust). Click to disable.'
+                        : 'Verified-only: limit graph expansion to parser-observed edges (highest trust). Click to enable.'
+                      : 'Verified-only filter applies to Fast mode only.'
+                  }
+                  arrow
+                  placement="top"
+                >
+                  <span>
+                    <IconButton
+                      onClick={() => setVerifiedOnly((v) => !v)}
+                      disabled={!filterApplies}
+                      size="small"
+                      aria-label="Toggle verified-only filter"
+                      aria-pressed={effectiveVerifiedOnly}
+                      sx={{
+                        mr: 0.5,
+                        color: effectiveVerifiedOnly ? 'success.main' : 'text.secondary',
+                        '&:hover': { color: effectiveVerifiedOnly ? 'success.light' : 'text.primary' },
+                      }}
+                    >
+                      {effectiveVerifiedOnly ? (
+                        <VerifiedIcon fontSize="small" />
+                      ) : (
+                        <VerifiedOutlinedIcon fontSize="small" />
+                      )}
+                    </IconButton>
+                  </span>
+                </Tooltip>
                 <IconButton
                   onClick={handleSubmit}
                   disabled={!input.trim() || disabled}
