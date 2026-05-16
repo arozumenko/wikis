@@ -639,6 +639,15 @@ async def _open_wiki_storage(wiki_id: str) -> tuple[Any, str | None]:
 
     Returns ``(storage, None)`` on success or ``(None, error_message)``
     when the wiki is unknown / unowned / has no on-disk index.
+
+    Path-safety note: ``wiki_id`` is **never** joined into a filesystem
+    path directly. The on-disk DB path derives from the wiki record's
+    ``repo_url`` + ``branch`` via ``derive_cache_key`` — the
+    caller-supplied ``wiki_id`` is only used as a DB lookup key. A
+    malicious traversal string like ``../../etc/passwd`` fails the
+    ``get_wiki`` lookup and returns a not-found error. Preserve this
+    invariant: any future refactor that uses ``wiki_id`` in a path
+    join would reintroduce a traversal risk.
     """
     if not _wiki_management or not _settings:
         return None, "graph tools unavailable in this deployment"
@@ -1199,6 +1208,23 @@ async def _http_search_project(project_id: str, query: str, hop_depth: int, top_
 # use cases AI IDE clients have asked for.
 
 
+def _resource_or_raise(result: dict[str, Any]) -> dict[str, Any]:
+    """Translate a tool's ``{"error": str}`` payload into an exception.
+
+    MCP tools historically return ``{"error": "..."}`` on failure; the
+    FastMCP tool dispatcher wraps those into proper JSON-RPC error
+    responses. ``resources/read`` doesn't have the same wrapping —
+    returning an error dict would surface as a successful read with a
+    malformed body, and many clients treat HTTP 200 + content as
+    "success" and feed the dict to the LLM. Raising a ``ValueError``
+    lets FastMCP convert the failure into a JSON-RPC error the way
+    every other resource handler is expected to.
+    """
+    if isinstance(result, dict) and "error" in result:
+        raise ValueError(result["error"])
+    return result
+
+
 @mcp.resource("wikis://{wiki_id}/repo_stats")
 async def repo_stats_resource(wiki_id: str) -> dict[str, Any]:
     """Graph statistics for a wiki, addressable by URI (#121 Phase 3).
@@ -1207,8 +1233,12 @@ async def repo_stats_resource(wiki_id: str) -> dict[str, Any]:
     auth, same cache-key resolution. The resource form exists so MCP
     clients can pin ``wikis://{wiki_id}/repo_stats`` in a dashboard /
     sidebar without holding a tool-call slot.
+
+    Raises ``ValueError`` on wiki-not-found / missing-index so MCP
+    clients see a proper JSON-RPC error rather than an error-shaped
+    success payload.
     """
-    return await get_graph_stats(wiki_id=wiki_id)
+    return _resource_or_raise(await get_graph_stats(wiki_id=wiki_id))
 
 
 @mcp.resource("wikis://{wiki_id}/surprising_connections")
@@ -1217,17 +1247,22 @@ async def surprising_connections_resource(wiki_id: str) -> dict[str, Any]:
 
     Thin wrapper over the ``surprising_connections`` tool with the
     tool's defaults (``top_n=10``, ``sample_edges_per_pair=3``,
-    ``context_depth=1``). Clients that need different parameters
-    should call the tool directly; this resource exists for the
-    common "show me what looks suspicious in this codebase" case.
+    ``context_depth=1`` pinned inside the tool). Clients that need
+    different parameters should call the tool directly; this resource
+    exists for the common "show me what looks suspicious in this
+    codebase" case.
 
     Per the issue: "top surprises, refreshed on each generation" —
     we don't cache today; each ``resources/read`` re-runs the SQL +
     Jaccard scoring. Two indexed queries plus per-pair sample
     hydration is cheap (<100ms on typical repos), so a TTL cache
     isn't justified for v1.
+
+    Raises ``ValueError`` on wiki-not-found / missing-index so MCP
+    clients see a proper JSON-RPC error rather than an error-shaped
+    success payload.
     """
-    return await surprising_connections(wiki_id=wiki_id)
+    return _resource_or_raise(await surprising_connections(wiki_id=wiki_id))
 
 
 def main():

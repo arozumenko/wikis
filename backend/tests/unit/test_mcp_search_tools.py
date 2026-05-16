@@ -1060,7 +1060,10 @@ async def test_repo_stats_resource_delegates_to_get_graph_stats():
 
 
 @pytest.mark.asyncio
-async def test_repo_stats_resource_surfaces_wiki_not_found():
+async def test_repo_stats_resource_raises_on_wiki_not_found():
+    """Resource handlers must raise on failure so FastMCP emits a
+    proper JSON-RPC error — returning ``{"error": ...}`` would surface
+    as a successful read with a malformed body."""
     import mcp_server.server as srv
 
     mock_mgmt = AsyncMock()
@@ -1072,9 +1075,8 @@ async def test_repo_stats_resource_surfaces_wiki_not_found():
     try:
         srv._wiki_management = mock_mgmt
         srv._settings = mock_settings
-        result = await srv.repo_stats_resource(wiki_id="missing")
-        assert "error" in result
-        assert "Wiki not found" in result["error"]
+        with pytest.raises(ValueError, match="Wiki not found"):
+            await srv.repo_stats_resource(wiki_id="missing")
     finally:
         srv._current_user_id.reset(token)
         srv._wiki_management = old_mgmt
@@ -1116,7 +1118,7 @@ async def test_surprising_connections_resource_uses_default_args():
 
 
 @pytest.mark.asyncio
-async def test_surprising_connections_resource_surfaces_wiki_not_found():
+async def test_surprising_connections_resource_raises_on_wiki_not_found():
     import mcp_server.server as srv
 
     mock_mgmt = AsyncMock()
@@ -1128,9 +1130,8 @@ async def test_surprising_connections_resource_surfaces_wiki_not_found():
     try:
         srv._wiki_management = mock_mgmt
         srv._settings = mock_settings
-        result = await srv.surprising_connections_resource(wiki_id="missing")
-        assert "error" in result
-        assert "Wiki not found" in result["error"]
+        with pytest.raises(ValueError, match="Wiki not found"):
+            await srv.surprising_connections_resource(wiki_id="missing")
     finally:
         srv._current_user_id.reset(token)
         srv._wiki_management = old_mgmt
