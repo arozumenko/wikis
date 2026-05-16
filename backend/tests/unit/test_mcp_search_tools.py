@@ -912,3 +912,98 @@ async def test_get_community_rejects_out_of_range_limit():
         wiki_id="wiki-1", macro_cluster=3, limit=2001,
     )
     assert "error" in result and "limit" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# #121 Phase 2: surprising_connections — verify the MCP tool forwards
+# parameters to storage and validates the input ranges. Storage-level
+# Jaccard scoring + ranking lives in test_unified_db_surprising_connections.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_forwards_args():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.compute_surprising_connections.return_value = {
+        "pairs": [
+            {
+                "cluster_a": 1, "cluster_b": 2,
+                "jaccard_distance": 1.0,
+                "context_a": ["frontend"], "context_b": ["backend"],
+                "edge_count": 2,
+                "sample_edges": [
+                    {"source_id": "F1", "target_id": "B1",
+                     "rel_type": "calls", "confidence": "EXTRACTED"},
+                ],
+            },
+        ],
+    }
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.surprising_connections(
+                wiki_id="wiki-1",
+                top_n=5,
+                context_depth=2,
+                sample_edges_per_pair=4,
+            )
+
+        fake_storage.compute_surprising_connections.assert_called_once_with(
+            top_n=5, context_depth=2, sample_edges_per_pair=4,
+        )
+        assert result["pairs"][0]["cluster_a"] == 1
+        fake_storage.close.assert_called_once()
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_rejects_out_of_range_args():
+    import mcp_server.server as srv
+
+    for kwargs in (
+        {"top_n": 0},
+        {"top_n": 101},
+        {"context_depth": 0},
+        {"context_depth": 6},
+        {"sample_edges_per_pair": 0},
+        {"sample_edges_per_pair": 11},
+    ):
+        result = await srv.surprising_connections(wiki_id="wiki-1", **kwargs)
+        assert "error" in result, f"Expected error for {kwargs}, got {result}"
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_returns_wiki_not_found():
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=None)
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        result = await srv.surprising_connections(wiki_id="missing")
+        assert "error" in result
+        assert "Wiki not found" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings

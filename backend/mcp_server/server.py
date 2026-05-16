@@ -860,6 +860,72 @@ async def get_community(
 
 
 @mcp.tool()
+async def surprising_connections(
+    wiki_id: str,
+    top_n: int = 10,
+    context_depth: int = 1,
+    sample_edges_per_pair: int = 3,
+) -> dict[str, Any]:
+    """Find the most surprising cross-cluster edges in the graph (#121).
+
+    A connection between two macro communities is "surprising" when
+    their **contexts** — the set of top-level folder prefixes
+    containing their nodes — are highly disjoint. Quantified as
+    Jaccard distance over the prefix sets. ``frontend/`` linking to
+    ``backend/`` is more surprising than two ``backend/`` clusters
+    linking to each other.
+
+    Useful for AI IDE clients to surface "this edge crosses
+    architectural boundaries — worth a closer look" without paying
+    LLM cost or retrieval cost.
+
+    Args:
+        wiki_id: Wiki identifier from ``search_wikis()``.
+        top_n: Maximum cluster-pairs to return (1-100, default 10).
+        context_depth: How many leading ``rel_path`` segments form
+            the cluster context (1-5, default 1 = top-level folder).
+        sample_edges_per_pair: Example edges to include per pair
+            (1-10, default 3).
+
+    Returns:
+        Dict with ``pairs`` (list, sorted by ``jaccard_distance``
+        descending). Each pair has ``cluster_a`` / ``cluster_b``
+        (always ``cluster_a < cluster_b``), ``jaccard_distance``
+        (0.0 - 1.0), ``context_a`` / ``context_b`` (sorted prefix
+        lists), ``edge_count``, ``sample_edges``. Empty list when
+        no cross-cluster edges exist.
+    """
+    if not 1 <= top_n <= 100:
+        return {"error": f"top_n must be between 1 and 100, got {top_n}"}
+    if not 1 <= context_depth <= 5:
+        return {
+            "error": (
+                f"context_depth must be between 1 and 5, "
+                f"got {context_depth}"
+            ),
+        }
+    if not 1 <= sample_edges_per_pair <= 10:
+        return {
+            "error": (
+                f"sample_edges_per_pair must be between 1 and 10, "
+                f"got {sample_edges_per_pair}"
+            ),
+        }
+
+    storage, err = await _open_wiki_storage(wiki_id)
+    if err:
+        return {"error": err}
+    try:
+        return storage.compute_surprising_connections(
+            top_n=top_n,
+            context_depth=context_depth,
+            sample_edges_per_pair=sample_edges_per_pair,
+        )
+    finally:
+        _close_storage_quietly(storage)
+
+
+@mcp.tool()
 async def get_page_neighbors(
     wiki_id: str,
     page_title: str,

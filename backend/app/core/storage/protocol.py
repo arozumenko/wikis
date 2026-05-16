@@ -643,6 +643,54 @@ class WikiStorageProtocol(Protocol):
         """
         ...
 
+    def compute_surprising_connections(
+        self,
+        top_n: int = 10,
+        context_depth: int = 1,
+        sample_edges_per_pair: int = 3,
+    ) -> dict[str, Any]:
+        """Cross-cluster edge pairs ranked by surprise (#121 Phase 2).
+
+        A "surprising connection" is an edge between two macro
+        clusters whose **contexts** (the set of top-level folder
+        prefixes containing their nodes) are highly disjoint.
+        Quantified as Jaccard distance: ``1 - |A ∩ B| / |A ∪ B|``
+        over the two clusters' context sets.
+
+        Implementations should:
+          1. Aggregate cross-cluster edges per unordered cluster pair
+             ``(min, max)`` to count edges and gather a canonical
+             representative pair list (no double-counting).
+          2. For each cluster appearing in those pairs, compute the
+             context — the set of ``rel_path`` prefixes truncated to
+             ``context_depth`` segments. ``context_depth=1`` means
+             top-level folder names (e.g. ``frontend``, ``backend``).
+          3. Compute Jaccard distance per pair using cached contexts.
+          4. Return the top-``top_n`` pairs sorted by Jaccard distance
+             descending, each with up to
+             ``sample_edges_per_pair`` example edges + hydrated source
+             / target metadata so MCP clients have something concrete
+             to surface.
+
+        Args:
+            top_n: Maximum pairs to return.
+            context_depth: How many leading ``rel_path`` segments
+                count as the cluster's context (1 = top-level folder).
+            sample_edges_per_pair: How many example edges to include
+                per pair.
+
+        Returns:
+            Dict with ``pairs`` (list, sorted by ``jaccard_distance``
+            descending). Each pair has ``cluster_a``, ``cluster_b``
+            (always ``cluster_a < cluster_b``), ``jaccard_distance``
+            (0.0 - 1.0), ``context_a``, ``context_b`` (sorted prefix
+            lists), ``edge_count``, and ``sample_edges`` (list of
+            ``{source_id, target_id, rel_type, confidence,
+            source_name, source_path, target_name, target_path}``).
+            Empty ``pairs`` list when no cross-cluster edges exist.
+        """
+        ...
+
     # ==================================================================
     # WIKI PAGES + source→page reverse index (#116 incremental regen)
     # ==================================================================
