@@ -113,11 +113,36 @@ def test_resolves_by_rel_path_when_symbol_name_misses(db):
 
 
 def test_source_equals_target_returns_zero_length(db):
+    """Same-node is a success case (length 0 is the signal — no `reason`
+    is set, so callers don't have to special-case a hybrid contract)."""
     result = db.shortest_path("Alpha", "Alpha")
     assert result["length"] == 0
-    assert result["reason"] == "same_node"
+    assert "reason" not in result  # contract: success path has no reason key
     assert result["edges"] == []
     assert [n["node_id"] for n in result["path"]] == ["A"]
+
+
+def test_ambiguous_source_label_surfaces_candidate_count(db):
+    """When a label resolves to multiple nodes, the response carries
+    ``source_candidates`` / ``target_candidates`` so callers can detect
+    the ambiguity instead of silently using the lowest-node_id match."""
+    # Add a second node with the same symbol_name as Alpha (A) in a
+    # different file. _resolve_label should still pick the lowest
+    # node_id but report a count of 2.
+    db.upsert_node(
+        "A2",
+        rel_path="dup_alpha.py",
+        symbol_name="Alpha",
+        symbol_type="class",
+        language="python",
+    )
+    db.conn.commit()
+
+    result = db.shortest_path("Alpha", "Beta")
+    # First-match deterministic: node_id "A" comes before "A2".
+    assert result["source"]["node_id"] == "A"
+    assert result["source_candidates"] == 2
+    assert result["target_candidates"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -178,3 +203,61 @@ def test_prefers_extracted_edge_when_multiple_exist_between_hops(db):
     assert result["length"] == 1
     assert result["edges"][0]["confidence"] == "EXTRACTED"
     assert result["edges"][0]["rel_type"] == "inheritance"
+
+
+# ---------------------------------------------------------------------------
+# Perf-regression guard — the original SQL-recursive-CTE draft hung at
+# this size (>8s on a 7×7 grid at default max_depth). The current
+# Python-layered-BFS impl with a visited set is O(V+E); this test
+# pins the runtime so a regression to the old algorithm would be
+# caught immediately rather than only in production.
+# ---------------------------------------------------------------------------
+
+
+def test_dense_grid_bfs_returns_quickly(tmp_path):
+    """7×7 grid, no path between opposite corners — worst-case search
+    (must exhaust the reachable component before giving up). Asserts
+    the BFS completes well under one second; the old CTE timed out
+    at >8s here.
+    """
+    import time
+
+    db = UnifiedWikiDB(tmp_path / "grid.wiki.db", embedding_dim=8)
+    try:
+        # Build a 7×7 connected grid (rows × cols).
+        for r in range(7):
+            for c in range(7):
+                nid = f"n_{r}_{c}"
+                db.upsert_node(
+                    nid,
+                    rel_path=f"r{r}/c{c}.py",
+                    symbol_name=nid,
+                    symbol_type="class",
+                    language="python",
+                )
+        for r in range(7):
+            for c in range(7):
+                if c < 6:
+                    db.upsert_edge(f"n_{r}_{c}", f"n_{r}_{c+1}", "calls")
+                if r < 6:
+                    db.upsert_edge(f"n_{r}_{c}", f"n_{r+1}_{c}", "calls")
+        # Add a disconnected node so opposite-corner traversal still
+        # has to exhaust the connected component when target is the
+        # disconnected node.
+        db.upsert_node(
+            "n_oof",
+            rel_path="oof.py",
+            symbol_name="n_oof",
+            symbol_type="class",
+            language="python",
+        )
+        db.conn.commit()
+
+        start = time.perf_counter()
+        result = db.shortest_path("n_0_0", "n_oof", max_depth=25)
+        elapsed = time.perf_counter() - start
+
+        assert result == {"path": None, "reason": "no_path_within_max_depth"}
+        assert elapsed < 1.0, f"shortest_path on 7x7 grid took {elapsed:.2f}s"
+    finally:
+        db.close()

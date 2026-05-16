@@ -625,6 +625,59 @@ async def search_wiki(
     return await _http_search_wiki(wiki_id, query, hop_depth, top_k)
 
 
+# ── Shared storage-open helper for graph-native MCP tools ────────────
+#
+# Resolves ``wiki_id`` → an open read-only ``WikiStorageProtocol``
+# handle, applying the same auth + cache-key derivation used by every
+# graph tool (``get_graph_stats``, ``god_nodes``, ``shortest_path``,
+# ``get_community``). Returns an error string instead of raising so
+# tools can forward it verbatim in their JSON response.
+
+
+async def _open_wiki_storage(wiki_id: str) -> tuple[Any, str | None]:
+    """Resolve ``wiki_id`` → open read-only storage handle.
+
+    Returns ``(storage, None)`` on success or ``(None, error_message)``
+    when the wiki is unknown / unowned / has no on-disk index.
+    """
+    if not _wiki_management or not _settings:
+        return None, "graph tools unavailable in this deployment"
+
+    user_id = _current_user_id.get()
+    wiki_record = await _wiki_management.get_wiki(wiki_id, user_id=user_id)
+    if wiki_record is None:
+        return None, (
+            f"Wiki not found: {wiki_id}. Use search_wikis() to find "
+            f"available wiki IDs."
+        )
+
+    from pathlib import Path
+
+    from app.core.storage import open_storage
+    from app.services.wiki_management import derive_cache_key
+
+    cache_key = derive_cache_key(
+        _settings.cache_dir, wiki_record.repo_url, wiki_record.branch,
+    )
+    if not cache_key:
+        return None, f"Wiki {wiki_id} has no cached index."
+    db_path = Path(_settings.cache_dir) / f"{cache_key}.wiki.db"
+    if not db_path.exists():
+        return None, f"Wiki {wiki_id} has no unified DB on disk."
+
+    storage = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
+    return storage, None
+
+
+def _close_storage_quietly(storage: Any) -> None:
+    if storage is None:
+        return
+    try:
+        storage.close()
+    except Exception:  # noqa: S110 — best-effort close
+        pass
+
+
 @mcp.tool()
 async def get_graph_stats(wiki_id: str) -> dict[str, Any]:
     """Return summary statistics for a wiki's underlying code graph (#120).
@@ -645,44 +698,13 @@ async def get_graph_stats(wiki_id: str) -> dict[str, Any]:
         ``hub_count``, and ``embedding_dim``. Shape is stable — keys
         always present even when counts are zero.
     """
-    if not _wiki_management or not _settings:
-        return {"error": "graph_stats unavailable in this deployment"}
-
-    user_id = _current_user_id.get()
-    wiki_record = await _wiki_management.get_wiki(wiki_id, user_id=user_id)
-    if wiki_record is None:
-        return {
-            "error": (
-                f"Wiki not found: {wiki_id}. Use search_wikis() to find "
-                f"available wiki IDs."
-            ),
-        }
-
-    # Resolve the per-wiki unified DB path via the same cache-key
-    # derivation that ``incremental_refresh`` uses, then open the
-    # backend-specific storage. Read-only so we don't need a lock.
-    from pathlib import Path
-
-    from app.core.storage import open_storage
-    from app.services.wiki_management import _derive_cache_key
-
-    cache_key = _derive_cache_key(
-        _settings.cache_dir, wiki_record.repo_url, wiki_record.branch,
-    )
-    if not cache_key:
-        return {"error": f"Wiki {wiki_id} has no cached index."}
-    db_path = Path(_settings.cache_dir) / f"{cache_key}.wiki.db"
-    if not db_path.exists():
-        return {"error": f"Wiki {wiki_id} has no unified DB on disk."}
-
-    storage = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
+    storage, err = await _open_wiki_storage(wiki_id)
+    if err:
+        return {"error": err}
     try:
         return storage.stats()
     finally:
-        try:
-            storage.close()
-        except Exception:  # noqa: S110 — best-effort close
-            pass
+        _close_storage_quietly(storage)
 
 
 # ── Graph-native MCP surface (#121 Phase 1) ──────────────────────────
@@ -691,53 +713,8 @@ async def get_graph_stats(wiki_id: str) -> dict[str, Any]:
 # from the unified DB — no LLM, no retrieval. AI IDE clients use these
 # for "what calls X?", "shortest dependency chain between X and Y", and
 # "all nodes in cluster N" without paying retrieval cost. All three
-# share the same `_open_wiki_storage` resolution path so auth + cache-
-# key lookup is consistent with ``get_graph_stats``.
-
-
-async def _open_wiki_storage(wiki_id: str) -> tuple[Any, str | None]:
-    """Resolve ``wiki_id`` → open read-only storage handle (#121).
-
-    Returns ``(storage, None)`` on success or ``(None, error_message)``
-    when the wiki is unknown / unowned / has no on-disk index. The
-    error string is suitable for returning directly to the MCP client.
-    """
-    if not _wiki_management or not _settings:
-        return None, "graph tools unavailable in this deployment"
-
-    user_id = _current_user_id.get()
-    wiki_record = await _wiki_management.get_wiki(wiki_id, user_id=user_id)
-    if wiki_record is None:
-        return None, (
-            f"Wiki not found: {wiki_id}. Use search_wikis() to find "
-            f"available wiki IDs."
-        )
-
-    from pathlib import Path
-
-    from app.core.storage import open_storage
-    from app.services.wiki_management import _derive_cache_key
-
-    cache_key = _derive_cache_key(
-        _settings.cache_dir, wiki_record.repo_url, wiki_record.branch,
-    )
-    if not cache_key:
-        return None, f"Wiki {wiki_id} has no cached index."
-    db_path = Path(_settings.cache_dir) / f"{cache_key}.wiki.db"
-    if not db_path.exists():
-        return None, f"Wiki {wiki_id} has no unified DB on disk."
-
-    storage = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
-    return storage, None
-
-
-def _close_storage_quietly(storage: Any) -> None:
-    if storage is None:
-        return
-    try:
-        storage.close()
-    except Exception:  # noqa: S110 — best-effort close
-        pass
+# share ``_open_wiki_storage`` so auth + cache-key lookup is
+# consistent with ``get_graph_stats``.
 
 
 @mcp.tool()

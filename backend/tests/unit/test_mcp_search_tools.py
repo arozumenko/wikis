@@ -549,7 +549,7 @@ async def test_get_graph_stats_returns_storage_stats_dict():
 
         with (
             patch(
-                "app.services.wiki_management._derive_cache_key",
+                "app.services.wiki_management.derive_cache_key",
                 return_value="cachekey-123",
             ),
             patch("pathlib.Path.exists", return_value=True),
@@ -620,7 +620,7 @@ async def test_get_graph_stats_no_cache_key_returns_error():
         srv._settings = mock_settings
 
         with patch(
-            "app.services.wiki_management._derive_cache_key",
+            "app.services.wiki_management.derive_cache_key",
             return_value=None,
         ):
             result = await srv.get_graph_stats(wiki_id="wiki-1")
@@ -655,7 +655,7 @@ async def test_get_graph_stats_missing_db_file_returns_error():
 
         with (
             patch(
-                "app.services.wiki_management._derive_cache_key",
+                "app.services.wiki_management.derive_cache_key",
                 return_value="cachekey-abc",
             ),
             patch("pathlib.Path.exists", return_value=False),
@@ -686,7 +686,7 @@ def _patch_open_storage(fake_storage: MagicMock):
     ``_open_wiki_storage`` helper to ``fake_storage``."""
     return (
         patch(
-            "app.services.wiki_management._derive_cache_key",
+            "app.services.wiki_management.derive_cache_key",
             return_value="cachekey-123",
         ),
         patch("pathlib.Path.exists", return_value=True),

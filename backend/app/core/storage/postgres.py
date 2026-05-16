@@ -2219,28 +2219,37 @@ class PostgresWikiStorage:
         }
 
     # ── shortest_path (#121 Phase 1) ──────────────────────────────────
+    #
+    # Canonical undirected shortest-path entry point. See the sqlite
+    # backend for the architectural note; both share the layered-BFS
+    # algorithm with a visited set, just expressed in their native SQL
+    # dialect (Postgres uses ``ANY(:ids)`` instead of IN-placeholders).
 
     _NODE_COLS_FOR_PATH = "node_id, symbol_name, rel_path, symbol_type"
     _EDGE_COLS_FOR_PATH = "source_id, target_id, rel_type, confidence"
 
-    def _resolve_label(self, conn, label: str) -> dict[str, Any] | None:
-        row = conn.execute(
+    def _resolve_label(
+        self, conn, label: str,
+    ) -> tuple[dict[str, Any] | None, int]:
+        rows = conn.execute(
             text(
                 f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
-                "WHERE symbol_name = :label ORDER BY node_id ASC LIMIT 1"
+                "WHERE symbol_name = :label ORDER BY node_id ASC"
             ),
             {"label": label},
-        ).mappings().fetchone()
-        if row is not None:
-            return dict(row)
-        row = conn.execute(
+        ).mappings().fetchall()
+        if rows:
+            return dict(rows[0]), len(rows)
+        rows = conn.execute(
             text(
                 f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
-                "WHERE rel_path = :label ORDER BY node_id ASC LIMIT 1"
+                "WHERE rel_path = :label ORDER BY node_id ASC"
             ),
             {"label": label},
-        ).mappings().fetchone()
-        return dict(row) if row else None
+        ).mappings().fetchall()
+        if rows:
+            return dict(rows[0]), len(rows)
+        return None, 0
 
     def shortest_path(
         self,
@@ -2252,10 +2261,10 @@ class PostgresWikiStorage:
             return {"path": None, "reason": "invalid_max_depth"}
 
         with self._engine.connect() as conn:
-            source = self._resolve_label(conn, source_label)
+            source, src_candidates = self._resolve_label(conn, source_label)
             if source is None:
                 return {"path": None, "reason": "source_not_found"}
-            target = self._resolve_label(conn, target_label)
+            target, tgt_candidates = self._resolve_label(conn, target_label)
             if target is None:
                 return {"path": None, "reason": "target_not_found"}
 
@@ -2265,61 +2274,69 @@ class PostgresWikiStorage:
                 return {
                     "source": source,
                     "target": target,
+                    "source_candidates": src_candidates,
+                    "target_candidates": tgt_candidates,
                     "path": [source],
                     "edges": [],
                     "length": 0,
-                    "reason": "same_node",
                 }
 
-            # Recursive-CTE BFS, undirected. `path` is a TEXT[] so we
-            # can use ``= ANY(path)`` for the cycle guard (much cheaper
-            # than string-LIKE on long arrays).
-            row = conn.execute(
-                text(
-                    f"""
-                    WITH RECURSIVE
-                      ue(node_id, next_node) AS (
-                        SELECT source_id, target_id FROM {self._edges}
-                        UNION ALL
-                        SELECT target_id, source_id FROM {self._edges}
-                      ),
-                      bfs(node_id, path, depth) AS (
-                        SELECT :src, ARRAY[:src]::text[], 0
-                        UNION ALL
-                        SELECT ue.next_node,
-                               b.path || ue.next_node,
-                               b.depth + 1
-                          FROM bfs AS b
-                          JOIN ue ON ue.node_id = b.node_id
-                         WHERE b.depth < :max_depth
-                           AND b.node_id <> :tgt
-                           AND NOT (ue.next_node = ANY(b.path))
-                      )
-                    SELECT path, depth FROM bfs
-                     WHERE node_id = :tgt
-                     ORDER BY depth ASC
-                     LIMIT 1
-                    """
-                ),
-                {"src": src_id, "tgt": tgt_id, "max_depth": max_depth},
-            ).mappings().fetchone()
+            visited: set[str] = {src_id}
+            parents: dict[str, str] = {}
+            frontier: list[str] = [src_id]
+            found = False
 
-            if row is None:
+            for _depth in range(max_depth):
+                if not frontier:
+                    break
+                rows = conn.execute(
+                    text(
+                        f"SELECT source_id, target_id FROM {self._edges} "
+                        "WHERE source_id = ANY(:ids) OR target_id = ANY(:ids)"
+                    ),
+                    {"ids": frontier},
+                ).mappings().fetchall()
+                frontier_set = set(frontier)
+                next_frontier: list[str] = []
+                for row in rows:
+                    a, b = row["source_id"], row["target_id"]
+                    for parent_id, child_id in ((a, b), (b, a)):
+                        if parent_id not in frontier_set:
+                            continue
+                        if child_id in visited:
+                            continue
+                        visited.add(child_id)
+                        parents[child_id] = parent_id
+                        next_frontier.append(child_id)
+                        if child_id == tgt_id:
+                            found = True
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+                frontier = next_frontier
+
+            if not found:
                 return {"path": None, "reason": "no_path_within_max_depth"}
 
-            node_ids: list[str] = list(row["path"])
+            path_ids: list[str] = [tgt_id]
+            while path_ids[-1] != src_id:
+                path_ids.append(parents[path_ids[-1]])
+            path_ids.reverse()
+
             node_rows = conn.execute(
                 text(
                     f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
                     "WHERE node_id = ANY(:ids)"
                 ),
-                {"ids": node_ids},
+                {"ids": path_ids},
             ).mappings().fetchall()
             node_by_id = {r["node_id"]: dict(r) for r in node_rows}
-            path_nodes = [node_by_id[nid] for nid in node_ids if nid in node_by_id]
+            path_nodes = [node_by_id[nid] for nid in path_ids if nid in node_by_id]
 
             edges: list[dict[str, Any]] = []
-            for a, b in zip(node_ids, node_ids[1:], strict=False):
+            for a, b in zip(path_ids, path_ids[1:], strict=False):
                 edge_row = conn.execute(
                     text(
                         f"SELECT {self._EDGE_COLS_FOR_PATH} FROM {self._edges} "
@@ -2339,9 +2356,11 @@ class PostgresWikiStorage:
             return {
                 "source": source,
                 "target": target,
+                "source_candidates": src_candidates,
+                "target_candidates": tgt_candidates,
                 "path": path_nodes,
                 "edges": edges,
-                "length": int(row["depth"]),
+                "length": len(path_ids) - 1,
             }
 
     # ==================================================================
