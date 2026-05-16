@@ -2,6 +2,8 @@ name: Test
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
   backend-tests:
@@ -13,6 +15,33 @@ jobs:
       - run: pip install -e ".[dev]"
         working-directory: backend
       - run: AUTH_ENABLED=false pytest tests/ -v --cov=app
+        working-directory: backend
+
+  # Stress-runs the WikiService.shutdown regression-guard unit tests.
+  # These exercise the asyncio.to_thread / cancellation interplay that
+  # caused the original CI segfault (#165) deterministically in <1s
+  # each, so repeating them in one Python process surfaces any
+  # scheduling regression without depending on the full FastAPI
+  # lifespan. An earlier draft included the integration suites + the
+  # lifespan-wiring test; those ran provider health checks on every
+  # iteration and timed out the runner on CI even though they were
+  # fast locally. The lifespan-wiring test still runs once in
+  # ``backend-tests`` above — only the repeated stress is scoped down.
+  backend-tests-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -e ".[dev]"
+        working-directory: backend
+      - name: Stress shutdown-race unit tests (50x)
+        run: |
+          AUTH_ENABLED=false pytest \
+            tests/test_wiki_service.py::TestWikiServiceShutdown \
+            -k "not lifespan_passes_configured" \
+            --count=50 -q
         working-directory: backend
 
   frontend-checks:

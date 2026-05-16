@@ -86,6 +86,14 @@ class Settings(BaseSettings):
     # Wiki page index cache
     wiki_index_cache_max_wikis: int = 50
 
+    # Lifespan shutdown drain timeout (#165 follow-up). Default of
+    # ``20.0`` leaves ~10s of headroom under Kubernetes'
+    # ``terminationGracePeriodSeconds`` default of 30s for the rest
+    # of teardown (engine.dispose, MCP session manager exit) before
+    # SIGKILL lands. If your orchestrator uses a different grace
+    # period, set this to roughly ``grace_period - 10`` seconds.
+    wiki_shutdown_timeout_s: float = 20.0
+
     # Q&A Cache
     qa_cache_enabled: bool = True
     qa_cache_similarity_threshold: float = 0.92

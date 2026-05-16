@@ -76,6 +76,12 @@ class WikiService:
         self.wiki_management = wiki_management
         self._invocations: dict[str, Invocation] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        # #165 follow-up: set by ``shutdown()`` so concurrent
+        # ``cancel_invocation`` calls during the drain window can't
+        # cancel a task we're trying to await. Cancellation marks the
+        # asyncio.Task done while the worker thread keeps running —
+        # the exact race that caused the CI segfault.
+        self._shutting_down: bool = False
 
     @property
     def invocations(self) -> dict[str, Invocation]:
@@ -148,6 +154,11 @@ class WikiService:
         only mask the leak, not fix it. The orphan threads will at
         least see live state for the rest of the shutdown sequence.
         """
+        # Mark the service as shutting down before snapshotting the
+        # pending set so a concurrent ``cancel_invocation`` call can't
+        # cancel a task we're about to await. Cancellation races
+        # shutdown — see the docstring above.
+        self._shutting_down = True
         pending = [t for t in self._tasks.values() if not t.done()]
         if not pending:
             return
@@ -1072,6 +1083,18 @@ class WikiService:
         return invocation
 
     async def cancel_invocation(self, invocation_id: str) -> bool:
+        if self._shutting_down:
+            # #165 follow-up: refuse to cancel during shutdown drain.
+            # ``shutdown()`` is awaiting these tasks so their inner
+            # ``asyncio.to_thread()`` worker threads can finish
+            # against live storage; cancelling here would mark the
+            # asyncio.Task done while leaving the thread mid-write —
+            # the exact race we hardened against.
+            logger.info(
+                "cancel_invocation(%s) refused: service is shutting down",
+                invocation_id,
+            )
+            return False
         invocation = self._invocations.get(invocation_id)
         if not invocation or invocation.status != "generating":
             return False
