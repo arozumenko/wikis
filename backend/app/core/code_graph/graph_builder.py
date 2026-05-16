@@ -182,6 +182,26 @@ from ..extractors import (  # #118 — non-code ingestion
     ExtractorRegistry,
 )
 
+
+# #119: Names of all languages handled by the BasicVisitorParser
+# family. Module-level constant so the lost-language diagnostic in
+# ``EnhancedUnifiedGraphBuilder.__init__`` and the
+# ``test_basic_visitor_langs_sync_with_factory`` test can both reach
+# it without instantiating the builder or importing the lang_configs
+# package (which would re-trigger the very failure mode the diagnostic
+# is designed to surface). Keep in sync with
+# ``app.core.parsers.lang_configs.build_basic_parsers()``; CI catches
+# drift via the sync-check test.
+_BASIC_VISITOR_LANGS = (
+    # Phase 1
+    "ruby", "php", "kotlin", "scala", "lua",
+    # Phase 2 — pure-config visitor fits
+    "swift", "dart", "powershell", "bash", "objc",
+    "verilog", "fortran", "julia", "pascal",
+    # Phase 2 — bespoke subclasses
+    "elixir", "r", "zig", "groovy",
+)
+
 # Log feature flag state at import time
 if SEPARATE_DOC_INDEX:
     logger.info("[FEATURE FLAG] WIKIS_DOC_SEPARATE_INDEX=1: Docs routed to vector store only (not graph)")
@@ -410,16 +430,14 @@ class EnhancedUnifiedGraphBuilder:
         # and disappear entirely. Operators need the loud signal so
         # they can react (typically: missing tree-sitter grammar wheel).
         #
-        # The lost-language list is a **literal** rather than imported
-        # from ``lang_configs`` — if the failure mode is an ImportError
-        # on the lang_configs package itself (e.g. a missing grammar
-        # raising at module load), a second import in the except branch
-        # would re-trigger the same failure and silently suppress the
-        # diagnostic we're trying to emit. Code-review R2 caught this
-        # as the load-bearing CR5 issue: the very failure mode CR5 was
-        # designed to surface was the one most likely to suppress its
-        # own log line.
-        _BASIC_VISITOR_LANGS = ("ruby", "php", "kotlin", "scala", "lua")
+        # The lost-language list is a **module-level literal** rather
+        # than imported from ``lang_configs`` — if the failure mode is
+        # an ImportError on the lang_configs package itself (e.g. a
+        # missing grammar raising at module load), a second import in
+        # the except branch would re-trigger the same failure and
+        # silently suppress the diagnostic. Lifting it to module scope
+        # also lets ``test_basic_visitor_langs_sync_with_factory``
+        # import it without instantiating the whole graph builder.
         try:
             from ..parsers.lang_configs import build_basic_parsers as _build_basic
 

@@ -643,27 +643,42 @@ def _make_symbol(
                 "identifier" in child.type
                 or "name" in child.type
                 or child.type in cfg.name_node_types
+                or child.type in cfg.name_chain_types
             ):
                 name_node = child
                 break
     if name_node is None:
         return None
 
-    # Name-chain drill-down: walk into the rightmost identifier-like
-    # descendant. Handles colon-method syntax (Lua), namespaced names
-    # (PHP), and member-access declarations.
+    # Name-chain drill-down. At each step prefer an identifier-shaped
+    # rightmost descendant (handles ``Foo:bar`` / ``foo.bar`` member-
+    # access naming where we want the last segment). When no
+    # identifier-shaped child exists, descend into the first named
+    # child that's itself in ``name_chain_types`` (handles nested
+    # wrappers like Julia's ``signature > call_expression > identifier``
+    # or Fortran's ``subroutine > subroutine_statement > name``).
     while name_node.type in cfg.name_chain_types:
-        leaves = [
-            c for c in name_node.children
-            if c.is_named and (
-                "identifier" in c.type
-                or "name" in c.type
-                or c.type in cfg.name_node_types
-            )
-        ]
-        if not leaves:
+        named_children = [c for c in name_node.children if c.is_named]
+        if not named_children:
             break
-        name_node = leaves[-1]
+        identifier_like = [
+            c for c in named_children
+            if "identifier" in c.type
+            or "name" in c.type
+            or c.type in cfg.name_node_types
+        ]
+        if identifier_like:
+            name_node = identifier_like[-1]
+            continue
+        # No direct identifier — try descending into the first nested
+        # chain wrapper.
+        nested_chain = [
+            c for c in named_children
+            if c.type in cfg.name_chain_types
+        ]
+        if not nested_chain:
+            break
+        name_node = nested_chain[0]
 
     name = _read_node_text(name_node, state.source_bytes).strip()
     if not name:
