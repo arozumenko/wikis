@@ -2381,6 +2381,143 @@ class PostgresWikiStorage:
                 "length": len(path_ids) - 1,
             }
 
+    # ── surprising_connections (#121 Phase 2) ─────────────────────────
+
+    @staticmethod
+    def _path_prefix(rel_path: str, depth: int) -> str:
+        """Folder prefix at ``depth`` segments, stripping the filename.
+        See sqlite backend for examples."""
+        if not rel_path:
+            return ""
+        parts = rel_path.split("/")
+        folders = parts[:-1]
+        if not folders:
+            return ""
+        return "/".join(folders[:depth])
+
+    def _fetch_cluster_contexts(
+        self, conn, clusters: set[int], depth: int,
+    ) -> dict[int, set[str]]:
+        """Bulk-fetch per-cluster folder-prefix sets — single
+        ``= ANY(:cs)`` query instead of one round-trip per cluster."""
+        if not clusters:
+            return {}
+        rows = conn.execute(
+            text(
+                f"SELECT macro_cluster, rel_path FROM {self._nodes} "
+                "WHERE macro_cluster = ANY(:cs) "
+                "  AND rel_path IS NOT NULL "
+                "  AND rel_path <> ''"
+            ),
+            {"cs": list(clusters)},
+        ).mappings().fetchall()
+        contexts: dict[int, set[str]] = {c: set() for c in clusters}
+        for row in rows:
+            prefix = self._path_prefix(row["rel_path"], depth)
+            if prefix:
+                contexts[int(row["macro_cluster"])].add(prefix)
+        return contexts
+
+    def compute_surprising_connections(
+        self,
+        top_n: int = 10,
+        context_depth: int = 1,
+        sample_edges_per_pair: int = 3,
+    ) -> dict[str, Any]:
+        with self._engine.connect() as conn:
+            pair_rows = conn.execute(
+                text(
+                    f"""
+                    SELECT
+                      CASE WHEN src.macro_cluster < tgt.macro_cluster
+                           THEN src.macro_cluster ELSE tgt.macro_cluster END AS c_lo,
+                      CASE WHEN src.macro_cluster < tgt.macro_cluster
+                           THEN tgt.macro_cluster ELSE src.macro_cluster END AS c_hi,
+                      COUNT(*) AS edge_count
+                      FROM {self._edges} e
+                      JOIN {self._nodes} src ON e.source_id = src.node_id
+                      JOIN {self._nodes} tgt ON e.target_id = tgt.node_id
+                     WHERE src.macro_cluster IS NOT NULL
+                       AND tgt.macro_cluster IS NOT NULL
+                       AND src.macro_cluster <> tgt.macro_cluster
+                     GROUP BY c_lo, c_hi
+                    """
+                ),
+            ).mappings().fetchall()
+
+            if not pair_rows:
+                return {"pairs": [], "skipped_pairs": 0}
+
+            clusters = {int(r["c_lo"]) for r in pair_rows} | {
+                int(r["c_hi"]) for r in pair_rows
+            }
+            contexts = self._fetch_cluster_contexts(
+                conn, clusters, context_depth,
+            )
+
+            scored: list[dict[str, Any]] = []
+            skipped = 0
+            for row in pair_rows:
+                c_lo, c_hi = int(row["c_lo"]), int(row["c_hi"])
+                ctx_lo = contexts.get(c_lo, set())
+                ctx_hi = contexts.get(c_hi, set())
+                union = ctx_lo | ctx_hi
+                if not union:
+                    skipped += 1
+                    continue
+                intersection = ctx_lo & ctx_hi
+                jaccard_distance = 1.0 - (len(intersection) / len(union))
+                scored.append(
+                    {
+                        "cluster_a": c_lo,
+                        "cluster_b": c_hi,
+                        "jaccard_distance": jaccard_distance,
+                        "context_a": sorted(ctx_lo),
+                        "context_b": sorted(ctx_hi),
+                        "edge_count": int(row["edge_count"]),
+                    },
+                )
+
+            scored.sort(
+                key=lambda p: (
+                    -p["jaccard_distance"],
+                    -p["edge_count"],
+                    p["cluster_a"],
+                    p["cluster_b"],
+                ),
+            )
+            top = scored[:top_n]
+
+            for pair in top:
+                sample = conn.execute(
+                    text(
+                        f"""
+                        SELECT e.source_id, e.target_id, e.rel_type, e.confidence,
+                               src.symbol_name AS source_name, src.rel_path AS source_path,
+                               tgt.symbol_name AS target_name, tgt.rel_path AS target_path
+                          FROM {self._edges} e
+                          JOIN {self._nodes} src ON e.source_id = src.node_id
+                          JOIN {self._nodes} tgt ON e.target_id = tgt.node_id
+                         WHERE ((src.macro_cluster = :a AND tgt.macro_cluster = :b)
+                             OR (src.macro_cluster = :b AND tgt.macro_cluster = :a))
+                         ORDER BY CASE e.confidence
+                                  WHEN 'EXTRACTED' THEN 0
+                                  WHEN 'INFERRED'  THEN 1
+                                  ELSE 2 END,
+                                  e.source_id, e.target_id
+                         LIMIT :lim
+                        """
+                    ),
+                    {
+                        "a": pair["cluster_a"],
+                        "b": pair["cluster_b"],
+                        "lim": sample_edges_per_pair,
+                    },
+                ).mappings().fetchall()
+                pair["sample_edges"] = [dict(r) for r in sample]
+
+            return {"pairs": top, "skipped_pairs": skipped}
+
     # ==================================================================
     # WIKI PAGES + source→page reverse index (#116 incremental regen)
     # ==================================================================

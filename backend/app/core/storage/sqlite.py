@@ -2369,6 +2369,165 @@ class UnifiedWikiDB:
             "length": len(path_ids) - 1,
         }
 
+    # ── surprising_connections (#121 Phase 2) ─────────────────────────
+
+    @staticmethod
+    def _path_prefix(rel_path: str, depth: int) -> str:
+        """Folder prefix at ``depth`` segments, stripping the
+        filename. Returns ``""`` for root-level files (no folder).
+
+        Example: ``("frontend/widgets/Btn.tsx", 1)`` → ``"frontend"``;
+        ``("frontend/widgets/Btn.tsx", 2)`` → ``"frontend/widgets"``;
+        ``("Btn.tsx", 1)`` → ``""`` (no folder).
+        """
+        if not rel_path:
+            return ""
+        parts = rel_path.split("/")
+        folders = parts[:-1]  # drop filename
+        if not folders:
+            return ""
+        return "/".join(folders[:depth])
+
+    def _fetch_cluster_contexts(
+        self, clusters: set[int], depth: int,
+    ) -> dict[int, set[str]]:
+        """Bulk-fetch per-cluster folder-prefix sets.
+
+        Avoids the N+1 round-trip pattern an earlier draft had when
+        each cluster was fetched individually. Chunked at
+        ``_BFS_FRONTIER_CHUNK`` (500) so the ``IN (?, ?, …)``
+        placeholder count stays comfortably under SQLite's default
+        ``SQLITE_LIMIT_VARIABLE_NUMBER`` of 999 — caller-side
+        ``top_n`` caps make this academic today (≤ ~200 distinct
+        clusters), but chunking costs nothing and eliminates the
+        class of failure.
+        """
+        contexts: dict[int, set[str]] = {c: set() for c in clusters}
+        if not clusters:
+            return contexts
+        cluster_list = list(clusters)
+        for chunk_start in range(0, len(cluster_list), self._BFS_FRONTIER_CHUNK):
+            chunk = cluster_list[chunk_start : chunk_start + self._BFS_FRONTIER_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                # Cluster IDs are integer bound parameters; only the
+                # placeholder shape (?, ?, …) is templated.
+                f"SELECT macro_cluster, rel_path FROM repo_nodes "  # noqa: S608
+                f"WHERE macro_cluster IN ({placeholders}) "
+                f"  AND rel_path IS NOT NULL AND rel_path != ''",
+                tuple(chunk),
+            ).fetchall()
+            for row in rows:
+                prefix = self._path_prefix(row["rel_path"], depth)
+                if prefix:
+                    contexts[int(row["macro_cluster"])].add(prefix)
+        return contexts
+
+    def compute_surprising_connections(
+        self,
+        top_n: int = 10,
+        context_depth: int = 1,
+        sample_edges_per_pair: int = 3,
+    ) -> dict[str, Any]:
+        # 1) Aggregate cross-cluster edges per unordered (lo, hi) pair.
+        #    CASE WHEN normalises direction so we don't double-count
+        #    (A→B) and (B→A) as different pairs.
+        pair_rows = self.conn.execute(
+            """
+            SELECT
+              CASE WHEN src.macro_cluster < tgt.macro_cluster
+                   THEN src.macro_cluster ELSE tgt.macro_cluster END AS c_lo,
+              CASE WHEN src.macro_cluster < tgt.macro_cluster
+                   THEN tgt.macro_cluster ELSE src.macro_cluster END AS c_hi,
+              COUNT(*) AS edge_count
+              FROM repo_edges e
+              JOIN repo_nodes src ON e.source_id = src.node_id
+              JOIN repo_nodes tgt ON e.target_id = tgt.node_id
+             WHERE src.macro_cluster IS NOT NULL
+               AND tgt.macro_cluster IS NOT NULL
+               AND src.macro_cluster != tgt.macro_cluster
+             GROUP BY c_lo, c_hi
+            """,
+        ).fetchall()
+
+        if not pair_rows:
+            return {"pairs": [], "skipped_pairs": 0}
+
+        # 2) Bulk-fetch contexts for every cluster appearing in pairs.
+        clusters = {int(r["c_lo"]) for r in pair_rows} | {
+            int(r["c_hi"]) for r in pair_rows
+        }
+        contexts = self._fetch_cluster_contexts(clusters, context_depth)
+
+        # 3) Score each pair by Jaccard distance. Pairs with two empty
+        # contexts (e.g. all root-level files) carry no signal — count
+        # them so the caller can distinguish "nothing surprising"
+        # (empty pairs / non-empty skipped) from "no cross-cluster
+        # edges" (zero raw pair rows).
+        scored: list[dict[str, Any]] = []
+        skipped = 0
+        for row in pair_rows:
+            c_lo, c_hi, edge_count = row["c_lo"], row["c_hi"], row["edge_count"]
+            ctx_lo = contexts.get(int(c_lo), set())
+            ctx_hi = contexts.get(int(c_hi), set())
+            union = ctx_lo | ctx_hi
+            if not union:
+                skipped += 1
+                continue
+            intersection = ctx_lo & ctx_hi
+            jaccard_distance = 1.0 - (len(intersection) / len(union))
+            scored.append(
+                {
+                    "cluster_a": int(c_lo),
+                    "cluster_b": int(c_hi),
+                    "jaccard_distance": jaccard_distance,
+                    "context_a": sorted(ctx_lo),
+                    "context_b": sorted(ctx_hi),
+                    "edge_count": int(edge_count),
+                },
+            )
+
+        # 4) Rank by surprise. Ties broken by edge_count desc then
+        #    (cluster_a, cluster_b) for determinism.
+        scored.sort(
+            key=lambda p: (
+                -p["jaccard_distance"],
+                -p["edge_count"],
+                p["cluster_a"],
+                p["cluster_b"],
+            ),
+        )
+        top = scored[:top_n]
+
+        # 5) Hydrate sample edges per top pair.
+        for pair in top:
+            sample = self.conn.execute(
+                """
+                SELECT e.source_id, e.target_id, e.rel_type, e.confidence,
+                       src.symbol_name AS source_name, src.rel_path AS source_path,
+                       tgt.symbol_name AS target_name, tgt.rel_path AS target_path
+                  FROM repo_edges e
+                  JOIN repo_nodes src ON e.source_id = src.node_id
+                  JOIN repo_nodes tgt ON e.target_id = tgt.node_id
+                 WHERE ((src.macro_cluster = ? AND tgt.macro_cluster = ?)
+                     OR (src.macro_cluster = ? AND tgt.macro_cluster = ?))
+                 ORDER BY CASE e.confidence
+                          WHEN 'EXTRACTED' THEN 0
+                          WHEN 'INFERRED'  THEN 1
+                          ELSE 2 END,
+                          e.source_id, e.target_id
+                 LIMIT ?
+                """,
+                (
+                    pair["cluster_a"], pair["cluster_b"],
+                    pair["cluster_b"], pair["cluster_a"],
+                    sample_edges_per_pair,
+                ),
+            ).fetchall()
+            pair["sample_edges"] = [dict(r) for r in sample]
+
+        return {"pairs": top, "skipped_pairs": skipped}
+
     # ══════════════════════════════════════════════════════════════════
     # WIKI PAGES + source→page reverse index (#116 incremental regen)
     # ══════════════════════════════════════════════════════════════════
