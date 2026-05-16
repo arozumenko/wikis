@@ -685,6 +685,203 @@ async def get_graph_stats(wiki_id: str) -> dict[str, Any]:
             pass
 
 
+# ── Graph-native MCP surface (#121 Phase 1) ──────────────────────────
+#
+# Three tools that answer structural graph questions deterministically
+# from the unified DB — no LLM, no retrieval. AI IDE clients use these
+# for "what calls X?", "shortest dependency chain between X and Y", and
+# "all nodes in cluster N" without paying retrieval cost. All three
+# share the same `_open_wiki_storage` resolution path so auth + cache-
+# key lookup is consistent with ``get_graph_stats``.
+
+
+async def _open_wiki_storage(wiki_id: str) -> tuple[Any, str | None]:
+    """Resolve ``wiki_id`` → open read-only storage handle (#121).
+
+    Returns ``(storage, None)`` on success or ``(None, error_message)``
+    when the wiki is unknown / unowned / has no on-disk index. The
+    error string is suitable for returning directly to the MCP client.
+    """
+    if not _wiki_management or not _settings:
+        return None, "graph tools unavailable in this deployment"
+
+    user_id = _current_user_id.get()
+    wiki_record = await _wiki_management.get_wiki(wiki_id, user_id=user_id)
+    if wiki_record is None:
+        return None, (
+            f"Wiki not found: {wiki_id}. Use search_wikis() to find "
+            f"available wiki IDs."
+        )
+
+    from pathlib import Path
+
+    from app.core.storage import open_storage
+    from app.services.wiki_management import _derive_cache_key
+
+    cache_key = _derive_cache_key(
+        _settings.cache_dir, wiki_record.repo_url, wiki_record.branch,
+    )
+    if not cache_key:
+        return None, f"Wiki {wiki_id} has no cached index."
+    db_path = Path(_settings.cache_dir) / f"{cache_key}.wiki.db"
+    if not db_path.exists():
+        return None, f"Wiki {wiki_id} has no unified DB on disk."
+
+    storage = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
+    return storage, None
+
+
+def _close_storage_quietly(storage: Any) -> None:
+    if storage is None:
+        return
+    try:
+        storage.close()
+    except Exception:  # noqa: S110 — best-effort close
+        pass
+
+
+@mcp.tool()
+async def god_nodes(wiki_id: str, top_n: int = 20) -> dict[str, Any]:
+    """Return the most-connected symbols and files in the wiki's graph.
+
+    Surfaces ``compute_god_nodes`` from the storage layer (§11.7 / B2)
+    so AI IDE clients can spot architectural hot-spots — classes
+    everything depends on, files with high cross-file fan-out — without
+    paying for retrieval or LLM cost.
+
+    Only architectural symbols (``is_architectural = 1``) are ranked by
+    degree; files are ranked by their cross-file outgoing edges.
+
+    Args:
+        wiki_id: Wiki identifier from ``search_wikis()``.
+        top_n: Number of top symbols / files to return (default 20,
+            max 200).
+
+    Returns:
+        Dict with ``by_symbol_type`` (top symbols by total degree) and
+        ``by_file`` (top files by external edges). Shape mirrors the
+        storage protocol's ``compute_god_nodes``. Returns
+        ``{"error": ...}`` when the wiki is unknown or has no index.
+    """
+    if not 1 <= top_n <= 200:
+        return {"error": f"top_n must be between 1 and 200, got {top_n}"}
+
+    storage, err = await _open_wiki_storage(wiki_id)
+    if err:
+        return {"error": err}
+    try:
+        return storage.compute_god_nodes(top_n=top_n)
+    finally:
+        _close_storage_quietly(storage)
+
+
+@mcp.tool()
+async def shortest_path(
+    wiki_id: str,
+    source_label: str,
+    target_label: str,
+    max_depth: int = 25,
+) -> dict[str, Any]:
+    """Undirected shortest path between two symbols in the graph (#121).
+
+    Resolves each label by ``symbol_name`` first then ``rel_path``
+    (deterministic, first match by ``node_id`` ASC). Treats edges as
+    undirected and returns the shortest hop-count path. Edge metadata
+    (``rel_type``, ``confidence``) is included for each hop. When
+    multiple edges exist between two consecutive nodes, the EXTRACTED
+    edge is preferred over INFERRED / AMBIGUOUS.
+
+    ``max_depth`` defaults to 25 (graph diameter on production
+    codebases is typically <20). Tighten it on dense graphs for
+    faster responses; loosen it only when you know the path is long.
+
+    Args:
+        wiki_id: Wiki identifier from ``search_wikis()``.
+        source_label: Symbol name or file path of the starting node.
+        target_label: Symbol name or file path of the destination.
+        max_depth: Maximum hops to search (1-50, default 25).
+
+    Returns:
+        On success::
+
+            {
+                "source": {"node_id", "symbol_name", "rel_path", "symbol_type"},
+                "target": {<same>},
+                "path": [<node>, ...],   # source first, target last
+                "edges": [{"source_id", "target_id", "rel_type", "confidence"}, ...],
+                "length": int,
+            }
+
+        On failure ``{"path": None, "reason": "..."}`` where reason
+        is one of ``source_not_found``, ``target_not_found``,
+        ``no_path_within_max_depth``, ``same_node``,
+        ``invalid_max_depth``.
+    """
+    if not 1 <= max_depth <= 50:
+        return {"path": None, "reason": "invalid_max_depth"}
+
+    storage, err = await _open_wiki_storage(wiki_id)
+    if err:
+        return {"error": err}
+    try:
+        return storage.shortest_path(
+            source_label=source_label,
+            target_label=target_label,
+            max_depth=max_depth,
+        )
+    finally:
+        _close_storage_quietly(storage)
+
+
+@mcp.tool()
+async def get_community(
+    wiki_id: str,
+    macro_cluster: int,
+    micro_cluster: int | None = None,
+    limit: int = 500,
+) -> dict[str, Any]:
+    """All nodes in a Leiden macro (optionally micro) community.
+
+    Communities are precomputed during graph build (``macro_cluster``
+    and ``micro_cluster`` columns on ``repo_nodes``). Pass only
+    ``macro_cluster`` to get every node in the macro community; add
+    ``micro_cluster`` to drill into a sub-cluster.
+
+    Args:
+        wiki_id: Wiki identifier from ``search_wikis()``.
+        macro_cluster: Macro cluster ID (integer from ``stats()``
+            ``macro_clusters`` or from a node's ``macro_cluster``).
+        micro_cluster: Optional sub-cluster within ``macro_cluster``.
+        limit: Maximum nodes to return (1-2000, default 500).
+
+    Returns:
+        Dict with ``macro_cluster``, ``micro_cluster`` (echoed),
+        ``count`` (returned), and ``nodes`` (list of node rows with
+        ``node_id``, ``symbol_name``, ``symbol_type``, ``rel_path``,
+        and other ``repo_nodes`` columns).
+    """
+    if not 1 <= limit <= 2000:
+        return {"error": f"limit must be between 1 and 2000, got {limit}"}
+
+    storage, err = await _open_wiki_storage(wiki_id)
+    if err:
+        return {"error": err}
+    try:
+        nodes = storage.get_nodes_by_cluster(
+            macro=macro_cluster,
+            micro=micro_cluster,
+            limit=limit,
+        )
+        return {
+            "macro_cluster": macro_cluster,
+            "micro_cluster": micro_cluster,
+            "count": len(nodes),
+            "nodes": nodes,
+        }
+    finally:
+        _close_storage_quietly(storage)
+
+
 @mcp.tool()
 async def get_page_neighbors(
     wiki_id: str,

@@ -2218,6 +2218,132 @@ class PostgresWikiStorage:
             "by_file": [dict(r) for r in file_rows],
         }
 
+    # ── shortest_path (#121 Phase 1) ──────────────────────────────────
+
+    _NODE_COLS_FOR_PATH = "node_id, symbol_name, rel_path, symbol_type"
+    _EDGE_COLS_FOR_PATH = "source_id, target_id, rel_type, confidence"
+
+    def _resolve_label(self, conn, label: str) -> dict[str, Any] | None:
+        row = conn.execute(
+            text(
+                f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
+                "WHERE symbol_name = :label ORDER BY node_id ASC LIMIT 1"
+            ),
+            {"label": label},
+        ).mappings().fetchone()
+        if row is not None:
+            return dict(row)
+        row = conn.execute(
+            text(
+                f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
+                "WHERE rel_path = :label ORDER BY node_id ASC LIMIT 1"
+            ),
+            {"label": label},
+        ).mappings().fetchone()
+        return dict(row) if row else None
+
+    def shortest_path(
+        self,
+        source_label: str,
+        target_label: str,
+        max_depth: int = 25,
+    ) -> dict[str, Any]:
+        if max_depth < 1:
+            return {"path": None, "reason": "invalid_max_depth"}
+
+        with self._engine.connect() as conn:
+            source = self._resolve_label(conn, source_label)
+            if source is None:
+                return {"path": None, "reason": "source_not_found"}
+            target = self._resolve_label(conn, target_label)
+            if target is None:
+                return {"path": None, "reason": "target_not_found"}
+
+            src_id = source["node_id"]
+            tgt_id = target["node_id"]
+            if src_id == tgt_id:
+                return {
+                    "source": source,
+                    "target": target,
+                    "path": [source],
+                    "edges": [],
+                    "length": 0,
+                    "reason": "same_node",
+                }
+
+            # Recursive-CTE BFS, undirected. `path` is a TEXT[] so we
+            # can use ``= ANY(path)`` for the cycle guard (much cheaper
+            # than string-LIKE on long arrays).
+            row = conn.execute(
+                text(
+                    f"""
+                    WITH RECURSIVE
+                      ue(node_id, next_node) AS (
+                        SELECT source_id, target_id FROM {self._edges}
+                        UNION ALL
+                        SELECT target_id, source_id FROM {self._edges}
+                      ),
+                      bfs(node_id, path, depth) AS (
+                        SELECT :src, ARRAY[:src]::text[], 0
+                        UNION ALL
+                        SELECT ue.next_node,
+                               b.path || ue.next_node,
+                               b.depth + 1
+                          FROM bfs AS b
+                          JOIN ue ON ue.node_id = b.node_id
+                         WHERE b.depth < :max_depth
+                           AND b.node_id <> :tgt
+                           AND NOT (ue.next_node = ANY(b.path))
+                      )
+                    SELECT path, depth FROM bfs
+                     WHERE node_id = :tgt
+                     ORDER BY depth ASC
+                     LIMIT 1
+                    """
+                ),
+                {"src": src_id, "tgt": tgt_id, "max_depth": max_depth},
+            ).mappings().fetchone()
+
+            if row is None:
+                return {"path": None, "reason": "no_path_within_max_depth"}
+
+            node_ids: list[str] = list(row["path"])
+            node_rows = conn.execute(
+                text(
+                    f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
+                    "WHERE node_id = ANY(:ids)"
+                ),
+                {"ids": node_ids},
+            ).mappings().fetchall()
+            node_by_id = {r["node_id"]: dict(r) for r in node_rows}
+            path_nodes = [node_by_id[nid] for nid in node_ids if nid in node_by_id]
+
+            edges: list[dict[str, Any]] = []
+            for a, b in zip(node_ids, node_ids[1:], strict=False):
+                edge_row = conn.execute(
+                    text(
+                        f"SELECT {self._EDGE_COLS_FOR_PATH} FROM {self._edges} "
+                        "WHERE (source_id = :a AND target_id = :b) "
+                        "   OR (source_id = :b AND target_id = :a) "
+                        "ORDER BY CASE confidence "
+                        "         WHEN 'EXTRACTED' THEN 0 "
+                        "         WHEN 'INFERRED'  THEN 1 "
+                        "         ELSE 2 END "
+                        "LIMIT 1"
+                    ),
+                    {"a": a, "b": b},
+                ).mappings().fetchone()
+                if edge_row is not None:
+                    edges.append(dict(edge_row))
+
+            return {
+                "source": source,
+                "target": target,
+                "path": path_nodes,
+                "edges": edges,
+                "length": int(row["depth"]),
+            }
+
     # ==================================================================
     # WIKI PAGES + source→page reverse index (#116 incremental regen)
     # ==================================================================

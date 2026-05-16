@@ -669,3 +669,246 @@ async def test_get_graph_stats_missing_db_file_returns_error():
         srv._current_user_id.reset(token)
         srv._wiki_management = old_mgmt
         srv._settings = old_settings
+
+
+# ---------------------------------------------------------------------------
+# #121 Phase 1: graph-native MCP tools — god_nodes / shortest_path /
+# get_community. All three share `_open_wiki_storage`, so we focus on
+# (a) plumbing each tool to its storage method, (b) input validation,
+# and (c) the wiki-not-found error path that exercises the shared
+# resolver. Storage-level behaviour is tested directly in
+# test_unified_db_graph_tools.py.
+# ---------------------------------------------------------------------------
+
+
+def _patch_open_storage(fake_storage: MagicMock):
+    """Return a context-manager stack that wires the shared
+    ``_open_wiki_storage`` helper to ``fake_storage``."""
+    return (
+        patch(
+            "app.services.wiki_management._derive_cache_key",
+            return_value="cachekey-123",
+        ),
+        patch("pathlib.Path.exists", return_value=True),
+        patch("app.core.storage.open_storage", return_value=fake_storage),
+    )
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_forwards_top_n_and_returns_storage_output():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.compute_god_nodes.return_value = {
+        "by_symbol_type": [
+            {"symbol_id": "n1", "name": "AuthService", "symbol_type": "class",
+             "rel_path": "auth/service.py", "degree": 42},
+        ],
+        "by_file": [
+            {"rel_path": "auth/service.py", "internal_arch": 5, "external_edges": 30},
+        ],
+    }
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.god_nodes(wiki_id="wiki-1", top_n=5)
+
+        fake_storage.compute_god_nodes.assert_called_once_with(top_n=5)
+        assert result["by_symbol_type"][0]["name"] == "AuthService"
+        fake_storage.close.assert_called_once()
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_rejects_out_of_range_top_n():
+    import mcp_server.server as srv
+
+    result = await srv.god_nodes(wiki_id="wiki-1", top_n=0)
+    assert "error" in result and "top_n" in result["error"]
+    result = await srv.god_nodes(wiki_id="wiki-1", top_n=201)
+    assert "error" in result and "top_n" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_forwards_args_and_returns_storage_output():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.shortest_path.return_value = {
+        "source": {"node_id": "a", "symbol_name": "AuthService",
+                   "rel_path": "auth.py", "symbol_type": "class"},
+        "target": {"node_id": "z", "symbol_name": "CacheManager",
+                   "rel_path": "cache.py", "symbol_type": "class"},
+        "path": [{"node_id": "a"}, {"node_id": "m"}, {"node_id": "z"}],
+        "edges": [
+            {"source_id": "a", "target_id": "m", "rel_type": "calls",
+             "confidence": "EXTRACTED"},
+            {"source_id": "m", "target_id": "z", "rel_type": "imports",
+             "confidence": "EXTRACTED"},
+        ],
+        "length": 2,
+    }
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.shortest_path(
+                wiki_id="wiki-1",
+                source_label="AuthService",
+                target_label="CacheManager",
+                max_depth=15,
+            )
+
+        fake_storage.shortest_path.assert_called_once_with(
+            source_label="AuthService",
+            target_label="CacheManager",
+            max_depth=15,
+        )
+        assert result["length"] == 2
+        assert len(result["path"]) == 3
+        fake_storage.close.assert_called_once()
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_rejects_invalid_max_depth():
+    import mcp_server.server as srv
+
+    result = await srv.shortest_path(
+        wiki_id="wiki-1", source_label="A", target_label="B", max_depth=0,
+    )
+    assert result == {"path": None, "reason": "invalid_max_depth"}
+    result = await srv.shortest_path(
+        wiki_id="wiki-1", source_label="A", target_label="B", max_depth=51,
+    )
+    assert result == {"path": None, "reason": "invalid_max_depth"}
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_returns_wiki_not_found():
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=None)
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        result = await srv.shortest_path(
+            wiki_id="missing", source_label="A", target_label="B",
+        )
+        assert "error" in result
+        assert "Wiki not found" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_community_forwards_macro_only():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.get_nodes_by_cluster.return_value = [
+        {"node_id": "n1", "symbol_name": "Foo", "macro_cluster": 3},
+        {"node_id": "n2", "symbol_name": "Bar", "macro_cluster": 3},
+    ]
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.get_community(wiki_id="wiki-1", macro_cluster=3)
+
+        fake_storage.get_nodes_by_cluster.assert_called_once_with(
+            macro=3, micro=None, limit=500,
+        )
+        assert result["macro_cluster"] == 3
+        assert result["micro_cluster"] is None
+        assert result["count"] == 2
+        assert len(result["nodes"]) == 2
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_community_forwards_macro_and_micro_with_custom_limit():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.get_nodes_by_cluster.return_value = []
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            await srv.get_community(
+                wiki_id="wiki-1", macro_cluster=5, micro_cluster=2, limit=100,
+            )
+
+        fake_storage.get_nodes_by_cluster.assert_called_once_with(
+            macro=5, micro=2, limit=100,
+        )
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_community_rejects_out_of_range_limit():
+    import mcp_server.server as srv
+
+    result = await srv.get_community(wiki_id="wiki-1", macro_cluster=3, limit=0)
+    assert "error" in result and "limit" in result["error"]
+    result = await srv.get_community(
+        wiki_id="wiki-1", macro_cluster=3, limit=2001,
+    )
+    assert "error" in result and "limit" in result["error"]
