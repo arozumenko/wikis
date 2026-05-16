@@ -526,6 +526,39 @@ class TestWikiServiceShutdown:
         assert completed
 
     @pytest.mark.asyncio
+    async def test_shutdown_does_not_cancel_to_thread_tasks(self, service):
+        """The QA + tech-lead review on PR #165 pointed out that the
+        first ``does_not_cancel`` test uses ``asyncio.sleep``, not
+        ``asyncio.to_thread`` — so it doesn't actually exercise the
+        case that segfaults in CI. This variant uses the real
+        to_thread pattern: verifies that the asyncio.Task completes
+        normally (not cancelled) AND the worker thread runs to
+        completion."""
+        import time
+
+        thread_finished = False
+
+        def slow_thread_work():
+            time.sleep(0.05)
+            nonlocal thread_finished
+            thread_finished = True
+
+        async def run_with_to_thread():
+            await asyncio.to_thread(slow_thread_work)
+
+        task = asyncio.create_task(run_with_to_thread())
+        service._tasks["tt"] = task
+
+        await service.shutdown(timeout=5.0)
+
+        assert task.done()
+        assert not task.cancelled(), (
+            "to_thread-wrapped task was cancelled — the worker thread "
+            "would still be running against soon-closed storage"
+        )
+        assert thread_finished
+
+    @pytest.mark.asyncio
     async def test_shutdown_swallows_task_exceptions(self, service):
         """``return_exceptions=True`` on the gather: shutdown should
         not re-raise an error from one task and abandon the others."""
@@ -576,3 +609,26 @@ class TestWikiServiceShutdown:
             await task
         except asyncio.CancelledError:
             pass
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_cancel_on_timeout(self, service):
+        """Reviewer-flagged Critical regression test: the timeout
+        path must NOT cancel still-pending tasks. An earlier draft
+        used ``asyncio.wait_for(gather(...))`` which cancelled the
+        children on timeout — reintroducing the original segfault.
+        """
+        async def slow():
+            await asyncio.sleep(0.5)
+
+        task = asyncio.create_task(slow())
+        service._tasks["slow"] = task
+
+        await service.shutdown(timeout=0.05)
+
+        # The task should still be pending — shutdown bailed without
+        # cancelling. Its worker thread (if any) is free to finish.
+        assert not task.done()
+        assert not task.cancelled()
+
+        # Clean up so pytest doesn't warn about a dangling task.
+        await task

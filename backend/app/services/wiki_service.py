@@ -134,29 +134,30 @@ class WikiService:
         fixture / lifespan tears the storage down underneath it,
         which the SQLite C library handles by segfaulting.
 
-        Fix: wait for every task to finish naturally. We deliberately
-        do **not** call ``task.cancel()`` — cancellation would let the
-        coroutine return early without joining its worker thread,
-        which is the exact failure we're guarding against. The
-        ``timeout`` is a safety net so a wedged task can't hang the
-        process forever; if we hit it we log loudly and let the
-        remaining shutdown steps run (the orphan threads will at
-        least see live state).
+        We use ``asyncio.wait`` (not ``asyncio.wait_for(gather(...))``)
+        because the latter cancels its children on timeout — and that
+        cancellation is the exact failure mode we're guarding against
+        (the asyncio side returns but the worker thread keeps running
+        on shared state). ``asyncio.wait`` returns ``(done, pending)``
+        without cancelling so we can log + bail without re-introducing
+        the bug.
+
+        If the timeout fires we explicitly do **not** cancel the still-
+        pending tasks. Their threads need the storage / engine alive
+        for as long as they're still running; cancelling here would
+        only mask the leak, not fix it. The orphan threads will at
+        least see live state for the rest of the shutdown sequence.
         """
         pending = [t for t in self._tasks.values() if not t.done()]
         if not pending:
             return
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*pending, return_exceptions=True),
-                timeout=timeout,
-            )
-        except (asyncio.TimeoutError, TimeoutError):
-            still_pending = sum(1 for t in pending if not t.done())
+        _, still_pending = await asyncio.wait(pending, timeout=timeout)
+        if still_pending:
             logger.error(
                 "WikiService.shutdown timeout: %d task(s) still in-flight "
-                "after %.0fs — proceeding with shutdown anyway",
-                still_pending,
+                "after %.0fs — proceeding with shutdown anyway (worker "
+                "threads will continue against live state)",
+                len(still_pending),
                 timeout,
             )
 
