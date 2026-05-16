@@ -93,6 +93,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
 
     logger.info("Shutting down")
+    # Drain in-flight invocation tasks before disposing the SQLAlchemy
+    # engine. Without this, a background task that called
+    # ``asyncio.to_thread()`` for SQLite work would race the storage
+    # close on the main thread → SIGSEGV in CI. Production benefits
+    # too: clean shutdown lets the pending writes complete instead of
+    # being interrupted mid-FTS-rebuild.
+    try:
+        await app.state.wiki_service.shutdown()
+    except Exception:  # noqa: BLE001
+        logger.exception("wiki_service.shutdown raised — continuing teardown")
     await dispose_engine()
 
 
