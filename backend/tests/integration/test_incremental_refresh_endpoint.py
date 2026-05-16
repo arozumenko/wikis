@@ -249,6 +249,15 @@ class TestIncrementalRefreshEndpoint:
             f"expected terminal status, got {invocation.status!r}"
         )
 
+        # #146 Gap 2: ``completed_at`` must be set so
+        # ``_cleanup_old_invocations`` can eventually reclaim memory
+        # for this entry. Before the fix, terminal branches in the
+        # incremental ``_run()`` set only ``status`` and the dict
+        # grew monotonically until process restart.
+        assert invocation.completed_at is not None, (
+            "completed_at must be set on terminal-state transitions"
+        )
+
         # And a subsequent refresh must NOT be 409'd by the completed entry.
         resp2 = await client.post(
             "/api/v1/wikis/test-wiki/incremental-refresh", json=body,
