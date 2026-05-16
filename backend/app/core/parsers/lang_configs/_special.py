@@ -338,6 +338,16 @@ class ZigParser(BasicVisitorParser):
     LITERALS passed as function arguments — ``const x =
     doStuff(struct{…})`` is correctly classified as a regular
     variable, not a container declaration.
+
+    Known limitation: comptime-block-wrapped struct expressions
+    (``const X = comptime blk: { break :blk struct {…}; };``) are
+    NOT detected as struct declarations. tree-sitter-zig parses this
+    as ``VarDecl > LabeledTypeExpr > Block > … > ErrorUnionExpr >
+    ContainerDecl``, and the descent here doesn't enter
+    ``LabeledTypeExpr``. A descent through labeled-block wrappers
+    would fix it but is deferred — the idiom is rare in practice
+    and a deep parser would handle it via proper expression
+    evaluation.
     """
 
     def _visit_structural(self, node: "Node", state, parent_id: str | None) -> None:

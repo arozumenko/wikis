@@ -724,10 +724,13 @@ class TestZig:
     def test_nested_struct_literal_in_call_arg_not_classified(
         self, tmp_path: Path,
     ) -> None:
-        """The structural detection must reject struct LITERALS passed
-        as call arguments — only top-level container declarations
-        count. Otherwise ``const x = doStuff(struct{…})`` would be
-        wrongly classified as a struct declaration."""
+        """Structural detection guarantees that only direct
+        ``ContainerDecl`` children of ``SuffixExpr`` count — struct
+        LITERALS passed as call arguments live inside
+        ``FnCallArguments`` and are skipped. Forward-guard against a
+        future change that loosened the direct-child requirement (the
+        prior text-prefix code happened to also reject this, but for
+        less robust reasons)."""
         src = tmp_path / "callarg.zig"
         src.write_text(
             'const Real    = struct { field: u8 };\n'
@@ -740,6 +743,43 @@ class TestZig:
         # a struct literal — NOT a struct declaration. Should be
         # VARIABLE, not STRUCT.
         assert "NotDecl" not in structs
+
+    def test_double_nested_error_union_struct_recognised(
+        self, tmp_path: Path,
+    ) -> None:
+        """Stress the descent loop: ``error{E}!error{F}!struct {…}``
+        wraps the struct under two ``ErrorUnionExpr`` levels. The
+        rightmost-child walk must descend through both before
+        finding the leaf with the ``ContainerDecl``."""
+        src = tmp_path / "double_eu.zig"
+        src.write_text(
+            'const Deep = error{X}!error{Y}!struct { field: u8 };\n'
+        )
+        result = ZigParser(ZIG).parse_file(src)
+        assert "Deep" in _names_by_type(result, SymbolType.STRUCT)
+
+    def test_comptime_block_struct_is_known_limitation(
+        self, tmp_path: Path,
+    ) -> None:
+        """Pinning test for the documented comptime-block limitation
+        (see ZigParser docstring). ``const X = comptime blk: { break
+        :blk struct {…}; };`` parses as ``VarDecl > LabeledTypeExpr >
+        Block > … > ContainerDecl``, and the descent here doesn't
+        enter ``LabeledTypeExpr``. Classified as VARIABLE; a future
+        refinement would extend the descent through labeled blocks.
+        """
+        src = tmp_path / "comptime.zig"
+        src.write_text(
+            'const ComptimeStruct = comptime blk: {\n'
+            '    break :blk struct { field: u8 };\n'
+            '};\n'
+        )
+        result = ZigParser(ZIG).parse_file(src)
+        # Not in STRUCT — this is the documented limitation. If a
+        # future fix lifts the comptime-block restriction, this
+        # assertion fails and the test signals the limitation has
+        # been resolved (update the docstring accordingly).
+        assert "ComptimeStruct" not in _names_by_type(result, SymbolType.STRUCT)
 
 
 class TestGroovy:
