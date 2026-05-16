@@ -2,6 +2,8 @@ name: Test
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
   backend-tests:
@@ -13,6 +15,28 @@ jobs:
       - run: pip install -e ".[dev]"
         working-directory: backend
       - run: AUTH_ENABLED=false pytest tests/ -v --cov=app
+        working-directory: backend
+
+  # Stress-runs the integration suites that have historically exposed
+  # asyncio + thread-pool teardown races (CI segfaults fixed in #165).
+  # A single run hides scheduling-dependent failures; repeating in one
+  # Python process surfaces them quickly. Targeted scope keeps the job
+  # under ~2 minutes so it doesn't slow every PR meaningfully.
+  backend-tests-stress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -e ".[dev]"
+        working-directory: backend
+      - name: Stress integration teardown paths (25x)
+        run: |
+          AUTH_ENABLED=false pytest \
+            tests/integration/test_incremental_refresh_endpoint.py \
+            tests/integration/test_export_import_roundtrip.py \
+            tests/test_wiki_service.py::TestWikiServiceShutdown \
+            --count=25 -q
         working-directory: backend
 
   frontend-checks:
