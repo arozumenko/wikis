@@ -863,7 +863,6 @@ async def get_community(
 async def surprising_connections(
     wiki_id: str,
     top_n: int = 10,
-    context_depth: int = 1,
     sample_edges_per_pair: int = 3,
 ) -> dict[str, Any]:
     """Find the most surprising cross-cluster edges in the graph (#121).
@@ -879,31 +878,32 @@ async def surprising_connections(
     architectural boundaries — worth a closer look" without paying
     LLM cost or retrieval cost.
 
+    The ``context_depth`` knob is intentionally fixed to 1 (top-level
+    folder) for v1 — at deeper resolutions the signal shifts from
+    "architectural boundary crossed" to a much noisier file-proximity
+    metric that doesn't have a UI story yet. The storage method still
+    accepts the knob so a future MCP surface can expose it once that
+    UI exists.
+
     Args:
         wiki_id: Wiki identifier from ``search_wikis()``.
         top_n: Maximum cluster-pairs to return (1-100, default 10).
-        context_depth: How many leading ``rel_path`` segments form
-            the cluster context (1-5, default 1 = top-level folder).
         sample_edges_per_pair: Example edges to include per pair
             (1-10, default 3).
 
     Returns:
         Dict with ``pairs`` (list, sorted by ``jaccard_distance``
-        descending). Each pair has ``cluster_a`` / ``cluster_b``
-        (always ``cluster_a < cluster_b``), ``jaccard_distance``
-        (0.0 - 1.0), ``context_a`` / ``context_b`` (sorted prefix
-        lists), ``edge_count``, ``sample_edges``. Empty list when
+        descending) and ``skipped_pairs`` (count of cross-cluster
+        pairs whose contexts were both empty — usually 0; non-zero
+        signals a pipeline issue with ``rel_path`` population). Each
+        pair has ``cluster_a`` / ``cluster_b`` (always
+        ``cluster_a < cluster_b``), ``jaccard_distance`` (0.0 - 1.0),
+        ``context_a`` / ``context_b`` (sorted prefix lists),
+        ``edge_count``, ``sample_edges``. Empty ``pairs`` list when
         no cross-cluster edges exist.
     """
     if not 1 <= top_n <= 100:
         return {"error": f"top_n must be between 1 and 100, got {top_n}"}
-    if not 1 <= context_depth <= 5:
-        return {
-            "error": (
-                f"context_depth must be between 1 and 5, "
-                f"got {context_depth}"
-            ),
-        }
     if not 1 <= sample_edges_per_pair <= 10:
         return {
             "error": (
@@ -918,7 +918,8 @@ async def surprising_connections(
     try:
         return storage.compute_surprising_connections(
             top_n=top_n,
-            context_depth=context_depth,
+            # Pinned to 1 in v1 — see docstring rationale.
+            context_depth=1,
             sample_edges_per_pair=sample_edges_per_pair,
         )
     finally:

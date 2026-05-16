@@ -2371,26 +2371,44 @@ class UnifiedWikiDB:
 
     # ── surprising_connections (#121 Phase 2) ─────────────────────────
 
-    def _cluster_context_prefixes(
-        self, cluster: int, depth: int,
-    ) -> set[str]:
-        """Return the set of rel_path prefixes (top ``depth`` segments)
-        for nodes in the given macro cluster. Used as the cluster's
-        "context" for Jaccard-distance scoring."""
+    @staticmethod
+    def _path_prefix(rel_path: str, depth: int) -> str:
+        """Folder prefix at ``depth`` segments, stripping the
+        filename. Returns ``""`` for root-level files (no folder).
+
+        Example: ``("frontend/widgets/Btn.tsx", 1)`` → ``"frontend"``;
+        ``("frontend/widgets/Btn.tsx", 2)`` → ``"frontend/widgets"``;
+        ``("Btn.tsx", 1)`` → ``""`` (no folder).
+        """
+        if not rel_path:
+            return ""
+        parts = rel_path.split("/")
+        folders = parts[:-1]  # drop filename
+        if not folders:
+            return ""
+        return "/".join(folders[:depth])
+
+    def _fetch_cluster_contexts(
+        self, clusters: set[int], depth: int,
+    ) -> dict[int, set[str]]:
+        """One indexed bulk query, return per-cluster folder-prefix
+        sets. Avoids the N+1 round-trip pattern an earlier draft had
+        when each cluster was fetched individually."""
+        if not clusters:
+            return {}
+        placeholders = ",".join("?" * len(clusters))
         rows = self.conn.execute(
-            "SELECT DISTINCT rel_path FROM repo_nodes "
-            "WHERE macro_cluster = ? AND rel_path IS NOT NULL AND rel_path != ''",
-            (cluster,),
+            f"SELECT macro_cluster, rel_path FROM repo_nodes "  # noqa: S608
+            f"WHERE macro_cluster IN ({placeholders}) "
+            f"  AND rel_path IS NOT NULL AND rel_path != ''",
+            tuple(clusters),
         ).fetchall()
-        prefixes: set[str] = set()
+        contexts: dict[int, set[str]] = {c: set() for c in clusters}
         for row in rows:
-            parts = row["rel_path"].split("/")
-            if not parts:
-                continue
-            prefix = "/".join(parts[:depth]) if parts[:depth] else parts[0]
+            prefix = self._path_prefix(row["rel_path"], depth)
             if prefix:
-                prefixes.add(prefix)
-        return prefixes
+                contexts[int(row["macro_cluster"])].add(prefix)
+        return contexts
 
     def compute_surprising_connections(
         self,
@@ -2420,27 +2438,28 @@ class UnifiedWikiDB:
         ).fetchall()
 
         if not pair_rows:
-            return {"pairs": []}
+            return {"pairs": [], "skipped_pairs": 0}
 
-        # 2) Cache contexts so each cluster is fetched once.
-        context_cache: dict[int, set[str]] = {}
+        # 2) Bulk-fetch contexts for every cluster appearing in pairs.
+        clusters = {int(r["c_lo"]) for r in pair_rows} | {
+            int(r["c_hi"]) for r in pair_rows
+        }
+        contexts = self._fetch_cluster_contexts(clusters, context_depth)
 
-        def ctx(cluster: int) -> set[str]:
-            if cluster not in context_cache:
-                context_cache[cluster] = self._cluster_context_prefixes(
-                    cluster, context_depth,
-                )
-            return context_cache[cluster]
-
-        # 3) Score each pair by Jaccard distance.
+        # 3) Score each pair by Jaccard distance. Pairs with two empty
+        # contexts (e.g. all root-level files) carry no signal — count
+        # them so the caller can distinguish "nothing surprising"
+        # (empty pairs / non-empty skipped) from "no cross-cluster
+        # edges" (zero raw pair rows).
         scored: list[dict[str, Any]] = []
+        skipped = 0
         for row in pair_rows:
             c_lo, c_hi, edge_count = row["c_lo"], row["c_hi"], row["edge_count"]
-            ctx_lo = ctx(c_lo)
-            ctx_hi = ctx(c_hi)
+            ctx_lo = contexts.get(int(c_lo), set())
+            ctx_hi = contexts.get(int(c_hi), set())
             union = ctx_lo | ctx_hi
             if not union:
-                # Both contexts empty — no signal; skip.
+                skipped += 1
                 continue
             intersection = ctx_lo & ctx_hi
             jaccard_distance = 1.0 - (len(intersection) / len(union))
@@ -2494,7 +2513,7 @@ class UnifiedWikiDB:
             ).fetchall()
             pair["sample_edges"] = [dict(r) for r in sample]
 
-        return {"pairs": top}
+        return {"pairs": top, "skipped_pairs": skipped}
 
     # ══════════════════════════════════════════════════════════════════
     # WIKI PAGES + source→page reverse index (#116 incremental regen)

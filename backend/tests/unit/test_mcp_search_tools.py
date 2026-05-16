@@ -956,12 +956,13 @@ async def test_surprising_connections_forwards_args():
             result = await srv.surprising_connections(
                 wiki_id="wiki-1",
                 top_n=5,
-                context_depth=2,
                 sample_edges_per_pair=4,
             )
 
+        # context_depth is pinned to 1 at the MCP layer for v1 — the
+        # MCP tool always forwards 1 regardless of caller input.
         fake_storage.compute_surprising_connections.assert_called_once_with(
-            top_n=5, context_depth=2, sample_edges_per_pair=4,
+            top_n=5, context_depth=1, sample_edges_per_pair=4,
         )
         assert result["pairs"][0]["cluster_a"] == 1
         fake_storage.close.assert_called_once()
@@ -978,8 +979,6 @@ async def test_surprising_connections_rejects_out_of_range_args():
     for kwargs in (
         {"top_n": 0},
         {"top_n": 101},
-        {"context_depth": 0},
-        {"context_depth": 6},
         {"sample_edges_per_pair": 0},
         {"sample_edges_per_pair": 11},
     ):

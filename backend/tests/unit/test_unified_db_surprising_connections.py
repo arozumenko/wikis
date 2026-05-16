@@ -148,7 +148,7 @@ def test_empty_graph_returns_no_pairs(tmp_path):
     db = UnifiedWikiDB(tmp_path / "empty.wiki.db", embedding_dim=8)
     try:
         result = db.compute_surprising_connections(top_n=10)
-        assert result == {"pairs": []}
+        assert result == {"pairs": [], "skipped_pairs": 0}
     finally:
         db.close()
 
@@ -161,7 +161,7 @@ def test_intra_cluster_edges_are_ignored(tmp_path):
         db.upsert_edge("X", "Y", "calls", confidence="EXTRACTED")
         db.conn.commit()
         result = db.compute_surprising_connections(top_n=10)
-        assert result == {"pairs": []}
+        assert result == {"pairs": [], "skipped_pairs": 0}
     finally:
         db.close()
 
@@ -175,9 +175,44 @@ def test_nodes_without_cluster_ignored(tmp_path):
         db.upsert_edge("X", "Y", "calls", confidence="EXTRACTED")
         db.conn.commit()
         result = db.compute_surprising_connections(top_n=10)
-        assert result == {"pairs": []}
+        assert result == {"pairs": [], "skipped_pairs": 0}
     finally:
         db.close()
+
+
+def test_root_level_files_dont_pollute_context(tmp_path):
+    """Flat files (no folder prefix) should produce empty prefix sets,
+    not be treated as their own folder. Two clusters of root-level
+    files connected to each other should show up as ``skipped_pairs``
+    rather than producing a misleading Jaccard score."""
+    db = UnifiedWikiDB(tmp_path / "root.wiki.db", embedding_dim=8)
+    try:
+        # Cluster 1: only root-level files
+        db.upsert_node("A", rel_path="config.py", macro_cluster=1)
+        # Cluster 2: only root-level files
+        db.upsert_node("B", rel_path="main.py", macro_cluster=2)
+        db.upsert_edge("A", "B", "calls", confidence="EXTRACTED")
+        db.conn.commit()
+        result = db.compute_surprising_connections(top_n=10)
+        assert result["pairs"] == []
+        # The pair existed (cross-cluster edge present) but was
+        # skipped — operators can see the count.
+        assert result["skipped_pairs"] == 1
+    finally:
+        db.close()
+
+
+def test_path_prefix_strips_filename(db):
+    """Direct unit test: the prefix helper drops the final segment.
+    Documents the contract the algorithm relies on so callers can
+    reason about the Jaccard scoring without reading SQL."""
+    pp = db._path_prefix
+    assert pp("frontend/widgets/Btn.tsx", 1) == "frontend"
+    assert pp("frontend/widgets/Btn.tsx", 2) == "frontend/widgets"
+    assert pp("frontend/widgets/Btn.tsx", 5) == "frontend/widgets"
+    # Root-level file → empty prefix (excluded from context set).
+    assert pp("Btn.tsx", 1) == ""
+    assert pp("", 1) == ""
 
 
 def test_directional_edges_collapse_to_unordered_pair(db):

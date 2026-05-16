@@ -680,14 +680,25 @@ class WikiStorageProtocol(Protocol):
                 per pair.
 
         Returns:
-            Dict with ``pairs`` (list, sorted by ``jaccard_distance``
-            descending). Each pair has ``cluster_a``, ``cluster_b``
-            (always ``cluster_a < cluster_b``), ``jaccard_distance``
-            (0.0 - 1.0), ``context_a``, ``context_b`` (sorted prefix
-            lists), ``edge_count``, and ``sample_edges`` (list of
-            ``{source_id, target_id, rel_type, confidence,
-            source_name, source_path, target_name, target_path}``).
-            Empty ``pairs`` list when no cross-cluster edges exist.
+            Dict with:
+
+            * ``pairs`` — list sorted by ``jaccard_distance``
+              descending. Each pair has ``cluster_a``, ``cluster_b``
+              (always ``cluster_a < cluster_b``),
+              ``jaccard_distance`` (0.0 - 1.0), ``context_a``,
+              ``context_b`` (sorted prefix lists), ``edge_count``,
+              and ``sample_edges`` (list of ``{source_id, target_id,
+              rel_type, confidence, source_name, source_path,
+              target_name, target_path}``).
+            * ``skipped_pairs`` — count of cross-cluster pairs whose
+              two contexts were both empty (root-level files /
+              missing ``rel_path``). Normally 0; non-zero signals a
+              pipeline issue worth surfacing to operators rather
+              than a normal "nothing surprising" result. Use
+              ``len(pairs)`` for the user-facing count.
+
+            Empty ``pairs`` + ``skipped_pairs == 0`` means no
+            cross-cluster edges exist.
         """
         ...
 

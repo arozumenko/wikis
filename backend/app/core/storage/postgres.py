@@ -2383,27 +2383,40 @@ class PostgresWikiStorage:
 
     # ── surprising_connections (#121 Phase 2) ─────────────────────────
 
-    def _cluster_context_prefixes(
-        self, conn, cluster: int, depth: int,
-    ) -> set[str]:
+    @staticmethod
+    def _path_prefix(rel_path: str, depth: int) -> str:
+        """Folder prefix at ``depth`` segments, stripping the filename.
+        See sqlite backend for examples."""
+        if not rel_path:
+            return ""
+        parts = rel_path.split("/")
+        folders = parts[:-1]
+        if not folders:
+            return ""
+        return "/".join(folders[:depth])
+
+    def _fetch_cluster_contexts(
+        self, conn, clusters: set[int], depth: int,
+    ) -> dict[int, set[str]]:
+        """Bulk-fetch per-cluster folder-prefix sets — single
+        ``= ANY(:cs)`` query instead of one round-trip per cluster."""
+        if not clusters:
+            return {}
         rows = conn.execute(
             text(
-                f"SELECT DISTINCT rel_path FROM {self._nodes} "
-                "WHERE macro_cluster = :c "
+                f"SELECT macro_cluster, rel_path FROM {self._nodes} "
+                "WHERE macro_cluster = ANY(:cs) "
                 "  AND rel_path IS NOT NULL "
                 "  AND rel_path <> ''"
             ),
-            {"c": cluster},
+            {"cs": list(clusters)},
         ).mappings().fetchall()
-        prefixes: set[str] = set()
+        contexts: dict[int, set[str]] = {c: set() for c in clusters}
         for row in rows:
-            parts = row["rel_path"].split("/")
-            if not parts:
-                continue
-            prefix = "/".join(parts[:depth]) if parts[:depth] else parts[0]
+            prefix = self._path_prefix(row["rel_path"], depth)
             if prefix:
-                prefixes.add(prefix)
-        return prefixes
+                contexts[int(row["macro_cluster"])].add(prefix)
+        return contexts
 
     def compute_surprising_connections(
         self,
@@ -2433,24 +2446,24 @@ class PostgresWikiStorage:
             ).mappings().fetchall()
 
             if not pair_rows:
-                return {"pairs": []}
+                return {"pairs": [], "skipped_pairs": 0}
 
-            context_cache: dict[int, set[str]] = {}
-
-            def ctx(cluster: int) -> set[str]:
-                if cluster not in context_cache:
-                    context_cache[cluster] = self._cluster_context_prefixes(
-                        conn, cluster, context_depth,
-                    )
-                return context_cache[cluster]
+            clusters = {int(r["c_lo"]) for r in pair_rows} | {
+                int(r["c_hi"]) for r in pair_rows
+            }
+            contexts = self._fetch_cluster_contexts(
+                conn, clusters, context_depth,
+            )
 
             scored: list[dict[str, Any]] = []
+            skipped = 0
             for row in pair_rows:
                 c_lo, c_hi = int(row["c_lo"]), int(row["c_hi"])
-                ctx_lo = ctx(c_lo)
-                ctx_hi = ctx(c_hi)
+                ctx_lo = contexts.get(c_lo, set())
+                ctx_hi = contexts.get(c_hi, set())
                 union = ctx_lo | ctx_hi
                 if not union:
+                    skipped += 1
                     continue
                 intersection = ctx_lo & ctx_hi
                 jaccard_distance = 1.0 - (len(intersection) / len(union))
@@ -2503,7 +2516,7 @@ class PostgresWikiStorage:
                 ).mappings().fetchall()
                 pair["sample_edges"] = [dict(r) for r in sample]
 
-            return {"pairs": top}
+            return {"pairs": top, "skipped_pairs": skipped}
 
     # ==================================================================
     # WIKI PAGES + source→page reverse index (#116 incremental regen)
