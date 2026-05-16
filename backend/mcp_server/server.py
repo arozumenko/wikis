@@ -322,12 +322,22 @@ async def get_wiki_page(wiki_id: str, page_id: str, offset: int = 0, limit: int 
 
 
 @mcp.tool()
-async def ask_codebase(wiki_id: str, question: str) -> dict[str, Any]:
+async def ask_codebase(
+    wiki_id: str,
+    question: str,
+    min_confidence: str | None = None,
+) -> dict[str, Any]:
     """Ask a natural language question about a codebase; returns an AI answer grounded in the wiki.
 
     Args:
         wiki_id: Wiki identifier from search_wikis().
         question: Question about the codebase — architecture, implementation details, how-tos.
+        min_confidence: Optional edge-confidence floor for graph expansion (#120/#157).
+            ``None`` (default) includes all edges. ``"EXTRACTED"`` keeps only direct
+            parser observations; ``"INFERRED"`` includes name-only resolution edges
+            (basic-tier languages like Ruby, PHP, Kotlin). Use this when answer
+            precision matters more than recall — INFERRED edges from lightweight
+            parsers can cite wrong call targets when symbol names collide.
     """
     if _ask_service:
         try:
@@ -335,7 +345,10 @@ async def ask_codebase(wiki_id: str, question: str) -> dict[str, Any]:
 
             from app.models.api import AskRequest
 
-            request = AskRequest(wiki_id=wiki_id, question=question)
+            request = AskRequest(
+                wiki_id=wiki_id, question=question,
+                min_confidence=min_confidence,
+            )
             result = await _ask_service.ask_sync(request)
             # Record QA interaction (direct await — no HTTP lifecycle)
             if result.recording and _qa_service:
@@ -446,7 +459,11 @@ async def list_projects(query: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-async def ask_project(project_id: str, question: str) -> dict[str, Any]:
+async def ask_project(
+    project_id: str,
+    question: str,
+    min_confidence: str | None = None,
+) -> dict[str, Any]:
     """Ask a question across all wikis in a project.
 
     Returns a cross-repo answer with source attribution per wiki.
@@ -454,6 +471,9 @@ async def ask_project(project_id: str, question: str) -> dict[str, Any]:
     Args:
         project_id: Project identifier from list_projects().
         question: Question about the codebase — architecture, implementation details, how-tos.
+        min_confidence: Optional edge-confidence floor for graph expansion (#120/#157).
+            See ``ask_codebase`` for the same parameter semantics. The filter
+            applies independently to each wiki's retriever in the project fan-out.
     """
     user_id = _current_user_id.get()
     if _ask_service:
@@ -462,7 +482,10 @@ async def ask_project(project_id: str, question: str) -> dict[str, Any]:
 
             from app.models.api import AskRequest
 
-            request = AskRequest(project_id=project_id, question=question)
+            request = AskRequest(
+                project_id=project_id, question=question,
+                min_confidence=min_confidence,
+            )
             result = await _ask_service.ask_sync(request, user_id=user_id)
             if result.recording and _qa_service:
                 try:

@@ -141,7 +141,13 @@ class AskService:
             code_graph=components.code_graph,
             repo_analysis=components.repo_analysis,
             llm_client=components.llm,
-            config=AskConfig(similarity_threshold=self.settings.ask_similarity_threshold),
+            config=AskConfig(
+                similarity_threshold=self.settings.ask_similarity_threshold,
+                # #120/#157: propagate the per-request edge-confidence
+                # floor into AskConfig so retriever-level filtering
+                # kicks in during graph expansion.
+                min_confidence=request.min_confidence,
+            ),
             query_service=components.query_service,
         )
 
