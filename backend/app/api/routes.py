@@ -97,6 +97,7 @@ async def generate_wiki(
     user: CurrentUser = Depends(get_current_user),
     service: WikiService = Depends(get_wiki_service),
 ) -> GenerateWikiResponse:
+    from app.services.wiki_service import GenerateInProgressError
     from app.services.wiki_service_errors import WikiAlreadyExistsError
 
     try:
@@ -105,6 +106,22 @@ async def generate_wiki(
         raise HTTPException(  # noqa: B904
             status_code=409,
             detail={"error": str(e), "wiki_id": e.wiki_id},
+        )
+    except GenerateInProgressError as exc:
+        # #145: another generate or incremental_refresh is mid-flight
+        # for this wiki. Surface the in-flight invocation_id so the
+        # caller can subscribe to its SSE stream instead of spawning
+        # a racing run that would corrupt the shared ``.wiki.db``.
+        # ``X-In-Flight-Invocation-Id``'s value may reference either a
+        # generate OR an incremental refresh (the helper checks both
+        # statuses) — callers shouldn't assume the operation type
+        # from the header alone; fetch the invocation to learn more.
+        raise HTTPException(  # noqa: B904
+            status_code=409,
+            detail=str(exc),
+            headers={
+                "X-In-Flight-Invocation-Id": exc.in_progress_invocation_id,
+            },
         )
     return GenerateWikiResponse(
         wiki_id=invocation.wiki_id,
@@ -991,10 +1008,15 @@ async def incremental_refresh_wiki(
     except IncrementalRefreshInProgressError as exc:
         # #140: surface the in-flight invocation_id so the caller can
         # join the existing SSE stream instead of retrying blindly.
+        # #145: header renamed to ``X-In-Flight-Invocation-Id`` for
+        # parity with the symmetric guard on /generate — the value may
+        # reference an incremental refresh OR a generate, so the
+        # per-endpoint name (``X-Incremental-...``) was misleading.
+        # No prior consumers existed; the rename is safe.
         raise HTTPException(
             409,
             detail=str(exc),
-            headers={"X-Incremental-Invocation-Id": exc.in_progress_invocation_id},
+            headers={"X-In-Flight-Invocation-Id": exc.in_progress_invocation_id},
         ) from exc
 
     if result is None:

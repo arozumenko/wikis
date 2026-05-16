@@ -620,6 +620,75 @@ class TestGenerateWiki:
             )
         assert resp.status_code == 409
 
+    @pytest.mark.asyncio
+    async def test_generate_409_when_incremental_refresh_in_flight(
+        self, client, test_app,
+    ):
+        """#145: a generate request must be rejected with 409 when an
+        incremental refresh is mid-flight on the same wiki. Without
+        this, both operations would write to the same .wiki.db
+        concurrently and corrupt FTS5/tsvector indices."""
+        from app.models.invocation import Invocation
+
+        # Pre-seed an in-flight incremental refresh in the service.
+        # The wiki_id matches what _make_wiki_id produces for the
+        # request below so the helper finds it.
+        from app.services.wiki_service import WikiService
+
+        wiki_id = WikiService._make_wiki_id(
+            "https://github.com/test/repo", "main",
+        )
+        in_flight_id = "incremental-in-flight-12345"
+        test_app.state.wiki_service._invocations[in_flight_id] = Invocation(
+            id=in_flight_id,
+            wiki_id=wiki_id,
+            repo_url="https://github.com/test/repo",
+            branch="main",
+            status="running",  # incremental refresh's in-flight status
+            owner_id="u1",
+        )
+
+        resp = await client.post(
+            "/api/v1/generate",
+            json={"repo_url": "https://github.com/test/repo", "branch": "main"},
+        )
+        assert resp.status_code == 409, resp.text
+        # The in-flight invocation id is surfaced so the caller can
+        # subscribe to its SSE stream instead of retrying blindly.
+        assert resp.headers["X-In-Flight-Invocation-Id"] == in_flight_id
+
+    @pytest.mark.asyncio
+    async def test_generate_409_when_another_generate_in_flight(
+        self, client, test_app,
+    ):
+        """#145: same guard covers two concurrent generates on the
+        same wiki (status=='generating'). Was previously caught by
+        WikiAlreadyExistsError via the DB record, but the in-memory
+        check is more direct + works when the DB hasn't been written
+        yet (the very first ms of a new generate)."""
+        from app.models.invocation import Invocation
+        from app.services.wiki_service import WikiService
+
+        wiki_id = WikiService._make_wiki_id(
+            "https://github.com/test/repo", "main",
+        )
+        in_flight_id = "generate-in-flight-99999"
+        test_app.state.wiki_service._invocations[in_flight_id] = Invocation(
+            id=in_flight_id,
+            wiki_id=wiki_id,
+            repo_url="https://github.com/test/repo",
+            branch="main",
+            status="generating",
+            owner_id="u1",
+        )
+
+        resp = await client.post(
+            "/api/v1/generate",
+            json={"repo_url": "https://github.com/test/repo", "branch": "main"},
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.headers["X-In-Flight-Invocation-Id"] == in_flight_id
+
 
 # ---------------------------------------------------------------------------
 # get_wiki_page
