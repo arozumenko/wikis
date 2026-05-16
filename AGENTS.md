@@ -363,7 +363,8 @@ Three tiers of parser coverage at `backend/app/core/parsers/`:
 | Tier | Parsers | Path | Approach |
 |------|---------|------|----------|
 | **Rich (deep)** | C++, C#, Go, Java, Python, JavaScript, TypeScript, Rust | `<lang>_parser.py` / `<lang>_visitor_parser.py` (1500–4000 LOC each) | Per-language type inference, field resolution, template instantiation |
-| **Basic (lightweight visitor)** | Ruby, PHP, Kotlin, Scala, Lua | `basic_visitor.py` + `lang_configs/<lang>.py` (~30 LOC config each) | Generic tree-sitter visitor driven by per-language `LanguageConfig` (node-type strings for class/function/call/import + inheritance field/types + name fallbacks + name-chain drill-down) |
+| **Basic (lightweight visitor)** | Ruby, PHP, Kotlin, Scala, Lua, Swift, Dart, PowerShell, Bash, Objective-C, Verilog, Fortran, Julia, Pascal | `basic_visitor.py` + `lang_configs/<lang>.py` (~30 LOC config each) | Generic tree-sitter visitor driven by per-language `LanguageConfig` (node-type strings for class/function/call/import + inheritance field/types + name fallbacks + name-chain drill-down) |
+| **Basic (bespoke subclass)** | Elixir, R, Zig, Groovy | `basic_visitor.py` subclass in `lang_configs/_special.py` | Same `BasicVisitorParser` two-pass design, but `_visit_structural` overridden where the grammar's shape doesn't fit pure config (Elixir: `call`-text discrimination for `defmodule`/`def`; R: backward parent-lookup on `binary_operator`; Zig: var-decl-with-struct-RHS pattern; Groovy: nested `command`/`unit`/`block` token-sequence walk) |
 | **Regex fallback** | (legacy / unsupported) | `code_splitter.py` | Last-resort extraction for languages without any tree-sitter coverage |
 
 All three tiers produce the same `Symbol` / `Relationship` / `ParseResult` shape so downstream graph builders, retrievers, and the wiki agent need zero special-casing.

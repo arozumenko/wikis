@@ -34,12 +34,31 @@ from app.core.parsers.basic_visitor import (
     make_id,
 )
 from app.core.parsers.lang_configs import (
+    BASH,
+    DART,
+    ELIXIR,
+    FORTRAN,
+    GROOVY,
+    JULIA,
     KOTLIN,
     LUA,
+    OBJC,
+    PASCAL,
     PHP,
+    POWERSHELL,
+    R,
     RUBY,
     SCALA,
+    SWIFT,
+    VERILOG,
+    ZIG,
     build_basic_parsers,
+)
+from app.core.parsers.lang_configs._special import (
+    ElixirParser,
+    GroovyParser,
+    RParser,
+    ZigParser,
 )
 
 FIXTURE_ROOT = Path(__file__).parent.parent / "fixtures" / "parsers"
@@ -118,13 +137,42 @@ class TestMakeId:
         assert make_id("a.b.c", "x/y/z") == "a_b_c_x_y_z"
 
 
+_EXPECTED_LANGS = frozenset({
+    # Phase 1
+    "ruby", "php", "kotlin", "scala", "lua",
+    # Phase 2 — pure-config
+    "swift", "dart", "powershell", "bash", "objc",
+    "verilog", "fortran", "julia", "pascal",
+    # Phase 2 — bespoke subclasses
+    "elixir", "r", "zig", "groovy",
+})
+
+
 class TestRegistry:
-    def test_build_basic_parsers_returns_five_languages(self) -> None:
+    def test_build_basic_parsers_returns_all_18_languages(self) -> None:
         parsers = build_basic_parsers()
-        assert set(parsers.keys()) == {"ruby", "php", "kotlin", "scala", "lua"}
+        assert set(parsers.keys()) == _EXPECTED_LANGS
         for name, parser in parsers.items():
             assert isinstance(parser, BasicVisitorParser)
             assert parser.config.name == name
+
+    def test_basic_visitor_langs_sync_with_factory(self) -> None:
+        """#151: the literal ``_BASIC_VISITOR_LANGS`` tuple in
+        ``graph_builder.py`` is hand-maintained so it can serve as a
+        lost-language diagnostic even when ``build_basic_parsers()``
+        fails to import. This test catches drift: a contributor adds
+        a new language to the factory but forgets the literal (or
+        vice versa). Failure here turns a silent omission in the
+        diagnostic into a CI break."""
+        from app.core.code_graph.graph_builder import _BASIC_VISITOR_LANGS
+
+        factory_keys = set(build_basic_parsers().keys())
+        literal_set = set(_BASIC_VISITOR_LANGS)
+        assert factory_keys == literal_set, (
+            f"build_basic_parsers() returns {sorted(factory_keys)} but "
+            f"_BASIC_VISITOR_LANGS lists {sorted(literal_set)} — keep "
+            f"them in sync to avoid silent omission from the diagnostic"
+        )
 
     def test_each_parser_reports_its_extensions(self) -> None:
         parsers = build_basic_parsers()
@@ -136,10 +184,25 @@ class TestRegistry:
 
     def test_each_parser_advertises_its_capabilities(self) -> None:
         parsers = build_basic_parsers()
-        # Languages with classes should report so; Lua should not.
+        # Languages with classes should report so; Lua + Bash should not.
         assert parsers["ruby"].capabilities.has_classes is True
         assert parsers["php"].capabilities.has_classes is True
+        assert parsers["swift"].capabilities.has_classes is True
         assert parsers["lua"].capabilities.has_classes is False
+        assert parsers["bash"].capabilities.has_classes is False
+
+    def test_bespoke_subclasses_used_for_quirky_grammars(self) -> None:
+        """Elixir/R/Zig/Groovy use BasicVisitorParser subclasses.
+        Verify the registry hands out the right instance type."""
+        parsers = build_basic_parsers()
+        assert isinstance(parsers["elixir"], ElixirParser)
+        assert isinstance(parsers["r"], RParser)
+        assert isinstance(parsers["zig"], ZigParser)
+        assert isinstance(parsers["groovy"], GroovyParser)
+        # All bespoke parsers still inherit from BasicVisitorParser so
+        # they slot into the dispatch path uniformly.
+        for name in ("elixir", "r", "zig", "groovy"):
+            assert isinstance(parsers[name], BasicVisitorParser)
 
 
 class TestUnsupportedConfig:
@@ -353,3 +416,270 @@ class TestLua:
         assert greet is not None
         # ``function Greeter:greet`` is on line 5 in the fixture.
         assert greet.range.start.line == 5
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — pure-config languages (Swift, Dart, PowerShell, Bash, Obj-C,
+# Verilog, Fortran, Julia, Pascal)
+# ---------------------------------------------------------------------------
+
+
+def _basic_result(cfg, fixture_path: Path):
+    return BasicVisitorParser(cfg).parse_file(fixture_path)
+
+
+class TestSwift:
+    @pytest.fixture
+    def result(self):
+        return _basic_result(SWIFT, FIXTURE_ROOT / "swift" / "hello.swift")
+
+    def test_class_and_methods(self, result) -> None:
+        assert "Greeter" in _names_by_type(result, SymbolType.CLASS)
+        methods = _names_by_type(result, SymbolType.METHOD)
+        assert "greet" in methods and "formatName" in methods
+
+    def test_top_level_function(self, result) -> None:
+        assert "standaloneHelper" in _names_by_type(result, SymbolType.FUNCTION)
+
+    def test_inheritance(self, result) -> None:
+        assert any(
+            src == "Greeter" and tgt == "Base"
+            for src, tgt in _inherit_pairs(result)
+        )
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestDart:
+    @pytest.fixture
+    def result(self):
+        return _basic_result(DART, FIXTURE_ROOT / "dart" / "hello.dart")
+
+    def test_class_and_methods(self, result) -> None:
+        assert "Greeter" in _names_by_type(result, SymbolType.CLASS)
+        methods = _names_by_type(result, SymbolType.METHOD)
+        assert "greet" in methods and "formatName" in methods
+
+    def test_inheritance(self, result) -> None:
+        assert any(
+            src == "Greeter" and "Base" in tgt
+            for src, tgt in _inherit_pairs(result)
+        )
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestPowerShell:
+    @pytest.fixture
+    def result(self):
+        return _basic_result(POWERSHELL, FIXTURE_ROOT / "powershell" / "hello.ps1")
+
+    def test_class_and_methods(self, result) -> None:
+        assert "Greeter" in _names_by_type(result, SymbolType.CLASS)
+        methods = _names_by_type(result, SymbolType.METHOD)
+        assert "Greet" in methods and "FormatName" in methods
+
+    def test_top_level_function(self, result) -> None:
+        assert "StandaloneHelper" in _names_by_type(result, SymbolType.FUNCTION)
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestBash:
+    @pytest.fixture
+    def result(self):
+        return _basic_result(BASH, FIXTURE_ROOT / "bash" / "hello.sh")
+
+    def test_no_classes_only_functions(self, result) -> None:
+        assert _names_by_type(result, SymbolType.CLASS) == set()
+        funcs = _names_by_type(result, SymbolType.FUNCTION)
+        assert {"greet", "format_name", "standalone_helper"} <= funcs
+
+    def test_call_edges(self, result) -> None:
+        pairs = _call_pairs(result)
+        assert any(src == "greet" and tgt == "format_name" for src, tgt in pairs)
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestObjC:
+    @pytest.fixture
+    def result(self):
+        return _basic_result(OBJC, FIXTURE_ROOT / "objc" / "hello.m")
+
+    def test_both_interface_and_implementation_emit_class(self, result) -> None:
+        # Obj-C emits Greeter twice: once for @interface, once for
+        # @implementation. Documented in the config; downstream
+        # dedup happens at the graph level if needed.
+        classes = [s for s in result.symbols if s.symbol_type == SymbolType.CLASS]
+        names = [s.name for s in classes]
+        assert names.count("Greeter") == 2
+
+    def test_methods_emitted(self, result) -> None:
+        methods = _names_by_type(result, SymbolType.METHOD)
+        assert "greet" in methods and "formatName" in methods
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestVerilog:
+    @pytest.fixture
+    def result(self):
+        return _basic_result(VERILOG, FIXTURE_ROOT / "verilog" / "hello.v")
+
+    def test_module_emitted_as_class(self, result) -> None:
+        # ``module greeter`` maps to CLASS (modules are Verilog's unit
+        # of encapsulation).
+        assert "greeter" in _names_by_type(result, SymbolType.CLASS)
+
+    def test_task_emitted_as_function(self, result) -> None:
+        assert "format_signal" in _names_by_type(result, SymbolType.FUNCTION)
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestFortran:
+    @pytest.fixture
+    def result(self):
+        return _basic_result(FORTRAN, FIXTURE_ROOT / "fortran" / "hello.f90")
+
+    def test_module_and_subroutines(self, result) -> None:
+        assert "greeter_mod" in _names_by_type(result, SymbolType.CLASS)
+        methods = _names_by_type(result, SymbolType.METHOD)
+        assert "greet" in methods and "format_name" in methods
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestJulia:
+    @pytest.fixture
+    def result(self):
+        return _basic_result(JULIA, FIXTURE_ROOT / "julia" / "hello.jl")
+
+    def test_struct_emitted(self, result) -> None:
+        assert "Greeter" in _names_by_type(result, SymbolType.STRUCT)
+
+    def test_functions_emitted(self, result) -> None:
+        funcs = _names_by_type(result, SymbolType.FUNCTION)
+        assert {"greet", "format_name", "standalone_helper"} <= funcs
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestPascal:
+    @pytest.fixture
+    def result(self):
+        return _basic_result(PASCAL, FIXTURE_ROOT / "pascal" / "hello.pas")
+
+    def test_class_emitted(self, result) -> None:
+        assert "TGreeter" in _names_by_type(result, SymbolType.CLASS)
+
+    def test_method_implementations_emit_with_dotted_drill_down(self, result) -> None:
+        # ``procedure TGreeter.Greet`` parses with ``genericDot`` as the
+        # name chain; we drill to ``Greet`` (rightmost identifier).
+        funcs = _names_by_type(result, SymbolType.FUNCTION)
+        assert "Greet" in funcs
+        assert "FormatName" in funcs
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — bespoke subclasses (Elixir, R, Zig, Groovy)
+# ---------------------------------------------------------------------------
+
+
+class TestElixir:
+    @pytest.fixture
+    def result(self):
+        return ElixirParser(ELIXIR).parse_file(FIXTURE_ROOT / "elixir" / "hello.ex")
+
+    def test_modules_emitted_as_classes(self, result) -> None:
+        classes = _names_by_type(result, SymbolType.CLASS)
+        assert "Greeter" in classes and "Main" in classes
+
+    def test_def_emits_method_inside_module(self, result) -> None:
+        methods = _names_by_type(result, SymbolType.METHOD)
+        assert {"greet", "format_name", "run"} <= methods
+
+    def test_call_edge_skips_def_keyword(self, result) -> None:
+        # ``def greet(name) do format_name(name) end`` should emit a
+        # CALLS edge to ``format_name`` from within Greeter.greet —
+        # NOT a CALLS edge to ``def`` (the discriminator-driven calls
+        # pass filters out declaration calls).
+        pairs = _call_pairs(result)
+        assert any(
+            "greet" in src and tgt == "format_name"
+            for src, tgt in pairs
+        )
+        assert not any(tgt in ("def", "defp", "defmodule") for _, tgt in pairs)
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestR:
+    @pytest.fixture
+    def result(self):
+        return RParser(R).parse_file(FIXTURE_ROOT / "r" / "hello.R")
+
+    def test_function_bindings_emit_as_functions(self, result) -> None:
+        funcs = _names_by_type(result, SymbolType.FUNCTION)
+        assert {"greet", "format_name", "standalone_helper"} <= funcs
+
+    def test_setRefClass_emits_as_class(self, result) -> None:
+        # ``Greeter <- setRefClass("Greeter", ...)`` — the binding's
+        # RHS is a call to a known R class-constructor.
+        assert "Greeter" in _names_by_type(result, SymbolType.CLASS)
+
+    def test_call_edges(self, result) -> None:
+        pairs = _call_pairs(result)
+        assert any(src == "greet" and tgt == "format_name" for src, tgt in pairs)
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestZig:
+    @pytest.fixture
+    def result(self):
+        return ZigParser(ZIG).parse_file(FIXTURE_ROOT / "zig" / "hello.zig")
+
+    def test_struct_decl_via_var_binding(self, result) -> None:
+        # ``const Greeter = struct {...}`` → STRUCT.
+        assert "Greeter" in _names_by_type(result, SymbolType.STRUCT)
+
+    def test_functions_via_fnproto(self, result) -> None:
+        funcs = _names_by_type(result, SymbolType.FUNCTION)
+        assert {"greet", "formatName", "standalone"} <= funcs
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)
+
+
+class TestGroovy:
+    @pytest.fixture
+    def result(self):
+        return GroovyParser(GROOVY).parse_file(FIXTURE_ROOT / "groovy" / "hello.groovy")
+
+    def test_class_emitted_from_command_unit_sequence(self, result) -> None:
+        # Groovy parses ``class Greeter { … }`` as a deeply-nested
+        # command/unit/block tree — the bespoke parser walks it to
+        # extract the class name.
+        assert "Greeter" in _names_by_type(result, SymbolType.CLASS)
+
+    def test_methods_emitted_inside_class_body(self, result) -> None:
+        methods = _names_by_type(result, SymbolType.METHOD)
+        assert "greet" in methods and "formatName" in methods
+
+    def test_positions(self, result) -> None:
+        _assert_positions_populated(result)

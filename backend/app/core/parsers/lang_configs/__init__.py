@@ -19,26 +19,71 @@ of source.
 
 from __future__ import annotations
 
+from app.core.parsers.lang_configs.bash import BASH
+from app.core.parsers.lang_configs.dart import DART
+from app.core.parsers.lang_configs.elixir import ELIXIR
+from app.core.parsers.lang_configs.fortran import FORTRAN
+from app.core.parsers.lang_configs.groovy import GROOVY
+from app.core.parsers.lang_configs.julia import JULIA
 from app.core.parsers.lang_configs.kotlin import KOTLIN
 from app.core.parsers.lang_configs.lua import LUA
+from app.core.parsers.lang_configs.objc import OBJC
+from app.core.parsers.lang_configs.pascal import PASCAL
 from app.core.parsers.lang_configs.php import PHP
+from app.core.parsers.lang_configs.powershell import POWERSHELL
+from app.core.parsers.lang_configs.r import R
 from app.core.parsers.lang_configs.ruby import RUBY
 from app.core.parsers.lang_configs.scala import SCALA
+from app.core.parsers.lang_configs.swift import SWIFT
+from app.core.parsers.lang_configs.verilog import VERILOG
+from app.core.parsers.lang_configs.zig import ZIG
 
-__all__ = ["KOTLIN", "LUA", "PHP", "RUBY", "SCALA", "build_basic_parsers"]
+__all__ = [
+    # Phase 1
+    "KOTLIN", "LUA", "PHP", "RUBY", "SCALA",
+    # Phase 2 — pure-config visitor fits
+    "BASH", "DART", "FORTRAN", "JULIA", "OBJC", "PASCAL", "POWERSHELL",
+    "SWIFT", "VERILOG",
+    # Phase 2 — bespoke subclasses (see _special.py)
+    "ELIXIR", "GROOVY", "R", "ZIG",
+    "build_basic_parsers",
+]
 
 
 def build_basic_parsers() -> dict:
-    """Construct one :class:`BasicVisitorParser` per registered language.
+    """Construct one BasicVisitorParser (or bespoke subclass) per
+    registered language. 18 languages across Phase 1 + Phase 2.
 
-    Lazy import of ``BasicVisitorParser`` so this module stays usable
-    in test code that wants to introspect the configs without spinning
-    up tree-sitter parsers.
+    Lazy import of the parser classes so this module stays usable in
+    test code that wants to introspect the configs without spinning up
+    tree-sitter parsers.
     """
     from app.core.parsers.basic_visitor import BasicVisitorParser
+    from app.core.parsers.lang_configs._special import (
+        ElixirParser,
+        GroovyParser,
+        RParser,
+        ZigParser,
+    )
 
     parsers: dict = {}
-    for cfg in (RUBY, PHP, KOTLIN, SCALA, LUA):
-        parser = BasicVisitorParser(cfg)
-        parsers[cfg.name] = parser
+    # Pure-config languages — the generic BasicVisitorParser handles
+    # them with only a LanguageConfig.
+    pure_config_languages = (
+        # Phase 1
+        RUBY, PHP, KOTLIN, SCALA, LUA,
+        # Phase 2 — clean fits
+        SWIFT, DART, POWERSHELL, BASH, OBJC,
+        VERILOG, FORTRAN, JULIA, PASCAL,
+    )
+    for cfg in pure_config_languages:
+        parsers[cfg.name] = BasicVisitorParser(cfg)
+
+    # Bespoke subclasses for languages whose grammar shape can't be
+    # expressed via the config — see ``_special.py`` for the rationale
+    # per language.
+    parsers[ELIXIR.name] = ElixirParser(ELIXIR)
+    parsers[R.name] = RParser(R)
+    parsers[ZIG.name] = ZigParser(ZIG)
+    parsers[GROOVY.name] = GroovyParser(GROOVY)
     return parsers
