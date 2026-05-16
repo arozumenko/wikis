@@ -4,15 +4,8 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { MermaidDiagram } from './MermaidDiagram';
 import { CodeBlock } from './CodeBlock';
-import { CitationChips } from './CitationChips';
+import { CitationChips, type SourceRef } from './CitationChips';
 import type { Components } from 'react-markdown';
-
-interface SourceRef {
-  file_path: string;
-  line_start?: number | null;
-  line_end?: number | null;
-  confidence?: string | null;
-}
 
 function extractText(node: React.ReactNode): string {
   if (node == null || typeof node === 'boolean') return '';

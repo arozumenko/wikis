@@ -3,7 +3,7 @@ import DescriptionIcon from '@mui/icons-material/Description';
 import VerifiedIcon from '@mui/icons-material/Verified';
 import HelpOutlineIcon from '@mui/icons-material/HelpOutline';
 
-interface SourceRef {
+export interface SourceRef {
   file_path: string;
   line_start?: number | null;
   line_end?: number | null;
@@ -27,6 +27,20 @@ function isLocalRepo(repoUrl?: string): boolean {
   return !!repoUrl && (repoUrl.startsWith('/') || repoUrl.startsWith('file://'));
 }
 
+// Only emit chip links for URLs we can prove are safe to put in an
+// `<a href>`. `repo_url` is server-supplied opaque text, so without
+// this guard a malicious / mis-stored value like `javascript:…` would
+// execute on click. The backend validates on ingestion but we don't
+// rely on that here.
+function isSafeHttpUrl(value: string): boolean {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === 'https:' || protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
 function buildUrl(
   repoUrl: string,
   filePath: string,
@@ -34,7 +48,7 @@ function buildUrl(
   lineStart?: number | null,
 ): string {
   const line = lineStart ? `#L${lineStart}` : '';
-  return `${repoUrl}/blob/${branch}/${filePath}${line}`;
+  return `${repoUrl}/blob/${branch}/${encodeURI(filePath)}${line}`;
 }
 
 function shortPath(filePath: string): string {
@@ -103,15 +117,17 @@ export function CitationChips({ sources, repoUrl, branch = 'main' }: CitationChi
         {sources.map((src, i) => {
           const label = `${shortPath(src.file_path)}${src.line_start ? `:${src.line_start}` : ''}`;
           const url =
-            repoUrl && !isLocalRepo(repoUrl)
+            repoUrl && !isLocalRepo(repoUrl) && isSafeHttpUrl(repoUrl)
               ? buildUrl(repoUrl, src.file_path, branch, src.line_start)
               : undefined;
 
           const meta = metaFor(src.confidence);
+          // Stable key: file_path + line is unique enough for the
+          // chip list. Tie-break with `i` for duplicate citations.
+          const key = `${src.file_path}:${src.line_start ?? ''}:${i}`;
 
           const chip = (
             <Chip
-              key={i}
               icon={meta?.icon ?? <DescriptionIcon sx={{ fontSize: 14 }} />}
               label={label}
               size="small"
@@ -120,7 +136,10 @@ export function CitationChips({ sources, repoUrl, branch = 'main' }: CitationChi
               component={url ? 'a' : 'span'}
               href={url}
               target="_blank"
-              rel="noopener"
+              // `noreferrer` strips Referer so we don't leak internal
+              // URLs to GitHub/GitLab/etc; `noopener` prevents
+              // window.opener access.
+              rel="noopener noreferrer"
               clickable={!!url}
               sx={{
                 fontFamily: 'monospace',
@@ -135,19 +154,16 @@ export function CitationChips({ sources, repoUrl, branch = 'main' }: CitationChi
           // to explain — keeps the bare chip behavior unchanged for
           // citations without graph-edge confidence.
           return meta ? (
-            <Tooltip
-              key={i}
-              title={meta.tooltip}
-              arrow
-              placement="top"
-            >
+            <Tooltip key={key} title={meta.tooltip} arrow placement="top">
               {/* Tooltip needs a real DOM child wrapper for the
                   anchor element when the inner element doesn't
                   forward refs (the Chip-as-link case). */}
               <span style={{ display: 'inline-flex' }}>{chip}</span>
             </Tooltip>
           ) : (
-            chip
+            <Box key={key} component="span" sx={{ display: 'inline-flex' }}>
+              {chip}
+            </Box>
           );
         })}
       </Box>

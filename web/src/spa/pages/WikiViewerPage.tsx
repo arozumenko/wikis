@@ -371,7 +371,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
   );
 
   const handleAsk = useCallback(
-    (question: string, mode: AskMode, minConfidence: MinConfidence = null) => {
+    (question: string, mode: AskMode, minConfidence: MinConfidence) => {
       if (!wikiId) return;
 
       // Cancel any in-flight research stream
@@ -465,11 +465,14 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
             question,
             chat_history: convHistory,
             k: 15,
-            // #120 Phase 3: optional verified-only filter. Backend
-            // rejects unknown values via Pydantic validator, so we
-            // pass through whatever AskBar gave us (already
-            // canonicalised to uppercase enum) or omit when null.
-            ...(minConfidence ? { min_confidence: minConfidence } : {}),
+            // #120 Phase 3: optional verified-only filter. Only the
+            // fast `/api/v1/ask` path honours `min_confidence` today;
+            // AskBar disables the toggle in non-fast modes but we
+            // belt-and-suspenders the page-level call so future
+            // callers (programmatic, tests) can't smuggle the param
+            // into a path that doesn't accept it. Backend rejects
+            // unknown values via Pydantic validator.
+            ...(minConfidence && mode === 'fast' ? { min_confidence: minConfidence } : {}),
           },
           (event) => {
             if (event.type === 'thinking_step') {

@@ -48,6 +48,28 @@ describe('CitationChips', () => {
     expect(screen.queryByRole('link')).toBeNull();
   });
 
+  it('refuses to emit a link for non-http(s) repoUrl schemes (XSS guard)', () => {
+    render(
+      <CitationChips
+        sources={[{ file_path: 'src/foo.ts', line_start: 1 }]}
+        repoUrl="javascript:alert(1)"
+      />,
+    );
+    expect(screen.queryByRole('link')).toBeNull();
+  });
+
+  it('sets rel="noopener noreferrer" on external chip links', () => {
+    render(
+      <CitationChips
+        sources={[{ file_path: 'src/foo.ts', line_start: 1 }]}
+        repoUrl="https://github.com/me/repo"
+      />,
+    );
+    const link = screen.getByRole('link') as HTMLAnchorElement;
+    expect(link.rel).toContain('noopener');
+    expect(link.rel).toContain('noreferrer');
+  });
+
   it('uses success color for EXTRACTED confidence and renders a tooltip', async () => {
     render(
       <CitationChips

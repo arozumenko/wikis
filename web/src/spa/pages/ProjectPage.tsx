@@ -389,7 +389,7 @@ export function ProjectPage() {
   }, [updateLastTurn]);
 
   const handleAsk = useCallback(
-    (question: string, mode: AskMode, minConfidence: MinConfidence = null) => {
+    (question: string, mode: AskMode, minConfidence: MinConfidence) => {
       if (!projectId) return;
 
       cancelStreamRef.current?.();
@@ -445,9 +445,10 @@ export function ProjectPage() {
             question,
             chat_history: convHistory,
             k: 15,
-            // #120 Phase 3: optional verified-only filter — see
-            // WikiViewerPage for the analogous wiki-scoped call.
-            ...(minConfidence ? { min_confidence: minConfidence } : {}),
+            // #120 Phase 3: optional verified-only filter — only
+            // sent on the fast path (see WikiViewerPage for the
+            // matching guard rationale).
+            ...(minConfidence && mode === 'fast' ? { min_confidence: minConfidence } : {}),
           },
           (event) => {
             if (event.type === 'thinking_step') {

@@ -184,7 +184,9 @@ export function AskBar({ onSubmit, disabled = false, repoLabel, placeholder: pla
                       ? verifiedOnly
                         ? 'Verified-only: limit graph expansion to parser-observed edges (highest trust). Click to disable.'
                         : 'Verified-only: limit graph expansion to parser-observed edges (highest trust). Click to enable.'
-                      : 'Verified-only filter applies to Fast mode only.'
+                      : verifiedOnly
+                        ? 'Verified-only is on but applies to Fast mode only — it will re-activate when you switch back to Fast.'
+                        : 'Verified-only filter applies to Fast mode only.'
                   }
                   arrow
                   placement="top"
@@ -195,14 +197,25 @@ export function AskBar({ onSubmit, disabled = false, repoLabel, placeholder: pla
                       disabled={!filterApplies}
                       size="small"
                       aria-label="Toggle verified-only filter"
-                      aria-pressed={effectiveVerifiedOnly}
+                      aria-pressed={verifiedOnly}
                       sx={{
                         mr: 0.5,
-                        color: effectiveVerifiedOnly ? 'success.main' : 'text.secondary',
-                        '&:hover': { color: effectiveVerifiedOnly ? 'success.light' : 'text.primary' },
+                        color: effectiveVerifiedOnly
+                          ? 'success.main'
+                          : verifiedOnly
+                            ? 'success.light'
+                            : 'text.secondary',
+                        opacity: verifiedOnly && !filterApplies ? 0.55 : 1,
+                        '&:hover': {
+                          color: effectiveVerifiedOnly ? 'success.light' : 'text.primary',
+                        },
                       }}
                     >
-                      {effectiveVerifiedOnly ? (
+                      {/* Filled icon whenever the *preference* is on,
+                          even if the current mode neutralises it —
+                          otherwise the user thinks they lost their
+                          setting when switching to Deep / Code Map. */}
+                      {verifiedOnly ? (
                         <VerifiedIcon fontSize="small" />
                       ) : (
                         <VerifiedOutlinedIcon fontSize="small" />

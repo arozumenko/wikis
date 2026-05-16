@@ -60,6 +60,22 @@ describe('AskBar — verified-only filter', () => {
     expect(onSubmit).toHaveBeenCalledWith('restored', 'fast', 'EXTRACTED');
   });
 
+  it('keeps icon filled and aria-pressed=true when verifiedOnly is on but mode != fast', async () => {
+    window.localStorage.setItem(STORAGE_KEY, '1');
+    const user = userEvent.setup();
+    const onSubmit = jest.fn();
+    render(<AskBar onSubmit={onSubmit} />);
+
+    // Switch to Deep mode
+    await user.click(screen.getByText('Fast'));
+    await user.click(screen.getByText('Deep Research'));
+
+    const toggle = screen.getByRole('button', { name: /verified-only filter/i });
+    expect(toggle).toBeDisabled();
+    // The preference is preserved, so aria-pressed must reflect it
+    expect(toggle).toHaveAttribute('aria-pressed', 'true');
+  });
+
   it('disables toggle and passes null minConfidence when not in fast mode', async () => {
     // Start with the toggle pre-enabled via storage; we should still
     // get a null minConfidence because non-fast modes don't honour
