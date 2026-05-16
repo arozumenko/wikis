@@ -21,9 +21,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Statuses that mean "an operation is actively writing to this wiki's
+# .wiki.db right now" — both ``generate`` and ``incremental_refresh``
+# treat encountering one of these for the same ``wiki_id`` as a
+# conflict and reject the new request with a 409. ``"running"`` is the
+# incremental refresh's in-flight status; ``"generating"`` is the full
+# regen's.
+_IN_FLIGHT_STATUSES: frozenset[str] = frozenset({"running", "generating"})
+
+
 class IncrementalRefreshInProgressError(Exception):
     """Raised by :meth:`WikiService.incremental_refresh` when another
-    incremental refresh is already running for the same wiki_id.
+    incremental refresh OR full generate is already running for the
+    same wiki_id.
 
     #140 idempotency guard: two concurrent runs against the same
     ``.wiki.db`` race each other's content-hash updates and may produce
@@ -35,6 +45,24 @@ class IncrementalRefreshInProgressError(Exception):
         self.in_progress_invocation_id = in_progress_invocation_id
         super().__init__(
             f"Incremental refresh already in progress for wiki {wiki_id} "
+            f"(invocation {in_progress_invocation_id})"
+        )
+
+
+class GenerateInProgressError(Exception):
+    """Raised by :meth:`WikiService.generate` when another generate or
+    incremental refresh is already running for the same wiki_id.
+
+    #145 symmetric guard to #140's incremental-side rejection. Both
+    code paths write to the same ``.wiki.db``; concurrent runs race
+    each other's writes. The route translates this into a 409.
+    """
+
+    def __init__(self, wiki_id: str, in_progress_invocation_id: str) -> None:
+        self.wiki_id = wiki_id
+        self.in_progress_invocation_id = in_progress_invocation_id
+        super().__init__(
+            f"Another operation is already running for wiki {wiki_id} "
             f"(invocation {in_progress_invocation_id})"
         )
 
@@ -58,6 +86,28 @@ class WikiService:
         """Remove an invocation and its task from tracking."""
         self._invocations.pop(inv_id, None)
         self._tasks.pop(inv_id, None)
+
+    def _find_in_flight_for_wiki(
+        self,
+        wiki_id: str,
+        blocked_statuses: frozenset[str] = _IN_FLIGHT_STATUSES,
+    ) -> "Invocation | None":
+        """Return the first in-memory invocation for ``wiki_id`` whose
+        status is in ``blocked_statuses``, or ``None`` if no conflict.
+
+        Shared between :meth:`generate` and :meth:`incremental_refresh`
+        so both endpoints enforce the same mutual-exclusion contract
+        (#140 + #145). The check is synchronous — callers MUST invoke
+        it before any ``await`` that could yield to a racing caller.
+        """
+        for inv in self._invocations.values():
+            if (
+                inv.wiki_id == wiki_id
+                and inv.status in blocked_statuses
+                and inv.id != ""
+            ):
+                return inv
+        return None
 
     async def persist_invocations(self) -> None:
         """Public wrapper — save all invocations to storage."""
@@ -136,6 +186,19 @@ class WikiService:
             wiki_id = make_local_wiki_id(path, info.branch if info.is_git else None)
         else:
             wiki_id = self._make_wiki_id(request.repo_url, request.branch)
+
+        # #145: symmetric in-flight check. ``incremental_refresh`` already
+        # rejects when a generate is mid-flight (PR #144); this is the
+        # reverse direction. Both endpoints write to the same ``.wiki.db``
+        # — without this check, ``incremental_refresh running + generate
+        # called`` could race content_hash updates and corrupt FTS5/
+        # tsvector indices.
+        #
+        # Synchronous check before any ``await`` so two callers racing
+        # through this function can't both pass.
+        in_flight = self._find_in_flight_for_wiki(wiki_id)
+        if in_flight is not None:
+            raise GenerateInProgressError(wiki_id, in_flight.id)
 
         # Block duplicate generation — reject if a wiki is already complete or generating
         # Use raw DB lookup (no access control) to detect ANY user's wiki for this repo+branch
@@ -603,20 +666,14 @@ class WikiService:
         # with the in-flight invocation_id so they can join the existing
         # SSE stream instead of spawning a parallel run.
         #
-        # Critical: construct + register the invocation BEFORE any
-        # awaits so two callers racing through this function can't both
-        # pass the check. ``status == "running"`` covers incremental
-        # refreshes; ``"generating"`` covers a full ``generate()`` on
-        # the same wiki — both write to the same ``.wiki.db`` and would
-        # corrupt each other's content_hash updates.
-        _BLOCKING_STATUSES = {"running", "generating"}
-        for inv in self._invocations.values():
-            if (
-                inv.wiki_id == wiki_id
-                and inv.status in _BLOCKING_STATUSES
-                and inv.id != ""
-            ):
-                raise IncrementalRefreshInProgressError(wiki_id, inv.id)
+        # Critical: check + register BEFORE any awaits so two callers
+        # racing through this function can't both pass. ``running``
+        # covers incremental refreshes; ``generating`` covers a full
+        # ``generate()`` on the same wiki — both write to the same
+        # ``.wiki.db``. Shared helper with :meth:`generate` (#145).
+        in_flight = self._find_in_flight_for_wiki(wiki_id)
+        if in_flight is not None:
+            raise IncrementalRefreshInProgressError(wiki_id, in_flight.id)
 
         # Reserve the invocation slot atomically (no awaits between the
         # guard check and this assignment) so a second caller racing

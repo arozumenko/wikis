@@ -97,6 +97,7 @@ async def generate_wiki(
     user: CurrentUser = Depends(get_current_user),
     service: WikiService = Depends(get_wiki_service),
 ) -> GenerateWikiResponse:
+    from app.services.wiki_service import GenerateInProgressError
     from app.services.wiki_service_errors import WikiAlreadyExistsError
 
     try:
@@ -105,6 +106,18 @@ async def generate_wiki(
         raise HTTPException(  # noqa: B904
             status_code=409,
             detail={"error": str(e), "wiki_id": e.wiki_id},
+        )
+    except GenerateInProgressError as exc:
+        # #145: another generate or incremental_refresh is mid-flight
+        # for this wiki. Surface the in-flight invocation_id so the
+        # caller can subscribe to its SSE stream instead of spawning
+        # a racing run that would corrupt the shared ``.wiki.db``.
+        raise HTTPException(  # noqa: B904
+            status_code=409,
+            detail=str(exc),
+            headers={
+                "X-In-Flight-Invocation-Id": exc.in_progress_invocation_id,
+            },
         )
     return GenerateWikiResponse(
         wiki_id=invocation.wiki_id,
