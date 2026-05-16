@@ -440,3 +440,139 @@ class TestLoadPersistedInvocationsOrphanSweep:
 
         assert service._invocations["done-inv"].status == "complete"
         assert service._invocations["failed-inv"].status == "failed"
+
+
+class TestWikiServiceShutdown:
+    """Regression guard for CI segfault on fixture teardown.
+
+    The crash happened when ``pytest_asyncio`` closed the event loop
+    while a background task was still awaiting ``asyncio.to_thread()``
+    for SQLite work. Cancellation interrupts the await but leaves the
+    OS thread running against soon-to-be-closed storage.
+    ``WikiService.shutdown()`` must wait for the task — and through it,
+    the worker thread — to finish naturally before returning.
+    """
+
+    @pytest.mark.asyncio
+    async def test_shutdown_waits_for_to_thread_workers_to_finish(self, service):
+        """A task that internally calls ``asyncio.to_thread`` must be
+        awaited to completion — the thread keeps running even if the
+        asyncio.Task is cancelled, so we explicitly do NOT cancel.
+
+        Without ``shutdown()``, this exact pattern is what segfaults
+        in CI: shutdown returns, the loop closes, the OS thread keeps
+        writing to a connection that's already closed.
+        """
+        import time
+
+        thread_finished = False
+
+        def slow_thread_work():
+            # Tiny sleep simulates the SQLite FTS rebuild that
+            # actually segfaults in CI when interrupted mid-flight.
+            time.sleep(0.05)
+            nonlocal thread_finished
+            thread_finished = True
+
+        async def run_with_to_thread():
+            await asyncio.to_thread(slow_thread_work)
+
+        task = asyncio.create_task(run_with_to_thread())
+        service._tasks["test-invocation"] = task
+
+        # Shutdown should block until the to_thread worker drains.
+        shutdown_started = time.monotonic()
+        await service.shutdown(timeout=5.0)
+        elapsed = time.monotonic() - shutdown_started
+
+        assert task.done()
+        assert thread_finished, (
+            "shutdown() returned before the worker thread finished — "
+            "this is the exact race that causes CI segfaults"
+        )
+        # Shutdown must have actually waited, not returned instantly.
+        assert elapsed >= 0.04, (
+            f"shutdown returned in {elapsed:.3f}s — it should have "
+            f"waited for the ~0.05s worker thread to finish"
+        )
+
+    @pytest.mark.asyncio
+    async def test_shutdown_is_a_noop_when_no_tasks_pending(self, service):
+        """Should not raise or hang when there's nothing to drain."""
+        await service.shutdown(timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_cancel_pending_tasks(self, service):
+        """Cancelling would mark the task done but leave the inner
+        thread running — the bug we're guarding against. Verify
+        ``shutdown`` lets tasks complete instead of cancelling."""
+        completed = False
+
+        async def finish_naturally():
+            nonlocal completed
+            await asyncio.sleep(0.05)
+            completed = True
+
+        task = asyncio.create_task(finish_naturally())
+        service._tasks["nat"] = task
+
+        await service.shutdown(timeout=2.0)
+
+        assert task.done()
+        assert not task.cancelled(), (
+            "task was cancelled instead of awaited — the underlying "
+            "to_thread worker would still be running"
+        )
+        assert completed
+
+    @pytest.mark.asyncio
+    async def test_shutdown_swallows_task_exceptions(self, service):
+        """``return_exceptions=True`` on the gather: shutdown should
+        not re-raise an error from one task and abandon the others."""
+
+        async def boom():
+            raise RuntimeError("simulated failure inside task")
+
+        async def slow_ok():
+            await asyncio.sleep(0.05)
+
+        task_bad = asyncio.create_task(boom())
+        task_good = asyncio.create_task(slow_ok())
+        service._tasks["bad"] = task_bad
+        service._tasks["good"] = task_good
+
+        # Must not raise.
+        await service.shutdown(timeout=2.0)
+
+        assert task_bad.done()
+        assert task_good.done()
+        # Consume the exception so pytest doesn't warn about an
+        # un-retrieved task exception.
+        assert task_bad.exception() is not None
+
+    @pytest.mark.asyncio
+    async def test_shutdown_logs_and_returns_on_timeout(
+        self, service, caplog,
+    ):
+        """A task that won't finish within the timeout should not
+        block shutdown forever — it logs and returns."""
+
+        async def never_finish():
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(never_finish())
+        service._tasks["wedged"] = task
+
+        with caplog.at_level("ERROR"):
+            await service.shutdown(timeout=0.1)
+
+        assert any(
+            "WikiService.shutdown timeout" in rec.message
+            for rec in caplog.records
+        )
+        # Clean up the still-pending task so pytest doesn't warn.
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass

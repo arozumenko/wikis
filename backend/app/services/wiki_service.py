@@ -120,6 +120,46 @@ class WikiService:
         """Public wrapper — save all invocations to storage."""
         await self._persist_invocations()
 
+    async def shutdown(self, timeout: float = 30.0) -> None:
+        """Drain in-flight invocation tasks before the app shuts down.
+
+        Each entry in ``self._tasks`` is an ``asyncio.Task`` wrapping a
+        coroutine that internally calls ``asyncio.to_thread(...)`` to
+        offload CPU-heavy work (SQLite writes, FTS rebuilds) onto a
+        worker thread. If the event loop closes while one of those
+        tasks is still awaiting its thread, the asyncio side surfaces
+        a ``CancelledError`` **but the underlying OS thread keeps
+        running** — Python can't interrupt thread execution. That
+        thread continues touching the SQLite connection while the
+        fixture / lifespan tears the storage down underneath it,
+        which the SQLite C library handles by segfaulting.
+
+        Fix: wait for every task to finish naturally. We deliberately
+        do **not** call ``task.cancel()`` — cancellation would let the
+        coroutine return early without joining its worker thread,
+        which is the exact failure we're guarding against. The
+        ``timeout`` is a safety net so a wedged task can't hang the
+        process forever; if we hit it we log loudly and let the
+        remaining shutdown steps run (the orphan threads will at
+        least see live state).
+        """
+        pending = [t for t in self._tasks.values() if not t.done()]
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=timeout,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            still_pending = sum(1 for t in pending if not t.done())
+            logger.error(
+                "WikiService.shutdown timeout: %d task(s) still in-flight "
+                "after %.0fs — proceeding with shutdown anyway",
+                still_pending,
+                timeout,
+            )
+
     INVOCATIONS_BUCKET = "wiki_registry"
     INVOCATIONS_KEY = "invocations.json"
 
