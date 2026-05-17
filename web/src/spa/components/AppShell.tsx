@@ -130,14 +130,19 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
       setRefreshing(true);
       try {
         const resp = await refreshWiki(repoContext.wikiId, accessToken);
-        // Reset before navigating — the stepper UI takes over from here.
-        setRefreshing(false);
-        setTokenInput('');
         navigate(
           `/wiki/${repoContext.wikiId}?generating=true&invocation=${resp.invocation_id}`,
         );
       } catch {
+        // swallow — UI surfaces failures via the wiki viewer SSE stream
+      } finally {
+        // Always clear the token state, whether the request
+        // succeeded or threw. Without this, a refresh failure would
+        // leave the PAT in React state and re-open the modal
+        // pre-filled — contradicting the dialog copy that says
+        // "the token is sent once for this refresh and not stored."
         setRefreshing(false);
+        setTokenInput('');
       }
     },
     [repoContext?.wikiId, navigate],

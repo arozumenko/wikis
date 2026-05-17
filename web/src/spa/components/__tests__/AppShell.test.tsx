@@ -285,6 +285,44 @@ describe('Refresh button — PAT prompt for private wikis (#172)', () => {
     expect(mockedRefresh).toHaveBeenCalledWith('wiki-1', 'ghp_test-token-123');
   });
 
+  it('private wiki — token state is cleared even when refresh API throws', async () => {
+    // Rio's PR #178 review caught: the original ``performRefresh``
+    // cleared ``tokenInput`` inside the ``try`` block AFTER the
+    // navigate call. A thrown refresh would leave the PAT in
+    // React state — contradicting the dialog's "not stored"
+    // promise. The fix moved the clear into ``finally``; this
+    // test pins it.
+    mockedRefresh.mockRejectedValueOnce(new Error('git: could not read Username'));
+
+    renderShellWithRepo({
+      wikiId: 'wiki-1',
+      repoUrl: 'https://github.com/owner/private-repo',
+      requiresToken: true,
+    });
+
+    fireEvent.click(screen.getByLabelText('Refresh wiki'));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    const input = screen.getByLabelText('GitHub token') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'ghp_will-fail' } });
+
+    const modalRefreshBtn = screen
+      .getAllByRole('button', { name: 'Refresh' })
+      .find((b) => !b.hasAttribute('disabled'));
+    fireEvent.click(modalRefreshBtn!);
+
+    // Let the rejected promise + finally settle.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Re-open the modal — the password field must be empty,
+    // proving the prior PAT didn't linger in state.
+    fireEvent.click(screen.getByLabelText('Refresh wiki'));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    const reopened = screen.getByLabelText('GitHub token') as HTMLInputElement;
+    expect(reopened.value).toBe('');
+  });
+
   it('private wiki — token modal Refresh button is disabled until a token is entered', () => {
     renderShellWithRepo({
       wikiId: 'wiki-1',
