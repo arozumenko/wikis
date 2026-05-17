@@ -19,13 +19,13 @@
     "seed": "npx tsx prisma/seed.ts"
   },
   "dependencies": {
-    "@better-auth/api-key": "^1.5.5",
+    "@better-auth/api-key": "^1.6.11",
     "@emotion/react": "^11.14.0",
     "@emotion/styled": "^11.14.1",
     "@mui/icons-material": "^5.18.0",
     "@mui/material": "^5.18.0",
     "@prisma/client": "^5.22.0",
-    "better-auth": "^1.5.5",
+    "better-auth": "^1.6.11",
     "highlight.js": "^11.11.1",
     "jose": "^6.2.1",
     "mermaid": "^11.13.0",
