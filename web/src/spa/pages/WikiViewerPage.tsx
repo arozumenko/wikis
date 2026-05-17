@@ -244,6 +244,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           branch: data.branch,
           indexedAt: data.indexed_at ?? data.created_at,
           commitHash: data.commit_hash,
+          requiresToken: data.requires_token,
         });
         if (data.pages.length > 0) {
           const urlPage = searchParams.get('page');
@@ -323,6 +324,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                     branch: data.branch,
                     indexedAt: data.indexed_at ?? data.created_at,
                     commitHash: data.commit_hash,
+                    requiresToken: data.requires_token,
                   });
                   if (data.pages.length > 0) setActivePageId(data.pages[0].id);
                 })
