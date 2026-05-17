@@ -393,13 +393,19 @@ async def get_wiki(
     wiki_record = await management.get_wiki(wiki_id, user_id=user_id)
     wiki_meta = WikiManagementService._record_to_summary(wiki_record, user_id) if wiki_record else None
 
-    # Check for active invocation — prefer "generating" over terminal states
+    # Check for active invocation — prefer any in-progress run
+    # (``generating`` = full regen, ``running`` = incremental refresh)
+    # over terminal states. Without breaking on both, a stale
+    # terminal invocation that happens to come earlier in dict
+    # iteration order would shadow a live ``running`` one. Mirrors
+    # ``list_wikis`` so the two endpoints can't disagree on which
+    # invocation is "active" for the same wiki (#175).
     active_invocation = None
     for inv in service.invocations.values():
         if inv.wiki_id == wiki_id:
-            if inv.status == "generating":
+            if inv.status in ("generating", "running"):
                 active_invocation = inv
-                break  # generating is always the most relevant
+                break
             if active_invocation is None:
                 active_invocation = inv  # keep first match as fallback
 
@@ -409,7 +415,11 @@ async def get_wiki(
 
     # If DB has a record in a non-complete state (new: registered at generation start),
     # serve it immediately so the UI gets repo details + status without needing an active invocation.
-    if wiki_meta and wiki_meta.status in ("generating", "failed", "partial", "cancelled") and not active_invocation:
+    # ``running`` is included defensively (#175 review) — today only
+    # ``WikiService.generate`` writes status to the DB and it only
+    # uses ``generating``, but if a future code path ever persists
+    # ``running``, this guard keeps the response shape consistent.
+    if wiki_meta and wiki_meta.status in ("generating", "running", "failed", "partial", "cancelled") and not active_invocation:
         return {
             "wiki_id": wiki_id,
             "repo_url": wiki_meta.repo_url,

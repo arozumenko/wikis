@@ -326,7 +326,13 @@ async def test_get_wiki_override_fires_for_running_incremental_refresh(
     app_with_mocks,
 ):
     """Detail endpoint must honour ``running`` (incremental refresh)
-    the same way as ``generating`` (full re-generation)."""
+    the same way as ``generating`` (full re-generation).
+
+    The dict here intentionally has a *terminal* invocation listed
+    **before** the live ``running`` one so the test fails if the
+    invocation-selection loop forgets to prefer in-progress runs.
+    Rio's PR review on #175 flagged this — without the fix, the
+    terminal one wins by virtue of dict-iteration order."""
     app, mock_management, mock_service = app_with_mocks
 
     wiki_record = _make_wiki_record()
@@ -336,7 +342,15 @@ async def test_get_wiki_override_fires_for_running_incremental_refresh(
     mock_management.storage.list_artifacts = AsyncMock(return_value=[])
 
     mock_service.invocations = {
-        "inv-r": _make_inflight_invocation(status="running", progress=0.3),
+        # Stale terminal invocation comes first in iteration order.
+        "inv-old-failed": _make_inflight_invocation(
+            status="failed", invocation_id="inv-old-failed",
+        ),
+        # The live in-progress run is second — the loop must still
+        # prefer it.
+        "inv-r": _make_inflight_invocation(
+            status="running", progress=0.3, invocation_id="inv-r",
+        ),
     }
 
     from app.services.wiki_management import WikiManagementService
@@ -355,6 +369,7 @@ async def test_get_wiki_override_fires_for_running_incremental_refresh(
     assert resp.status_code == 200
     assert resp.json()["status"] == "running"
     assert resp.json()["progress"] == 0.3
+    assert resp.json()["invocation_id"] == "inv-r"
 
 
 @pytest.mark.asyncio
