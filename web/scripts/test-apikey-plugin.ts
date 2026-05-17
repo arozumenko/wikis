@@ -132,7 +132,7 @@ const tests: TestCase[] = [
       // contract. What matters is the row in the table.
       assert.equal(created.referenceId, userId, 'response.referenceId should be the user id');
 
-      const rows = db.apiKey ?? [];
+      const rows = db.apiKey;
       assert.equal(rows.length, 1, 'one api key row should exist');
       const row = rows[0];
 
@@ -193,7 +193,7 @@ const tests: TestCase[] = [
     },
   },
   {
-    name: 'persists every column the Prisma ApiKey model requires',
+    name: 'persists the critical columns we depend on',
     async run() {
       const db = freshDb();
       const auth = makeAuth(db);
@@ -203,26 +203,32 @@ const tests: TestCase[] = [
         body: { name: 'schema-shape', userId },
       });
 
-      const row = (db.apiKey ?? [])[0];
+      const row = db.apiKey[0];
       assert.ok(row, 'row should exist');
 
-      // Every column the Prisma migration declares as required
-      // must be present in the row the plugin writes. If
-      // Better-Auth introduces a new required column in a future
-      // bump, this set misses it and the test fails — prompting a
-      // Prisma migration before the dep upgrade ships.
-      const requiredColumns = [
-        'id',
-        'configId',
-        'key',
-        'userId',
-        'enabled',
-        'rateLimitEnabled',
-        'requestCount',
-        'createdAt',
-        'updatedAt',
+      // CRITICAL_COLUMNS is a *subset* of the Prisma ``ApiKey``
+      // model — specifically the columns whose presence and
+      // population our application logic depends on. It is NOT an
+      // exhaustive mirror of the schema; a Better-Auth bump that
+      // adds a new required column would not be caught here
+      // (Prisma's own migration step is the right place for that).
+      // What this guards is: "the columns we actually read in our
+      // codebase + the columns the Prisma model declares as
+      // non-nullable-without-default are still written by the
+      // plugin." Keep in sync with ``prisma/schema.prisma``'s
+      // ``ApiKey`` model when our usage changes.
+      const CRITICAL_COLUMNS = [
+        'id',           // PK
+        'configId',     // referenced by validate path
+        'key',          // hashed key, used for verify
+        'userId',       // the remap target — the load-bearing one
+        'enabled',      // gates auth — non-nullable, default true
+        'rateLimitEnabled', // non-nullable, default false
+        'requestCount', // non-nullable, default 0
+        'createdAt',    // non-nullable
+        'updatedAt',    // non-nullable
       ];
-      for (const col of requiredColumns) {
+      for (const col of CRITICAL_COLUMNS) {
         assert.ok(col in row, `row missing required column "${col}"`);
       }
       assert.equal(row.userId, userId);
@@ -243,8 +249,12 @@ async function main() {
     } catch (err) {
       console.error(`  ✗ ${t.name}`);
       console.error(`    ${(err as Error).message}`);
+      // Print the full stack — assertion frames may be 5+ deep for
+      // async arrow callbacks and a truncated slice can miss the
+      // actual failing line. CI log volume is not a concern here.
       if (err instanceof Error && err.stack) {
-        console.error(err.stack.split('\n').slice(1, 5).map((l) => '    ' + l).join('\n'));
+        const lines = err.stack.split('\n').slice(1);
+        console.error(lines.map((l) => '    ' + l).join('\n'));
       }
       failed += 1;
     }
