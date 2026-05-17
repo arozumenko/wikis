@@ -324,3 +324,135 @@ def test_vision_extension_with_registered_extractor_does_not_warn(
         if "will be ingested via the legacy text-read path" in r.getMessage()
     ]
     assert fallthrough_warnings == []
+
+
+def test_vision_eligible_file_without_extractor_is_skipped(
+    tmp_path: Path,
+) -> None:
+    """#173: a vision-eligible file (PNG / PDF / etc.) without a
+    registered extractor must NOT appear in the indexed results.
+
+    The previous behaviour was to WARN about the missing extractor
+    and then fall through to ``open(path, 'r', encoding='utf-8',
+    errors='ignore')``, which turned PNG bytes into 1186 chars of
+    binary garbage and indexed that as a "document." The fix in
+    graph_builder.py skips the file entirely when the extension is
+    in ``KNOWN_VISION_EXTENSIONS`` and no extractor is configured;
+    the WARNING still fires (covered by the test above) so
+    operators see the configuration gap.
+    """
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "spec.pdf").write_bytes(b"%PDF-1.4 not a real pdf")
+    (docs / "diag.png").write_bytes(_TINY_PNG)
+    # Non-vision text file in the same batch — must still go through.
+    (docs / "README.md").write_text("# Hello\n")
+
+    builder = EnhancedUnifiedGraphBuilder(extractor_registry=None)
+    results = builder._parse_documentation_files(
+        [
+            str(docs / "spec.pdf"),
+            str(docs / "diag.png"),
+            str(docs / "README.md"),
+        ],
+        str(tmp_path),
+    )
+
+    # The two vision-eligible files must be absent from results —
+    # asserting the indexer does not produce any "document symbol"
+    # for them. The previous bug would have placed both here with
+    # garbage source_text.
+    assert str(docs / "spec.pdf") not in results
+    assert str(docs / "diag.png") not in results
+    # The plain-text doc still routes through the legacy text-read
+    # path — the skip is targeted, not a blanket "no registry =
+    # skip everything."
+    assert str(docs / "README.md") in results
+    assert "Hello" in results[str(docs / "README.md")].symbols[0].source_text
+
+
+def test_known_vision_extensions_covers_every_binary_doc_extension() -> None:
+    """Rio's review on #173 caught that ``.doc`` was in
+    ``DOCUMENTATION_EXTENSIONS`` (mapped to ``'document'``) but missing
+    from ``KNOWN_VISION_EXTENSIONS`` — so legacy Word binaries fell
+    through to the UTF-8 garbage path that the rest of this PR fixes.
+
+    This test pins the invariant: every binary ``doc_type`` in
+    ``DOCUMENTATION_EXTENSIONS`` must also be in
+    ``KNOWN_VISION_EXTENSIONS``, so future drift is caught at CI
+    time rather than in a wiki's index.
+
+    If you're adding a new binary extension to
+    ``DOCUMENTATION_EXTENSIONS`` and this test fails, add it to
+    ``KNOWN_VISION_EXTENSIONS`` too. If you're adding a new TEXT
+    extension (markdown variant, config format, etc.) update
+    ``TEXT_DOC_TYPES`` below to keep this assertion meaningful.
+    """
+    from app.core.constants import DOCUMENTATION_EXTENSIONS
+    from app.core.extractors.protocol import KNOWN_VISION_EXTENSIONS
+
+    # Doc types that go through the legacy text-read path (open + utf-8)
+    # rather than needing an extractor — these are genuinely textual
+    # formats. Anything else in DOCUMENTATION_EXTENSIONS is binary and
+    # must be in KNOWN_VISION_EXTENSIONS to avoid the garbage-in-index
+    # bug fixed by this PR. Keep this aligned with the doc_type values
+    # in ``app/core/constants.py::DOCUMENTATION_EXTENSIONS``.
+    TEXT_DOC_TYPES = {
+        # Prose / markup
+        "markdown",
+        "restructuredtext",
+        "plaintext",
+        "asciidoc",
+        # Web / data interchange (all text-based)
+        "html",
+        "xml",
+        "json",
+        "yaml",
+        "toml",
+        # Config files
+        "config",         # .ini, .cfg, .conf, .properties, .env, .mod
+        # Build / IaC / schema (all text formats)
+        "build_config",   # .gradle, .kts, Makefile, CMakeLists.txt
+        "schema",         # .wsdl, .xsd, .proto
+        "infrastructure", # .tf, .tfvars, .hcl, Dockerfile
+        "script",         # .sh, .bash, .bat, .cmd, .ps1, Jenkinsfile
+    }
+
+    binary_extensions = {
+        ext for ext, doc_type in DOCUMENTATION_EXTENSIONS.items()
+        if doc_type not in TEXT_DOC_TYPES
+    }
+    missing = binary_extensions - KNOWN_VISION_EXTENSIONS
+    assert not missing, (
+        f"DOCUMENTATION_EXTENSIONS has binary entries missing from "
+        f"KNOWN_VISION_EXTENSIONS: {sorted(missing)}. Without this, "
+        f"those extensions silently ingest binary bytes as UTF-8 "
+        f"garbage when no vision extractor is registered. Add them to "
+        f"KNOWN_VISION_EXTENSIONS in app/core/extractors/protocol.py."
+    )
+
+
+def test_vision_eligible_with_extractor_still_ingests(tmp_path: Path) -> None:
+    """Counter-test to #173: with a registered extractor, the PNG
+    flows through the extractor and the result IS indexed. Catches a
+    regression where someone widens the skip to apply unconditionally
+    (which would silently break image ingestion for users with a
+    properly configured vision LLM)."""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "diag.png").write_bytes(_TINY_PNG)
+
+    from app.core.extractors import ExtractorRegistry
+    from app.core.extractors.image import ImageExtractor
+    registry = ExtractorRegistry()
+    registry.register(ImageExtractor(llm=_StubLLM()))
+
+    builder = EnhancedUnifiedGraphBuilder(extractor_registry=registry)
+    results = builder._parse_documentation_files(
+        [str(docs / "diag.png")], str(tmp_path),
+    )
+
+    # With an extractor wired up, the PNG IS indexed (using LLM-
+    # derived text). Asserts the skip in #173 doesn't fire when an
+    # extractor is present.
+    assert str(docs / "diag.png") in results
