@@ -261,15 +261,23 @@ function LoginForm() {
 }
 
 export default function LoginPage() {
-  const { mode } = useThemeMode();
+  const { mode, mounted } = useThemeMode();
   const theme = createAppTheme(mode);
 
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
-      <Suspense>
-        <LoginForm />
-      </Suspense>
+      {/* Don't render the form until the client-side theme is known
+          — see ``useThemeMode`` for the rationale. Showing nothing
+          briefly is better than rendering with SSR-default light
+          theme and then re-painting with dark, which would leave
+          MUI's input text color out of sync with the SSR background
+          (the classic "white on white" symptom). */}
+      {mounted ? (
+        <Suspense>
+          <LoginForm />
+        </Suspense>
+      ) : null}
     </ThemeProvider>
   );
 }
