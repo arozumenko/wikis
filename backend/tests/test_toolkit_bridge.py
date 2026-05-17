@@ -341,6 +341,65 @@ class TestLoadLegacyArtifacts:
         assert components.retriever_stack is None
         assert components.storage is None
 
+    def test_falls_back_when_refs_point_at_different_commit_than_on_disk(
+        self, tmp_path
+    ):
+        """Rio's finding #2: real onetest-ai/core scenario — cache_index
+        ``refs`` says ``8c210362`` but ``graphs`` only registers
+        ``ca9addbd``.  ``load_graph_by_repo_name`` returns None because the
+        canonicalized key doesn't match any ``graphs`` entry; the cache-
+        index scan must rescue us.
+        """
+        import json
+
+        # Write artifacts under the OLD commit hash
+        _write_legacy_cache(
+            tmp_path,
+            "old-commit-key",
+            "owner/repo:main:ca9addbd",
+            register_index=False,
+        )
+        # Cache index points the bare ref at a DIFFERENT commit
+        (tmp_path / "cache_index.json").write_text(
+            json.dumps(
+                {
+                    "graphs": {"owner/repo:main:ca9addbd:combined": "old-commit-key"},
+                    "refs": {"owner/repo:main": "owner/repo:main:8c210362"},
+                }
+            )
+        )
+
+        components = EngineComponents()
+        # _load_cached_artifacts is called with the bare ref (matches
+        # production: ``_extract_repo_identifier`` returns
+        # ``owner/repo:branch``).
+        _load_cached_artifacts(
+            components, str(tmp_path), "wiki-x", "owner/repo:main"
+        )
+
+        assert components.code_graph is not None
+        assert components.code_graph.number_of_nodes() == 1
+        assert components.query_service is not None
+
+    def test_fts_index_passed_to_query_service_only_when_open(self, tmp_path):
+        """Rio's finding #1: if FTS load fails inside
+        ``load_graph_by_repo_name`` the index instance exists but
+        ``is_open=False``.  We must not hand that to GraphQueryService."""
+        _write_legacy_cache(tmp_path, "no-fts-key", "owner/repo:main:abcd1234")
+        # NB: ``_write_legacy_cache`` writes only ``.code_graph.gz`` — no
+        # ``.fts5.db`` companion — so the FTS load inside GraphManager
+        # silently fails and leaves ``is_open=False``.
+
+        components = EngineComponents()
+        ok = _load_legacy_artifacts(
+            components, tmp_path, "owner/repo:main:abcd1234"
+        )
+        assert ok is True
+        # The query_service was created — confirm its fts attribute is
+        # None rather than a closed GraphTextIndex.
+        assert components.query_service is not None
+        assert components.query_service.fts is None
+
     def test_load_cached_artifacts_falls_back_when_wiki_db_missing_on_disk(
         self, tmp_path
     ):

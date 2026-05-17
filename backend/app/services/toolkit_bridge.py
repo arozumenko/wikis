@@ -444,20 +444,113 @@ def _load_legacy_artifacts(
 
         graph_manager = GraphManager(cache_dir=str(cache_path))
         graph = graph_manager.load_graph_by_repo_name(repo_identifier, graph_type="combined")
+
+        # ``load_graph_by_repo_name`` requires a commit-resolved identifier
+        # via ``refs``.  Bare ``owner/repo:branch`` lookups, or refs that
+        # point at a different commit than the actual on-disk artifacts,
+        # cleanly return ``None``.  Fall back to a direct cache-index scan
+        # so we still find a usable graph for the same repo:branch even
+        # when the commit metadata has drifted.
+        cache_key = None
+        if graph is None or graph.number_of_nodes() == 0:
+            graph, cache_key = _scan_legacy_graphs_for_repo(
+                graph_manager, cache_path, repo_identifier
+            )
         if graph is None or graph.number_of_nodes() == 0:
             return False
 
+        # ``load_graph_by_repo_name`` loads the FTS index internally but
+        # swallows load failures — capture only when ``is_open`` so we
+        # don't hand a stale/empty index to ``GraphQueryService``.
         fts_index = getattr(graph_manager, "fts_index", None)
+        if fts_index is not None and not getattr(fts_index, "is_open", False):
+            # Try once more for the scanned cache_key (covers the
+            # commit-drift fallback above).
+            if cache_key:
+                try:
+                    fts_index.load(cache_key)
+                except Exception:  # noqa: S110
+                    pass
+            if not getattr(fts_index, "is_open", False):
+                fts_index = None
+
         components.graph_manager = graph_manager
         components.code_graph = graph
         components.query_service = GraphQueryService(graph, fts_index=fts_index)
         logger.info(
-            "Loaded legacy artifacts for %s (%d nodes, %d edges) — refresh recommended",
+            "Loaded legacy artifacts for %s (%d nodes, %d edges, fts=%s) — refresh recommended",
             repo_identifier,
             graph.number_of_nodes(),
             graph.number_of_edges(),
+            "yes" if fts_index is not None else "no",
         )
         return True
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Legacy artifact fallback failed for %s: %s", repo_identifier, e)
         return False
+
+
+def _scan_legacy_graphs_for_repo(
+    graph_manager: Any,
+    cache_path: Path,
+    repo_identifier: str,
+) -> tuple[Any, str | None]:
+    """Find any ``.code_graph.gz`` registered for ``repo_identifier``.
+
+    Walks ``cache_index.json``'s ``graphs`` section for entries whose key
+    matches ``repo_identifier`` as a prefix (``owner/repo:branch``).
+    Prefers the file with the most-recent mtime among matches.  Returns
+    ``(graph, cache_key)`` or ``(None, None)`` when nothing usable is on
+    disk.
+    """
+    import gzip
+    import pickle
+
+    index_file = cache_path / "cache_index.json"
+    if not index_file.exists():
+        return None, None
+    try:
+        with open(index_file) as fh:
+            index = json.load(fh)
+    except Exception:
+        return None, None
+
+    graphs = index.get("graphs", {})
+    candidates: list[tuple[float, str, Path]] = []
+    for graph_key, cache_key in graphs.items():
+        if not graph_key.startswith(f"{repo_identifier}:") and not graph_key.startswith(
+            f"{repo_identifier.rsplit(':', 1)[0]}:"
+        ):
+            continue
+        if not graph_key.endswith(":combined"):
+            continue
+        cache_file = cache_path / f"{cache_key}.code_graph.gz"
+        if not cache_file.exists():
+            continue
+        candidates.append((cache_file.stat().st_mtime, cache_key, cache_file))
+
+    if not candidates:
+        return None, None
+    candidates.sort(reverse=True)
+    _, cache_key, cache_file = candidates[0]
+
+    try:
+        with gzip.open(cache_file, "rb") as fh:
+            graph = pickle.load(fh)  # noqa: S301 — self-generated graph pickle
+    except Exception as e:
+        logger.warning("Failed to load legacy graph %s: %s", cache_file, e)
+        return None, None
+
+    # Pull the FTS5 index for the same cache_key (non-fatal on miss).
+    if getattr(graph_manager, "fts_index", None) is not None:
+        try:
+            graph_manager.fts_index.load(cache_key)
+        except Exception:  # noqa: S110
+            pass
+
+    logger.info(
+        "Legacy graph located via cache_index scan: %s (cache_key=%s)",
+        cache_file.name,
+        cache_key,
+    )
+    return graph, cache_key
