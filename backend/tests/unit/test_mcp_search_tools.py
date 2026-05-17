@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1136,3 +1135,339 @@ async def test_surprising_connections_resource_raises_on_wiki_not_found():
         srv._current_user_id.reset(token)
         srv._wiki_management = old_mgmt
         srv._settings = old_settings
+
+
+# ---------------------------------------------------------------------------
+# #121 follow-up: project-scoped graph-native tools + resources.
+# Mock the project_service + storage so we exercise the aggregation
+# logic (sorting, merging, attribution) without spinning up real DBs.
+# ---------------------------------------------------------------------------
+
+
+def _patch_project_open(handles_returner):
+    """Patch ``_open_project_storages`` to return the handles produced
+    by ``handles_returner()``. Returns the context manager directly."""
+    async def fake(project_id: str):
+        return handles_returner(), None
+    return patch("mcp_server.server._open_project_storages", side_effect=fake)
+
+
+def _make_storage(stats=None, god=None, path=None, surprises=None):
+    """Minimal MagicMock with the storage methods our project tools call."""
+    storage = MagicMock()
+    if stats is not None:
+        storage.stats.return_value = stats
+    if god is not None:
+        storage.compute_god_nodes.return_value = god
+    if path is not None:
+        storage.shortest_path.return_value = path
+    if surprises is not None:
+        storage.compute_surprising_connections.return_value = surprises
+    return storage
+
+
+# ── god_nodes_project ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_project_merges_and_ranks_globally():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(god={
+        "by_symbol_type": [
+            {"symbol_id": "n1", "name": "Heavy", "symbol_type": "class",
+             "rel_path": "a.py", "degree": 80},
+            {"symbol_id": "n2", "name": "Light", "symbol_type": "class",
+             "rel_path": "b.py", "degree": 5},
+        ],
+        "by_file": [
+            {"rel_path": "a.py", "internal_arch": 4, "external_edges": 12},
+        ],
+    })
+    w2 = _make_storage(god={
+        "by_symbol_type": [
+            {"symbol_id": "n3", "name": "Champion", "symbol_type": "class",
+             "rel_path": "x.py", "degree": 100},
+        ],
+        "by_file": [
+            {"rel_path": "x.py", "internal_arch": 8, "external_edges": 30},
+        ],
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1), ("w-2", w2)]):
+        result = await srv.god_nodes_project(project_id="p-1", top_n=2)
+
+    # Highest degree first; Champion from w-2 wins over Heavy from w-1.
+    assert [s["name"] for s in result["by_symbol_type"]] == ["Champion", "Heavy"]
+    assert result["by_symbol_type"][0]["wiki_id"] == "w-2"
+    assert result["by_symbol_type"][1]["wiki_id"] == "w-1"
+    # File ranking: x.py (30 edges) beats a.py (12 edges).
+    assert result["by_file"][0]["rel_path"] == "x.py"
+    assert result["by_file"][0]["wiki_id"] == "w-2"
+    assert result["wiki_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_project_top_n_caps_after_merge():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(god={
+        "by_symbol_type": [
+            {"symbol_id": f"n{i}", "name": f"S{i}", "symbol_type": "c",
+             "rel_path": "p.py", "degree": 100 - i}
+            for i in range(20)
+        ],
+        "by_file": [],
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1)]):
+        result = await srv.god_nodes_project(project_id="p-1", top_n=3)
+    assert len(result["by_symbol_type"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_project_rejects_out_of_range_top_n():
+    import mcp_server.server as srv
+    assert "error" in await srv.god_nodes_project(project_id="p-1", top_n=0)
+    assert "error" in await srv.god_nodes_project(project_id="p-1", top_n=201)
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_project_propagates_project_error():
+    import mcp_server.server as srv
+
+    async def fake(project_id: str):
+        return [], "Project not found: missing. Use list_projects()..."
+
+    with patch("mcp_server.server._open_project_storages", side_effect=fake):
+        result = await srv.god_nodes_project(project_id="missing")
+    assert "error" in result
+    assert "Project not found" in result["error"]
+
+
+# ── shortest_path_project ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_project_returns_paths_sorted_by_length():
+    import mcp_server.server as srv
+
+    long_path = {
+        "source": {"node_id": "a"}, "target": {"node_id": "z"},
+        "source_candidates": 1, "target_candidates": 1,
+        "path": [{"node_id": "a"}, {"node_id": "m"}, {"node_id": "z"}],
+        "edges": [], "length": 2,
+    }
+    short_path = {
+        "source": {"node_id": "a"}, "target": {"node_id": "z"},
+        "source_candidates": 1, "target_candidates": 1,
+        "path": [{"node_id": "a"}, {"node_id": "z"}],
+        "edges": [], "length": 1,
+    }
+    w_long = _make_storage(path=long_path)
+    w_short = _make_storage(path=short_path)
+
+    with _patch_project_open(lambda: [("w-long", w_long), ("w-short", w_short)]):
+        result = await srv.shortest_path_project(
+            project_id="p-1", source_label="Foo", target_label="Bar",
+        )
+
+    assert [p["wiki_id"] for p in result["paths"]] == ["w-short", "w-long"]
+    assert result["missing"] == []
+    assert result["wiki_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_project_collects_missing_with_reasons():
+    import mcp_server.server as srv
+
+    found = {
+        "source": {"node_id": "a"}, "target": {"node_id": "b"},
+        "source_candidates": 1, "target_candidates": 1,
+        "path": [{"node_id": "a"}, {"node_id": "b"}],
+        "edges": [], "length": 1,
+    }
+    w_found = _make_storage(path=found)
+    w_miss = _make_storage(
+        path={"path": None, "reason": "source_not_found"},
+    )
+
+    with _patch_project_open(lambda: [("w-1", w_found), ("w-2", w_miss)]):
+        result = await srv.shortest_path_project(
+            project_id="p-1", source_label="X", target_label="Y",
+        )
+
+    assert len(result["paths"]) == 1
+    assert result["paths"][0]["wiki_id"] == "w-1"
+    assert result["missing"] == [
+        {"wiki_id": "w-2", "reason": "source_not_found"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_project_no_matches_returns_empty_paths():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(path={"path": None, "reason": "target_not_found"})
+    w2 = _make_storage(path={"path": None, "reason": "source_not_found"})
+
+    with _patch_project_open(lambda: [("w-1", w1), ("w-2", w2)]):
+        result = await srv.shortest_path_project(
+            project_id="p-1", source_label="X", target_label="Y",
+        )
+    assert result["paths"] == []
+    assert len(result["missing"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_project_rejects_invalid_max_depth():
+    import mcp_server.server as srv
+
+    for bad in (0, 51):
+        result = await srv.shortest_path_project(
+            project_id="p-1", source_label="X", target_label="Y", max_depth=bad,
+        )
+        assert "error" in result
+
+
+# ── surprising_connections_project ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_project_merges_and_ranks_by_jaccard():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(surprises={
+        "pairs": [
+            {"cluster_a": 1, "cluster_b": 2, "jaccard_distance": 0.5,
+             "context_a": ["a"], "context_b": ["b"], "edge_count": 1,
+             "sample_edges": []},
+        ],
+        "skipped_pairs": 0,
+    })
+    w2 = _make_storage(surprises={
+        "pairs": [
+            {"cluster_a": 5, "cluster_b": 6, "jaccard_distance": 1.0,
+             "context_a": ["x"], "context_b": ["y"], "edge_count": 3,
+             "sample_edges": []},
+        ],
+        "skipped_pairs": 2,
+    })
+
+    with _patch_project_open(lambda: [("w-low", w1), ("w-high", w2)]):
+        result = await srv.surprising_connections_project(
+            project_id="p-1", top_n=10,
+        )
+
+    # Distance 1.0 first (more surprising).
+    assert result["pairs"][0]["wiki_id"] == "w-high"
+    assert result["pairs"][0]["jaccard_distance"] == 1.0
+    assert result["pairs"][1]["wiki_id"] == "w-low"
+    # Sums the per-wiki skipped counters.
+    assert result["skipped_pairs_total"] == 2
+    assert result["wiki_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_project_rejects_out_of_range_args():
+    import mcp_server.server as srv
+
+    for kwargs in (
+        {"top_n": 0}, {"top_n": 101},
+        {"sample_edges_per_pair": 0}, {"sample_edges_per_pair": 11},
+    ):
+        result = await srv.surprising_connections_project(
+            project_id="p-1", **kwargs,
+        )
+        assert "error" in result, f"Expected error for {kwargs}, got {result}"
+
+
+# ── Resources ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_project_resources_registered():
+    import mcp_server.server as srv
+
+    templates = await srv.mcp.list_resource_templates()
+    uris = {t.uriTemplate for t in templates}
+    assert "wikis://projects/{project_id}/repo_stats" in uris
+    assert "wikis://projects/{project_id}/surprising_connections" in uris
+
+
+@pytest.mark.asyncio
+async def test_project_repo_stats_resource_aggregates_per_wiki():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(stats={
+        "node_count": 10, "edge_count": 20,
+        "confidence_breakdown": {"extracted": 18, "inferred": 2, "ambiguous": 0},
+    })
+    w2 = _make_storage(stats={
+        "node_count": 5, "edge_count": 15,
+        "confidence_breakdown": {"extracted": 12, "inferred": 2, "ambiguous": 1},
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1), ("w-2", w2)]):
+        result = await srv.project_repo_stats_resource(project_id="p-1")
+
+    assert result["wiki_count"] == 2
+    assert result["node_count"] == 15
+    assert result["edge_count"] == 35
+    assert result["confidence_breakdown"] == {
+        "extracted": 30, "inferred": 4, "ambiguous": 1,
+    }
+    assert len(result["per_wiki"]) == 2
+    assert {p["wiki_id"] for p in result["per_wiki"]} == {"w-1", "w-2"}
+
+
+@pytest.mark.asyncio
+async def test_project_repo_stats_resource_raises_on_project_not_found():
+    import mcp_server.server as srv
+
+    async def fake(project_id: str):
+        return [], "Project not found: missing. ..."
+
+    with patch(
+        "mcp_server.server._open_project_storages", side_effect=fake,
+    ):
+        with pytest.raises(ValueError, match="Project not found"):
+            await srv.project_repo_stats_resource(project_id="missing")
+
+
+@pytest.mark.asyncio
+async def test_project_surprising_connections_resource_delegates_to_tool():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(surprises={
+        "pairs": [
+            {"cluster_a": 1, "cluster_b": 2, "jaccard_distance": 1.0,
+             "context_a": ["a"], "context_b": ["b"], "edge_count": 1,
+             "sample_edges": []},
+        ],
+        "skipped_pairs": 0,
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1)]):
+        result = await srv.project_surprising_connections_resource(
+            project_id="p-1",
+        )
+
+    assert result["pairs"][0]["wiki_id"] == "w-1"
+    assert result["wiki_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_project_surprising_connections_resource_raises_on_not_found():
+    import mcp_server.server as srv
+
+    async def fake(project_id: str):
+        return [], "Project not found: missing."
+
+    with patch(
+        "mcp_server.server._open_project_storages", side_effect=fake,
+    ):
+        with pytest.raises(ValueError, match="Project not found"):
+            await srv.project_surprising_connections_resource(
+                project_id="missing",
+            )
