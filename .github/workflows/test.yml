@@ -56,3 +56,10 @@ jobs:
         working-directory: web
       - run: npm run lint
         working-directory: web
+      # Regression guard for the Better-Auth api-key plugin × our
+      # schema remap (#170). Standalone tsx script because the
+      # Better-Auth packages are ESM-only and our Jest config is
+      # CJS-based — adding ESM transform support just for one test
+      # would expand the framework surface significantly.
+      - run: npm run test:integration
+        working-directory: web

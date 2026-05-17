@@ -13,7 +13,8 @@
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write src/",
     "format:check": "prettier --check src/",
-    "test": "jest"
+    "test": "jest",
+    "test:integration": "tsx scripts/test-apikey-plugin.ts"
   },
   "prisma": {
     "seed": "npx tsx prisma/seed.ts"
@@ -42,6 +43,7 @@
     "unist-util-visit": "^5.0.0"
   },
   "devDependencies": {
+    "@better-auth/memory-adapter": "^1.6.11",
     "@eslint/js": "^10.0.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
