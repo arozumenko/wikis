@@ -281,22 +281,29 @@ async def list_wikis(
         except Exception:  # noqa: S110
             pass
 
-        # Find the most relevant invocation — prefer "generating" over terminal
+        # Find the most relevant invocation — prefer an in-progress
+        # run (generating or running) over a terminal one.
         best_inv = None
         for inv in service.invocations.values():
             if inv.wiki_id == wiki.wiki_id:
-                if inv.status == "generating":
+                if inv.status in ("generating", "running"):
                     best_inv = inv
                     break
                 if best_inv is None:
                     best_inv = inv
         if best_inv:
             wiki.invocation_id = best_inv.id
-            # Only override DB status if the invocation is still generating.
-            # DB is source of truth for terminal states.
-            if best_inv.status == "generating":
+            # Only override DB status if the invocation is still in
+            # progress. DB is source of truth for terminal states.
+            # ``generating`` = full re-generation;
+            # ``running``    = incremental refresh.
+            # #175: keep this branch in lock-step with the matching
+            # block in ``get_wiki`` so the dashboard and the viewer
+            # never disagree on whether a refresh is live.
+            if best_inv.status in ("generating", "running"):
                 wiki.status = best_inv.status
                 wiki.progress = best_inv.progress
+                wiki.error = None
 
     # Add active/failed invocations not yet in completed list
     for inv in service.invocations.values():
@@ -438,9 +445,13 @@ async def get_wiki(
                     wiki_meta = WikiManagementService._record_to_summary(wiki_record, user_id) if wiki_record else None
                 except Exception:  # noqa: S110
                     pass
-            # Still generating or failed — return minimal info so the UI
+            # Still in progress or failed — return minimal info so the UI
             # can show repo details and offer a retry button (backward compat for pre-migration wikis).
-            if not wiki_meta and active_invocation.status in ("generating", "failed", "partial", "cancelled"):
+            # #175: includes ``running`` (incremental refresh) alongside
+            # ``generating`` (full re-generation).
+            if not wiki_meta and active_invocation.status in (
+                "generating", "running", "failed", "partial", "cancelled",
+            ):
                 return {
                     "wiki_id": wiki_id,
                     "repo_url": active_invocation.repo_url,
@@ -535,12 +546,25 @@ async def get_wiki(
     }
     if active_invocation:
         response["invocation_id"] = active_invocation.id
-        # Only let the in-memory invocation override DB status if it is still generating.
-        # DB is the source of truth for terminal states (complete/failed/partial).
-        # Without this guard, a stale failed invocation from a prior attempt (within 1hr TTL)
-        # would shadow a successful retry and display "failed" after page refresh.
-        if active_invocation.status == "generating":
+        # Only let the in-memory invocation override DB status if a
+        # run is *still in progress*. DB is the source of truth for
+        # terminal states (complete/failed/partial).
+        #
+        # ``generating``: full re-generation via ``WikiService.generate``
+        # ``running``:    incremental refresh via
+        #                 ``WikiService.incremental_refresh``
+        #
+        # #175: also clear ``error`` and update ``progress``. Without
+        # this, the dashboard (which already applied the override) and
+        # the wiki viewer would disagree when a refresh runs after a
+        # prior failure — the viewer would show ``status='generating'``
+        # but ALSO surface the stale ``error`` string from the failed
+        # attempt, confusing the SPA's render logic. Keep these in
+        # lock-step with ``list_wikis`` below.
+        if active_invocation.status in ("generating", "running"):
             response["status"] = active_invocation.status
+            response["progress"] = active_invocation.progress
+            response["error"] = None
     return response
 
 

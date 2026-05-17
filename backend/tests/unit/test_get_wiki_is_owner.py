@@ -245,3 +245,230 @@ async def test_get_wiki_inflight_invocation_has_is_owner_false(app_with_mocks):
     data = resp.json()
     assert "is_owner" in data
     assert data["is_owner"] is False
+
+
+# ---------------------------------------------------------------------------
+# #175 — list/detail endpoints must agree on status when a live
+# in-progress invocation supersedes a stale DB record.
+#
+# Repro shape: a wiki has ``status='failed'`` + ``error='old…'`` from
+# a prior failed run. The user retries; a new generating invocation
+# now lives in ``service.invocations``. Both the list endpoint
+# (dashboard cards) and the detail endpoint (wiki viewer) MUST
+# surface ``status='generating'`` with no leftover ``error`` so the
+# SPA stops showing "Generation failed" while a refresh is live.
+# ---------------------------------------------------------------------------
+
+
+def _make_inflight_invocation(
+    status: str = "generating",
+    progress: float = 0.1,
+    invocation_id: str = "inv-new",
+) -> MagicMock:
+    """Build a mock in-flight invocation matching the live refresh."""
+    inv = MagicMock()
+    inv.id = invocation_id
+    inv.wiki_id = "wiki-1"
+    inv.repo_url = "https://github.com/example/repo"
+    inv.branch = "main"
+    inv.status = status
+    inv.progress = progress
+    inv.error = None
+    inv.pages_completed = 0
+    inv.created_at = datetime(2024, 1, 2)
+    inv.owner_id = "user-1"
+    return inv
+
+
+@pytest.mark.asyncio
+async def test_get_wiki_override_clears_stale_error_when_refresh_is_live(
+    app_with_mocks,
+):
+    """Detail endpoint: when a generating invocation supersedes a
+    prior-failed DB record, response must surface generating status
+    AND drop the stale error string."""
+    app, mock_management, mock_service = app_with_mocks
+
+    wiki_record = _make_wiki_record()
+    wiki_summary = _make_wiki_summary(status="failed", is_owner=True)
+    wiki_summary.error = "Git clone failed (from prior attempt)"
+
+    mock_management.get_wiki = AsyncMock(return_value=wiki_record)
+    mock_management.storage.list_artifacts = AsyncMock(return_value=[])
+
+    mock_service.invocations = {
+        "inv-new": _make_inflight_invocation(status="generating", progress=0.42),
+    }
+
+    from app.services.wiki_management import WikiManagementService
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(
+            WikiManagementService,
+            "_record_to_summary",
+            staticmethod(lambda record, user_id: wiki_summary),
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test",
+        ) as client:
+            resp = await client.get("/api/v1/wikis/wiki-1")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "generating"
+    assert data["error"] is None
+    assert data["progress"] == 0.42
+    assert data["invocation_id"] == "inv-new"
+
+
+@pytest.mark.asyncio
+async def test_get_wiki_override_fires_for_running_incremental_refresh(
+    app_with_mocks,
+):
+    """Detail endpoint must honour ``running`` (incremental refresh)
+    the same way as ``generating`` (full re-generation)."""
+    app, mock_management, mock_service = app_with_mocks
+
+    wiki_record = _make_wiki_record()
+    wiki_summary = _make_wiki_summary(status="complete", is_owner=True)
+
+    mock_management.get_wiki = AsyncMock(return_value=wiki_record)
+    mock_management.storage.list_artifacts = AsyncMock(return_value=[])
+
+    mock_service.invocations = {
+        "inv-r": _make_inflight_invocation(status="running", progress=0.3),
+    }
+
+    from app.services.wiki_management import WikiManagementService
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(
+            WikiManagementService,
+            "_record_to_summary",
+            staticmethod(lambda record, user_id: wiki_summary),
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test",
+        ) as client:
+            resp = await client.get("/api/v1/wikis/wiki-1")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "running"
+    assert resp.json()["progress"] == 0.3
+
+
+@pytest.mark.asyncio
+async def test_get_wiki_terminal_invocation_does_not_override(app_with_mocks):
+    """Counter-test: a leftover *failed* in-memory invocation must NOT
+    shadow a *successfully completed* DB record. The DB is the source
+    of truth for terminal states; only in-progress invocations override.
+    """
+    app, mock_management, mock_service = app_with_mocks
+
+    wiki_record = _make_wiki_record()
+    wiki_summary = _make_wiki_summary(status="complete", is_owner=True)
+
+    mock_management.get_wiki = AsyncMock(return_value=wiki_record)
+    mock_management.storage.list_artifacts = AsyncMock(return_value=[])
+
+    mock_service.invocations = {
+        "inv-old": _make_inflight_invocation(status="failed"),
+    }
+
+    from app.services.wiki_management import WikiManagementService
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(
+            WikiManagementService,
+            "_record_to_summary",
+            staticmethod(lambda record, user_id: wiki_summary),
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test",
+        ) as client:
+            resp = await client.get("/api/v1/wikis/wiki-1")
+
+    # Status stays "complete" — terminal in-memory invocation does
+    # not regress the DB's authoritative state.
+    assert resp.json()["status"] == "complete"
+
+
+def _make_serializable_wiki_summary(
+    status: str = "complete",
+    is_owner: bool = True,
+    error: str | None = None,
+) -> MagicMock:
+    """Like ``_make_wiki_summary`` but populates every field the
+    ``WikiListResponse`` Pydantic schema requires as concrete typed
+    values, not MagicMock auto-attrs (which fail validation)."""
+    ws = _make_wiki_summary(status=status, is_owner=is_owner)
+    ws.error = error
+    ws.progress = None
+    ws.owner_id = "user-1"
+    ws.visibility = "personal"
+    return ws
+
+
+@pytest.mark.asyncio
+async def test_list_wikis_override_clears_stale_error_when_refresh_is_live(
+    app_with_mocks,
+):
+    """List endpoint: same contract as the detail endpoint above. The
+    dashboard card must show generating + no error when a refresh
+    supersedes a prior failed run."""
+    app, mock_management, mock_service = app_with_mocks
+
+    wiki_summary = _make_serializable_wiki_summary(
+        status="failed", is_owner=True,
+        error="Git clone failed (from prior attempt)",
+    )
+
+    wiki_list = MagicMock()
+    wiki_list.wikis = [wiki_summary]
+    mock_management.list_wikis = AsyncMock(return_value=wiki_list)
+    mock_management.storage.list_artifacts = AsyncMock(return_value=[])
+
+    mock_service.invocations = {
+        "inv-new": _make_inflight_invocation(status="generating", progress=0.42),
+    }
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test",
+    ) as client:
+        resp = await client.get("/api/v1/wikis")
+
+    assert resp.status_code == 200
+    wikis = resp.json()["wikis"]
+    assert len(wikis) == 1
+    assert wikis[0]["status"] == "generating"
+    assert wikis[0]["error"] is None
+    assert wikis[0]["progress"] == 0.42
+
+
+@pytest.mark.asyncio
+async def test_list_wikis_override_fires_for_running_incremental_refresh(
+    app_with_mocks,
+):
+    """List endpoint: running (incremental refresh) is honoured."""
+    app, mock_management, mock_service = app_with_mocks
+
+    wiki_summary = _make_serializable_wiki_summary(
+        status="complete", is_owner=True,
+    )
+
+    wiki_list = MagicMock()
+    wiki_list.wikis = [wiki_summary]
+    mock_management.list_wikis = AsyncMock(return_value=wiki_list)
+    mock_management.storage.list_artifacts = AsyncMock(return_value=[])
+
+    mock_service.invocations = {
+        "inv-r": _make_inflight_invocation(status="running", progress=0.3),
+    }
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test",
+    ) as client:
+        resp = await client.get("/api/v1/wikis")
+
+    assert resp.json()["wikis"][0]["status"] == "running"
+    assert resp.json()["wikis"][0]["progress"] == 0.3
