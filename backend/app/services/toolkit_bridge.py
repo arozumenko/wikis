@@ -329,6 +329,11 @@ def _load_cached_artifacts(
             logger.info("Found .wiki.db via glob fallback: %s", wiki_dbs[0])
 
     if not cache_key:
+        # No unified DB found — try the legacy ``.code_graph.gz`` + ``.fts5.db``
+        # layout so wikis generated before UnifiedWikiDB rolled out keep
+        # serving ask/research traffic until they're refreshed.
+        if _load_legacy_artifacts(components, cache_path, repo_identifier):
+            return
         logger.warning(f"No unified DB found for {repo_identifier} — ask/research may fail")
         return
 
@@ -344,6 +349,11 @@ def _load_cached_artifacts(
         else:
             if not db_path.exists():
                 logger.warning(f"Unified DB file not found: {db_path}")
+                # cache_index points at a wiki.db that's missing on disk
+                # (e.g. cache cleaned but the index entry survived).  Try
+                # the legacy artifacts before giving up.
+                if _load_legacy_artifacts(components, cache_path, repo_identifier):
+                    return
                 return
             db = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
 
@@ -404,3 +414,50 @@ def _load_cached_artifacts(
         )
     except Exception as e:
         logger.warning(f"Failed to load unified DB {cache_key}: {e}")
+
+
+def _load_legacy_artifacts(
+    components: EngineComponents,
+    cache_path: Path,
+    repo_identifier: str,
+) -> bool:
+    """Rehydrate ask/research engine state from pre-UnifiedDB cache artifacts.
+
+    Older wikis (pre-UnifiedWikiDB rollout) stored their graph as
+    ``<cache_key>.code_graph.gz`` plus a companion ``<cache_key>.fts5.db``
+    instead of a single ``.wiki.db``.  When a wiki on disk still uses that
+    layout the standard ``_load_cached_artifacts`` path bails out and the
+    agent tools fall back to "No documentation found" responses.
+
+    This loader bridges the gap until the wiki is refreshed: it pulls the
+    NetworkX graph + FTS5 index via ``GraphManager``, then constructs a
+    ``GraphQueryService`` so ask/research tools have functional symbol
+    resolution, relationship traversal, and FTS5 search.  No
+    ``UnifiedRetriever`` is created — dense retrieval gracefully degrades
+    to FTS5 / graph search inside ``research_tools.create_codebase_tools``.
+
+    Returns True when legacy artifacts were located and wired in.
+    """
+    try:
+        from app.core.code_graph.graph_query_service import GraphQueryService
+        from app.core.graph_manager import GraphManager
+
+        graph_manager = GraphManager(cache_dir=str(cache_path))
+        graph = graph_manager.load_graph_by_repo_name(repo_identifier, graph_type="combined")
+        if graph is None or graph.number_of_nodes() == 0:
+            return False
+
+        fts_index = getattr(graph_manager, "fts_index", None)
+        components.graph_manager = graph_manager
+        components.code_graph = graph
+        components.query_service = GraphQueryService(graph, fts_index=fts_index)
+        logger.info(
+            "Loaded legacy artifacts for %s (%d nodes, %d edges) — refresh recommended",
+            repo_identifier,
+            graph.number_of_nodes(),
+            graph.number_of_edges(),
+        )
+        return True
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning("Legacy artifact fallback failed for %s: %s", repo_identifier, e)
+        return False
