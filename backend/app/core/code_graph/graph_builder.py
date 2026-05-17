@@ -2814,6 +2814,18 @@ class EnhancedUnifiedGraphBuilder:
                     # plaintext, etc.) — those are NOT in
                     # ``KNOWN_VISION_EXTENSIONS``.
                     if file_extension in KNOWN_VISION_EXTENSIONS:
+                        # The per-extension WARN above already told
+                        # the operator *that* this extension is
+                        # missing an extractor. The debug line
+                        # records *which file* was skipped so an
+                        # audit of "where did my PNGs go?" is
+                        # answerable without correlating against
+                        # ``ls`` — but at DEBUG so it doesn't fire
+                        # by default on a 500-image repo.
+                        logger.debug(
+                            "[doc-extractor] skipping vision file "
+                            "(no extractor): %s", file_path,
+                        )
                         continue
                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()

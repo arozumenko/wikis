@@ -42,6 +42,7 @@ KNOWN_VISION_EXTENSIONS: frozenset[str] = frozenset({
     ".gif",
     ".webp",
     # #118 phase 2 — Office formats (via LibreOffice → PDF → vision)
+    ".doc",   # legacy Word (OLE2 binary) — same LibreOffice path as .docx
     ".docx",
     ".xlsx",
     ".pptx",
