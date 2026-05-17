@@ -6,6 +6,10 @@ interface RepoContextData {
   branch?: string;
   indexedAt?: string;
   commitHash?: string | null;
+  // #172 — surfaced so the AppShell refresh button can prompt for a
+  // PAT when re-cloning a private repo (initial generate flow does
+  // this; the in-header refresh icon previously skipped the check).
+  requiresToken?: boolean;
 }
 
 interface RepoContextValue {

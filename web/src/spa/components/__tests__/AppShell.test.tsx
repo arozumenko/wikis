@@ -182,3 +182,123 @@ describe('wikiId threading', () => {
     expect(qs).toHaveAttribute('data-project-id', '');
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// 4. Refresh-button flow (#172) — public vs private wiki
+// ---------------------------------------------------------------------------
+
+import { refreshWiki } from '../../api/wiki';
+
+function renderShellWithRepo(repoContext: {
+  wikiId?: string;
+  repoUrl?: string;
+  branch?: string;
+  indexedAt?: string;
+  commitHash?: string | null;
+  requiresToken?: boolean;
+}) {
+  const defaultProps = {
+    mode: 'light' as const,
+    onToggleTheme: jest.fn(),
+    repoContext,
+  };
+  return render(
+    <MemoryRouter initialEntries={['/wiki/wiki-1']}>
+      <Routes>
+        <Route path="/wiki/:wikiId" element={<AppShell {...defaultProps} />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+describe('Refresh button — PAT prompt for private wikis (#172)', () => {
+  const mockedRefresh = refreshWiki as jest.MockedFunction<typeof refreshWiki>;
+
+  beforeEach(() => {
+    mockedRefresh.mockResolvedValue({
+      wiki_id: 'wiki-1',
+      invocation_id: 'inv-1',
+      status: 'generating',
+    } as Awaited<ReturnType<typeof refreshWiki>>);
+  });
+
+  it('public wiki — confirm dialog refreshes without prompting for a token', async () => {
+    renderShellWithRepo({
+      wikiId: 'wiki-1',
+      repoUrl: 'https://github.com/owner/public-repo',
+      requiresToken: false,
+    });
+
+    // Open confirm dialog
+    fireEvent.click(screen.getByLabelText('Refresh wiki'));
+    expect(screen.getByText('Refresh Wiki')).toBeInTheDocument();
+
+    // Confirm — should call refreshWiki(wikiId) directly, no token
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    expect(mockedRefresh).toHaveBeenCalledWith('wiki-1', undefined);
+    // Token dialog must NOT appear
+    expect(
+      screen.queryByText('GitHub access token required'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('private wiki — confirm dialog opens token modal, no refresh until token submitted', () => {
+    renderShellWithRepo({
+      wikiId: 'wiki-1',
+      repoUrl: 'https://github.com/owner/private-repo',
+      requiresToken: true,
+    });
+
+    fireEvent.click(screen.getByLabelText('Refresh wiki'));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    // Token modal opens
+    expect(
+      screen.getByText('GitHub access token required'),
+    ).toBeInTheDocument();
+    // Refresh API NOT called yet — waiting for the user's PAT
+    expect(mockedRefresh).not.toHaveBeenCalled();
+  });
+
+  it('private wiki — submitting the PAT calls refreshWiki with the token', async () => {
+    renderShellWithRepo({
+      wikiId: 'wiki-1',
+      repoUrl: 'https://github.com/owner/private-repo',
+      requiresToken: true,
+    });
+
+    fireEvent.click(screen.getByLabelText('Refresh wiki'));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    const input = screen.getByLabelText('GitHub token') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'ghp_test-token-123' } });
+
+    // The token-modal's confirm button (distinct from the confirm
+    // dialog's Refresh button which already closed).
+    const modalRefreshBtn = screen
+      .getAllByRole('button', { name: 'Refresh' })
+      .find((b) => !b.hasAttribute('disabled'));
+    fireEvent.click(modalRefreshBtn!);
+
+    expect(mockedRefresh).toHaveBeenCalledWith('wiki-1', 'ghp_test-token-123');
+  });
+
+  it('private wiki — token modal Refresh button is disabled until a token is entered', () => {
+    renderShellWithRepo({
+      wikiId: 'wiki-1',
+      repoUrl: 'https://github.com/owner/private-repo',
+      requiresToken: true,
+    });
+
+    fireEvent.click(screen.getByLabelText('Refresh wiki'));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    // The modal's Refresh button is the only Refresh button still
+    // visible at this point — the confirm-dialog one closed.
+    const refreshButtons = screen.getAllByRole('button', { name: 'Refresh' });
+    // All visible Refresh buttons must be disabled before any input.
+    refreshButtons.forEach((btn) => expect(btn).toBeDisabled());
+  });
+});
