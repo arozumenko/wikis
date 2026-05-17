@@ -21,11 +21,22 @@ function getSavedMode(): ThemeMode | null {
 
 export function useThemeMode() {
   const [mode, setMode] = useState<ThemeMode>(() => getSavedMode() ?? getSystemPreference());
+  // ``mounted`` flips to ``true`` after the first client effect.
+  // SSR-rendered consumers (the Next.js login page) gate their
+  // themed UI on this flag to avoid a hydration mismatch: the SSR
+  // ``useState`` initializer returns ``'light'`` (no ``window`` on
+  // the server) while the client init returns the real preference,
+  // and that mismatch leaves MUI's emotion classes in a mixed
+  // light/dark state — the white-on-white input symptom. Pure
+  // client-rendered SPA consumers (``ssr: false``) can ignore this
+  // flag because there is no SSR step to disagree with.
+  const [mounted, setMounted] = useState(false);
 
   // Sync with actual client preference on mount (SSR always defaults to 'light')
   useEffect(() => {
     const actual = getSavedMode() ?? getSystemPreference();
     setMode(actual);
+    setMounted(true);
   }, []);
 
   useEffect(() => {
@@ -51,5 +62,5 @@ export function useThemeMode() {
     });
   }, []);
 
-  return { mode, toggleMode } as const;
+  return { mode, toggleMode, mounted } as const;
 }
