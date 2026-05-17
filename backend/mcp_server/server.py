@@ -665,8 +665,13 @@ async def _open_wiki_storage(wiki_id: str) -> tuple[Any, str | None]:
     from app.core.storage import open_storage
     from app.services.wiki_management import derive_cache_key
 
+    # Aligned with ``_open_project_storages`` — both code paths must
+    # treat a null ``branch`` the same way, otherwise the same wiki
+    # resolves under different cache keys depending on which helper
+    # opens it. ``"main"`` matches the production default + the rest
+    # of the codebase's null-branch handling.
     cache_key = derive_cache_key(
-        _settings.cache_dir, wiki_record.repo_url, wiki_record.branch,
+        _settings.cache_dir, wiki_record.repo_url, wiki_record.branch or "main",
     )
     if not cache_key:
         return None, f"Wiki {wiki_id} has no cached index."
@@ -678,25 +683,46 @@ async def _open_wiki_storage(wiki_id: str) -> tuple[Any, str | None]:
     return storage, None
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Cast ``value`` to ``int`` for sort keys / aggregation, falling
+    back to ``default`` on any TypeError / ValueError. Used in the
+    project-scoped aggregators because they merge results across N
+    storage backends and we don't want a single misbehaving wiki to
+    crash the whole sort. The fallback puts bad values at the back
+    of the ranking rather than mid-pack."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """``float`` analogue of :func:`_safe_int`."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 async def _open_project_storages(
     project_id: str,
-) -> tuple[list[tuple[str, Any]], str | None]:
+) -> tuple[list[tuple[str, Any]], int, str | None]:
     """Resolve ``project_id`` → list of ``(wiki_id, storage)`` for all
-    wikis the caller can see in the project.
+    wikis the caller can see in the project, plus a count of wikis
+    skipped because their on-disk DB was missing or unopenable.
 
-    Returns ``([(wiki_id, storage), ...], None)`` on success. The list
-    may be empty if the project exists but has no member wikis — that's
-    not an error. Wikis whose on-disk DB is missing (e.g. generation
-    incomplete) are silently skipped with a warning log so a partial
-    project still produces a useful response.
+    Returns ``(handles, skipped, None)`` on success. ``handles`` may
+    be empty if the project genuinely has no member wikis, OR if all
+    wikis were skipped — the ``skipped`` count lets callers
+    distinguish those cases without reading server logs.
 
-    Returns ``([], error_message)`` only when the project itself can't
-    be loaded or the deployment lacks the services required.
+    Returns ``([], 0, error_message)`` only when the project itself
+    can't be loaded or the deployment lacks required services.
 
     Caller MUST close each storage via ``_close_storage_quietly``.
     """
     if not _session_factory or not _settings:
-        return [], "project graph tools unavailable in this deployment"
+        return [], 0, "project graph tools unavailable in this deployment"
 
     user_id = _current_user_id.get()
 
@@ -712,12 +738,13 @@ async def _open_project_storages(
             project_id, user_id=user_id,
         )
     if wikis is None:
-        return [], (
+        return [], 0, (
             f"Project not found: {project_id}. Use list_projects() to find "
             f"available project IDs."
         )
 
     handles: list[tuple[str, Any]] = []
+    skipped = 0
     for w in wikis:
         cache_key = derive_cache_key(
             _settings.cache_dir, w.repo_url, w.branch or "main",
@@ -727,6 +754,7 @@ async def _open_project_storages(
                 "[project graph] wiki %s has no cached index — skipping",
                 w.id,
             )
+            skipped += 1
             continue
         db_path = Path(_settings.cache_dir) / f"{cache_key}.wiki.db"
         if not db_path.exists():
@@ -734,6 +762,7 @@ async def _open_project_storages(
                 "[project graph] wiki %s has no unified DB on disk — skipping",
                 w.id,
             )
+            skipped += 1
             continue
         try:
             storage = open_storage(
@@ -744,9 +773,10 @@ async def _open_project_storages(
                 "[project graph] wiki %s storage open failed: %s — skipping",
                 w.id, exc,
             )
+            skipped += 1
             continue
         handles.append((w.id, storage))
-    return handles, None
+    return handles, skipped, None
 
 
 def _close_project_storages(handles: list[tuple[str, Any]]) -> None:
@@ -1065,7 +1095,7 @@ async def god_nodes_project(
     if not 1 <= top_n <= 200:
         return {"error": f"top_n must be between 1 and 200, got {top_n}"}
 
-    handles, err = await _open_project_storages(project_id)
+    handles, skipped, err = await _open_project_storages(project_id)
     if err:
         return {"error": err}
     try:
@@ -1079,16 +1109,25 @@ async def god_nodes_project(
                 all_files.append({"wiki_id": wid, **f})
 
         all_symbols.sort(
-            key=lambda s: (-int(s.get("degree", 0)), s.get("wiki_id", ""), s.get("symbol_id", "")),
+            key=lambda s: (
+                -_safe_int(s.get("degree", 0)),
+                str(s.get("wiki_id", "")),
+                str(s.get("symbol_id", "")),
+            ),
         )
         all_files.sort(
-            key=lambda f: (-int(f.get("external_edges", 0)), f.get("wiki_id", ""), f.get("rel_path", "")),
+            key=lambda f: (
+                -_safe_int(f.get("external_edges", 0)),
+                str(f.get("wiki_id", "")),
+                str(f.get("rel_path", "")),
+            ),
         )
 
         return {
             "by_symbol_type": all_symbols[:top_n],
             "by_file": all_files[:top_n],
             "wiki_count": len(handles),
+            "wikis_skipped": skipped,
         }
     finally:
         _close_project_storages(handles)
@@ -1133,7 +1172,7 @@ async def shortest_path_project(
     if not 1 <= max_depth <= 50:
         return {"error": f"max_depth must be between 1 and 50, got {max_depth}"}
 
-    handles, err = await _open_project_storages(project_id)
+    handles, skipped, err = await _open_project_storages(project_id)
     if err:
         return {"error": err}
     try:
@@ -1149,11 +1188,12 @@ async def shortest_path_project(
                 missing.append({"wiki_id": wid, "reason": r.get("reason", "")})
             else:
                 paths.append({"wiki_id": wid, **r})
-        paths.sort(key=lambda p: (int(p["length"]), p["wiki_id"]))
+        paths.sort(key=lambda p: (_safe_int(p.get("length", 0)), str(p["wiki_id"])))
         return {
             "paths": paths,
             "missing": missing,
             "wiki_count": len(handles),
+            "wikis_skipped": skipped,
         }
     finally:
         _close_project_storages(handles)
@@ -1202,7 +1242,7 @@ async def surprising_connections_project(
             ),
         }
 
-    handles, err = await _open_project_storages(project_id)
+    handles, skipped, err = await _open_project_storages(project_id)
     if err:
         return {"error": err}
     try:
@@ -1214,23 +1254,28 @@ async def surprising_connections_project(
                 context_depth=1,
                 sample_edges_per_pair=sample_edges_per_pair,
             )
-            skipped_total += int(r.get("skipped_pairs", 0))
+            skipped_total += _safe_int(r.get("skipped_pairs", 0))
             for p in r.get("pairs", []):
                 all_pairs.append({"wiki_id": wid, **p})
 
+        # Sort with safe casts so a future backend returning non-int
+        # cluster IDs or non-float jaccard scores can't crash the
+        # aggregator mid-sort. The sort still ranks by the
+        # primary signals; bad values just fall to the back.
         all_pairs.sort(
             key=lambda p: (
-                -float(p["jaccard_distance"]),
-                -int(p["edge_count"]),
-                p["wiki_id"],
-                int(p["cluster_a"]),
-                int(p["cluster_b"]),
+                -_safe_float(p.get("jaccard_distance", 0)),
+                -_safe_int(p.get("edge_count", 0)),
+                str(p.get("wiki_id", "")),
+                _safe_int(p.get("cluster_a", 0)),
+                _safe_int(p.get("cluster_b", 0)),
             ),
         )
         return {
             "pairs": all_pairs[:top_n],
             "skipped_pairs_total": skipped_total,
             "wiki_count": len(handles),
+            "wikis_skipped": skipped,
         }
     finally:
         _close_project_storages(handles)
@@ -1582,7 +1627,7 @@ async def project_repo_stats_resource(project_id: str) -> dict[str, Any]:
     Raises ``ValueError`` on project-not-found so MCP clients see a
     proper JSON-RPC error.
     """
-    handles, err = await _open_project_storages(project_id)
+    handles, skipped, err = await _open_project_storages(project_id)
     if err:
         raise ValueError(err)
     try:
@@ -1593,14 +1638,15 @@ async def project_repo_stats_resource(project_id: str) -> dict[str, Any]:
         for wid, storage in handles:
             s = storage.stats()
             per_wiki.append({"wiki_id": wid, **s})
-            total_nodes += int(s.get("node_count", 0))
-            total_edges += int(s.get("edge_count", 0))
+            total_nodes += _safe_int(s.get("node_count", 0))
+            total_edges += _safe_int(s.get("edge_count", 0))
             cb = s.get("confidence_breakdown") or {}
             for k in confidence_total:
-                confidence_total[k] += int(cb.get(k, 0))
+                confidence_total[k] += _safe_int(cb.get(k, 0))
         return {
             "project_id": project_id,
             "wiki_count": len(handles),
+            "wikis_skipped": skipped,
             "node_count": total_nodes,
             "edge_count": total_edges,
             "confidence_breakdown": confidence_total,

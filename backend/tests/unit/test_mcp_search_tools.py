@@ -1144,11 +1144,13 @@ async def test_surprising_connections_resource_raises_on_wiki_not_found():
 # ---------------------------------------------------------------------------
 
 
-def _patch_project_open(handles_returner):
+def _patch_project_open(handles_returner, skipped: int = 0):
     """Patch ``_open_project_storages`` to return the handles produced
-    by ``handles_returner()``. Returns the context manager directly."""
+    by ``handles_returner()``. The helper now returns
+    ``(handles, skipped, err)`` — pass ``skipped`` to simulate wikis
+    that were silently dropped (missing-on-disk DB etc.)."""
     async def fake(project_id: str):
-        return handles_returner(), None
+        return handles_returner(), skipped, None
     return patch("mcp_server.server._open_project_storages", side_effect=fake)
 
 
@@ -1237,7 +1239,7 @@ async def test_god_nodes_project_propagates_project_error():
     import mcp_server.server as srv
 
     async def fake(project_id: str):
-        return [], "Project not found: missing. Use list_projects()..."
+        return [], 0, "Project not found: missing. Use list_projects()..."
 
     with patch("mcp_server.server._open_project_storages", side_effect=fake):
         result = await srv.god_nodes_project(project_id="missing")
@@ -1426,7 +1428,7 @@ async def test_project_repo_stats_resource_raises_on_project_not_found():
     import mcp_server.server as srv
 
     async def fake(project_id: str):
-        return [], "Project not found: missing. ..."
+        return [], 0, "Project not found: missing. ..."
 
     with patch(
         "mcp_server.server._open_project_storages", side_effect=fake,
@@ -1462,7 +1464,7 @@ async def test_project_surprising_connections_resource_raises_on_not_found():
     import mcp_server.server as srv
 
     async def fake(project_id: str):
-        return [], "Project not found: missing."
+        return [], 0, "Project not found: missing."
 
     with patch(
         "mcp_server.server._open_project_storages", side_effect=fake,
@@ -1471,3 +1473,88 @@ async def test_project_surprising_connections_resource_raises_on_not_found():
             await srv.project_surprising_connections_resource(
                 project_id="missing",
             )
+
+
+# ── wikis_skipped propagation (review fixup) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_project_surfaces_skipped_count():
+    """Round-2 reviewer Important: a partial project (one wiki has no
+    on-disk DB) used to disappear from the response. Now
+    ``wikis_skipped`` carries that signal so callers can distinguish
+    "project empty" from "all wikis dropped on disk read"."""
+    import mcp_server.server as srv
+
+    w1 = _make_storage(god={"by_symbol_type": [], "by_file": []})
+
+    with _patch_project_open(lambda: [("w-1", w1)], skipped=2):
+        result = await srv.god_nodes_project(project_id="p-1")
+    assert result["wikis_skipped"] == 2
+    assert result["wiki_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_project_surfaces_skipped_count():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(path={"path": None, "reason": "source_not_found"})
+
+    with _patch_project_open(lambda: [("w-1", w1)], skipped=3):
+        result = await srv.shortest_path_project(
+            project_id="p-1", source_label="X", target_label="Y",
+        )
+    assert result["wikis_skipped"] == 3
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_project_surfaces_skipped_count():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(surprises={"pairs": [], "skipped_pairs": 0})
+
+    with _patch_project_open(lambda: [("w-1", w1)], skipped=1):
+        result = await srv.surprising_connections_project(project_id="p-1")
+    assert result["wikis_skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_project_repo_stats_resource_surfaces_skipped_count():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(stats={
+        "node_count": 1, "edge_count": 1,
+        "confidence_breakdown": {"extracted": 1, "inferred": 0, "ambiguous": 0},
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1)], skipped=4):
+        result = await srv.project_repo_stats_resource(project_id="p-1")
+    assert result["wikis_skipped"] == 4
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_project_handles_bad_types_in_sort():
+    """Round-2 reviewer Important: cast failures inside the sort key
+    used to propagate as unhandled exceptions. Safe casts should
+    push bad values to the back of the sort and keep the tool
+    responsive."""
+    import mcp_server.server as srv
+
+    w1 = _make_storage(surprises={
+        "pairs": [
+            {"cluster_a": "not-an-int", "cluster_b": 2,
+             "jaccard_distance": "bad", "context_a": [], "context_b": [],
+             "edge_count": "nope", "sample_edges": []},
+            {"cluster_a": 1, "cluster_b": 2,
+             "jaccard_distance": 0.9, "context_a": [], "context_b": [],
+             "edge_count": 5, "sample_edges": []},
+        ],
+        "skipped_pairs": 0,
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1)]):
+        result = await srv.surprising_connections_project(project_id="p-1")
+
+    # Both pairs return, well-typed one ranks first.
+    assert len(result["pairs"]) == 2
+    assert result["pairs"][0]["jaccard_distance"] == 0.9
