@@ -324,3 +324,74 @@ def test_vision_extension_with_registered_extractor_does_not_warn(
         if "will be ingested via the legacy text-read path" in r.getMessage()
     ]
     assert fallthrough_warnings == []
+
+
+def test_vision_eligible_file_without_extractor_is_skipped(
+    tmp_path: Path,
+) -> None:
+    """#173: a vision-eligible file (PNG / PDF / etc.) without a
+    registered extractor must NOT appear in the indexed results.
+
+    The previous behaviour was to WARN about the missing extractor
+    and then fall through to ``open(path, 'r', encoding='utf-8',
+    errors='ignore')``, which turned PNG bytes into 1186 chars of
+    binary garbage and indexed that as a "document." The fix in
+    graph_builder.py skips the file entirely when the extension is
+    in ``KNOWN_VISION_EXTENSIONS`` and no extractor is configured;
+    the WARNING still fires (covered by the test above) so
+    operators see the configuration gap.
+    """
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "spec.pdf").write_bytes(b"%PDF-1.4 not a real pdf")
+    (docs / "diag.png").write_bytes(_TINY_PNG)
+    # Non-vision text file in the same batch — must still go through.
+    (docs / "README.md").write_text("# Hello\n")
+
+    builder = EnhancedUnifiedGraphBuilder(extractor_registry=None)
+    results = builder._parse_documentation_files(
+        [
+            str(docs / "spec.pdf"),
+            str(docs / "diag.png"),
+            str(docs / "README.md"),
+        ],
+        str(tmp_path),
+    )
+
+    # The two vision-eligible files must be absent from results —
+    # asserting the indexer does not produce any "document symbol"
+    # for them. The previous bug would have placed both here with
+    # garbage source_text.
+    assert str(docs / "spec.pdf") not in results
+    assert str(docs / "diag.png") not in results
+    # The plain-text doc still routes through the legacy text-read
+    # path — the skip is targeted, not a blanket "no registry =
+    # skip everything."
+    assert str(docs / "README.md") in results
+    assert "Hello" in results[str(docs / "README.md")].symbols[0].source_text
+
+
+def test_vision_eligible_with_extractor_still_ingests(tmp_path: Path) -> None:
+    """Counter-test to #173: with a registered extractor, the PNG
+    flows through the extractor and the result IS indexed. Catches a
+    regression where someone widens the skip to apply unconditionally
+    (which would silently break image ingestion for users with a
+    properly configured vision LLM)."""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "diag.png").write_bytes(_TINY_PNG)
+
+    from app.core.extractors import ExtractorRegistry
+    from app.core.extractors.image import ImageExtractor
+    registry = ExtractorRegistry()
+    registry.register(ImageExtractor(llm=_StubLLM()))
+
+    builder = EnhancedUnifiedGraphBuilder(extractor_registry=registry)
+    results = builder._parse_documentation_files(
+        [str(docs / "diag.png")], str(tmp_path),
+    )
+
+    # With an extractor wired up, the PNG IS indexed (using LLM-
+    # derived text). Asserts the skip in #173 doesn't fire when an
+    # extractor is present.
+    assert str(docs / "diag.png") in results
