@@ -37,6 +37,7 @@ from ..constants import (
     DOT_DIR_WHITELIST,
     EXPANSION_SYMBOL_TYPES,
     KNOWN_FILENAMES,
+    classify_known_filename,
 )
 from ..document_compressor import DocumentCompressor
 from ..document_ranker import DocumentRanker
@@ -5024,9 +5025,11 @@ class OptimizedWikiGenerationAgent:
         if ext in DOCUMENTATION_EXTENSIONS_SET:
             return True
 
-        # Check known filenames (Makefile, Dockerfile, etc.)
+        # Check known filenames (Makefile, Dockerfile, etc.) — also
+        # picks up suffixed variants like Dockerfile.prod via the
+        # prefix-match-aware classifier (#181 Bug A).
         filename = _P(file_path).name
-        if filename in KNOWN_FILENAMES:
+        if classify_known_filename(filename) is not None:
             return True
 
         # Check filename stem

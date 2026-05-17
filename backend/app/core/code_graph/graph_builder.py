@@ -176,6 +176,7 @@ from ..constants import (
     DOC_SYMBOL_TYPES, ARCHITECTURAL_SYMBOLS,
     DOCUMENTATION_EXTENSIONS as _DOC_EXTENSIONS_MAP,
     KNOWN_FILENAMES as _KNOWN_FILENAMES_MAP,
+    classify_known_filename as _classify_known_filename,
 )
 from ..extractors import (  # #118 — non-code ingestion
     KNOWN_VISION_EXTENSIONS,
@@ -884,9 +885,12 @@ class EnhancedUnifiedGraphBuilder:
                 language = self.SUPPORTED_LANGUAGES.get(file_extension)
                 doc_type = self.DOCUMENTATION_EXTENSIONS.get(file_extension)
                 
-                # Fallback: check known filenames for extensionless / special files
+                # Fallback: check known filenames for extensionless /
+                # special files.  Uses prefix-match-aware classifier so
+                # ``Dockerfile.prod`` / ``Makefile.local`` classify
+                # alongside their base forms (#181 Bug A).
                 if not language and not doc_type:
-                    doc_type = self.KNOWN_FILENAMES.get(file_path.name)
+                    doc_type = _classify_known_filename(file_path.name)
                 
                 if language:
                     files_by_language[language].append(str(file_path))
@@ -2738,7 +2742,10 @@ class EnhancedUnifiedGraphBuilder:
                 file_extension = Path(file_path).suffix.lower()
                 doc_type = self.DOCUMENTATION_EXTENSIONS.get(file_extension)
                 if not doc_type:
-                    doc_type = self.KNOWN_FILENAMES.get(Path(file_path).name, 'text')
+                    # Prefix-match-aware lookup so suffixed conventional
+                    # names (Dockerfile.prod, Makefile.local) classify
+                    # the same as their base form (#181 Bug A).
+                    doc_type = _classify_known_filename(Path(file_path).name) or 'text'
 
                 # #118: try the registered extractor first; ``None``
                 # registry or no handler for this extension → legacy path.

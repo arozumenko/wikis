@@ -83,6 +83,11 @@ dev = [
     # via the ``--count`` flag. Caught the segfault we just fixed by
     # repeated execution rather than a single run.
     "pytest-repeat>=0.9",
+    # #181 follow-up: parallelize the suite so CI doesn't spend ~30 min
+    # serializing tests that finish in milliseconds.  ``-n auto`` runs
+    # one worker per logical CPU; GitHub Actions Ubuntu runners are
+    # 4-vCPU which drops the wall clock to ~7-8 min.
+    "pytest-xdist>=3.5",
     "ruff>=0.4.0",
 ]
 
