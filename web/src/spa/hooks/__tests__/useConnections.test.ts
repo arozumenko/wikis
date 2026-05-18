@@ -6,6 +6,17 @@ import { useConnections } from '../useConnections';
 import type { AtlassianConnection } from '../useConnections';
 import type { GitConnectionEntry } from '../../lib/git-pat';
 
+// Mock atlassian-oauth so tests never hit the network
+jest.mock('../../lib/atlassian-oauth', () => ({
+  refreshAtlassianTokens: jest.fn(),
+  // Preserve other exports in case they're needed transitively
+  fetchAccessibleResources: jest.fn(),
+  startAtlassianOAuth: jest.fn(),
+  completeAtlassianOAuth: jest.fn(),
+}));
+
+import { refreshAtlassianTokens } from '../../lib/atlassian-oauth';
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -51,6 +62,7 @@ function makeGitConnection(overrides?: Partial<GitConnectionEntry>): GitConnecti
 describe('useConnections', () => {
   beforeEach(() => {
     window.localStorage.clear();
+    jest.clearAllMocks();
   });
 
   // -------------------------------------------------------------------------
@@ -187,5 +199,117 @@ describe('useConnections', () => {
     // No network call expected — token is fresh
     const updated = await result.current.refreshAtlassianIfNeeded();
     expect(updated?.access_token).toBe('access-tok');
+  });
+
+  // -------------------------------------------------------------------------
+  // refreshAtlassianIfNeeded — within-5-min-of-expiry branch
+  // -------------------------------------------------------------------------
+
+  it('refreshAtlassianIfNeeded happy path: rotates tokens when expiring soon', async () => {
+    const mockRefresh = refreshAtlassianTokens as jest.MockedFunction<typeof refreshAtlassianTokens>;
+    const rotatedAt = Date.now() + 3600 * 1000;
+    mockRefresh.mockResolvedValueOnce({
+      access_token: 'rotated-access',
+      refresh_token: 'rotated-refresh',
+      expires_at: rotatedAt,
+      scope: 'read:confluence-content.all',
+    });
+
+    const { result } = renderHook(() => useConnections());
+    // expires_at 4 minutes from now — inside the 5-minute refresh window
+    const conn = makeAtlassianConnection({ expires_at: Date.now() + 4 * 60 * 1000 });
+
+    act(() => {
+      result.current.saveAtlassian(conn);
+    });
+
+    let updated: AtlassianConnection | null = null;
+    await act(async () => {
+      updated = await result.current.refreshAtlassianIfNeeded();
+    });
+
+    // refreshAtlassianTokens was called with the old refresh token
+    expect(mockRefresh).toHaveBeenCalledTimes(1);
+    expect(mockRefresh).toHaveBeenCalledWith('refresh-tok');
+
+    // Returned connection has rotated tokens
+    expect(updated).not.toBeNull();
+    expect(updated!.access_token).toBe('rotated-access');
+    expect(updated!.refresh_token).toBe('rotated-refresh');
+    expect(updated!.expires_at).toBe(rotatedAt);
+
+    // Hook state updated
+    expect(result.current.atlassian?.access_token).toBe('rotated-access');
+
+    // localStorage updated
+    const stored = JSON.parse(localStorage.getItem('wikis.connections.atlassian')!);
+    expect(stored.access_token).toBe('rotated-access');
+    expect(stored.refresh_token).toBe('rotated-refresh');
+    // scope is not persisted
+    expect(stored.scope).toBeUndefined();
+  });
+
+  it('refreshAtlassianIfNeeded failure path: localStorage and state unchanged when refresh rejects', async () => {
+    const mockRefresh = refreshAtlassianTokens as jest.MockedFunction<typeof refreshAtlassianTokens>;
+    mockRefresh.mockRejectedValueOnce(new Error('Network error'));
+
+    const { result } = renderHook(() => useConnections());
+    const conn = makeAtlassianConnection({ expires_at: Date.now() + 4 * 60 * 1000 });
+
+    act(() => {
+      result.current.saveAtlassian(conn);
+    });
+
+    // The rejection should propagate out of the hook
+    await expect(
+      act(async () => {
+        await result.current.refreshAtlassianIfNeeded();
+      }),
+    ).rejects.toThrow('Network error');
+
+    // State unchanged — still has the original tokens
+    expect(result.current.atlassian?.access_token).toBe('access-tok');
+
+    // localStorage unchanged
+    const stored = JSON.parse(localStorage.getItem('wikis.connections.atlassian')!);
+    expect(stored.access_token).toBe('access-tok');
+  });
+
+  // -------------------------------------------------------------------------
+  // refreshAtlassianNow — force-refresh regardless of expiry
+  // -------------------------------------------------------------------------
+
+  it('refreshAtlassianNow forces a refresh even when token is fresh', async () => {
+    const mockRefresh = refreshAtlassianTokens as jest.MockedFunction<typeof refreshAtlassianTokens>;
+    const rotatedAt = Date.now() + 7200 * 1000;
+    mockRefresh.mockResolvedValueOnce({
+      access_token: 'force-rotated-access',
+      refresh_token: 'force-rotated-refresh',
+      expires_at: rotatedAt,
+      scope: 'read:confluence-content.all',
+    });
+
+    const { result } = renderHook(() => useConnections());
+    // Token is fresh — 1 hour from now (outside the 5-min window)
+    const conn = makeAtlassianConnection({ expires_at: Date.now() + 3600 * 1000 });
+
+    act(() => {
+      result.current.saveAtlassian(conn);
+    });
+
+    let updated: AtlassianConnection | null = null;
+    await act(async () => {
+      updated = await result.current.refreshAtlassianNow();
+    });
+
+    expect(mockRefresh).toHaveBeenCalledTimes(1);
+    expect(updated!.access_token).toBe('force-rotated-access');
+    expect(result.current.atlassian?.access_token).toBe('force-rotated-access');
+  });
+
+  it('refreshAtlassianNow returns null when no connection is stored', async () => {
+    const { result } = renderHook(() => useConnections());
+    const updated = await result.current.refreshAtlassianNow();
+    expect(updated).toBeNull();
   });
 });

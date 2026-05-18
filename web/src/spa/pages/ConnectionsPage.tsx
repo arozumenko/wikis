@@ -24,7 +24,7 @@ export function ConnectionsPage() {
     atlassian,
     removeAtlassian,
     removeGitConnection,
-    refreshAtlassianIfNeeded,
+    refreshAtlassianNow,
   } = useConnections();
 
   const [wizardOpen, setWizardOpen] = useState(false);
@@ -71,7 +71,7 @@ export function ConnectionsPage() {
           <AtlassianConnectionCard
             connection={atlassian}
             onRemove={removeAtlassian}
-            onRefresh={refreshAtlassianIfNeeded}
+            onRefresh={refreshAtlassianNow}
           />
         </Box>
       )}

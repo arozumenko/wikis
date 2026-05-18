@@ -52,6 +52,13 @@ export interface UseConnectionsResult {
    * Returns null if there is no Atlassian connection.
    */
   refreshAtlassianIfNeeded: () => Promise<AtlassianConnection | null>;
+  /**
+   * Unconditionally refreshes the Atlassian access token regardless of expiry.
+   * Useful for the manual "Refresh" button in the UI.
+   *
+   * Returns null if there is no Atlassian connection.
+   */
+  refreshAtlassianNow: () => Promise<AtlassianConnection | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +143,21 @@ export function useConnections(): UseConnectionsResult {
     setAtlassian(null);
   }, []);
 
+  /** Internal: call the refresh endpoint and persist + update state. */
+  const doRefresh = useCallback(async (current: AtlassianConnection): Promise<AtlassianConnection> => {
+    const tokens = await refreshAtlassianTokens(current.refresh_token);
+    const updated: AtlassianConnection = {
+      ...current,
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+      expires_at: tokens.expires_at,
+      // scope is not part of AtlassianConnection — not persisted
+    };
+    persistAtlassian(updated);
+    setAtlassian(updated);
+    return updated;
+  }, []);
+
   const refreshAtlassianIfNeeded = useCallback(async (): Promise<AtlassianConnection | null> => {
     const current = loadAtlassian();
     if (!current) return null;
@@ -143,19 +165,14 @@ export function useConnections(): UseConnectionsResult {
     const needsRefresh = current.expires_at - Date.now() < REFRESH_WINDOW_MS;
     if (!needsRefresh) return current;
 
-    const tokens = await refreshAtlassianTokens(current.refresh_token);
-    const updated: AtlassianConnection = {
-      ...current,
-      access_token: tokens.access_token,
-      refresh_token: tokens.refresh_token,
-      expires_at: tokens.expires_at,
-      scope: tokens.scope,
-    } as AtlassianConnection & { scope: string };
+    return doRefresh(current);
+  }, [doRefresh]);
 
-    persistAtlassian(updated);
-    setAtlassian(updated);
-    return updated;
-  }, []);
+  const refreshAtlassianNow = useCallback(async (): Promise<AtlassianConnection | null> => {
+    const current = loadAtlassian();
+    if (!current) return null;
+    return doRefresh(current);
+  }, [doRefresh]);
 
   // -------------------------------------------------------------------------
   // Git PATs
@@ -188,5 +205,6 @@ export function useConnections(): UseConnectionsResult {
     saveGitConnection,
     removeGitConnection,
     refreshAtlassianIfNeeded,
+    refreshAtlassianNow,
   };
 }

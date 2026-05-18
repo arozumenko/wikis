@@ -53,6 +53,16 @@ export function OAuthCallback() {
         const tokens = await completeAtlassianOAuth(code, state);
         const resources = await fetchAccessibleResources(tokens.access_token);
 
+        // Guard: at least one accessible site is required to form a valid connection.
+        if (!resources[0]) {
+          setErrorMsg(
+            'No Atlassian sites found for this account. ' +
+              'Check that the OAuth app has the right scopes or that you have access to at least one Atlassian site.',
+          );
+          setPhase('error');
+          return;
+        }
+
         // Use the first accessible resource as the primary site
         const primary = resources[0];
         const connection: AtlassianConnection = {
@@ -60,8 +70,8 @@ export function OAuthCallback() {
           access_token: tokens.access_token,
           refresh_token: tokens.refresh_token,
           expires_at: tokens.expires_at,
-          cloud_id: primary?.id ?? '',
-          site_name: primary?.name ?? '',
+          cloud_id: primary.id,
+          site_name: primary.name,
           accessible_resources: resources,
           created_at: Date.now(),
         };

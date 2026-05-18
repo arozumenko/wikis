@@ -45,6 +45,7 @@ export function AtlassianConnectionCard({
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<'ok' | 'fail' | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [refreshResult, setRefreshResult] = useState<'ok' | 'fail' | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
 
   async function handleTest() {
@@ -63,8 +64,14 @@ export function AtlassianConnectionCard({
 
   async function handleRefresh() {
     setRefreshing(true);
+    setRefreshResult(null);
     try {
       await onRefresh();
+      setRefreshResult('ok');
+      // Auto-clear the success message after 3 seconds
+      setTimeout(() => setRefreshResult(null), 3000);
+    } catch {
+      setRefreshResult('fail');
     } finally {
       setRefreshing(false);
     }
@@ -129,7 +136,7 @@ export function AtlassianConnectionCard({
             </Box>
           </Box>
 
-          <Box sx={{ mt: 2, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+          <Box sx={{ mt: 2, display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
             <Button
               size="small"
               variant="outlined"
@@ -148,6 +155,16 @@ export function AtlassianConnectionCard({
             >
               {refreshing ? 'Refreshing…' : 'Refresh'}
             </Button>
+            {refreshResult === 'ok' && (
+              <Typography variant="caption" color="success.main">
+                Token refreshed
+              </Typography>
+            )}
+            {refreshResult === 'fail' && (
+              <Typography variant="caption" color="error.main">
+                Refresh failed — check your connection
+              </Typography>
+            )}
             <Button
               size="small"
               variant="outlined"
