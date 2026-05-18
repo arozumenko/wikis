@@ -37,14 +37,6 @@ jest.mock('../../api/project', () => ({
 const mockGenerateWikiMultiSource = jest.fn();
 const mockScanSource = jest.fn();
 
-jest.mock('../../api/wiki', () => ({
-  ...jest.requireActual('../../api/wiki'),
-  generateWikiMultiSource: (...args: unknown[]) => mockGenerateWikiMultiSource(...args),
-  scanSource: (...args: unknown[]) => mockScanSource(...args),
-  listWikis: jest.fn().mockResolvedValue({ wikis: [] }),
-}));
-
-// listWikis is called when is_owner=true — give it a default mock
 jest.mock('../../api/wiki', () => {
   const actual = jest.requireActual('../../api/wiki');
   return {
@@ -145,8 +137,16 @@ const mockProjectOwner = {
   wiki_count: 0,
 };
 
-function setup(initialPath = `/project/${PROJECT_ID}/ingestion`) {
-  mockGetProject.mockResolvedValue(mockProjectOwner);
+const mockProjectNonOwner = {
+  ...mockProjectOwner,
+  is_owner: false,
+};
+
+function setup(
+  initialPath = `/project/${PROJECT_ID}/ingestion`,
+  project = mockProjectOwner,
+) {
+  mockGetProject.mockResolvedValue(project);
   mockListProjectWikis.mockResolvedValue({ wikis: [] });
 
   render(
@@ -302,5 +302,27 @@ describe('Project Ingestion tab (#210)', () => {
     );
     // Must NOT attempt to link — wiki already exists
     expect(mockAddWikiToProject).not.toHaveBeenCalled();
+  });
+
+  it('non-owner: direct link to /ingestion falls back to overview, no wizard rendered', async () => {
+    // A non-owner following a direct link to /project/:id/ingestion must
+    // land on the overview tab. The ingestion wizard must not render, and
+    // the Ingestion tab must not appear in the tab bar.
+    setup(`/project/${PROJECT_ID}/ingestion`, mockProjectNonOwner);
+
+    // Wait for load to complete — the project name is a reliable marker
+    expect(await screen.findByText('Test Project')).toBeInTheDocument();
+
+    // Overview tab is active (tab label present)
+    expect(screen.getByRole('tab', { name: 'Overview' })).toBeInTheDocument();
+
+    // Ingestion tab is NOT shown for non-owners
+    expect(screen.queryByTestId('tab-ingestion')).not.toBeInTheDocument();
+
+    // The inline wizard must not render
+    expect(screen.queryByTestId('add-source-wizard')).not.toBeInTheDocument();
+
+    // Overview content IS visible — the empty-wikis alert is shown for non-owners
+    expect(screen.getByText(/no wikis in this project yet/i)).toBeInTheDocument();
   });
 });

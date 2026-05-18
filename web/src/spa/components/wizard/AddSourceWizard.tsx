@@ -77,6 +77,11 @@ interface AddSourceWizardProps {
    * The ``open`` prop is still respected — when ``inline=true`` and
    * ``open=false`` the component renders nothing, keeping the same
    * contract as the dialog variant for callers that gate on open.
+   *
+   * Note: the discard guard (``isDirty`` confirm prompt) is not triggered
+   * by navigation away from inline mode — there is no Cancel button or
+   * Dialog backdrop to intercept. Callers using ``inline`` mode are
+   * responsible for any "leaving page" confirmations if needed.
    */
   inline?: boolean;
 }

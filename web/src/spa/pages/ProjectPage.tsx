@@ -122,9 +122,6 @@ export function ProjectPage() {
   const { projectId, tab: tabParam } = useParams<{ projectId: string; tab?: string }>();
   const navigate = useNavigate();
 
-  // Derive active tab from URL param; default to 'overview'.
-  const activeTab: ProjectTab = tabParam === 'ingestion' ? 'ingestion' : 'overview';
-
   const [project, setProject] = useState<ProjectResponse | null>(null);
   const [wikis, setWikis] = useState<WikiSummary[]>([]);
   const [allWikis, setAllWikis] = useState<WikiSummary[]>([]);
@@ -227,6 +224,14 @@ export function ProjectPage() {
   }, [load]);
 
   const isOwner = project?.is_owner ?? false;
+
+  // Derive active tab from URL param, gated on ownership.
+  // A non-owner following a direct link to /project/:id/ingestion is silently
+  // redirected to 'overview'. isOwner is false until the project loads, but the
+  // loading spinner prevents any content from rendering during that window, so
+  // owners hitting /project/:id/ingestion directly see no flash.
+  const activeTab: ProjectTab =
+    tabParam === 'ingestion' && isOwner ? 'ingestion' : 'overview';
 
   // Wikis not yet in this project
   const memberIds = new Set(wikis.map((w) => w.wiki_id));
