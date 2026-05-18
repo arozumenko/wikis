@@ -202,7 +202,13 @@ class WikiService:
                             f"Server restarted during {prior_status}"
                         )
                         inv.completed_at = datetime.now()
-                        if inv.wiki_id:
+                        # #191 (Copilot C5): only propagate to WikiRecord for
+                        # full-generation orphans. ``running`` is the
+                        # incremental-refresh in-flight status — the wiki was
+                        # ``complete`` before the refresh started, so marking
+                        # it failed would invalidate previously-good content
+                        # (``get_wiki`` would short-circuit to no pages).
+                        if inv.wiki_id and prior_status == "generating":
                             orphaned_wiki_ids.append((inv.wiki_id, inv.error))
                     self._invocations[inv_id] = inv
                 except Exception:  # noqa: S110
@@ -575,13 +581,34 @@ class WikiService:
             # from a previous run is still pinned to "generating"/1.0 —
             # this defensive update guarantees the dashboard/detail view
             # reflects backend truth instead of stale "100% Generating".
+            #
+            # Copilot C1: mark_status is update-only. If pre-registration
+            # silently failed (the catch at line ~397 swallows DB errors),
+            # no WikiRecord exists and mark_status returns False. Without
+            # the fallback below the failure state would never reach the
+            # dashboard / retry flow.
             if self.wiki_management and invocation.wiki_id:
                 try:
-                    await self.wiki_management.mark_status(
+                    updated = await self.wiki_management.mark_status(
                         wiki_id=invocation.wiki_id,
                         status=invocation.status,
                         error=invocation.error,
                     )
+                    if (
+                        not updated
+                        and invocation.status != "complete"
+                        and invocation.repo_url
+                    ):
+                        await self.wiki_management.register_wiki(
+                            wiki_id=invocation.wiki_id,
+                            repo_url=invocation.repo_url,
+                            branch=invocation.branch,
+                            title=f"Wiki for {invocation.repo_url}",
+                            page_count=invocation.pages_completed,
+                            owner_id=invocation.owner_id,
+                            status=invocation.status,
+                            error=invocation.error,
+                        )
                 except Exception as _db_err:
                     logger.warning(f"Failed to reconcile wiki status in DB: {_db_err}")
 

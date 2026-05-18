@@ -289,6 +289,13 @@ export function subscribeSSE(
   let backoffIndex = 0;
   let controller: AbortController | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // #191 (Copilot C6): if a clean close yields zero events on a connection
+  // cycle AND we have previously received an event, treat the stream as
+  // terminal and stop reconnecting. Without this, consumers that forget to
+  // call close() on a terminal SSE event (e.g. IncrementalRefreshBanner
+  // handles incremental_summary but doesn't close) would reconnect forever
+  // — the backend keeps returning empty replies for a terminated invocation.
+  let hasEverReceivedEvent = false;
 
   const scheduleReconnect = () => {
     if (closed) return;
@@ -315,14 +322,17 @@ export function subscribeSSE(
       });
 
       if (!resp.ok || !resp.body) {
-        // 404 = invocation gone/expired; do not retry (terminal).
-        // Other non-2xx → reconnect with backoff (server may be restarting).
+        // 401/403/404 = terminal (auth / not found). Surface to onError
+        // so callers can render an error state, then stop.
         if (resp.status === 404 || resp.status === 401 || resp.status === 403) {
-          onError?.(new Error(`HTTP ${resp.status}`));
           closed = true;
+          onError?.(new Error(`HTTP ${resp.status}`));
           return;
         }
-        onError?.(new Error(`HTTP ${resp.status}`));
+        // #191 (Copilot C3): 5xx and other non-2xx are transient — the
+        // server may be restarting. Reconnect silently; do NOT call
+        // onError here. Consumers like IncrementalRefreshBanner treat any
+        // onError as a permanent failure UI.
         scheduleReconnect();
         return;
       }
@@ -333,7 +343,7 @@ export function subscribeSSE(
       let eventType = '';
       let dataStr = '';
       let eventIdField = '';
-      let firstEventSeen = false;
+      let firstEventSeenThisCycle = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -357,8 +367,9 @@ export function subscribeSSE(
                 const raw = JSON.parse(dataStr) as Record<string, unknown>;
                 const { type, payload } = parseSSEData(eventType, raw);
                 if (eventIdField) lastEventId = eventIdField;
-                if (!firstEventSeen) {
-                  firstEventSeen = true;
+                if (!firstEventSeenThisCycle) {
+                  firstEventSeenThisCycle = true;
+                  hasEverReceivedEvent = true;
                   backoffIndex = 0;
                 }
                 onEvent({ type, ...payload } as SSEEventData);
@@ -372,13 +383,17 @@ export function subscribeSSE(
           }
         }
       }
-      // Stream ended cleanly (server closed). If we haven't been told to
-      // stop, treat it as a transient drop and reconnect — unlike a normal
-      // EventSource, fetch + ReadableStream gives no built-in resume.
-      if (!closed) scheduleReconnect();
+      if (closed) return;
+      // Stream ended cleanly. If this cycle delivered zero events and we
+      // had received events on a prior cycle, the producer is done — stop
+      // reconnecting. Otherwise treat as a transient drop and reconnect.
+      if (hasEverReceivedEvent && !firstEventSeenThisCycle) return;
+      scheduleReconnect();
     } catch (e) {
       if ((e as Error).name === 'AbortError') return;
-      onError?.(e as Error);
+      // #191 (Copilot C3): silent reconnect on transient network errors.
+      // onError is reserved for terminal failures (HTTP 4xx, surfaced
+      // above) so reconnecting consumers don't see a false "failed" UI.
       if (!closed) scheduleReconnect();
     }
   };

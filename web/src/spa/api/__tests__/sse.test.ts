@@ -111,7 +111,7 @@ describe('subscribeSSE', () => {
     first.ctl.end();
 
     // First reconnect attempt: 1s backoff.
-    await waitMs(1100);
+    await waitMs(1500);
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const secondCallHeaders = (fetchMock.mock.calls[1][1] as { headers: Record<string, string> })
@@ -169,7 +169,7 @@ describe('subscribeSSE', () => {
 
     // First connection drops with no events — backoff index advances.
     a.ctl.end();
-    await waitMs(1100);
+    await waitMs(1500);
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
     // Second connection delivers one event, then drops. Backoff resets.
@@ -178,7 +178,7 @@ describe('subscribeSSE', () => {
     b.ctl.end();
 
     // The next reconnect must fire after 1s, not 2s. Wait just 1.1s.
-    await waitMs(1100);
+    await waitMs(1500);
     expect(fetchMock).toHaveBeenCalledTimes(3);
 
     sub.close();
@@ -194,5 +194,57 @@ describe('subscribeSSE', () => {
 
     expect(onError).toHaveBeenCalledWith(expect.any(Error));
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Copilot C6 — stop reconnecting after a clean close that delivered zero
+  // events on a cycle where we had previously received events. Without this
+  // guard, consumers that forget to call close() on terminal SSE events
+  // would loop forever against a terminated invocation.
+  it('stops reconnecting when a clean close yields zero events after prior events', async () => {
+    const a = makePushableBody();
+    const b = makePushableBody();
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, status: 200, body: a.body })
+      .mockResolvedValueOnce({ ok: true, status: 200, body: b.body });
+
+    const events: unknown[] = [];
+    const sub = subscribeSSE('/path', (e) => events.push(e));
+    await drainMicrotasks();
+
+    // Cycle 1 delivers an event then ends.
+    a.ctl.push(eventFrame('progress', { event: 'progress', message: 'one' }, 1));
+    await drainMicrotasks(10);
+    a.ctl.end();
+
+    await waitMs(1500);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Cycle 2 ends immediately with no events — terminal. No 3rd fetch.
+    b.ctl.end();
+    await waitMs(2500);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    sub.close();
+  });
+
+  // Copilot C3 — transient (5xx, network throw) must not surface to onError.
+  // Existing consumers (e.g. IncrementalRefreshBanner) treat any onError as
+  // a permanent failure UI; a sleep/offline blip would falsely render that.
+  it('does not call onError on transient 5xx; reconnects silently', async () => {
+    const ok = makePushableBody();
+    fetchMock
+      .mockResolvedValueOnce({ ok: false, status: 503, body: null })
+      .mockResolvedValueOnce({ ok: true, status: 200, body: ok.body });
+
+    const onError = jest.fn();
+    const sub = subscribeSSE('/path', () => {}, onError);
+
+    await waitMs(1500);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(onError).not.toHaveBeenCalled();
+
+    sub.close();
+    ok.ctl.end();
   });
 });

@@ -98,9 +98,14 @@ export function IncrementalRefreshBanner({
             break;
           case 'incremental_summary':
             setStats(event.stats);
+            // #191 (Copilot C6): close on terminal events so the
+            // reconnect-on-clean-close loop in subscribeSSE doesn't keep
+            // re-opening the stream after the refresh is done.
+            sub.close();
             break;
           case 'task_failed':
             setError(event.error);
+            sub.close();
             break;
         }
       },

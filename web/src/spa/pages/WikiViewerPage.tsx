@@ -229,6 +229,23 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
     }
   }, [searchParams, pages]);
 
+  // #191: read activePageId via a ref inside loadAndReconcile so the resume
+  // callback doesn't close over the stale (initial null) value and reset
+  // the user's selected page on every focus/online event (Copilot C2).
+  const activePageIdRef = useRef<string | null>(activePageId);
+  activePageIdRef.current = activePageId;
+
+  // #191 (Rio M1): in-flight async fetches from loadAndReconcile must not
+  // call setRepo etc. after the component unmounts — would re-populate the
+  // RepoContext for a wiki that's no longer mounted.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   /**
    * Refetch the wiki detail and reconcile local state with backend truth.
    *
@@ -257,6 +274,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
 
       getWiki(wikiId)
         .then((data) => {
+          if (!mountedRef.current) return;
           setWiki(data);
           setPages(data.pages);
           setRepo({
@@ -269,11 +287,12 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           });
 
           if (data.status === 'generating' && data.invocation_id) {
-            // Switch SSE subscription if the backend reports a *different*
-            // invocation id than we were tracking — the prior one is
-            // orphaned and any buffered events from it are stale.
+            // #191 (Copilot C4): drop the `prev &&` guard so a null→id
+            // transition (user was viewing a terminal failure, backend
+            // reports a fresh generating invocation after retry) also
+            // clears the stale events buffer. Same-id case still skipped.
             setActiveInvocationId((prev) => {
-              if (prev && prev !== data.invocation_id) setGenEvents([]);
+              if (prev !== data.invocation_id) setGenEvents([]);
               return data.invocation_id!;
             });
             setIsGenerating(true);
@@ -312,11 +331,16 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                 ? data.pages.find((p) => p.title === urlPageTitle)
                 : null;
             setActivePageId(matched ? matched.id : data.pages[0].id);
-          } else if (data.pages.length > 0 && !activePageId) {
+          } else if (data.pages.length > 0 && !activePageIdRef.current) {
+            // Land on a page when gen→complete arrived via REST on resume
+            // (the SSE wiki_complete handler does the same, but only fires
+            // if the SSE stream delivered the terminal event). Read via
+            // ref to avoid the stale-closure bug — see Copilot C2.
             setActivePageId(data.pages[0].id);
           }
         })
         .catch(() => {
+          if (!mountedRef.current) return;
           // 404 + URL params claim generation in-flight → keep the
           // generating UI; the SSE subscriber will pick up events. For any
           // other failure on the initial load, surface the error.
@@ -331,13 +355,13 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           }
         })
         .finally(() => {
+          if (!mountedRef.current) return;
           if (isInitial) setLoading(false);
         });
     },
-    // searchParams / activePageId / urlGenerating / urlInvocationId are
-    // intentionally read fresh each call — closing over them would force
-    // re-running on every URL change. The effect below already gates on
-    // wikiId; resume callbacks always operate on the current wikiId.
+    // searchParams / urlGenerating / urlInvocationId are intentionally
+    // read fresh each call. activePageId is read via activePageIdRef to
+    // avoid stale-closure resets on resume.
     [wikiId, setRepo],
   );
 
