@@ -349,4 +349,164 @@ describe('AddSourceWizard', () => {
     await user.click(screen.getByTestId('wizard-next'));
     expect(await screen.findByTestId('step-confirm')).toBeInTheDocument();
   });
+
+  // -------------------------------------------------------------------
+  // #217 — auth presence in scan cache hash
+  // -------------------------------------------------------------------
+
+  it('#217: toggling from no-PAT to paste-PAT causes a cache miss and re-scan', async () => {
+    // First scan: no PAT → backend returns reachable but no preview.
+    // Then user switches to paste mode and adds a PAT.
+    // Re-entering Scan step must call scanSource again (cache miss) because
+    // auth presence changed (null → non-null), invalidating the hash (#217).
+    const user = userEvent.setup();
+
+    // First scan resolves with reachable=true but no preview.
+    mockScanSource.mockResolvedValueOnce({
+      source_type: 'git',
+      reachable: true,
+      preview: null,
+      warnings: [],
+    });
+    // Second scan (after adding a PAT) resolves with a full preview.
+    mockScanSource.mockResolvedValueOnce({
+      source_type: 'git',
+      reachable: true,
+      preview: {
+        default_branch: null,
+        resolved_branch: 'main',
+        commit_hash: null,
+        file_count: 10,
+        top_paths: [],
+        size_bytes: 0,
+      },
+      warnings: [],
+    });
+
+    renderWizard();
+    await user.click(screen.getByTestId('connector-git'));
+    await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/private-repo');
+    // Advance to Scan with no PAT — first scan fires.
+    await user.click(screen.getByTestId('wizard-next'));
+    // Wait for the first scan result (reachable, no preview).
+    await screen.findByTestId('scan-no-preview');
+    expect(mockScanSource).toHaveBeenCalledTimes(1);
+
+    // Go back to Configure and switch to paste-PAT mode.
+    await user.click(screen.getByTestId('wizard-back'));
+    // MUI Select renders a hidden native input (pointer-events: none) for the
+    // data-testid. Click the visible combobox div (role="combobox") instead.
+    const patSourceCombobox = screen.getAllByRole('combobox')[0];
+    await user.click(patSourceCombobox);
+    await user.click(await screen.findByText('Paste token once (not stored)'));
+    // Enter a PAT value.
+    await user.type(screen.getByTestId('pasted-pat-input'), 'ghp_secrettoken');
+
+    // Re-enter Scan step — auth presence changed (null → non-null),
+    // so the cache hash differs and scanSource must be called again.
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('scan-success');
+    expect(mockScanSource).toHaveBeenCalledTimes(2);
+  });
+
+  // -------------------------------------------------------------------
+  // #221 — Confluence preview rendering
+  // -------------------------------------------------------------------
+
+  it('#221: Confluence preview renders spaces list and total_pages', async () => {
+    const user = userEvent.setup();
+
+    // Wire up Atlassian connection so the wizard can advance past Configure.
+    mockUseConnections.mockReturnValue({
+      connections: [],
+      atlassian: {
+        access_token: 'tok',
+        refresh_token: null,
+        site_name: 'mysite.atlassian.net',
+        accessible_resources: [{ id: 'r1', url: 'https://mysite.atlassian.net', name: 'My Site' }],
+      },
+      refreshAtlassianIfNeeded: mockRefreshAtlassianIfNeeded,
+    });
+
+    mockScanSource.mockResolvedValue({
+      source_type: 'confluence',
+      reachable: true,
+      preview: {
+        spaces: [
+          { key: 'ENG', name: 'Engineering', page_count: 120 },
+          { key: 'DEV', name: 'DevOps', page_count: null },
+        ],
+        total_pages: null,
+      },
+      warnings: [],
+    });
+
+    renderWizard();
+    // Pick Confluence connector.
+    await user.click(screen.getByTestId('connector-confluence'));
+    // Configure step — add at least one space key via the autocomplete input.
+    const spaceInput = await screen.findByTestId('space-keys-input');
+    await user.type(spaceInput, 'ENG');
+    await user.keyboard('{Enter}');
+    // Advance to Scan.
+    await user.click(screen.getByTestId('wizard-next'));
+
+    // Scan success panel for Confluence.
+    expect(await screen.findByTestId('scan-success')).toBeInTheDocument();
+
+    // Space chips: ENG with page count, DEV with "?".
+    expect(screen.getByTestId('confluence-space-ENG')).toBeInTheDocument();
+    expect(screen.getByText('Engineering (120 pages)')).toBeInTheDocument();
+    expect(screen.getByTestId('confluence-space-DEV')).toBeInTheDocument();
+    expect(screen.getByText('DevOps (?)')).toBeInTheDocument();
+
+    // total_pages is null → should show '?'
+    expect(screen.getByText('?')).toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------
+  // #221 — Jira preview rendering
+  // -------------------------------------------------------------------
+
+  it('#221: Jira preview renders matching_issues, sample keys, and JQL-validated indicator', async () => {
+    const user = userEvent.setup();
+
+    mockUseConnections.mockReturnValue({
+      connections: [],
+      atlassian: {
+        access_token: 'tok',
+        refresh_token: null,
+        site_name: 'mysite.atlassian.net',
+        accessible_resources: [{ id: 'r1', url: 'https://mysite.atlassian.net', name: 'My Site' }],
+      },
+      refreshAtlassianIfNeeded: mockRefreshAtlassianIfNeeded,
+    });
+
+    mockScanSource.mockResolvedValue({
+      source_type: 'jira',
+      reachable: true,
+      preview: {
+        matching_issues: 47,
+        sample_issue_keys: ['PROJ-1', 'PROJ-2', 'PROJ-3'],
+        jql_validated: true,
+      },
+      warnings: [],
+    });
+
+    renderWizard();
+    await user.click(screen.getByTestId('connector-jira'));
+    // JiraConfigure has a JQL text area pre-filled — just advance.
+    await user.click(screen.getByTestId('wizard-next'));
+
+    expect(await screen.findByTestId('scan-success')).toBeInTheDocument();
+
+    // Matching issues count.
+    expect(screen.getByText('47')).toBeInTheDocument();
+    // JQL validated indicator.
+    expect(screen.getByText('✓ Yes')).toBeInTheDocument();
+    // Sample issue key chips.
+    expect(screen.getByTestId('jira-issue-PROJ-1')).toBeInTheDocument();
+    expect(screen.getByTestId('jira-issue-PROJ-2')).toBeInTheDocument();
+    expect(screen.getByTestId('jira-issue-PROJ-3')).toBeInTheDocument();
+  });
 });

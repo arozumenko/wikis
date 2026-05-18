@@ -21,7 +21,12 @@ import {
   TextField,
   Typography,
 } from '@mui/material';
-import type { ScanResponse } from '../../api/wiki';
+import type {
+  ConfluenceScanPreview,
+  GitScanPreview,
+  JiraScanPreview,
+  ScanResponse,
+} from '../../api/wiki';
 import type { WizardFormData } from './types';
 
 interface StepConfirmProps {
@@ -73,8 +78,7 @@ export function StepConfirm({
       )}
       {!scanSkipped && scanResult?.preview && (
         <Alert severity="success" sx={{ mt: 2 }} data-testid="confirm-scan-stats">
-          Preview: {scanResult.preview.file_count.toLocaleString()} files,{' '}
-          {scanResult.preview.top_paths.length} top-level entries.
+          {buildPreviewSummary(scanResult)}
         </Alert>
       )}
 
@@ -118,6 +122,26 @@ export function StepConfirm({
       )}
     </Box>
   );
+}
+
+/** Produce a human-readable single-line summary for the scan-stats Alert. */
+function buildPreviewSummary(result: ScanResponse): string {
+  const p = result.preview;
+  if (!p) return 'Source reachable.';
+  if (result.source_type === 'git') {
+    const gp = p as GitScanPreview;
+    return `Preview: ${gp.file_count.toLocaleString()} files, ${gp.top_paths.length} top-level entries.`;
+  }
+  if (result.source_type === 'confluence') {
+    const cp = p as ConfluenceScanPreview;
+    const pages = cp.total_pages != null ? cp.total_pages.toLocaleString() : '?';
+    return `Preview: ${cp.spaces.length} space${cp.spaces.length !== 1 ? 's' : ''}, ${pages} pages.`;
+  }
+  if (result.source_type === 'jira') {
+    const jp = p as JiraScanPreview;
+    return `Preview: ${jp.matching_issues.toLocaleString()} matching issue${jp.matching_issues !== 1 ? 's' : ''}${jp.jql_validated ? ', JQL validated.' : '.'}`;
+  }
+  return 'Source reachable.';
 }
 
 function buildSummaryRows(data: WizardFormData): [string, string][] {

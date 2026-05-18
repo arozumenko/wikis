@@ -23,8 +23,14 @@ import {
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import FolderOutlinedIcon from '@mui/icons-material/FolderOutlined';
 import { ApiError } from '../../api/client';
-import { scanSource } from '../../api/wiki';
-import type { ScanRequest, ScanResponse } from '../../api/wiki';
+import { hashScanRequest, scanSource } from '../../api/wiki';
+import type {
+  ConfluenceScanPreview,
+  GitScanPreview,
+  JiraScanPreview,
+  ScanRequest,
+  ScanResponse,
+} from '../../api/wiki';
 
 interface StepScanProps {
   buildScanRequest: () => ScanRequest | null;
@@ -55,10 +61,8 @@ function formatBytes(n: number): string {
 
 function hashRequest(req: ScanRequest | null): string | null {
   if (!req) return null;
-  // Deterministic-enough fingerprint: source_type + sorted scope keys +
-  // auth presence. Skips token *values* deliberately — caching across
-  // auth-mode toggles is fine when the underlying scope is identical.
-  return JSON.stringify({ type: req.source_type, scope: req.scope });
+  // Delegate to the shared helper (#217) so auth presence is factored in.
+  return hashScanRequest(req);
 }
 
 export function StepScan({
@@ -198,82 +202,250 @@ export function StepScan({
         </Alert>
       );
     }
-    return (
-      <Box sx={{ mt: 1 }} data-testid="scan-success">
-        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
-          <CheckCircleIcon color="success" />
-          <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
-            Source reachable
-          </Typography>
-        </Stack>
 
-        <Stack direction="row" spacing={3} sx={{ mb: 2 }}>
-          <Box>
-            <Typography variant="caption" color="text.secondary">
-              Branch
-            </Typography>
-            <Typography variant="body2" sx={{ fontWeight: 500 }}>
-              {p.resolved_branch}
-            </Typography>
-          </Box>
-          <Box>
-            <Typography variant="caption" color="text.secondary">
-              Files
-            </Typography>
-            <Typography variant="body2" sx={{ fontWeight: 500 }}>
-              {p.file_count.toLocaleString()}
-            </Typography>
-          </Box>
-          <Box>
-            <Typography variant="caption" color="text.secondary">
-              Size
-            </Typography>
-            <Typography variant="body2" sx={{ fontWeight: 500 }}>
-              {formatBytes(p.size_bytes)}
-            </Typography>
-          </Box>
-          {p.commit_hash && (
+    const header = (
+      <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
+        <CheckCircleIcon color="success" />
+        <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+          Source reachable
+        </Typography>
+      </Stack>
+    );
+
+    const warnings =
+      state.result.warnings.length > 0 ? (
+        <Alert severity="warning" sx={{ mt: 2 }}>
+          {state.result.warnings.map((w) => (
+            <Box key={w}>{w}</Box>
+          ))}
+        </Alert>
+      ) : null;
+
+    // Git preview (#221)
+    if (isGitPreview(state.result)) {
+      const gp = state.result.preview as GitScanPreview;
+      return (
+        <Box sx={{ mt: 1 }} data-testid="scan-success">
+          {header}
+          <Stack direction="row" spacing={3} sx={{ mb: 2 }}>
             <Box>
               <Typography variant="caption" color="text.secondary">
-                Commit
+                Branch
               </Typography>
-              <Typography variant="body2" sx={{ fontFamily: 'monospace', fontWeight: 500 }}>
-                {p.commit_hash.slice(0, 7)}
+              <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                {gp.resolved_branch}
               </Typography>
             </Box>
+            <Box>
+              <Typography variant="caption" color="text.secondary">
+                Files
+              </Typography>
+              <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                {gp.file_count.toLocaleString()}
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="caption" color="text.secondary">
+                Size
+              </Typography>
+              <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                {formatBytes(gp.size_bytes)}
+              </Typography>
+            </Box>
+            {gp.commit_hash && (
+              <Box>
+                <Typography variant="caption" color="text.secondary">
+                  Commit
+                </Typography>
+                <Typography variant="body2" sx={{ fontFamily: 'monospace', fontWeight: 500 }}>
+                  {gp.commit_hash.slice(0, 7)}
+                </Typography>
+              </Box>
+            )}
+          </Stack>
+
+          {gp.top_paths.length > 0 && (
+            <>
+              <Divider sx={{ my: 1.5 }} />
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: 'block', mb: 1 }}
+              >
+                Top-level entries
+              </Typography>
+              <Stack direction="row" spacing={0.75} sx={{ flexWrap: 'wrap', gap: 0.75 }}>
+                {gp.top_paths.map((path) => (
+                  <Chip
+                    key={path}
+                    icon={path.endsWith('/') ? <FolderOutlinedIcon /> : undefined}
+                    label={path}
+                    size="small"
+                    variant="outlined"
+                  />
+                ))}
+              </Stack>
+            </>
           )}
-        </Stack>
+          {warnings}
+        </Box>
+      );
+    }
 
-        {p.top_paths.length > 0 && (
-          <>
-            <Divider sx={{ my: 1.5 }} />
-            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
-              Top-level entries
-            </Typography>
-            <Stack direction="row" spacing={0.75} sx={{ flexWrap: 'wrap', gap: 0.75 }}>
-              {p.top_paths.map((path) => (
-                <Chip
-                  key={path}
-                  icon={path.endsWith('/') ? <FolderOutlinedIcon /> : undefined}
-                  label={path}
-                  size="small"
-                  variant="outlined"
-                />
-              ))}
-            </Stack>
-          </>
-        )}
+    // Confluence preview (#221)
+    if (isConfluencePreview(state.result)) {
+      const cp = state.result.preview as ConfluenceScanPreview;
+      return (
+        <Box sx={{ mt: 1 }} data-testid="scan-success">
+          {header}
+          <Stack direction="row" spacing={3} sx={{ mb: 2 }}>
+            <Box>
+              <Typography variant="caption" color="text.secondary">
+                Total pages
+              </Typography>
+              <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                {cp.total_pages != null ? cp.total_pages.toLocaleString() : '?'}
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="caption" color="text.secondary">
+                Spaces
+              </Typography>
+              <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                {cp.spaces.length}
+              </Typography>
+            </Box>
+          </Stack>
 
-        {state.result.warnings.length > 0 && (
-          <Alert severity="warning" sx={{ mt: 2 }}>
-            {state.result.warnings.map((w) => (
-              <Box key={w}>{w}</Box>
-            ))}
-          </Alert>
-        )}
-      </Box>
+          {cp.spaces.length > 0 && (
+            <>
+              <Divider sx={{ my: 1.5 }} />
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: 'block', mb: 1 }}
+              >
+                Spaces
+              </Typography>
+              <Stack direction="row" spacing={0.75} sx={{ flexWrap: 'wrap', gap: 0.75 }}>
+                {cp.spaces.map((space) => (
+                  <Chip
+                    key={space.key}
+                    label={
+                      space.page_count != null
+                        ? `${space.name} (${space.page_count.toLocaleString()} pages)`
+                        : `${space.name} (?)`
+                    }
+                    size="small"
+                    variant="outlined"
+                    data-testid={`confluence-space-${space.key}`}
+                  />
+                ))}
+              </Stack>
+            </>
+          )}
+          {warnings}
+        </Box>
+      );
+    }
+
+    // Jira preview (#221)
+    if (isJiraPreview(state.result)) {
+      const jp = state.result.preview as JiraScanPreview;
+      return (
+        <Box sx={{ mt: 1 }} data-testid="scan-success">
+          {header}
+          <Stack direction="row" spacing={3} sx={{ mb: 2 }}>
+            <Box>
+              <Typography variant="caption" color="text.secondary">
+                Matching issues
+              </Typography>
+              <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                {jp.matching_issues.toLocaleString()}
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="caption" color="text.secondary">
+                JQL validated
+              </Typography>
+              <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                {jp.jql_validated ? '✓ Yes' : '✗ No'}
+              </Typography>
+            </Box>
+          </Stack>
+
+          {jp.sample_issue_keys.length > 0 && (
+            <>
+              <Divider sx={{ my: 1.5 }} />
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: 'block', mb: 1 }}
+              >
+                Sample issues
+              </Typography>
+              <Stack direction="row" spacing={0.75} sx={{ flexWrap: 'wrap', gap: 0.75 }}>
+                {jp.sample_issue_keys.map((key) => (
+                  <Chip
+                    key={key}
+                    label={key}
+                    size="small"
+                    variant="outlined"
+                    data-testid={`jira-issue-${key}`}
+                  />
+                ))}
+              </Stack>
+            </>
+          )}
+          {warnings}
+        </Box>
+      );
+    }
+
+    // Fallback — unknown preview shape (defensive)
+    return (
+      <Alert severity="info" data-testid="scan-no-preview">
+        Source is reachable but preview type is unrecognised.
+      </Alert>
     );
   }
 
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Type guards for preview discriminated union (#221)
+// ---------------------------------------------------------------------------
+
+function isGitPreview(
+  result: ScanResponse,
+): result is ScanResponse & { preview: GitScanPreview } {
+  const p = result.preview;
+  return (
+    p !== null &&
+    result.source_type === 'git' &&
+    'resolved_branch' in p
+  );
+}
+
+function isConfluencePreview(
+  result: ScanResponse,
+): result is ScanResponse & { preview: ConfluenceScanPreview } {
+  const p = result.preview;
+  return (
+    p !== null &&
+    result.source_type === 'confluence' &&
+    'spaces' in p
+  );
+}
+
+function isJiraPreview(
+  result: ScanResponse,
+): result is ScanResponse & { preview: JiraScanPreview } {
+  const p = result.preview;
+  return (
+    p !== null &&
+    result.source_type === 'jira' &&
+    'matching_issues' in p
+  );
 }

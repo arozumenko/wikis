@@ -73,11 +73,46 @@ export interface GitScanPreview {
   size_bytes: number;
 }
 
+export interface ConfluenceSpaceInfo {
+  key: string;
+  name: string;
+  page_count: number | null;
+}
+
+export interface ConfluenceScanPreview {
+  spaces: ConfluenceSpaceInfo[];
+  total_pages: number | null;
+}
+
+export interface JiraScanPreview {
+  matching_issues: number;
+  sample_issue_keys: string[];
+  jql_validated: boolean;
+}
+
 export interface ScanResponse {
   source_type: string;
   reachable: boolean;
-  preview: GitScanPreview | null;
+  preview: GitScanPreview | ConfluenceScanPreview | JiraScanPreview | null;
   warnings: string[];
+}
+
+/**
+ * Deterministic cache key for a scan request.
+ *
+ * Includes source_type, scope, and auth *presence* (not the token value)
+ * so that switching auth mode (e.g. no PAT → paste a PAT) invalidates
+ * the cached scan result without embedding credentials in the hash.
+ *
+ * Used in both AddSourceWizard (currentScopeHash memo) and StepScan
+ * (hashRequest) to ensure the two sides stay in sync — a single shared
+ * function eliminates the class of bug where one side forgets to include
+ * auth presence while the other does (#217).
+ */
+export function hashScanRequest(req: ScanRequest): string {
+  const authPresence =
+    'pat' in req.auth ? { hasToken: req.auth.pat != null } : { hasToken: true };
+  return JSON.stringify({ type: req.source_type, scope: req.scope, auth: authPresence });
 }
 
 export const scanSource = (req: ScanRequest) =>
