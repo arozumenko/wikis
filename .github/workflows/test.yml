@@ -4,6 +4,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual button for ``backend-integration-tests`` — the full suite
+  # with coverage takes ~10 min and depends on FastAPI lifespan +
+  # provider health checks, so we don't gate every PR on it.  Click
+  # "Run workflow" from the Actions tab to fire it on demand.
+  workflow_dispatch:
 
 jobs:
   # Fast unit tests — millisecond-scale, no FastAPI lifespan, no network.
@@ -20,12 +25,20 @@ jobs:
       - run: AUTH_ENABLED=false pytest tests/unit -q -n auto
         working-directory: backend
 
-  # Integration + remaining tests with coverage.  Sharded across 4
-  # parallel jobs via pytest-xdist's ``--dist worksteal`` so a slow
-  # test in one worker doesn't pin the wall clock.  Drops 30-min
-  # serial → ~8-min parallel.  Excludes ``tests/unit`` (already
-  # gated by ``backend-unit-tests`` above) to avoid duplicate runs.
+  # Integration + remaining tests with coverage.  Parallelized via
+  # pytest-xdist's ``--dist worksteal`` so a slow test in one worker
+  # doesn't pin the wall clock — ~10 min wall on a 4-vCPU runner.
+  # Excludes ``tests/unit`` (already gated by ``backend-unit-tests``
+  # above) to avoid duplicate runs.
+  #
+  # Manual-trigger only.  These tests bring up FastAPI lifespan +
+  # provider health checks, which makes them too slow + flaky to gate
+  # every PR on.  Run them from the Actions tab via "Run workflow"
+  # (workflow_dispatch) when a change touches the FastAPI layer,
+  # LangGraph agents, or anything that interacts with cached
+  # artifacts on disk.
   backend-integration-tests:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
