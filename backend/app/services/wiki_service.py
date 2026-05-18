@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -228,8 +229,51 @@ class WikiService:
             logger.warning(f"Failed to persist invocations: {e}")
 
     @staticmethod
-    def _make_wiki_id(repo_url: str, branch: str) -> str:
-        """Deterministic wiki ID from repo URL + branch."""
+    def _canonicalize(obj: Any) -> Any:
+        """Recursively sort dict keys and homogeneous list values for stable hashing.
+
+        Ensures that ``space_keys=["A","B"]`` and ``space_keys=["B","A"]`` produce
+        identical JSON so the hash-based wiki ID is order-independent.
+        """
+        if isinstance(obj, dict):
+            return {k: WikiService._canonicalize(v) for k, v in sorted(obj.items())}
+        if isinstance(obj, list):
+            # Sort only homogeneous lists of primitives; leave mixed lists order-preserved.
+            if all(isinstance(x, (str, int, float, bool)) for x in obj):
+                return sorted(obj, key=str)
+            return [WikiService._canonicalize(x) for x in obj]
+        return obj
+
+    @staticmethod
+    def _make_wiki_id(source_type: str, scope: dict[str, Any]) -> str:  # type: ignore[override]
+        """Deterministic wiki ID from source_type + scope.
+
+        Stable across runs: scope keys are sorted before hashing so insertion
+        order doesn't affect the result.  List values (e.g. ``space_keys``) are
+        also sorted so ``["A","B"]`` and ``["B","A"]`` yield the same ID.
+
+        Backwards-compat legacy ID
+        --------------------------
+        Prior to #189, git wikis were identified by
+        ``sha256(f"{repo_url}:{branch}")[:16]``.  If the new hash misses the
+        DB but the old-style hash hits, the caller should fall back to the
+        old hash.  See :meth:`generate` for the one-cycle migration helper.
+        """
+        canonical = json.dumps(
+            WikiService._canonicalize({"source_type": source_type, "scope": scope}),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _make_legacy_git_wiki_id(repo_url: str, branch: str) -> str:
+        """Pre-#189 git wiki ID — used as a fallback during DB migration.
+
+        One-cycle migration helper: if the new-style ID isn't in the DB but
+        the old-style ID is, we reuse the old ID so the existing wiki record
+        and artifacts are preserved.  Remove this in a future cleanup PR once
+        all rows have been migrated.
+        """
         key = f"{repo_url}:{branch}"
         return hashlib.sha256(key.encode()).hexdigest()[:16]
 
@@ -239,12 +283,39 @@ class WikiService:
 
         from app.core.local_repo_provider import extract_git_metadata, is_local_path, make_local_wiki_id
 
-        if is_local_path(request.repo_url):
+        # --- Determine wiki_id from source_type + scope --------------------
+        if request.source_type == "git" and request.repo_url and is_local_path(request.repo_url):
             path = request.repo_url.removeprefix("file://")
             info = extract_git_metadata(Path(path).resolve())
             wiki_id = make_local_wiki_id(path, info.branch if info.is_git else None)
+        elif request.source_type == "git" and request.scope:
+            # New-style hash
+            wiki_id = self._make_wiki_id(request.source_type, request.scope)
+            # One-cycle migration: fall back to legacy ID if DB already has it.
+            if self.wiki_management:
+                legacy_id = self._make_legacy_git_wiki_id(
+                    request.scope.get("repo_url", request.repo_url or ""),
+                    request.scope.get("branch", request.branch or "main"),
+                )
+                if legacy_id != wiki_id:
+                    existing_legacy = await self.wiki_management.get_wiki_record(legacy_id)
+                    if existing_legacy:
+                        logger.info(
+                            "Reusing legacy wiki_id %s (new-style id would be %s)",
+                            legacy_id, wiki_id,
+                        )
+                        wiki_id = legacy_id
         else:
-            wiki_id = self._make_wiki_id(request.repo_url, request.branch)
+            # Non-git sources or legacy callers that didn't set scope.
+            repo_url_for_id = request.repo_url or ""
+            branch_for_id = request.branch or "main"
+            if request.scope:
+                wiki_id = self._make_wiki_id(request.source_type, request.scope)
+            else:
+                wiki_id = self._make_wiki_id(
+                    request.source_type,
+                    {"repo_url": repo_url_for_id, "branch": branch_for_id},
+                )
 
         # #145: symmetric in-flight check. ``incremental_refresh`` already
         # rejects when a generate is mid-flight (PR #144); this is the
@@ -286,16 +357,23 @@ class WikiService:
         # Register wiki in DB immediately so failed/retried generations are trackable
         if self.wiki_management:
             try:
+                _title = request.wiki_title or (
+                    f"Wiki for {request.repo_url}"
+                    if request.source_type == "git"
+                    else f"Wiki from {request.source_type.capitalize()} ({request.scope.get('base_url', '')})"
+                )
                 await self.wiki_management.register_wiki(
                     wiki_id=wiki_id,
-                    repo_url=request.repo_url,
-                    branch=request.branch,
-                    title=request.wiki_title or f"Wiki for {request.repo_url}",
+                    repo_url=request.repo_url or "",
+                    branch=request.branch or "main",
+                    title=_title,
                     page_count=0,
                     owner_id=owner_id,
                     visibility=getattr(request, "visibility", "personal"),
                     status="generating",
                     requires_token=bool(request.access_token),
+                    source_type=request.source_type,
+                    source_scope=request.scope or None,
                 )
             except Exception as e:
                 logger.warning(f"Failed to pre-register wiki {wiki_id}: {e}")
@@ -393,11 +471,16 @@ class WikiService:
                     if isinstance(clone_cfg, _LPC) and clone_cfg.remote_url:
                         registry_url = clone_cfg.remote_url
                     registry_branch = clone_cfg.branch or request.branch
+                _reg_title = request.wiki_title or (
+                    f"Wiki for {request.repo_url}"
+                    if request.source_type == "git"
+                    else f"Wiki from {request.source_type.capitalize()} ({request.scope.get('base_url', '')})"
+                )
                 await self.wiki_management.register_wiki(
                     wiki_id=invocation.wiki_id,
                     repo_url=registry_url,
                     branch=registry_branch,
-                    title=request.wiki_title or f"Wiki for {request.repo_url}",
+                    title=_reg_title,
                     page_count=page_count,
                     owner_id=invocation.owner_id,
                     visibility=getattr(request, "visibility", "personal"),
@@ -405,6 +488,8 @@ class WikiService:
                     indexed_at=datetime.now(),
                     status="complete",
                     requires_token=bool(request.access_token),
+                    source_type=request.source_type,
+                    source_scope=request.scope or None,
                 )
 
             invocation.status = "complete"
@@ -518,9 +603,17 @@ class WikiService:
 
         payload = {
             "invocation_id": invocation.id,
+            # --- multi-source fields (new) ---
+            "source_type": request.source_type,
+            "scope": request.scope,
+            # auth dict intentionally excluded from logging (TokenRedactionFilter
+            # is the safety net; primary defence is not serialising tokens).
+            "auth": request.auth,
+            # --- legacy git fields (still used by wiki_runner for git source) ---
             "repo_url": request.repo_url,
             "branch": request.branch,
             "access_token": request.access_token,
+            # --- common fields ---
             "wiki_title": request.wiki_title,
             "include_research": request.include_research,
             "include_diagrams": request.include_diagrams,

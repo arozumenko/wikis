@@ -1,9 +1,39 @@
-"""Pydantic request/response models for all API endpoints."""
+"""Pydantic request/response models for all API endpoints.
+
+Generate-wiki API contract (frontend-facing)
+--------------------------------------------
+POST /api/v1/wikis accepts:
+
+    {
+      "source_type": "git" | "confluence" | "jira",  // default "git"
+      "scope": {
+        // git:        {"repo_url": str, "branch": str}
+        // confluence: {"base_url": str, "space_keys": list[str]}
+        // jira:       {"base_url": str, "jql": str}
+      },
+      "auth": {
+        // git:        {"pat": str | null}                (optional)
+        // confluence: {"access_token": str,
+        //              "refresh_token": str | null,
+        //              "client_id": str | null}
+        // jira:       {"access_token": str,
+        //              "refresh_token": str | null,
+        //              "client_id": str | null}
+      },
+      "wiki_title": "optional string",
+      "structure_planner": "agentic" | "graph_clustering"  // optional
+    }
+
+Backwards compatibility: the legacy flat fields (``repo_url``, ``branch``,
+``access_token``) are still accepted and auto-normalised into the
+``source_type`` / ``scope`` / ``auth`` shape by the model validator, so
+existing API consumers and the entire test suite continue to work.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -13,12 +43,30 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class GenerateWikiRequest(BaseModel):
-    """Request to generate a wiki from a repository."""
+    """Request to generate a wiki from a repository or Atlassian source.
 
-    repo_url: str
-    branch: str = "main"
+    Preferred (new) shape
+    ---------------------
+    source_type + scope + auth — see module docstring for field shapes.
+
+    Backwards-compatible (legacy) shape
+    ------------------------------------
+    repo_url + branch + access_token — auto-normalized into the new shape
+    by the ``_normalize_legacy`` validator so old callers keep working.
+    """
+
+    # --- new multi-source fields -------------------------------------------
+    source_type: Literal["git", "confluence", "jira"] = "git"
+    scope: dict[str, Any] = Field(default_factory=dict)
+    auth: dict[str, Any] = Field(default_factory=dict)
+
+    # --- legacy git-only shim (kept for backwards compat) ------------------
+    repo_url: str | None = None
+    branch: str | None = None
     provider: str = "github"  # github | gitlab | bitbucket | ado | local
     access_token: str | None = None
+
+    # --- common options -------------------------------------------------------
     wiki_title: str | None = None
     include_research: bool = True
     include_diagrams: bool = True
@@ -27,31 +75,85 @@ class GenerateWikiRequest(BaseModel):
     # LLM overrides (optional, falls back to server config)
     llm_model: str | None = None
     embedding_model: str | None = None
-    # Structure planner override (optional, falls back to server config)
+    # Structure planner override — "agentic" maps to "agent", "graph_clustering" to "cluster".
+    # The legacy "planner_type" field still accepted to avoid breaking internal callers.
+    structure_planner: Literal["agentic", "graph_clustering"] | None = None
     planner_type: Literal["agent", "cluster"] | None = None
     # Test exclusion (optional; only honoured when planner_type == "cluster").
     exclude_tests: bool | None = None
 
+    # ------------------------------------------------------------------
+    # Validators
+    # ------------------------------------------------------------------
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy(cls, values: Any) -> Any:
+        """Normalize legacy flat-field shape into the new scope/auth shape.
+
+        If ``repo_url`` is present and ``scope`` is absent or empty, build:
+            source_type = "git"
+            scope = {"repo_url": <repo_url>, "branch": <branch or "main">}
+            auth  = {"pat": <access_token>}  (only when access_token set)
+
+        Also maps ``structure_planner`` → ``planner_type`` for the subprocess.
+        """
+        if not isinstance(values, dict):
+            return values
+
+        repo_url = values.get("repo_url")
+        scope = values.get("scope")
+        if repo_url and not scope:
+            branch = values.get("branch") or "main"
+            values["source_type"] = "git"
+            values["scope"] = {"repo_url": repo_url, "branch": branch}
+            if values.get("access_token"):
+                values["auth"] = {"pat": values["access_token"]}
+
+        # Map structure_planner → planner_type
+        sp = values.get("structure_planner")
+        if sp and not values.get("planner_type"):
+            if sp == "agentic":
+                values["planner_type"] = "agent"
+            elif sp == "graph_clustering":
+                values["planner_type"] = "cluster"
+
+        return values
+
     @model_validator(mode="after")
-    def _validate_local_path(self) -> GenerateWikiRequest:
-        from app.config import get_settings
-        from app.core.local_repo_provider import is_local_path, validate_local_path
+    def _validate_and_backfill(self) -> "GenerateWikiRequest":
+        """Back-fill legacy fields from scope so downstream code still works."""
+        if self.source_type == "git":
+            # Ensure repo_url and branch are set (legacy pipeline reads them directly).
+            if not self.repo_url:
+                self.repo_url = self.scope.get("repo_url", "")
+            if not self.branch:
+                self.branch = self.scope.get("branch") or "main"
+            if not self.access_token:
+                self.access_token = self.auth.get("pat") or None
 
-        if not is_local_path(self.repo_url):
-            return self
+            # Local path validation (unchanged from original).
+            from app.core.local_repo_provider import is_local_path, validate_local_path
 
-        # Auto-tag provider
-        if self.provider == "github":
-            self.provider = "local"
+            if self.repo_url and is_local_path(self.repo_url):
+                if self.provider == "github":
+                    self.provider = "local"
+                from app.config import get_settings
 
-        settings = get_settings()
-        allowed: list[str] = []
-        if settings.allowed_local_paths:
-            allowed = [p.strip() for p in settings.allowed_local_paths.split(",") if p.strip()]
+                settings = get_settings()
+                allowed: list[str] = []
+                if settings.allowed_local_paths:
+                    allowed = [p.strip() for p in settings.allowed_local_paths.split(",") if p.strip()]
+                path = self.repo_url.removeprefix("file://")
+                validate_local_path(path, allowed or None)
+        else:
+            # For non-git sources, set stubs so invocation serialisation
+            # (which references repo_url / branch) doesn't blow up.
+            if not self.repo_url:
+                self.repo_url = self.scope.get("base_url", "")
+            if not self.branch:
+                self.branch = "main"
 
-        # Raises ValueError → Pydantic turns into 422
-        path = self.repo_url.removeprefix("file://")
-        validate_local_path(path, allowed or None)
         return self
 
 
