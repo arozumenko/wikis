@@ -148,15 +148,17 @@ async def test_orphan_recovery_terminal_invocations_unchanged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_orphan_recovery_skips_wiki_record_for_incremental_refresh() -> None:
-    """An orphaned ``running`` invocation must NOT flip WikiRecord to failed.
+async def test_orphan_recovery_marks_running_orphan_as_failed() -> None:
+    """An orphaned ``running`` invocation MUST flip WikiRecord to failed.
 
-    Copilot C5: ``running`` is the incremental-refresh in-flight status. The
-    wiki was ``complete`` before the refresh started; if the backend restarts
-    mid-refresh, flipping the WikiRecord to ``failed`` makes ``get_wiki``
-    return an empty pages list for content that's still in artifact storage.
-    The in-memory Invocation is still marked failed (unblocks the 409 guard)
-    — only the persistent record is left alone.
+    #177 inverts the earlier C5 decision: ``incremental_refresh`` now calls
+    ``register_wiki(status='running')`` at start, so an orphaned ``running``
+    row in the DB means the refresh crashed mid-flight. On restart we must
+    transition it to ``failed`` so the user sees a clear "refresh crashed,
+    please retry" signal instead of stale ``running`` state.
+
+    The in-memory Invocation is marked failed (unblocks the 409 guard) AND
+    the persistent WikiRecord is updated via ``mark_status``.
     """
     persisted = {
         "inv-running": {
@@ -187,8 +189,12 @@ async def test_orphan_recovery_skips_wiki_record_for_incremental_refresh() -> No
     inv = service._invocations["inv-running"]
     assert inv.status == "failed"
     assert "Server restarted during running" in (inv.error or "")
-    # Critical assertion: WikiRecord is NOT touched for incremental orphans.
-    wiki_management.mark_status.assert_not_awaited()
+    # #177: WikiRecord IS now updated for incremental orphans (inverts C5).
+    wiki_management.mark_status.assert_awaited_once()
+    call_args = wiki_management.mark_status.await_args
+    assert call_args.kwargs["wiki_id"] == "owner--repo--main"
+    assert call_args.kwargs["status"] == "failed"
+    assert "Server restarted" in call_args.kwargs["error"]
 
 
 @pytest.mark.asyncio
