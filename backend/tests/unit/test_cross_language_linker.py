@@ -8,6 +8,7 @@ import networkx as nx
 import pytest
 
 from app.core.code_graph.cross_language_linker import (
+    link_api_surface_any_language,
     link_l0_exact,
     link_l1_api_surface,
     link_l2_hybrid,
@@ -150,3 +151,92 @@ class TestRunner:
         )
         rel_types = sorted(a["relationship_type"] for _, _, a in edges)
         assert rel_types == ["cross_language_L0", "cross_language_L1"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 8 — same-language API-surface variant for cross-repo cascade
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestLinkAPISurfaceAnyLanguage:
+    """``link_api_surface_any_language`` mirrors L1 but skips the
+    "different language" guard. The caller (cross-repo linker) is
+    responsible for filtering within-repo edges via ``wiki_id``.
+    """
+
+    def test_pairs_same_language_surface_matches(self):
+        """Two Python nodes sharing a REST surface must produce an edge
+        (the regular L1 helper rejects this on purpose)."""
+        g = nx.MultiDiGraph()
+        g.add_node("py.a", language="python", rel_path="svc_a/api.py",
+                   file_name="api", symbol_name="create_user", symbol_type="function")
+        g.add_node("py.b", language="python", rel_path="svc_b/api.py",
+                   file_name="api", symbol_name="post_user", symbol_type="function")
+        surfaces = {
+            "py.a": [{"kind": "rest", "surface": "POST /api/users",
+                      "weight_hint": 0.7, "metadata": {}}],
+            "py.b": [{"kind": "rest", "surface": "POST /api/users",
+                      "weight_hint": 0.7, "metadata": {}}],
+        }
+
+        # Baseline: regular L1 helper drops same-language pairs.
+        assert link_l1_api_surface(g, surfaces) == []
+
+        # Variant must emit the edge.
+        edges = link_api_surface_any_language(g, surfaces)
+        assert len(edges) == 1
+        src, tgt, attrs = edges[0]
+        assert {src, tgt} == {"py.a", "py.b"}
+        assert attrs["relationship_type"] == "api_surface_any_language"
+        assert attrs["edge_class"] == "cross_language"
+        assert attrs["provenance"]["matcher"] == "api_surface_any:rest"
+        assert attrs["provenance"]["surface"] == "POST /api/users"
+        assert attrs["provenance"]["level"] == "L1"
+
+    def test_solo_surface_skipped(self):
+        g = nx.MultiDiGraph()
+        g.add_node("py.a", language="python", rel_path="svc_a/api.py",
+                   file_name="api", symbol_name="x", symbol_type="function")
+        surfaces = {
+            "py.a": [{"kind": "rest", "surface": "GET /alone",
+                      "weight_hint": 0.7, "metadata": {}}],
+        }
+        assert link_api_surface_any_language(g, surfaces) == []
+
+    def test_unknown_node_skipped(self):
+        g = nx.MultiDiGraph()
+        g.add_node("py.a", language="python", rel_path="svc_a/api.py",
+                   file_name="api", symbol_name="x", symbol_type="function")
+        surfaces = {
+            "py.a":     [{"kind": "rest", "surface": "POST /x",
+                          "weight_hint": 0.7, "metadata": {}}],
+            "missing":  [{"kind": "rest", "surface": "POST /x",
+                          "weight_hint": 0.7, "metadata": {}}],
+        }
+        assert link_api_surface_any_language(g, surfaces) == []
+
+    def test_custom_edge_class_and_provenance(self):
+        g = nx.MultiDiGraph()
+        g.add_node("py.a", language="python", rel_path="svc_a/api.py",
+                   file_name="api", symbol_name="x", symbol_type="function")
+        g.add_node("py.b", language="python", rel_path="svc_b/api.py",
+                   file_name="api", symbol_name="y", symbol_type="function")
+        surfaces = {
+            "py.a": [{"kind": "rest", "surface": "POST /x",
+                      "weight_hint": 0.7, "metadata": {}}],
+            "py.b": [{"kind": "rest", "surface": "POST /x",
+                      "weight_hint": 0.7, "metadata": {}}],
+        }
+        edges = link_api_surface_any_language(
+            g,
+            surfaces,
+            edge_class="cross_repo",
+            relationship_type="cross_repo_api_surface",
+            provenance_source="cross_repo_linker",
+            provenance_level="L1",
+        )
+        assert len(edges) == 1
+        _, _, attrs = edges[0]
+        assert attrs["edge_class"] == "cross_repo"
+        assert attrs["relationship_type"] == "cross_repo_api_surface"
+        assert attrs["provenance"]["source"] == "cross_repo_linker"

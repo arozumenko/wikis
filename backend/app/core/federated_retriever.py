@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .code_graph.cross_repo_linker import make_project_node_id
 from .multi_retriever import MultiWikiRetrieverStack
 
 logger = logging.getLogger(__name__)
@@ -113,7 +114,11 @@ class FederatedRetrieverStack(MultiWikiRetrieverStack):
             if not node_id:
                 continue
             try:
-                edges = getter(node_id) or []
+                source_wiki_id = (hit.metadata or {}).get("source_wiki_id") or (hit.metadata or {}).get("wiki_id")
+                lookup_id = make_project_node_id(source_wiki_id, node_id) if source_wiki_id else node_id
+                edges = getter(lookup_id) or []
+                if not edges and lookup_id != node_id:
+                    edges = getter(node_id) or []
             except Exception:  # pragma: no cover — defensive
                 continue
             for edge in edges:
@@ -149,12 +154,20 @@ class FederatedRetrieverStack(MultiWikiRetrieverStack):
             edge_weight = 1.0
         base_norm = float(source_hit.metadata.get("normalized_score", 0.0) or 0.0)
         new_norm = max(0.0, base_norm * self._dampening * edge_weight)
+        provenance = dict(edge.get("provenance") or {})
         meta = {
             **(target_node.get("attrs") or {}),
-            "node_id": target_node.get("node_id") or edge.get("target_node_id"),
+            "node_id": target_node.get("node_id") or provenance.get("target_raw_node_id") or edge.get("target_node_id"),
+            "project_node_id": target_node.get("project_node_id") or edge.get("target_node_id"),
             "source_wiki_id": target_node.get("wiki_id", ""),
             "cross_repo_origin": (source_hit.metadata or {}).get("node_id"),
             "cross_repo_edge_weight": edge_weight,
+            "cross_repo_edge_class": edge.get("edge_class", "cross_repo"),
+            "cross_repo_relationship_type": provenance.get("source_relationship_type", "cross_repo"),
+            "cross_repo_surface": provenance.get("surface", ""),
+            "cross_repo_matcher": provenance.get("matcher", ""),
+            "cross_repo_level": provenance.get("level", ""),
+            "cross_repo_provenance": provenance,
             "normalized_score": new_norm,
             "score": new_norm,  # legacy consumers
         }

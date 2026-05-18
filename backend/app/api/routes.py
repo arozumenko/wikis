@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json as _json
+import logging
 import re
 from dataclasses import asdict
 from datetime import datetime
@@ -70,6 +71,7 @@ from app.services.wiki_management import WikiManagementService
 from app.services.wiki_service import WikiService
 
 router = APIRouter(prefix="/api/v1")
+logger = logging.getLogger(__name__)
 
 NOT_IMPLEMENTED = "Not implemented — Phase 2"
 
@@ -1102,6 +1104,7 @@ async def get_project(
 async def update_project(
     project_id: str,
     body: ProjectUpdateRequest,
+    request: Request,
     user: CurrentUser = Depends(get_current_user),
     svc: ProjectService = Depends(get_project_service),
 ) -> ProjectResponse:
@@ -1115,12 +1118,27 @@ async def update_project(
     if updated is None:
         raise HTTPException(403, "Only the project owner can modify this project")
     count = await svc.get_wiki_count(project_id)
+
+    # Phase 9 lifecycle — metadata changes invalidate the cached
+    # cross-repo graph; mark stale so the next read enqueues recompute.
+    try:
+        from app.services.project_recompute import mark_project_stale
+
+        mark_project_stale(
+            project_id=project_id,
+            reason="project_updated",
+            settings=request.app.state.settings,
+        )
+    except Exception:  # noqa: BLE001
+        pass  # never break update_project on a lifecycle hook
+
     return _project_response(updated, count, user_id=user.id)
 
 
 @router.delete("/projects/{project_id}", status_code=200)
 async def delete_project(
     project_id: str,
+    request: Request,
     user: CurrentUser = Depends(get_current_user),
     svc: ProjectService = Depends(get_project_service),
 ) -> JSONResponse:
@@ -1131,6 +1149,17 @@ async def delete_project(
     deleted = await svc.delete_project(project_id, owner_id=user.id)
     if not deleted:
         raise HTTPException(403, "Only the project owner can delete this project")
+    try:
+        from app.core.storage.project_storage import drop_project_storage
+
+        settings = request.app.state.settings
+        drop_project_storage(
+            project_id,
+            cache_dir=getattr(settings, "cache_dir", None),
+            settings=settings,
+        )
+    except Exception:
+        logger.warning("Failed to delete project graph storage for %s", project_id, exc_info=True)
     return JSONResponse({"deleted": True, "project_id": project_id})
 
 
@@ -1138,6 +1167,7 @@ async def delete_project(
 async def add_wiki_to_project(
     project_id: str,
     body: ProjectAddWikiRequest,
+    request: Request,
     user: CurrentUser = Depends(get_current_user),
     svc: ProjectService = Depends(get_project_service),
 ) -> ProjectResponse:
@@ -1156,6 +1186,20 @@ async def add_wiki_to_project(
         # Wiki already in project — idempotent, return current state
         pass
     count = await svc.get_wiki_count(project_id)
+
+    # Phase 9 lifecycle — wiki membership changed; mark stale so the
+    # next read enqueues recompute over the new wiki set.
+    try:
+        from app.services.project_recompute import mark_project_stale
+
+        mark_project_stale(
+            project_id=project_id,
+            reason=f"wiki_added:{body.wiki_id}",
+            settings=request.app.state.settings,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
     return _project_response(existing, count, user_id=user.id)
 
 
@@ -1163,6 +1207,7 @@ async def add_wiki_to_project(
 async def remove_wiki_from_project(
     project_id: str,
     wiki_id: str,
+    request: Request,
     user: CurrentUser = Depends(get_current_user),
     svc: ProjectService = Depends(get_project_service),
 ) -> JSONResponse:
@@ -1172,6 +1217,20 @@ async def remove_wiki_from_project(
     removed = await svc.remove_wiki(project_id, wiki_id=wiki_id, owner_id=user.id)
     if not removed:
         raise HTTPException(403, "Only the project owner can remove wikis")
+
+    # Phase 9 lifecycle — wiki membership changed; mark stale so the
+    # next read enqueues recompute over the new wiki set.
+    try:
+        from app.services.project_recompute import mark_project_stale
+
+        mark_project_stale(
+            project_id=project_id,
+            reason=f"wiki_removed:{wiki_id}",
+            settings=request.app.state.settings,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
     return JSONResponse({"removed": True, "project_id": project_id, "wiki_id": wiki_id})
 
 
@@ -1205,6 +1264,7 @@ async def recompute_project_route(
     project_id: str,
     request: Request,
     user: CurrentUser = Depends(get_current_user),
+    svc: ProjectService = Depends(get_project_service),
 ) -> EventSourceResponse:
     """Stream a project-level recompute (relatedness → cross-repo → leiden).
 
@@ -1217,6 +1277,13 @@ async def recompute_project_route(
 
     settings = request.app.state.settings
     storage = request.app.state.storage
+
+    project = await svc.get_project(project_id, user_id=user.id)
+    if project is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    owner_id = getattr(project, "owner_id", None)
+    if owner_id and owner_id != user.id:
+        raise HTTPException(403, "Only the project owner can recompute the project graph")
 
     queue: asyncio.Queue = asyncio.Queue()
 

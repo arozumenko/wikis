@@ -106,6 +106,12 @@ class FilesystemRepositoryIndexer:
         self.code_documents = []
         self.all_documents = []
         self.relationship_graph = None
+        # Phase 6 — L0 cross-language relationships emitted by per-language
+        # parsers during ``EnhancedUnifiedGraphBuilder.analyze_repository``.
+        # Populated from ``UnifiedAnalysis.cross_language_relationships`` and
+        # consumed by ``run_cross_language_linker`` so parser-resolved exact
+        # matches are promoted to ``cross_language`` graph edges.
+        self._parser_cross_language_relationships: list = []
         self.last_index_stats = None
         self._doc_type_counts = {
             "text": 0,
@@ -360,6 +366,11 @@ class FilesystemRepositoryIndexer:
             documents_iter = getattr(analysis, "documents_iter", None)
             self.all_documents = analysis.documents
             self.relationship_graph = analysis.unified_graph
+            # Phase 6 L0 — keep parser-supplied cross-language relationships
+            # so the Phase 1c linker can promote them to ``cross_language`` edges.
+            self._parser_cross_language_relationships = list(
+                getattr(analysis, "cross_language_relationships", None) or []
+            )
 
             # Apply post-processing to add repository metadata
             self._add_repository_metadata()
@@ -510,7 +521,9 @@ class FilesystemRepositoryIndexer:
                     )
 
                     surfaces_by_node = extract_api_surfaces_for_graph(
-                        self.relationship_graph
+                        self.relationship_graph,
+                        repo_root=getattr(self, "_repo_root", None)
+                        or getattr(self, "current_repo_path", None),
                     )
                     logger.info(
                         "Phase 1c: extracted API surfaces for %d nodes",
@@ -524,6 +537,9 @@ class FilesystemRepositoryIndexer:
 
                     cl_edges = run_cross_language_linker(
                         self.relationship_graph,
+                        cross_language_relationships=(
+                            self._parser_cross_language_relationships or None
+                        ),
                         surfaces_by_node=surfaces_by_node or None,
                         flags=_flags,
                     )
@@ -535,8 +551,10 @@ class FilesystemRepositoryIndexer:
                             continue
                         self.relationship_graph.add_edge(src, tgt, **attrs)
                     logger.info(
-                        "Phase 1c: cross-language linker added %d edges",
+                        "Phase 1c: cross-language linker added %d edges "
+                        "(parser L0 inputs: %d)",
                         len(cl_edges),
+                        len(self._parser_cross_language_relationships),
                     )
 
                 if _flags.test_linker:

@@ -1937,6 +1937,60 @@
         }
       }
     },
+    "/api/v1/projects/{project_id}/recompute": {
+      "post": {
+        "summary": "Recompute Project Route",
+        "description": "Stream a project-level recompute (relatedness \u2192 cross-repo \u2192 leiden).\n\nGated server-side by ``flags.project_graph``. Emits SSE progress events\nmatching the wiki-generation widget contract.",
+        "operationId": "recompute_project_route_api_v1_projects__project_id__recompute_post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/projects/{project_id}/search": {
       "get": {
         "summary": "Search Project",
@@ -2226,7 +2280,7 @@
           },
           "steps": {
             "items": {
-              "$ref": "#/$defs/CallStackStep"
+              "$ref": "#/components/schemas/CallStackStep"
             },
             "title": "Steps",
             "type": "array"
@@ -2291,14 +2345,14 @@
           },
           "call_stacks": {
             "items": {
-              "$ref": "#/$defs/CallStack"
+              "$ref": "#/components/schemas/CallStack"
             },
             "title": "Call Stacks",
             "type": "array"
           },
           "sections": {
             "items": {
-              "$ref": "#/$defs/CodeMapSection"
+              "$ref": "#/components/schemas/CodeMapSection"
             },
             "title": "Sections",
             "type": "array"
@@ -2330,7 +2384,7 @@
           },
           "symbols": {
             "items": {
-              "$ref": "#/$defs/CodeMapSymbol"
+              "$ref": "#/components/schemas/CodeMapSymbol"
             },
             "title": "Symbols",
             "type": "array"
@@ -3372,6 +3426,18 @@
           "file_path": {
             "title": "File Path",
             "type": "string"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Node Id"
           },
           "line_start": {
             "anyOf": [

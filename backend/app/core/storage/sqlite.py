@@ -1358,12 +1358,26 @@ class UnifiedWikiDB:
         if isinstance(annotations, dict):
             annotations = json.dumps(annotations)
 
+        # Phase 1 (graph-quality roadmap): persist provenance + confidence
+        # so initial ``from_networkx`` import retains the linker/parser
+        # attribution that the in-memory graph already carries. Backfill
+        # a minimal AST provenance when nothing is set so phase2_stats_v2
+        # never falls back to the generic "unknown" bucket.
+        provenance = data.get("provenance")
+        if provenance is None:
+            created_by = data.get("created_by") or "ast"
+            provenance = {"source": str(created_by)}
+            rel_type_val = data.get("relationship_type")
+            if rel_type_val:
+                provenance["matcher"] = str(rel_type_val)
+
         return {
             "source_id": str(u),
             "target_id": str(v),
             "rel_type": data.get("relationship_type", ""),
             "edge_class": data.get("edge_class", "structural"),
             "analysis_level": data.get("analysis_level", "comprehensive"),
+            "confidence": data.get("confidence", "EXTRACTED"),
             "weight": data.get("weight", 1.0),
             "raw_similarity": data.get("raw_similarity"),
             "source_file": data.get("source_file", ""),
@@ -1371,6 +1385,7 @@ class UnifiedWikiDB:
             "language": data.get("language", ""),
             "annotations": annotations,
             "created_by": data.get("created_by", "ast"),
+            "provenance": provenance,
         }
 
     def to_networkx(self) -> nx.MultiDiGraph:
@@ -1395,6 +1410,16 @@ class UnifiedWikiDB:
                     d["parameters"] = json.loads(params)
                 except (json.JSONDecodeError, TypeError):
                     pass
+            # Deserialize api_surface back to list[dict]. The TEXT column
+            # holds the JSON-encoded ``[APISurface, ...]`` list; without
+            # this, downstream consumers (cross-language linker, project
+            # recompute) see a raw string and silently drop every surface.
+            api_surface = d.get("api_surface")
+            if api_surface and isinstance(api_surface, str):
+                try:
+                    d["api_surface"] = json.loads(api_surface)
+                except (json.JSONDecodeError, TypeError):
+                    d["api_surface"] = None
             G.add_node(nid, **d)
 
         # --- Load edges ---

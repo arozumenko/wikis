@@ -13,37 +13,201 @@
 
 ---
 
-## 0. Reconciliation: plan claims vs. live code
+## 0. Current implementation audit — 2026-04-28
 
-| Claim from plans | Code state | Gap to close |
+This replaces the original pre-implementation reconciliation table. Phases 0–9 now have substantial code in place. The first 2026-04-28 follow-up wired several gaps (cross-repo API-surface evidence, Phase 6 L0 handoff, `node_id_style` default flip, lifecycle PATCH/add/remove triggers), and the later 2026-04-28 gap-closure pass addressed the second audit's P0 implementation mismatches. The audit narrative below is retained as historical diagnosis; the status table in section 0.5 is the current source of truth for what was closed and what remains.
+
+### 0.1 Phase status snapshot
+
+This table preserves the second-audit snapshot; section 0.5 records the gap-closure status for items that changed during the follow-up implementation pass.
+
+| Phase | Current implementation evidence | Visible gap or ambiguity | Actionable next step |
+|---|---|---|---|
+| 0 — Storage parity | `backend/app/core/storage/protocol.py`, `sqlite.py`, and `postgres.py` now expose the planned FTS/path/vector methods, `score_norm`, `get_embedding_by_id`, and batch similarity paths. Tests exist in `backend/tests/storage/test_storage_parity.py` and `backend/tests/storage/test_score_normalization.py`. | Closed. | Keep as baseline; do not regress protocol parity when adding new storage methods. |
+| 1 — Observability/dedup/provenance | `backend/app/core/graph_topology_diagnostics.py` provides `Phase2Stats`; `_add_edge` stores `provenance` and uses typed-edge dedup; SQLite/Postgres persist `repo_edges.provenance`. Tests exist in `backend/tests/unit/test_phase2_observability.py` and `backend/tests/unit/test_edge_dedup.py`. | The roadmap called these integration tests, but they currently live mostly in unit coverage. This is fine for fast checks, but there is no full `FilesystemIndexer -> run_phase2 -> repo_meta` regression. | Add one integration test that indexes a tiny repo and asserts `phase2_stats_v2`, provenance, dedup, and score thresholds survive the real storage path. |
+| 2 — IDF/tiered lexical/REST | `backend/app/core/graph_lexical_v2.py` implements IDF, T1–T4 lexical tiers, REST disambiguation, and tests. `WIKI_ORPHAN_LEXICAL_TIERED` / `WIKI_ORPHAN_LEXICAL_IDF_GATE` default ON. | The original rollout table said lexical tiering should default OFF until Phase 3. The implementation flipped it ON to satisfy real-repo wiring. The roadmap still contains both stories. | Update the rollout schedule to mark the ON-by-default behavior intentional, or explicitly revert defaults. Do not leave the contradiction unresolved. |
+| 3 — Cascade reorder/explicit refs/embedding reuse | `backend/app/core/graph_topology.py` dispatches v2 as explicit refs -> hybrid -> tiered lexical -> directory; `backend/app/core/graph_orphan_cascade_v2.py` provides explicit markdown/backtick/import refs and embedding reuse. | Closed for ordering. | Add a single integration test that asserts pass order from emitted stats on a fixture where every pass has at least one possible hit. |
+| 4 — Hybrid RRF | `backend/app/core/graph_orphan_hybrid.py` implements RRF fusion and the v2 cascade calls it before lexical. Tests exist in `backend/tests/unit/test_rrf_fusion.py`. | Matryoshka/halfvec remain unimplemented, which was optional. The planned slow perf test (`test_phase2_perf.py`) is not present. | Mark Matryoshka/halfvec explicitly out of this wiring push, and add a small perf/contract test that proves hybrid does not re-embed when `repo_vec` already has orphan embeddings. |
+| 5 — Node disambiguation | `backend/app/core/code_graph/graph_builder.py` implements `WIKI_NODE_ID_STYLE=stem|rel_path`; qualified/FQN indexes are implemented and tested. **2026-04-28 follow-up:** default flipped from `stem` to `rel_path` in both `FeatureFlags` and `get_feature_flags()` env loader. `WIKI_NODE_ID_STYLE=stem` still pins the legacy collision-prone behavior for back-compat. | Partial: rich symbol node creation uses `rel_path`, but documentation nodes, basic-parser nodes, and several relationship-resolution fallbacks still construct legacy stem-shaped IDs. See 0.4. | Finish node-id propagation, especially relationship source/target resolution and project-level namespacing. |
+| 6 — Cross-language linker/test linker | `backend/app/core/filesystem_indexer.py` runs Phase 1c before `from_networkx`; `api_surface_extractor.py`, `cross_language_linker.py`, and `test_linker.py` exist; `cross_language`, `test_link`, and `cross_repo` are synthetic in `graph_topology.py`. `architectural_projection()` now skips `cross_language` and `test_link` edges. `test_linker` is **disabled by default** after a real-repo run produced 1.25M edges from one TS workspace (the same-stem heuristic was symbol-level Cartesian; it is now bounded to file/module-level nodes). **2026-04-28 follow-up:** Phase 1c now passes parser-supplied `cross_language_relationships` (captured from `analysis.cross_language_relationships`) into `run_cross_language_linker`. | Partial: the handoff is wired, but `_detect_cross_language_relationships()` is currently a stub returning `[]`; in the normal non-streaming path `parse_results` is also cleared before that stub runs. L1 API extraction also depends on `source_text`, which rich parser graph nodes do not currently expose as a top-level node attr. L2 remains out of scope and test linker remains opt-in. | Treat Phase 6 as structurally wired but not functionally complete until L0 emits real parser relationships and L1 works on rich parser nodes. |
+| 7 — Project storage/federation | `backend/app/core/storage/project_storage.py` provides memory/SQLite/Postgres backends; `backend/app/services/multi_wiki_components.py` chooses `FederatedQueryService`/`FederatedRetrieverStack` when flags and project storage are available. | `project_nodes` exists in storage but `upsert_project_node` is unused in the application path. Federated retriever currently resolves target content through per-wiki query services rather than materialized `project_nodes`, so the storage schema and the retriever design disagree. The module docstring still says SQLite/Postgres are follow-up work even though they are implemented. | Either materialize project nodes during `recompute_project`, or revise the Phase 7 contract to say project storage only owns edges/relatedness/meta and node lookup remains delegated to per-wiki services. Add an integration test for `build_multi_wiki_components` with persisted `project_edges`. |
+| 8 — Cross-repo linker/relatedness/project clustering | `backend/app/services/project_recompute.py` scores every wiki pair, persists `repo_relatedness`, calls `build_cross_repo_edges`, persists `project_edges`, and optionally stores community metadata. **2026-04-28 follow-up:** `recompute_project()` now extracts `surfaces_by_node` from the merged graph via `extract_api_surfaces_for_graph(...)` (best-effort, defaults to `{}`) and threads it into `build_cross_repo_edges`. `build_cross_repo_edges` accepts a new `allow_same_language=True` flag (default ON) which adds the `link_api_surface_any_language` matcher to the cascade so two same-language repos sharing a REST surface still produce `cross_repo` edges; the wiki_id guard immediately downstream filters within-repo pairs. | Partial: cross-repo graph nodes/edges are not namespaced by wiki id, stale project edges/relatedness are not cleared before recompute, and API-surface extraction may still be empty if source text was not present on graph nodes. FTS/vector hit maps are still not threaded through. | Add end-to-end tests with colliding node IDs and removed wikis; then namespace project graph IDs and clear/rebuild persisted project edges atomically. |
+| 9 — Lifecycle/SSE/UI | Backend SSE route `POST /projects/{project_id}/recompute`, lifecycle stale marking on wiki rebuild, read-time auto-enqueue, `subscribeRecomputeSSE`, and `RecomputeWidget` exist. **2026-04-28 follow-up:** new `mark_project_stale(project_id, reason, settings)` helper added to `services/project_recompute.py` (gated by `flags.project_graph`, swallows storage errors). `PATCH /projects/{id}`, `POST /projects/{id}/wikis`, and `DELETE /projects/{id}/wikis/{wiki_id}` now call it with reasons `project_updated`, `wiki_added:<id>`, `wiki_removed:<id>` so the next read-time `maybe_enqueue_recompute` enqueues a background recompute. | Partial: triggers are wired, but there is no in-flight recompute guard, no stale-edge cleanup, manual recompute does not enforce owner-only access in the route, generated OpenAPI/types still omit the route, and there are no frontend/backend SSE contract tests. `ProjectPage.tsx` import grouping for `RecomputeWidget` is still inconsistent. | Add recompute locking/idempotency, stale cleanup, route authorization tests, generated types, SSE contract tests, component/API tests, and import cleanup. |
+
+### 0.2 Highest-priority implementation gaps
+
+0. **`test_linker` is disabled by default after a real-repo edge explosion.** A single TypeScript workspace produced **1,254,462** `test_link` edges in Phase 1c. Root cause: `link_same_stem` paired every test-file *symbol* with every prod-file *symbol* sharing a stem (N×M Cartesian per file pair, multiplied by common stems like `index`, `utils`, `base`). Mitigations applied: `WIKI_TEST_LINKER` defaults to `False`; `link_same_stem` is now restricted to file/module-level nodes; `architectural_projection()` skips `test_link` and `cross_language` edges so they can never inflate Leiden communities. Re-enabling on real repos is gated on a richer matcher that handles Gherkin features, AI markdown/yaml fixtures, and CLI snapshot tests — stem-only heuristics are not safe for those.
+1. **(Closed 2026-04-28) Cross-repo edges in the real recompute path.** `recompute_project()` extracts API surfaces from the merged graph, namespaces project node IDs, clears stale project rows before rebuild, persists project nodes, and threads same-language API-surface evidence into `build_cross_repo_edges`. Remaining verification: FTS/vector hit maps are still not threaded through, and real-repo UI testing is required.
+2. **(Closed for parser-supplied `target_file` evidence 2026-04-28) Phase 6 L0 in Phase 1c.** `EnhancedUnifiedGraphBuilder._detect_cross_language_relationships()` now runs before parse-result cleanup and emits L0 rows for parser relationships whose `target_file` resolves to another language. Remaining work: broaden L0 producers beyond `target_file` signals.
+3. **(Closed 2026-04-28) `rel_path` node IDs.** Graph-builder node creation/resolution now uses centralized rel-path-aware ID construction for rich, documentation, basic-parser, diagnostic, source, and target paths. Cross-repo project IDs are also namespaced as `wiki_id::raw_node_id`.
+4. **(Partially closed 2026-04-28) Project lifecycle triggers.** `mark_project_stale` plus PATCH/add/remove hooks mark stale; recompute clears stale rows, writes a lightweight `recompute_in_progress` marker, and manual recompute is owner-gated. Remaining work: route tests and a stronger lock/lease if multi-process recompute concurrency becomes a requirement.
+5. **(Closed 2026-04-28) Project storage `project_nodes` design choice.** `project_storage.py` now documents memory/SQLite/Postgres support, and `recompute_project()` materializes project nodes with `wiki_id` and `raw_node_id`. Federated content lookup still delegates to per-wiki query services, with project nodes available as auxiliary materialized metadata.
+6. **Frontend/backend recompute contract is untested (open).** Add backend SSE schema tests and frontend stream/widget tests; generated API types are stale for the recompute route.
+
+### 0.3 Test gaps to add before release
+
+- `backend/tests/integration/test_phase1c_indexing.py`: build a tiny multi-language repo through `FilesystemIndexer`, then assert persisted `api_surface`, `cross_language`, and `test_link` rows.
+- `backend/tests/integration/test_orphan_cascade_v2_order.py`: force explicit, hybrid, lexical, and directory candidates and assert the first successful pass wins.
+- `backend/tests/integration/test_project_recompute_edges.py`: two related repos with shared API surface in the same language and in different languages; assert relatedness rows, non-zero cross-repo edges, clustering metadata, and SSE events.
+- `backend/tests/integration/test_recompute_sse_contract.py`: validate `project_relatedness_progress`, `cross_repo_linker_progress`, `project_clustering_progress`, `recompute_complete`, and `recompute_error` payloads match the frontend union.
+- `web/src/spa/api/__tests__/sse-recompute.test.ts`: parse JSON-RPC and flat recompute events, including terminal complete/error events.
+- `web/src/spa/components/__tests__/RecomputeWidget.test.tsx`: start/cancel/error/success paths and per-phase progress rendering.
+
+### 0.4 Deep holistic implementation audit — 2026-04-28
+
+This section is the second-pass audit requested after the first closure sweep. It reviews the current roadmap implementation against the three source plans (`PLANNING_GRAPH_QUALITY_IMPROVEMENTS.md`, `PLANNING_ORPHAN_RESOLUTION_V2.md`, `PLANNING_CROSS_LANGUAGE_GRAPH_FEDERATION.md`) and against the code that now exists. The headline is: the roadmap is no longer mostly theoretical, but several high-risk areas are only structurally wired. The remaining work is less about adding files and more about making the existing files agree on identity, evidence, lifecycle, and weight semantics.
+
+#### 0.4.1 Current verdict by roadmap area
+
+| Area | Evidence in code | Audit verdict | Why it matters |
+|---|---|---|---|
+| Storage parity | `backend/app/core/storage/protocol.py`, `sqlite.py`, `postgres.py` expose the new storage hooks (`count_fts_matches`, `search_fts_by_column`, `search_fts_with_path`, `get_embedding_by_id`, `batch_similarity_search`, normalized scores). | Mostly closed. | The storage surface exists, but higher-level code does not always consume the more precise methods. Example: `graph_lexical_v2.py` still implements all lexical tiers by one broad `search_fts5(...)` call and in-memory filtering rather than the planned column/path-specific query methods. |
+| Phase-2 observability and provenance | `graph_topology.py` writes provenance via `_add_edge`; `Phase2Stats` is persisted under `phase2_stats_v2`; edge dedup exists. | Closed at unit level, integration gap remains. | Unit tests cover the helpers, but there is still no full `FilesystemIndexer -> run_phase2 -> storage meta` integration test proving stats/provenance survive the real storage path. |
+| Tiered lexical / IDF / REST disambiguation | `graph_lexical_v2.py` implements IDF gating, tier eligibility, generic REST-class query disambiguation, and score filtering. | Partially closed. | The logic exists, but the v2 hybrid pass can preempt it with pure FTS when embeddings are missing. That means common-name FTS matches can still resolve before the tiered IDF guard gets a chance to run. |
+| Orphan cascade reorder / hybrid RRF | `graph_topology.resolve_orphans()` dispatches explicit refs -> hybrid -> lexical -> directory when `orphan_cascade_v2=True`; `graph_orphan_hybrid.py` implements RRF. | Partially closed. | The cascade order exists, but `resolve_orphans_hybrid()` explicitly degrades to pure FTS on missing embeddings and then `graph_topology` stores those edges as `edge_class="semantic"`. This mismatches the source plan, where embedding-less orphans should fall through to lexical-only Pass 3. |
+| Node disambiguation | `FeatureFlags.node_id_style` and `get_feature_flags()` now default to `rel_path`; rich parser symbol nodes use rel-path slugs. | Partially closed. | Several graph-builder paths still synthesize legacy stem IDs: documentation nodes, basic parser nodes, direct/fallback relationship resolution, and some diagnostics. Cross-repo storage also does not namespace node IDs by wiki. |
+| Cross-language linker | `cross_language_linker.py` exists with L0/L1/L2/L3; Phase 1c calls it before `from_networkx`; `cross_language` is excluded from architectural projection. | Structurally wired, functionally incomplete. | L0 is wired but `_detect_cross_language_relationships()` returns `[]`; L1 depends on `source_text`, but rich parser graph nodes do not expose source text as a top-level attr; L2 has no real FTS/vec maps in Phase 1c. |
+| Test linker safety | `WIKI_TEST_LINKER` defaults to `False`; `link_same_stem()` is restricted to file/module-level nodes; `test_link` is excluded from architectural projection. | Mitigated, not release-ready. | The 1.25M-edge explosion class is mitigated. The richer test-fixture matcher (Gherkin, AI markdown/yaml prompts, CLI snapshots) is still absent, so default-off is correct. |
+| Cross-repo linker | `project_recompute.py` computes relatedness and calls `build_cross_repo_edges`; the linker now accepts `surfaces_by_node` and `allow_same_language=True`. | Partially closed, high-risk identity gap remains. | The cascade can now produce same-language API-surface edges in unit tests, but project graphs use original node IDs rather than `wiki_id::node_id` namespacing. Colliding node IDs across repos can overwrite nodes in `merged_graph` and resolve to the wrong wiki at query time. |
+| Project storage / federation | `project_storage.py`, `federated_query_service.py`, `federated_retriever.py`, and `multi_wiki_components.py` exist. | Design mismatch. | The source federation plan described materialized project nodes/edges with source wiki IDs and rich node columns. Current storage persists only `(node_id, wiki_id, attrs)` and currently recompute only writes edges/relatedness/meta, not project nodes. This can be a valid design choice, but docs and retrieval code must explicitly align to it. |
+| Lifecycle / SSE / UI | `mark_project_stale()`, GET-time `maybe_enqueue_recompute()`, manual recompute SSE route, `subscribeRecomputeSSE`, and `RecomputeWidget` exist. | Partially closed. | Stale marking exists, but recompute has no in-flight guard, old project edges are not cleared, manual recompute is not owner-gated in the route, generated OpenAPI/types are stale, and SSE/widget tests are missing. |
+
+#### 0.4.2 Ranked remaining gaps and logic mismatches
+
+1. **Hybrid Pass 2 can bypass the tiered lexical safety gates.**
+    - Code path: `graph_topology._resolve_orphans_v2()` calls `graph_orphan_hybrid.resolve_orphans_hybrid()` before `graph_lexical_v2.resolve_orphans_lexical_tiered()`.
+    - Mismatch: `PLANNING_ORPHAN_RESOLUTION_V2.md` says Pass 2 processes remaining orphans with embeddings and Pass 3 handles orphans without embeddings. Current code says a missing embedding "does NOT abort" and degrades to pure FTS.
+    - Impact: IDF/symbol-type guards can be skipped, and pure FTS links are persisted as `edge_class="semantic"` / `created_by="hybrid_rrf"`. This can reintroduce the common-symbol flooding the roadmap was designed to prevent.
+    - Fix direction: if no vector branch exists for an orphan, return `[]` from hybrid and let Pass 3 lexical handle it, or explicitly run the same IDF/tier checks before accepting pure-FTS hybrid results.
+
+2. **Phase 1c confidence weights are overwritten by Phase 2 edge weighting.**
+    - Code path: `cross_language_linker.py` clamps weights to `[0.3, 0.8]`; `test_linker.py` emits weight `0.5`; `graph_topology.apply_edge_weights()` later rewrites every edge's `weight` based on structural in-degree and a synthetic floor.
+    - Mismatch: `PLANNING_CROSS_LANGUAGE_GRAPH_FEDERATION.md` defines a distinct cross-language weight tier. Current Phase 2 does not preserve that tier.
+    - Impact: `cross_language` and `test_link` are excluded from architectural projection, so clustering is protected, but persisted weights used by ask/research/federated expansion no longer represent linker confidence. Synthetic edges with target structural in-degree `0` can be rewritten above the intended cross-language ceiling.
+    - Fix direction: preserve explicit weights for edge classes whose linkers already assign calibrated confidence, or add per-class caps/normalization in `apply_edge_weights()`.
+
+3. **API surface extraction may not see rich parser code text.**
+    - Code path: `api_surface_extractor.extract_api_surfaces()` reads `node_data["source_text"]`; rich symbol nodes in `graph_builder._process_file_symbols()` store the symbol object but do not expose `source_text` as a top-level node attribute.
+    - Impact: Phase 1c L1 can be empty on Python/TypeScript/Java/Go rich-parser repos, even though those are the main languages where REST decorators matter. Phase 8 relatedness can also under-score API overlap if `api_surface` was never persisted.
+    - Fix direction: add `source_text`, `docstring`, decorators/base classes, and any parser metadata needed by `api_surface_extractor` to rich graph node attrs, or teach the extractor to read from the stored symbol object.
+
+4. **Phase 6 L0 is wired but has no producer.**
+    - Code path: `FilesystemIndexer` now forwards `analysis.cross_language_relationships`; `EnhancedUnifiedGraphBuilder._detect_cross_language_relationships()` currently returns an empty list. In the default non-streaming path, `parse_results` is cleared before that helper and before `_generate_language_stats()`.
+    - Impact: the L0 handoff is connected, but it cannot promote real parser-supplied relationships until the builder actually emits them before cleanup.
+    - Fix direction: move cross-language relationship detection before parse-result cleanup or derive it from `unified_graph`; replace the stub with real parser signals (proto/FFI/decorator/import relationships).
+
+5. **The `rel_path` node ID default is not propagated through every node creator/resolver.**
+    - Code paths: rich symbol node IDs use rel-path slugs; doc nodes use `doc_lang::file_stem::symbol`; basic parser nodes use `language::file_stem::symbol`; `_resolve_source_node_sync()` and `_resolve_target_node_sync()` still construct legacy stem IDs for direct matches and fallbacks.
+    - Impact: the default flip fixes one important collision class for rich symbols, but not the entire graph identity system. It can also create inferred fallback nodes with old-style IDs instead of resolving to real rel-path nodes.
+    - Fix direction: centralize node-id construction in one helper and require all graph-builder paths (rich, basic, docs, relationship resolution, diagnostics) to use it. Add tests with same-stem files across rich/basic/doc inputs.
+
+6. **Project graph node IDs are not namespaced by wiki.**
+    - Code path: `project_recompute.recompute_project()` merges per-wiki graphs by original `node_id` and tags node attrs with `wiki_id`; `project_edges` store only original source/target IDs; `FederatedRetrieverStack` resolves target nodes by `target_node_id` through `MultiGraphQueryService.get_node()`.
+    - Mismatch: `PLANNING_CROSS_LANGUAGE_GRAPH_FEDERATION.md` specified `{wiki_id}::{original_node_id}` project IDs.
+    - Impact: two repos with identical `rel_path` and symbol names can collide in the merged graph, overwrite `wiki_id`, and make cross-repo expansion resolve the wrong node. This risk increases after the `rel_path` default because common layouts (`src/api/users.py::create_user`) become deterministic across repos.
+    - Fix direction: namespace project graph nodes and edges at the project boundary. Store source/target wiki IDs as first-class edge columns or edge attrs, not only inside provenance.
+
+7. **Project recompute does not clear stale rows.**
+    - Code path: `project_recompute.recompute_project()` upserts relatedness and edges, then stamps `stale=False`; `ProjectStorageProtocol` has no clear/delete API for project edges or old pair scores.
+    - Impact: removing a wiki, changing API surfaces, lowering relatedness, or deleting code can leave obsolete `project_edges` and `repo_relatedness` rows in storage. Lifecycle stale triggers can fire correctly while the recompute result remains contaminated by old rows.
+    - Fix direction: add `clear_project_edges(project_id)` and `clear_repo_relatedness(project_id)` or transactional "replace recompute generation" semantics before writing fresh rows. Tests must cover wiki removal.
+
+8. **Read-time recompute can enqueue duplicate background jobs.**
+    - Code path: `routes.get_project()` calls `maybe_enqueue_recompute()` on each GET; `maybe_enqueue_recompute()` schedules `asyncio.create_task()` when stale but does not set an in-flight marker before returning.
+    - Impact: repeated project reads can launch overlapping recomputes for the same project. This can amplify cost and make stale-row races worse.
+    - Fix direction: persist `recompute_in_progress` / `recompute_started_at` or use an in-process keyed lock with storage-backed fallback. Clear it on success/error.
+
+9. **Manual recompute authorization is weaker than the UI contract.**
+    - Code path: `RecomputeWidget` only renders the start button for owners; `POST /projects/{project_id}/recompute` only requires an authenticated user and delegates accessibility to `ProjectService.list_project_wikis()` inside `recompute_project()`, which permits shared projects.
+    - Impact: a non-owner who can view a shared project can likely trigger an expensive recompute by calling the API directly, despite the UI hiding the button.
+    - Fix direction: enforce owner-only access in `recompute_project_route()` (or intentionally document shared-user recompute as allowed), then add route tests.
+
+10. **Project storage contract and current design disagree.**
+     - Code path: `project_storage.py` docstring still says SQLite/Postgres implementations are follow-up even though they exist; the planned project schema included rich node columns and source wiki IDs, but the current storage stores `attrs` JSON and recompute does not materialize nodes.
+     - Impact: future implementers will not know whether `project_nodes` is a required materialized table or a vestigial protocol member. Federated retriever currently depends on per-wiki query services for node lookup, so the code acts as an edge/relatedness store rather than a full project graph store.
+     - Fix direction: make a deliberate contract choice. Either materialize `project_nodes` and use them in query/retrieval, or remove/de-emphasize node materialization from the Phase 7 contract and document per-wiki lookup as the intended design.
+
+11. **Federated retriever ignores configured dampening during construction.**
+     - Code path: `multi_wiki_components.py` constructs `FederatedRetrieverStack(wiki_stacks)` without passing `flags.cross_repo_dampening`; the class falls back to `_DEFAULT_DAMPENING = 0.7`.
+     - Impact: changing `WIKI_CROSS_REPO_DAMPENING` affects linker output but not retriever expansion scoring.
+     - Fix direction: pass `dampening=float(flags.cross_repo_dampening)` when constructing the federated retriever and cover it with a unit test.
+
+12. **Feature-flag rollout comments and defaults still disagree.**
+     - Code path: many comments say "default off until ..." while the dataclass/env defaults are already `True` (`orphan_lexical_tiered`, `orphan_cascade_v2`, `orphan_hybrid_search`, `cross_language_linking`, `project_graph`, `federated_query`, `federated_retriever`, `cross_repo_linking`, `project_clustering`).
+     - Impact: operators reading the code get a rollback story that no longer matches behavior. This matters because several features are only partially complete.
+     - Fix direction: update comments to say which defaults are intentionally on for dogfood and which should be considered experimental, or temporarily flip high-risk features off until the P0 items above are fixed.
+
+13. **The test front is still mostly unit-level.**
+     - Current green command: `AUTH_ENABLED=false python -m pytest tests/unit/test_cross_language_linker.py tests/unit/test_cross_repo_linker.py tests/unit/test_project_recompute.py tests/unit/test_test_linker.py tests/unit/test_graph_clustering.py tests/unit/test_node_id_collision.py -q --tb=short` (79 passed in the last run).
+     - Gap: no integration test currently proves actual indexing produces persisted `api_surface` rows, real `cross_language` edges, bounded test links, project recompute edge rows, or SSE payload compatibility with frontend consumers.
+     - Fix direction: prioritize the integration tests listed in 0.3 and add frontend tests before enabling the feature set as release-ready.
+
+#### 0.4.3 Code duplication and consolidation opportunities
+
+These are not all correctness bugs, but they increase the chance that the roadmap diverges again.
+
+| Duplication / drift | Where | Consolidation direction |
 |---|---|---|
-| `WikiStorageProtocol` has `count_fts_matches`, `search_fts_by_column`, `search_fts_with_path`, `get_embedding_by_id`, `batch_similarity_search` | **Absent** — only `search_fts`, `search_fts5`, `search_fts_by_symbol_name`, `search_vec`, `search_hybrid` exist in `backend/app/core/storage/protocol.py` | Phase 0 — protocol additions + dual-backend impls |
-| FTS scores comparable across backends | SQLite `bm25(...)` returns **negative**, ORDER BY ASC (`backend/app/core/storage/sqlite.py` L749). Postgres `ts_rank_cd` returns **positive**, ORDER BY DESC (`backend/app/core/storage/postgres.py` L825) | Phase 0 — normalize to `[0,1]` `score_norm` field at storage boundary |
-| Pass 1 FTS uses path_prefix + symbol_types + IDF gate | `backend/app/core/graph_topology.py` L376–L405 calls `db.search_fts5(query=symbol_name, limit=fts_limit)` with **no filters, no IDF** | Phase 1+2 |
-| Pass 2 reuses Phase 1b embeddings | Pass 2 always re-embeds via `embed_batch_fn`. Phase 1b already stores embeddings per node_id in `repo_vec` | Phase 3 — `get_embedding_by_id` + reuse |
-| Cascade order: explicit-ref → hybrid → lexical → directory | Current order: lexical → vector → directory; doc-link edges injected as a **separate later step** in `inject_doc_edges` | Phase 3 — reorder + extract markdown/backtick parsing into Pass 1 |
-| Per-edge `provenance` dict + `Phase2Stats` + `explain_connectivity()` | `_add_edge` stores only `relationship_type`/`edge_class`/`created_by`/`raw_similarity`. No stats dataclass, no diagnostic API | Phase 1 |
-| Edge dedup before insert | `_add_edge` does NOT check `G.has_edge(u,v,rel_type)`; `inject_doc_edges` uses a local `seen` set only for doc edges | Phase 1 |
-| `cross_language` and `test_link` edge classes; excluded from in-degree | `_SYNTHETIC_CLASSES = {"directory","lexical","semantic","doc","bridge"}` — both new classes missing | Phase 6 |
-| `cross_language_linker.py`, `api_surface_extractor.py`, `cross_repo_linker.py`, `relatedness_scorer.py`, `project_storage.py`, `federated_query_service.py`, `federated_retriever.py` | All **absent** | Phases 6–7 |
-| Node IDs collision-safe across same-stem files in different dirs | `node_id = f"{language}::{file_name}::{local_qualified_name}"` where `file_name = Path(file_path).stem`. Hash-suffix only fires when same `node_id` is seen with a *different* `file_path`, so two distinct files with the same stem and same class collide silently the first time. | Phase 5 (3A) |
-| `GENERIC_CLASS_NAMES` + REST endpoint disambiguation | Not present; TS parser captures decorators but Java/Go/C# stub `has_decorators=False` | Phase 2 (REST), Phase 6 (per-language API extractors) |
-| Feature flags `orphan_cascade_v2`, `WIKI_CROSS_LANGUAGE_LINKING`, `WIKI_PROJECT_GRAPH`, etc. | Only `hierarchical_leiden`, `capability_validation`, `smart_expansion`, `coverage_ledger`, `language_hints`, `exclude_tests` exist | Every phase adds its own flag |
-| `cross_language_relationships` already detected in Phase 1 | Yes — `graph_builder.py` populates `RepositoryGraph.cross_language_relationships`, but this list is **not converted to weighted graph edges with `edge_class="cross_language"`**. It is metadata only. | Phase 6 — wire it into the graph |
+| API-surface pairing logic duplicated between `link_l1_api_surface()` and `link_api_surface_any_language()`. | `backend/app/core/code_graph/cross_language_linker.py` | Extract one internal `_link_api_surface_pairs(..., allow_same_language, edge_class, relationship_type, provenance_source)` helper. |
+| Stale-marking storage open/write repeated. | `mark_projects_for_wiki_stale()` and `mark_project_stale()` in `project_recompute.py`, plus route hooks. | Add a private `_set_project_stale(store/project_id/reason)` helper; route hooks should call a service-layer function, not inline imports in every route. |
+| SSE stream parsing duplicated for ask/research and recompute. | `web/src/spa/api/sse.ts` | Extract a generic `subscribeSSE(url, method, handlers)` parser that accepts event normalization callbacks. |
+| Node ID construction scattered across rich parser, basic parser, doc nodes, source/target resolvers, and diagnostics. | `graph_builder.py` | Introduce a single `make_node_id(language, rel_path, file_name, qualified_name, style)` helper and use it everywhere. |
+| Project graph design split between "materialized nodes" docs and "edge store plus per-wiki lookup" code. | `project_storage.py`, `federated_query_service.py`, `federated_retriever.py`, `multi_wiki_components.py` | Decide and document one contract. If per-wiki lookup is intended, simplify project storage protocol and make edge rows carry wiki IDs. |
 
-**Bottom-line gap inventory** (single source of truth, ordered by what blocks what):
+#### 0.4.4 Recommended future-work front
 
-* **G1.** Storage protocol is too narrow → blocks every phase that needs richer FTS / embedding lookup.
-* **G2.** FTS score semantics differ between backends → blocks RRF (Phase 4) and any threshold tuning.
-* **G3.** No edge dedup, no provenance, no Phase2Stats → blocks observability needed to validate every later change.
-* **G4.** Pass 1 FTS is unfiltered + un-IDF-gated → produces noise that will corrupt RRF (Phase 4) if not fixed first.
-* **G5.** Pass 2 re-embeds → 5–20× slower than necessary; blocks cascade reorder because reorder makes Pass 2 fire more often.
-* **G6.** Cascade ordering wrong → must be fixed *after* Pass 1 cleanup and *before* hybrid RRF lands.
-* **G7.** `file_name`-stem-based node IDs collide silently → blocks reliable explicit-ref Pass 1, REST disambiguation, and cross-language/cross-repo linking (every linker resolves by stem today).
-* **G8.** No `cross_language`/`test_link` edge classes and no `_SYNTHETIC_CLASSES` membership → cross-language edges would distort weighting + hub detection if added prematurely.
-* **G9.** No project storage / federation layer → cross-repo linking can't be expressed without it.
+**P0 - Correctness blockers from the second audit (closed unless section 0.5 says otherwise)**
 
-This dependency graph dictates phase ordering below.
+1. Fix hybrid fallback semantics so missing embeddings do not bypass tiered lexical/IDF safeguards.
+2. Preserve or cap Phase 1c linker weights in `apply_edge_weights()` instead of rewriting them as generic synthetic weights.
+3. Expose rich parser `source_text` / decorator metadata to `api_surface_extractor`, then add a real Phase 1c integration test.
+4. Replace `_detect_cross_language_relationships()` stub with real L0 producers or remove the L0 claim from the roadmap until producers exist.
+5. Centralize node ID construction and propagate `rel_path` style to docs/basic/parser relationship resolution.
+6. Namespace project-level nodes/edges with `wiki_id::node_id` or add source/target wiki IDs as first-class edge keys.
+7. Clear/replace project edges and relatedness on recompute, especially after wiki removal.
+8. Add an in-flight recompute guard and owner/permission tests for manual recompute.
+
+**P1 - Verification and contract coverage**
+
+1. Add `backend/tests/integration/test_phase1c_indexing.py` covering real `FilesystemIndexer` persistence of `api_surface`, `cross_language`, and bounded `test_link` edges.
+2. Add `backend/tests/integration/test_project_recompute_edges.py` with two related repos whose node IDs intentionally collide before namespacing.
+3. Add `backend/tests/integration/test_recompute_sse_contract.py` validating backend event names and payload shapes.
+4. Add frontend `sse-recompute` and `RecomputeWidget` tests.
+5. Add route tests for PATCH/add/remove stale marking and recompute owner policy.
+6. Add storage tests for project edge cleanup/replacement semantics.
+
+**P2 - Cleanup and rollout hygiene**
+
+1. Update feature-flag comments/default policy so code comments match current behavior.
+2. Update `project_storage.py` module docstring and Phase 7 roadmap text to match the chosen project-node strategy.
+3. Pass `flags.cross_repo_dampening` into `FederatedRetrieverStack`.
+4. Normalize imports in `ProjectPage.tsx` by moving `RecomputeWidget` into the import block before the `CodeMapTree` runtime declaration.
+5. Refactor the duplicated API-surface matcher and SSE parser once tests lock behavior.
+
+#### 0.4.5 Updated release-readiness conclusion
+
+The second-audit P0 implementation mismatches were closed in the follow-up 2026-04-28 gap-closure pass and are covered by focused unit/storage regressions. The implementation is now suitable for dogfood on small real repositories, with the important caveat that the remaining release risk has shifted from core wiring to integration/UI verification and real-repo tuning.
+
+Keep high-risk features observable and easy to roll back via feature flags until the P1 integration tests pass against actual indexed repositories.
+
+### 0.5 Gap-closure implementation status — 2026-04-28
+
+| Audit gap | Status | Implementation evidence | Remaining verification |
+|---|---|---|---|
+| Hybrid Pass 2 bypassed tiered lexical safety when embeddings were missing. | **Closed** | `graph_orphan_hybrid.resolve_orphans_hybrid()` now returns `[]` without cached/persisted embeddings and no longer calls `embed_fn`, so the cascade falls through to tiered lexical. | Add a full cascade integration test showing explicit -> hybrid -> lexical -> directory ordering on one fixture. |
+| Phase 1c confidence weights were overwritten by Phase 2. | **Closed** | `graph_topology.apply_edge_weights()` preserves explicit weights for calibrated synthetic classes: `cross_language`, `test_link`, and `cross_repo`. | Keep storage-level tests for persisted weights when Phase 1c runs through `FilesystemIndexer`. |
+| Rich parser nodes did not expose source text to API-surface extraction. | **Closed** | Rich graph nodes now expose top-level `source_text`, `docstring`, `parameters`, and `return_type`; `api_surface_extractor` also reuses existing `api_surface` and falls back to `symbol.source_text`. | Add real FastAPI/React indexing fixture to prove REST surfaces persist through storage. |
+| Phase 6 L0 was wired but had no producer. | **Closed for parser-supplied `target_file` evidence** | `_detect_cross_language_relationships()` now runs before parse-result cleanup and emits L0 rows from parser relationships with cross-language `target_file`. | Broaden producers beyond `target_file` relationships, especially proto/gRPC, FFI, GraphQL, and generated-client conventions. |
+| `rel_path` node IDs were not propagated consistently. | **Closed for graph-builder node creation/resolution paths** | Central `_make_node_id()` helper is used for rich, documentation, basic-parser, diagnostics, and source/target resolver paths; rel-path cache recovery prevents stem fallback. | Add one end-to-end same-stem repo fixture covering rich/basic/doc nodes together. |
+| Project graph node IDs were not namespaced by wiki. | **Closed** | `make_project_node_id()` namespaces project graph nodes/edges as `wiki_id::raw_node_id`; recompute stores `raw_node_id` and provenance for both endpoints; federated query/retriever resolve namespaced IDs. | Run real multi-wiki project recompute on repos with intentionally colliding paths/symbols. |
+| Project recompute did not clear stale rows. | **Closed** | `ProjectStorageProtocol` now has `clear_project_nodes`, `clear_project_edges`, and `clear_repo_relatedness`; memory/SQLite/Postgres implement them; recompute clears before rebuilding. | Add route/integration coverage for wiki removal followed by recompute. |
+| Read-time/manual recompute lifecycle was incomplete. | **Partially closed** | Recompute writes a lightweight `recompute_in_progress` meta marker, clears it on normal completion/skip, marks stale lifecycle changes, and manual recompute is owner-gated in the route. | Replace the lightweight marker with a stronger lock/lease if concurrent server processes are expected; add route tests. |
+| Project storage contract/documentation drifted from implementation. | **Closed** | `project_storage.py` docstring now reflects the in-memory/SQLite/Postgres implementations, and `recompute_project()` materializes project nodes. | Decide whether project nodes should become the primary lookup path or remain auxiliary metadata next to per-wiki query services. |
+| Federated retriever ignored configured dampening. | **Closed** | `build_multi_wiki_components()` passes `flags.cross_repo_dampening` into `FederatedRetrieverStack`. | Add a component-level test for the builder path; class-level dampening tests already exist. |
+| Cross-repo same-language API-surface edges had no cascade path. | **Closed** | `link_api_surface_any_language()` is wired into `build_cross_repo_edges(..., allow_same_language=True)` and filtered by `wiki_id`. | Validate on a same-language two-service project with shared REST surfaces. |
+| Frontend/backend recompute contract lacks tests and generated API coverage. | **Open** | Backend and frontend wiring exist, but tests/types are still missing. | Add backend SSE contract tests, frontend `subscribeRecomputeSSE` tests, `RecomputeWidget` tests, and regenerate API types. |
+
+The phase descriptions below remain useful for the original design intent, but sections 0.1–0.5 are the current implementation record.
 
 ---
 

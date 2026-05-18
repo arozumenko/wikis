@@ -102,6 +102,11 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
         "test_link",        # Phase 6 — test linker
         "cross_repo",       # Phase 8 — cross-repo linker
     })
+    _CALIBRATED_SYNTHETIC_CLASSES = frozenset({
+        "cross_language",
+        "test_link",
+        "cross_repo",
+    })
     structural_in: Dict[str, int] = {}
     for _u, v, data in G.edges(data=True):
         if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:
@@ -114,10 +119,19 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
         in_deg = structural_in.get(v, 0)
         w = 1.0 / math.log(in_deg + 2)
 
+        edge_class = data.get("edge_class", "structural")
         # Synthetic recovery edges get a weight floor so Leiden
-        # actually groups orphan nodes with their anchors.
-        if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:
-            w = max(w, SYNTHETIC_WEIGHT_FLOOR)
+        # actually groups orphan nodes with their anchors. Linker-added
+        # synthetic classes already carry calibrated confidence weights,
+        # so keep those explicit values instead of rewriting them.
+        if edge_class in _SYNTHETIC_CLASSES:
+            if edge_class in _CALIBRATED_SYNTHETIC_CLASSES and data.get("weight") is not None:
+                try:
+                    w = float(data["weight"])
+                except (TypeError, ValueError):
+                    w = SYNTHETIC_WEIGHT_FLOOR
+            else:
+                w = max(w, SYNTHETIC_WEIGHT_FLOOR)
             synthetic_count += 1
 
         data["weight"] = w
@@ -1336,12 +1350,30 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
             import json
             annotations = json.dumps(annotations)
 
+        # Phase 1 (graph-quality roadmap): provenance + confidence must
+        # round-trip from NetworkX edge attrs into the DB. Earlier
+        # revisions silently dropped them here, leaving every persisted
+        # row with NULL provenance and the default 'EXTRACTED'
+        # confidence regardless of upstream linker decisions, which
+        # broke phase2_stats_v2 attribution.
+        provenance = data.get("provenance")
+        if provenance is None:
+            # Backfill a minimal provenance so downstream stats can
+            # always attribute an edge to its producer instead of the
+            # generic "unknown" bucket.
+            created_by = data.get("created_by") or "ast"
+            provenance = {"source": str(created_by)}
+            rel_type_val = data.get("relationship_type")
+            if rel_type_val:
+                provenance["matcher"] = str(rel_type_val)
+
         edge_batch.append({
             "source_id": str(u),
             "target_id": str(v),
             "rel_type": data.get("relationship_type", ""),
             "edge_class": data.get("edge_class", "structural"),
             "analysis_level": data.get("analysis_level", "comprehensive"),
+            "confidence": data.get("confidence", "EXTRACTED"),
             "weight": data.get("weight", 1.0),
             "raw_similarity": data.get("raw_similarity"),
             "source_file": data.get("source_file", ""),
@@ -1349,6 +1381,7 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
             "language": data.get("language", ""),
             "annotations": annotations,
             "created_by": data.get("created_by", "ast"),
+            "provenance": provenance,
         })
 
         if len(edge_batch) >= PERSIST_BATCH_SIZE:

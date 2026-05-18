@@ -626,6 +626,11 @@ class TypeScriptEnhancedParser(BaseParser):
                     parent_symbol=parent_symbol,
                     full_name=full_name,
                     return_type=aliased_type,
+                    # Preserve full declaration text so downstream consumers
+                    # (API surface extractor, cross-language linker) can hash
+                    # the alias body. Without this the node arrives with
+                    # source_text=None and obj: surfaces never pair.
+                    source_text=self.parser._get_node_text(node),
                     metadata={
                         'is_type_alias': True,
                         'aliased_type': aliased_type,

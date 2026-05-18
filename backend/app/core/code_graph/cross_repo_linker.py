@@ -26,6 +26,7 @@ import logging
 from typing import Iterable
 
 from .cross_language_linker import (
+    link_api_surface_any_language,
     link_l0_exact,
     link_l1_api_surface,
     link_l2_hybrid,
@@ -35,7 +36,33 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "build_cross_repo_edges",
+    "make_project_node_id",
+    "split_project_node_id",
 ]
+
+
+PROJECT_NODE_SEPARATOR = "::"
+
+
+def make_project_node_id(wiki_id: str, raw_node_id: str) -> str:
+    """Return the project-wide node id for a wiki-local graph node."""
+    wiki = str(wiki_id or "")
+    raw = str(raw_node_id or "")
+    if not wiki:
+        return raw
+    prefix = f"{wiki}{PROJECT_NODE_SEPARATOR}"
+    return raw if raw.startswith(prefix) else f"{prefix}{raw}"
+
+
+def split_project_node_id(project_node_id: str) -> tuple[str | None, str]:
+    """Split ``wiki_id::raw_node_id`` while preserving raw graph IDs."""
+    node_id = str(project_node_id or "")
+    if PROJECT_NODE_SEPARATOR not in node_id:
+        return None, node_id
+    wiki_id, raw_node_id = node_id.split(PROJECT_NODE_SEPARATOR, 1)
+    if raw_node_id.count(PROJECT_NODE_SEPARATOR) < 2:
+        return None, node_id
+    return wiki_id, raw_node_id
 
 
 def _clamp_unit(x: float) -> float:
@@ -75,6 +102,7 @@ def build_cross_repo_edges(
     threshold: float = 0.15,
     dampening: float = 0.7,
     max_wikis: int = 50,
+    allow_same_language: bool = True,
 ) -> list[dict]:
     """Build cross-repo edge rows ready for ``project_edges`` upsert.
 
@@ -132,6 +160,21 @@ def build_cross_repo_edges(
             cascade_edges.extend(
                 link_l1_api_surface(merged_graph, surfaces_by_node)
             )
+            if allow_same_language:
+                # Two repos in the same language (e.g. two Python
+                # services) must still be paired by shared API surface.
+                # The wiki_id filter below drops within-repo edges, so
+                # this only adds cross-repo same-language pairs.
+                cascade_edges.extend(
+                    link_api_surface_any_language(
+                        merged_graph,
+                        surfaces_by_node,
+                        edge_class="cross_repo",
+                        relationship_type="cross_repo_api_surface",
+                        provenance_source="cross_repo_linker",
+                        provenance_level="L1",
+                    )
+                )
             cascade_edges.extend(
                 link_l2_hybrid(
                     merged_graph,
@@ -149,14 +192,20 @@ def build_cross_repo_edges(
             continue
 
         for src, tgt, attrs in cascade_edges:
-            src_wiki = merged_graph.nodes.get(src, {}).get("wiki_id")
-            tgt_wiki = merged_graph.nodes.get(tgt, {}).get("wiki_id")
+            src_node = merged_graph.nodes.get(src, {})
+            tgt_node = merged_graph.nodes.get(tgt, {})
+            src_wiki = src_node.get("wiki_id")
+            tgt_wiki = tgt_node.get("wiki_id")
             # Only keep edges that actually cross this pair.
             if not src_wiki or not tgt_wiki or src_wiki == tgt_wiki:
                 continue
             if {src_wiki, tgt_wiki} != {wiki_a, wiki_b}:
                 continue
-            dedup_key = (src, tgt)
+            src_raw = src_node.get("raw_node_id") or split_project_node_id(src)[1]
+            tgt_raw = tgt_node.get("raw_node_id") or split_project_node_id(tgt)[1]
+            src_project_id = make_project_node_id(src_wiki, src_raw)
+            tgt_project_id = make_project_node_id(tgt_wiki, tgt_raw)
+            dedup_key = (src_project_id, tgt_project_id)
             if dedup_key in seen:
                 continue
             seen.add(dedup_key)
@@ -172,12 +221,16 @@ def build_cross_repo_edges(
                     "base_weight": round(base_weight, 6),
                     "dampening": dampening,
                     "source_relationship_type": attrs.get("relationship_type"),
+                    "source_wiki_id": src_wiki,
+                    "target_wiki_id": tgt_wiki,
+                    "source_raw_node_id": src_raw,
+                    "target_raw_node_id": tgt_raw,
                 }
             )
             rows.append(
                 {
-                    "source_node_id": src,
-                    "target_node_id": tgt,
+                    "source_node_id": src_project_id,
+                    "target_node_id": tgt_project_id,
                     "edge_class": "cross_repo",
                     "weight": weight,
                     "provenance": provenance,

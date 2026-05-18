@@ -129,7 +129,10 @@ async def build_multi_wiki_components(
     if flags.federated_retriever and project_storage is not None:
         from app.core.federated_retriever import FederatedRetrieverStack
 
-        multi_stack = FederatedRetrieverStack(wiki_stacks)
+        multi_stack = FederatedRetrieverStack(
+            wiki_stacks,
+            dampening=float(getattr(flags, "cross_repo_dampening", 0.7) or 0.7),
+        )
     else:
         from app.core.multi_retriever import MultiWikiRetrieverStack
 
@@ -183,6 +186,12 @@ async def build_multi_wiki_components(
     ):
         multi_stack._fqs = multi_gqs
 
+    repo_paths = {
+        wid: comp.repo_path
+        for wid, comp in loaded.items()
+        if isinstance(comp.repo_path, str) and comp.repo_path
+    }
+
     # Build a combined code_graph (use primary's; multi-graph ops use query_service)
     merged = EngineComponents(
         retriever_stack=multi_stack,
@@ -190,7 +199,7 @@ async def build_multi_wiki_components(
         code_graph=primary.code_graph,
         repo_analysis=primary.repo_analysis,
         llm=primary.llm,
-        repo_path=primary.repo_path,
+        repo_path=repo_paths or primary.repo_path,
         query_service=multi_gqs,
     )
 

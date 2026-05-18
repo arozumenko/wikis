@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections import defaultdict
 from collections.abc import AsyncGenerator
 from typing import Union
@@ -48,6 +49,7 @@ _MAX_SYMBOLS_PER_SECTION = 8
 # Relationship types for call-tree expansion (tight: only actual call flow)
 _CALL_FLOW_REL_TYPES = frozenset({
     "calls", "imports", "inherits", "implements", "extends", "overrides",
+    "cross_repo", "cross_repo_api_surface",
 })
 
 # Generic symbol names to skip during graph expansion (too common, add noise)
@@ -58,6 +60,49 @@ _GENERIC_EXPANSION_NAMES = frozenset({
     "start", "stop", "open", "close", "read", "write", "send", "split",
     "true", "false", "none", "null", "error", "result", "response", "request",
 })
+
+_SYMBOL_OUTPUT_RE = re.compile(
+    r"(?:`(?P<backtick>[^`]+)`|\*\*(?P<bold>[^*]+)\*\*)\s+"
+    r"\((?P<symbol_type>[^)\[]+)(?:\s*\[[^\]]*\])?\)"
+    r"(?:\s*\[[^\]]+\])?\s*(?:in|—)\s*`?(?P<file_path>[^`\s]+)`?"
+)
+_WIKI_TAG_RE = re.compile(r"\[wiki:\s*([^\]]+)\]")
+_NODE_ID_TAG_RE = re.compile(r"\[id:\s*`([^`]+)`\]")
+_LINE_SUFFIX_RE = re.compile(r":\d+(?:-\d+)?$")
+
+
+def _extract_tool_source_references(output: str, seen_symbols: set[str]) -> list[SourceReference]:
+    """Extract source references from progressive tool output.
+
+    Progressive tools emit compact, human-readable lines.  Project-level
+    answers need to preserve the exact wiki/node id from those lines so the
+    code-map phase can seed traversal in the owning repo instead of resolving
+    by ambiguous symbol names across every wiki.
+    """
+    refs: list[SourceReference] = []
+    for line in str(output or "").splitlines():
+        wiki_match = _WIKI_TAG_RE.search(line)
+        node_match = _NODE_ID_TAG_RE.search(line)
+        wiki_id = wiki_match.group(1).strip() if wiki_match else None
+        node_id = node_match.group(1).strip() if node_match else None
+        for match in _SYMBOL_OUTPUT_RE.finditer(line):
+            symbol = (match.group("backtick") or match.group("bold") or "").strip()
+            symbol_type = match.group("symbol_type").strip()
+            file_path = _LINE_SUFFIX_RE.sub("", match.group("file_path").strip().rstrip(".,"))
+            key = node_id or f"{wiki_id or ''}:{symbol}:{file_path}"
+            if not symbol or not file_path or key in seen_symbols:
+                continue
+            seen_symbols.add(key)
+            refs.append(
+                SourceReference(
+                    file_path=file_path,
+                    node_id=node_id,
+                    symbol=symbol,
+                    symbol_type=symbol_type,
+                    wiki_id=wiki_id,
+                )
+            )
+    return refs
 
 
 # ---------------------------------------------------------------------------
@@ -100,17 +145,33 @@ def _build_call_tree_from_sources(
                 "relationships": [],
             }
 
+    def _relationship_node_id(rel, attr: str) -> str:
+        value = getattr(rel, attr, "")
+        return value if isinstance(value, str) else ""
+
     # --- Resolve ask sources to graph seeds ---
     seed_node_ids: list[str] = []
     storage = getattr(gqs, "storage", None)  # available on StorageQueryService
     for src in sources:
         node_id: str | None = None
+        source_node_id = getattr(src, "node_id", None)
+        if source_node_id and hasattr(gqs, "get_node"):
+            candidate_ids = [source_node_id]
+            if src.wiki_id and "::" not in source_node_id:
+                candidate_ids.insert(0, f"{src.wiki_id}::{source_node_id}")
+            for candidate_id in candidate_ids:
+                try:
+                    if gqs.get_node(candidate_id) is not None:
+                        node_id = candidate_id
+                        break
+                except Exception:
+                    continue
         # Try resolving by symbol name first (most precise).  When the symbol
         # is qualified (e.g. ``fmt::format_to`` or ``Pkg.Mod.func``), also
         # retry with the simple trailing name — many graphs index symbols
         # under the unqualified name with the qualifier living in
         # ``parent_symbol``.
-        if src.symbol:
+        if not node_id and src.symbol:
             node_id = gqs.resolve_symbol(
                 src.symbol, file_path=src.file_path or ""
             )
@@ -189,8 +250,8 @@ def _build_call_tree_from_sources(
             if rel_label not in _CALL_FLOW_REL_TYPES:
                 continue
 
-            src_raw = gqs.resolve_symbol(rel.source_name)
-            tgt_raw = gqs.resolve_symbol(rel.target_name)
+            src_raw = _relationship_node_id(rel, "source_node_id") or gqs.resolve_symbol(rel.source_name)
+            tgt_raw = _relationship_node_id(rel, "target_node_id") or gqs.resolve_symbol(rel.target_name)
             if not src_raw or not tgt_raw:
                 continue
 
@@ -592,11 +653,6 @@ class ResearchService:
         # --- Step 1: Run ask engine, forwarding tool-call events to the UI ---
         ask_answer = ""
         ask_sources: list[SourceReference] = []
-        import re
-        _SYM_LINE_RE = re.compile(
-            r"(?:`|\*\*)(\w+)(?:`|\*\*)\s+\((\w+)(?:\s*\[[^\]]*\])?\)(?:\s*\[[^\]]*\])?\s*(?:in|—)\s*`?([\w/.]+)`?"
-        )
-
         # Collect ALL symbols from tool results; we'll filter after we have the answer
         all_tool_symbols: list[SourceReference] = []
 
@@ -633,16 +689,9 @@ class ResearchService:
                         output = step_data.get("output", "")
                         tool = step_data.get("tool", "")
                         if tool in ("search_symbols", "get_code", "query_graph", "search_docs"):
-                            for m in _SYM_LINE_RE.finditer(output):
-                                sym_name, sym_type, file_path = m.groups()
-                                key = f"{sym_name}:{file_path}"
-                                if key not in seen_symbols:
-                                    seen_symbols.add(key)
-                                    all_tool_symbols.append(SourceReference(
-                                        file_path=file_path,
-                                        symbol=sym_name,
-                                        symbol_type=sym_type,
-                                    ))
+                            all_tool_symbols.extend(
+                                _extract_tool_source_references(output, seen_symbols)
+                            )
 
                 if event_type == "answer_chunk":
                     chunk = event.get("data", {}).get("chunk", "")

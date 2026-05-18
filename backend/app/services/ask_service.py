@@ -252,10 +252,13 @@ class AskService:
                         sources.append(
                             SourceReference(
                                 file_path=s.get("file_path") or s.get("source", ""),
+                                node_id=s.get("node_id"),
                                 snippet=s.get("snippet"),
                                 symbol=s.get("symbol"),
                                 symbol_type=s.get("symbol_type") or s.get("type"),
                                 relevance_score=s.get("relevance_score"),
+                                wiki_id=s.get("wiki_id"),
+                                wiki_title=s.get("wiki_title"),
                             )
                         )
             elif event_type in ("ask_error", "task_failed"):

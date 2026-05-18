@@ -2,13 +2,8 @@
 
 Per-project storage of cross-repo nodes/edges, repo↔repo relatedness,
 and project metadata. Backend-agnostic via :class:`ProjectStorageProtocol`;
-this module ships an in-memory implementation that satisfies the
-contract for tests and the off-by-default ``WIKI_PROJECT_GRAPH`` flag.
-
-Concrete SQLite/Postgres implementations live in a follow-up ticket
-(Phase 7.1 schema migration). The in-memory backend is sufficient for
-unit tests of :mod:`federated_query_service` and
-:mod:`federated_retriever`.
+this module ships in-memory, SQLite, and PostgreSQL implementations that
+satisfy the same contract.
 
 All write paths are no-ops when ``flags.project_graph`` is ``False``,
 but the **read** paths still return empty lists/None so callers can
@@ -28,6 +23,7 @@ __all__ = [
     "SqliteProjectStorage",
     "PostgresProjectStorage",
     "open_project_storage",
+    "drop_project_storage",
 ]
 
 
@@ -63,14 +59,21 @@ class ProjectStorageProtocol(Protocol):
     def get_project_nodes(self, project_id: str) -> list[dict[str, Any]]:
         """Return all project nodes."""
 
+    def clear_project_nodes(self, project_id: str) -> None:
+        """Delete all project-scoped nodes."""
+
     def get_project_edges(
         self,
         project_id: str,
         *,
         source_node_id: str | None = None,
+        target_node_id: str | None = None,
         edge_class: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return project edges, optionally filtered by source and class."""
+        """Return project edges, optionally filtered by source, target, and class."""
+
+    def clear_project_edges(self, project_id: str) -> None:
+        """Delete all project-scoped edges."""
 
     def upsert_repo_relatedness(
         self,
@@ -84,6 +87,9 @@ class ProjectStorageProtocol(Protocol):
 
     def get_repo_relatedness(self, project_id: str) -> list[dict[str, Any]]:
         """Return all relatedness rows for a project."""
+
+    def clear_repo_relatedness(self, project_id: str) -> None:
+        """Delete all repo relatedness rows for a project."""
 
     def set_project_meta(self, project_id: str, key: str, value: Any) -> None:
         """Persist a small JSON-serializable metadata blob."""
@@ -143,6 +149,11 @@ class InMemoryProjectStorage:
             return []
         return list(store.nodes.values())
 
+    def clear_project_nodes(self, project_id: str) -> None:
+        store = self._stores.get(project_id)
+        if store is not None:
+            store.nodes.clear()
+
     # ------------------------------------------------------------------
     # Edges
     # ------------------------------------------------------------------
@@ -172,19 +183,27 @@ class InMemoryProjectStorage:
         project_id: str,
         *,
         source_node_id: str | None = None,
+        target_node_id: str | None = None,
         edge_class: str | None = None,
     ) -> list[dict[str, Any]]:
         store = self._stores.get(project_id)
         if store is None:
             return []
         rows: list[dict[str, Any]] = []
-        for (src, _tgt, cls), row in store.edges.items():
+        for (src, tgt, cls), row in store.edges.items():
             if source_node_id is not None and src != source_node_id:
+                continue
+            if target_node_id is not None and tgt != target_node_id:
                 continue
             if edge_class is not None and cls != edge_class:
                 continue
             rows.append(dict(row))
         return rows
+
+    def clear_project_edges(self, project_id: str) -> None:
+        store = self._stores.get(project_id)
+        if store is not None:
+            store.edges.clear()
 
     # ------------------------------------------------------------------
     # Relatedness
@@ -213,6 +232,11 @@ class InMemoryProjectStorage:
         if store is None:
             return []
         return [dict(r) for r in store.relatedness.values()]
+
+    def clear_repo_relatedness(self, project_id: str) -> None:
+        store = self._stores.get(project_id)
+        if store is not None:
+            store.relatedness.clear()
 
     # ------------------------------------------------------------------
     # Meta
@@ -266,6 +290,8 @@ CREATE TABLE IF NOT EXISTS project_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_project_edges_src
     ON project_edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_project_edges_tgt
+    ON project_edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_project_edges_class
     ON project_edges(edge_class);
 
@@ -342,6 +368,12 @@ class SqliteProjectStorage:
             out.append({"node_id": r["node_id"], "wiki_id": r["wiki_id"], **attrs})
         return out
 
+    def clear_project_nodes(self, project_id: str) -> None:
+        if not project_id:
+            return
+        self._conn.execute("DELETE FROM project_nodes")
+        self._conn.commit()
+
     # ------------------------------------------------------------------
     # Edges
     # ------------------------------------------------------------------
@@ -375,6 +407,7 @@ class SqliteProjectStorage:
         project_id: str,
         *,
         source_node_id: str | None = None,
+        target_node_id: str | None = None,
         edge_class: str | None = None,
     ) -> list[dict[str, Any]]:
         sql = (
@@ -385,6 +418,9 @@ class SqliteProjectStorage:
         if source_node_id is not None:
             sql += " AND source_id = ?"
             params.append(source_node_id)
+        if target_node_id is not None:
+            sql += " AND target_id = ?"
+            params.append(target_node_id)
         if edge_class is not None:
             sql += " AND edge_class = ?"
             params.append(edge_class)
@@ -405,6 +441,12 @@ class SqliteProjectStorage:
                 }
             )
         return out
+
+    def clear_project_edges(self, project_id: str) -> None:
+        if not project_id:
+            return
+        self._conn.execute("DELETE FROM project_edges")
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # Relatedness
@@ -446,6 +488,12 @@ class SqliteProjectStorage:
                 }
             )
         return out
+
+    def clear_repo_relatedness(self, project_id: str) -> None:
+        if not project_id:
+            return
+        self._conn.execute("DELETE FROM project_relatedness")
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # Meta
@@ -534,6 +582,10 @@ class PostgresProjectStorage:
                 f'ON "{schema}".project_edges(source_id)'
             ))
             conn.execute(text(
+                f'CREATE INDEX IF NOT EXISTS idx_project_edges_tgt '
+                f'ON "{schema}".project_edges(target_id)'
+            ))
+            conn.execute(text(
                 f'CREATE INDEX IF NOT EXISTS idx_project_edges_class '
                 f'ON "{schema}".project_edges(edge_class)'
             ))
@@ -555,6 +607,14 @@ class PostgresProjectStorage:
             self._engine.dispose()
         except Exception:  # pragma: no cover
             pass
+
+    def drop_schema(self) -> None:
+        """Drop the entire per-project schema and all project graph tables."""
+        text = self._text
+        schema = self._schema
+        with self._engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        logger.info("Dropped PostgreSQL project schema: %s", schema)
 
     # ------------------------------------------------------------------
     # Nodes
@@ -597,6 +657,13 @@ class PostgresProjectStorage:
             out.append({"node_id": r._mapping["node_id"], "wiki_id": r._mapping["wiki_id"], **attrs})
         return out
 
+    def clear_project_nodes(self, project_id: str) -> None:
+        if not project_id:
+            return
+        text = self._text
+        with self._engine.begin() as conn:
+            conn.execute(text(f'DELETE FROM "{self._schema}".project_nodes'))
+
     # ------------------------------------------------------------------
     # Edges
     # ------------------------------------------------------------------
@@ -636,6 +703,7 @@ class PostgresProjectStorage:
         project_id: str,
         *,
         source_node_id: str | None = None,
+        target_node_id: str | None = None,
         edge_class: str | None = None,
     ) -> list[dict[str, Any]]:
         text = self._text
@@ -647,6 +715,9 @@ class PostgresProjectStorage:
         if source_node_id is not None:
             sql += " AND source_id = :s"
             params["s"] = source_node_id
+        if target_node_id is not None:
+            sql += " AND target_id = :t"
+            params["t"] = target_node_id
         if edge_class is not None:
             sql += " AND edge_class = :c"
             params["c"] = edge_class
@@ -662,6 +733,13 @@ class PostgresProjectStorage:
             }
             for r in rows
         ]
+
+    def clear_project_edges(self, project_id: str) -> None:
+        if not project_id:
+            return
+        text = self._text
+        with self._engine.begin() as conn:
+            conn.execute(text(f'DELETE FROM "{self._schema}".project_edges'))
 
     # ------------------------------------------------------------------
     # Relatedness
@@ -714,6 +792,13 @@ class PostgresProjectStorage:
             }
             for r in rows
         ]
+
+    def clear_repo_relatedness(self, project_id: str) -> None:
+        if not project_id:
+            return
+        text = self._text
+        with self._engine.begin() as conn:
+            conn.execute(text(f'DELETE FROM "{self._schema}".project_relatedness'))
 
     # ------------------------------------------------------------------
     # Meta
@@ -815,3 +900,91 @@ def open_project_storage(
             exc_info=True,
         )
         return InMemoryProjectStorage()
+
+
+def _project_sqlite_path(
+    project_id: str,
+    *,
+    cache_dir: str | None = None,
+    settings: Any | None = None,
+) -> str:
+    """Return the SQLite project DB path without opening/creating it."""
+    base_dir = cache_dir
+    if not base_dir and settings is not None:
+        base_dir = getattr(settings, "cache_dir", None)
+    base_dir = base_dir or "./data/cache"
+    safe_id = _PROJECT_SCHEMA_RE.sub("_", str(project_id)).strip("_") or "default"
+    return os.path.join(base_dir, "projects", f"{safe_id}.project.db")
+
+
+def drop_project_storage(
+    project_id: str,
+    *,
+    cache_dir: str | None = None,
+    settings: Any | None = None,
+) -> bool:
+    """Delete persisted project graph storage for SQLite or PostgreSQL.
+
+    SQLite stores each project graph in ``<cache_dir>/projects/*.project.db``.
+    PostgreSQL stores each project graph in a schema derived from the project id.
+    This mirrors wiki deletion: metadata rows are handled by ``ProjectService``;
+    this helper removes the backend-specific graph payload.
+
+    Returns ``True`` when a backend cleanup operation was attempted and did not
+    raise. Missing SQLite files are treated as a successful no-op.
+    """
+    if not project_id:
+        return False
+
+    if settings is None:
+        try:
+            from ...config import get_settings
+
+            settings = get_settings()
+        except Exception:
+            settings = None
+
+    try:
+        from .factory import is_postgres_backend
+    except Exception:
+        is_postgres_backend = lambda *_a, **_kw: False  # type: ignore  # noqa: E731
+
+    try:
+        if settings is not None and is_postgres_backend(settings):
+            dsn = getattr(settings, "wiki_storage_dsn", "") or ""
+            if not dsn:
+                logger.warning(
+                    "Postgres project storage cleanup requested for %s but WIKI_STORAGE_DSN is empty",
+                    project_id,
+                )
+                return False
+            from sqlalchemy import create_engine, text  # type: ignore
+
+            schema = _safe_project_schema(project_id)
+            engine = create_engine(dsn, future=True)
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+                logger.info("Dropped PostgreSQL project schema: %s", schema)
+                return True
+            finally:
+                engine.dispose()
+
+        db_path = _project_sqlite_path(
+            project_id,
+            cache_dir=cache_dir,
+            settings=settings,
+        )
+        deleted_any = False
+        for path in (db_path, f"{db_path}-wal", f"{db_path}-shm"):
+            if not os.path.exists(path):
+                continue
+            os.remove(path)
+            deleted_any = True
+            logger.info("Deleted project SQLite storage file: %s", path)
+        if not deleted_any:
+            logger.debug("No project SQLite storage files found for %s at %s", project_id, db_path)
+        return True
+    except Exception:
+        logger.warning("Failed to delete project storage for %s", project_id, exc_info=True)
+        return False

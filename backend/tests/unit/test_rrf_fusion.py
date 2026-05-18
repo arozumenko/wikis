@@ -133,6 +133,10 @@ class TestHybridPass2:
         assert hyb.resolve_orphans_hybrid(db, G, "o", flags=_flags()) == []
 
     def test_fts_only_when_no_embedding(self):
+        # Hybrid Pass 2 intentionally aborts when no embedding is available so
+        # the v2 cascade falls through to the tiered lexical pass (see
+        # ``resolve_orphans_hybrid`` docstring). FTS hits alone do not
+        # produce hybrid results.
         nodes = {
             "o": {"symbol_name": "AuthHandler", "rel_path": "src/auth/handler.py"},
         }
@@ -147,9 +151,7 @@ class TestHybridPass2:
         G.add_node("o", **nodes["o"])
 
         out = hyb.resolve_orphans_hybrid(db, G, "o", flags=_flags())
-        assert {h["node_id"] for h in out} == {"h1", "h2"}
-        # FTS first hit gets rank 1 → highest rrf_score.
-        assert out[0]["node_id"] == "h1"
+        assert out == []
 
     def test_hybrid_fuses_fts_and_vec(self):
         nodes = {
@@ -206,12 +208,16 @@ class TestHybridPass2:
                 {"node_id": "strong", "score_norm": 0.9},
             ],
         }
-        db = _FakeDB(nodes=nodes, fts_results=fts)
+        # An embedding is required for hybrid Pass 2 to run; supply one via
+        # the orphan_embeddings cache so the FTS branch is exercised.
+        vec = {((0.1, 0.2), "src/auth"): []}
+        db = _FakeDB(nodes=nodes, fts_results=fts, vec_results=vec)
         G = nx.MultiDiGraph()
         G.add_node("o", **nodes["o"])
 
         out = hyb.resolve_orphans_hybrid(
             db, G, "o", flags=_flags(fts_min_score_norm=0.15),
+            orphan_embeddings={"o": [0.1, 0.2]},
         )
         assert {h["node_id"] for h in out} == {"strong"}
 
@@ -230,7 +236,11 @@ class TestHybridPass2:
         )
         assert {h["node_id"] for h in out} == {"match"}
 
-    def test_falls_back_to_embed_fn(self):
+    def test_embed_fn_is_not_called(self):
+        # ``embed_fn`` is intentionally not invoked by Pass 2 — the cascade
+        # must reuse persisted embeddings rather than re-embed orphans
+        # synchronously (see ``resolve_orphans_hybrid`` docstring). When no
+        # embedding is available, the function aborts and returns ``[]``.
         nodes = {
             "o": {
                 "symbol_name": "AuthHandler",
@@ -252,5 +262,5 @@ class TestHybridPass2:
         out = hyb.resolve_orphans_hybrid(
             db, G, "o", flags=_flags(), embed_fn=_embed,
         )
-        assert called  # the fallback fired
-        assert {h["node_id"] for h in out} == {"match"}
+        assert called == []  # embed_fn must not be invoked
+        assert out == []

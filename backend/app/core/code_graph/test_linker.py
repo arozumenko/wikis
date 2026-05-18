@@ -64,12 +64,30 @@ def _strip_test_class(name: str) -> str:
     return name
 
 
+# Symbol types that represent "the file" rather than "a thing inside the
+# file". Same-stem matching only links these — pairing every symbol in a
+# test file with every symbol in the prod file is a Cartesian explosion
+# (measured at 1.25M edges on a single TS repo).
+_FILE_LEVEL_TYPES = frozenset({"module", "module_doc", "file_doc"})
+
+
 def link_same_stem(g: nx.MultiDiGraph) -> List[Tuple[str, str, dict]]:
-    """Pair test nodes with production nodes that share a stem."""
+    """Pair test files with production files that share a stem.
+
+    Restricted to file/module-level nodes (``module``, ``module_doc``,
+    ``file_doc``). Linking every symbol in the test file to every symbol
+    in the prod file produces an N×M Cartesian product per file pair
+    and blows the edge count up by 4–5 orders of magnitude on real
+    repositories. File-level edges still let downstream consumers walk
+    from a test file to its prod file in one hop.
+    """
     by_stem: Dict[Tuple[str, str], List[str]] = defaultdict(list)  # (stem, lang) -> nodes
     test_nodes: List[Tuple[str, str, str]] = []  # (node_id, stripped_stem, lang)
 
     for nid, data in g.nodes(data=True):
+        stype = (data.get("symbol_type") or "").lower()
+        if stype not in _FILE_LEVEL_TYPES:
+            continue
         lang = (data.get("language") or "").lower()
         stem = (data.get("file_name") or "").lower()
         if not stem:

@@ -65,6 +65,12 @@ class RelationshipResult:
     source_type: str = ""
     target_type: str = ""
     hop_distance: int = 1
+    source_node_id: str = ""
+    target_node_id: str = ""
+    source_wiki_id: str = ""
+    target_wiki_id: str = ""
+    weight: float = 1.0
+    provenance: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +493,8 @@ class GraphQueryService:
                         source_type=(src_data.get("symbol_type") or "").lower(),
                         target_type=(tgt_data.get("symbol_type") or "").lower(),
                         hop_distance=hop,
+                        source_node_id=src,
+                        target_node_id=tgt,
                     )
                 )
 

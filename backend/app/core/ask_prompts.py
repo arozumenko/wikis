@@ -48,6 +48,10 @@ Do NOT summarise prior answers — just use them as context.
 
 2. **Connect** — call `get_relationships` for the 2-3 most relevant symbols to
    understand how they relate (callers, callees, inheritance, imports).
+    In project mode, if `find_cross_repo_links` is available, use it for questions
+    about cross-repo integration, API contracts, shared DTOs, clients/servers,
+    FFI/ABI, protobuf/gRPC, GraphQL, BDD, or CLI boundaries. Treat those direct
+    project links as high-confidence evidence.
 
 3. **Read selectively** — call `get_code` ONLY for the 2-4 symbols you truly need
    to read. This is expensive (~200-2000 tokens). Do NOT dump every search result
@@ -105,6 +109,7 @@ Each tool has its own description — read it. Below are cost/strategy hints onl
 | Tool | Cost | When to use |
 |------|------|-------------|
 | `search_symbols` | Cheap | First step — discover classes, functions, modules |
+| `find_cross_repo_links` | Cheap | Project mode only — direct API-surface/contracts between repos |
 | `get_relationships` | Medium | After finding key symbols — see callers, callees, inheritance |
 | `get_code` | **Expensive** | Only 2-4 key symbols — reads full source |
 | `search_docs` | Medium | README / config / architecture questions only |

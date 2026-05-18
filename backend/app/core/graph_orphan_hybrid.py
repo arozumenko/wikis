@@ -176,15 +176,15 @@ def resolve_orphans_hybrid(
     ``orphan_rrf_threshold`` / ``orphan_hybrid_top_n``) so callers
     only need to override for explicit experiments.
 
-    Embedding source order:
+     Embedding source order:
 
     1. ``orphan_embeddings[orphan_id]`` (Phase-3 reuse cache).
     2. ``db.get_embedding_by_id(orphan_id)`` (Phase-0 storage hook).
-    3. ``embed_fn(text)`` — last resort; only invoked when the orphan
-       has neither a persisted embedding nor a cached one.
 
-    A missing embedding does NOT abort: the hybrid degrades to
-    pure-FTS with the same RRF threshold.
+     Missing embeddings abort this hybrid pass so the v2 cascade can fall
+     through to the tiered lexical pass, where IDF and type guards apply.
+     ``embed_fn`` is intentionally not called here; Pass 2 must reuse
+     persisted embeddings rather than re-embedding orphans synchronously.
     """
     flags = flags or get_feature_flags()
     k = k if k is not None else flags.orphan_rrf_k
@@ -235,23 +235,8 @@ def resolve_orphans_hybrid(
             embedding = db.get_embedding_by_id(orphan_id)
         except Exception:  # noqa: BLE001
             embedding = None
-    if embedding is None and embed_fn is not None:
-        text = ""
-        if db_node:
-            text = (
-                db_node.get("source_text", "")
-                or db_node.get("docstring", "")
-                or ""
-            )
-        if not text:
-            data = G.nodes.get(orphan_id, {}) or {}
-            text = data.get("source_text", "") or data.get("docstring", "") or ""
-        if text and len(text.strip()) >= 10:
-            try:
-                embedding = embed_fn(text)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("embed_fn for %s failed: %s", orphan_id, exc)
-                embedding = None
+    if embedding is None:
+        return []
 
     vec_hits: List[Dict[str, Any]] = []
     if embedding and db is not None and hasattr(db, "search_vec"):

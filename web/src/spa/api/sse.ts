@@ -487,11 +487,13 @@ export function subscribeRecomputeSSE(
   (async () => {
     try {
       const token = await getAuthToken();
-      const headers: Record<string, string> = {};
+      const headers: Record<string, string> = {
+        Accept: 'text/event-stream',
+      };
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
       const resp = await fetch(
-        `${API_BASE}/projects/${encodeURIComponent(projectId)}/recompute`,
+        `${API_BASE}/api/v1/projects/${encodeURIComponent(projectId)}/recompute`,
         { method: 'POST', headers, signal: controller.signal },
       );
 

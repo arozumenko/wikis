@@ -175,10 +175,12 @@ class FeatureFlags:
     #: falling back to a 16-bit file-hash suffix. ``"rel_path"``
     #: replaces the stem with a path-safe ``rel_path`` slug, which
     #: removes the collision class entirely (no hash suffix). Default
-    #: ``"stem"`` for one release; flip to ``"rel_path"`` next.
+    #: ``"rel_path"`` (flipped 2026-04-28 — the previous ``"stem"``
+    #: default left silent collisions active on every fresh rebuild).
     #: NOT retroactive — existing wikis stay on the build-time scheme
-    #: until a full rebuild.
-    node_id_style: str = "stem"
+    #: until a full rebuild. Set ``WIKI_NODE_ID_STYLE=stem`` to pin
+    #: the legacy behaviour for compat checks.
+    node_id_style: str = "rel_path"
 
     #: Build the qualified-name (``Parent.symbol``) and FQN
     #: (``rel_path::Parent.symbol``) lookup indexes on top of the
@@ -197,8 +199,13 @@ class FeatureFlags:
 
     #: Run the test↔code linker (same-stem heuristic, shared decorator,
     #: test-framework imports) and inject ``test_link`` edges. Default
-    #: off; cheap, but its weight floor affects clustering.
-    test_linker: bool = True
+    #: **off** — the same-stem heuristic produces a Cartesian explosion
+    #: between every test symbol and every prod symbol that share a
+    #: file stem (a single ``index.ts`` ↔ ``index.test.ts`` pair can
+    #: emit thousands of edges; on real repos this has been measured at
+    #: 1.25M+ edges). Re-enable only after restricting matchers to
+    #: file/module-level nodes (see :mod:`code_graph.test_linker`).
+    test_linker: bool = False
 
     #: Extract API surfaces (REST / gRPC / GraphQL / FFI / BDD / CLI)
     #: from parser output during Phase 1c and persist them on the
@@ -283,10 +290,10 @@ def get_feature_flags() -> FeatureFlags:
         orphan_hybrid_top_n=_env_int("WIKI_ORPHAN_HYBRID_TOP_N", 20),
         orphan_hybrid_alpha=_env_float("WIKI_ORPHAN_HYBRID_ALPHA", 0.5),
         orphan_hybrid_strategy=os.environ.get("WIKI_ORPHAN_HYBRID_STRATEGY", "rrf").strip() or "rrf",
-        node_id_style=(os.environ.get("WIKI_NODE_ID_STYLE", "stem").strip().lower() or "stem"),
+        node_id_style=(os.environ.get("WIKI_NODE_ID_STYLE", "rel_path").strip().lower() or "rel_path"),
         qualified_name_index=_env_bool("WIKI_QUALIFIED_NAME_INDEX", True),
         cross_language_linking=_env_bool("WIKI_CROSS_LANGUAGE_LINKING", True),
-        test_linker=_env_bool("WIKI_TEST_LINKER", True),
+        test_linker=_env_bool("WIKI_TEST_LINKER", False),
         api_surface_extraction=_env_bool("WIKI_API_SURFACE_EXTRACTION", True),
         project_graph=_env_bool("WIKI_PROJECT_GRAPH", True),
         federated_query=_env_bool("WIKI_FEDERATED_QUERY", True),

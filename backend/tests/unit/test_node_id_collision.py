@@ -47,6 +47,10 @@ def _symbol(name: str, full_name: str | None = None, stype: str = "class"):
             end=SimpleNamespace(line=10),
         ),
         parent_symbol=None,
+        source_text=f"class {name}: pass",
+        docstring="",
+        parameters=[],
+        return_type="",
     )
 
 
@@ -131,3 +135,38 @@ class TestNodeIdRelPath:
             )
 
         assert list(g.nodes()) == ["python::src__x_py::X"]
+
+    def test_rich_node_exposes_source_text_for_api_surface_extraction(self):
+        b = _builder()
+        g = nx.MultiDiGraph()
+        reg = _registry()
+
+        with patch("app.core.code_graph.graph_builder.get_feature_flags", return_value=_flags(node_id_style="rel_path")):
+            b._process_file_symbols(
+                g, "/repo/src/api.py", _result([_symbol("create_user")]),
+                "python", reg, repo_root="/repo",
+            )
+
+        node = g.nodes["python::src__api_py::create_user"]
+        assert node["source_text"] == "class create_user: pass"
+
+    def test_rel_path_resolution_does_not_fall_back_to_stem_id(self):
+        b = _builder()
+        g = nx.MultiDiGraph()
+        node_id = "python::src__service_py::Handler"
+        g.add_node(node_id)
+        node_cache = {node_id: True}
+
+        with patch("app.core.code_graph.graph_builder.get_feature_flags", return_value=_flags(node_id_style="rel_path")):
+            result = b._resolve_source_node_sync(
+                "Handler",
+                "python",
+                "service",
+                "/repo/src/service.py",
+                g,
+                _registry(),
+                {},
+                node_cache,
+            )
+
+        assert result == node_id

@@ -8,7 +8,9 @@ from typing import Any
 
 import pytest
 
+from app.core.code_graph.federated_query_service import FederatedQueryService
 from app.core.federated_retriever import FederatedRetrieverStack
+from app.core.storage.project_storage import InMemoryProjectStorage
 
 
 @dataclass
@@ -43,6 +45,16 @@ class _StubFQS:
         return self._nodes.get(node_id)
 
 
+class _NodeService:
+    def __init__(self, nodes: dict[str, dict]) -> None:
+        self._nodes = nodes
+        self.graph = None
+        self.storage = None
+
+    def get_node(self, node_id: str) -> dict | None:
+        return self._nodes.get(node_id)
+
+
 @pytest.fixture
 def base_stacks():
     return [
@@ -66,6 +78,22 @@ class TestExpansion:
         fqs = _StubFQS(
             edges={"n1": [{"target_node_id": "n2", "weight": 1.0}]},
             nodes={"n2": {"node_id": "n2", "wiki_id": "wiki-b", "content": "world"}},
+        )
+        stack = FederatedRetrieverStack(base_stacks, federated_query_service=fqs)
+        out = _run(stack.aretrieve("q", k=5))
+        node_ids = [d.metadata["node_id"] for d in out]
+        assert "n1" in node_ids and "n2" in node_ids
+
+    def test_expands_along_namespaced_cross_repo_edge(self, base_stacks):
+        fqs = _StubFQS(
+            edges={
+                "wiki-a::n1": [
+                    {"target_node_id": "wiki-b::n2", "weight": 1.0},
+                ]
+            },
+            nodes={
+                "wiki-b::n2": {"node_id": "n2", "wiki_id": "wiki-b", "content": "world"},
+            },
         )
         stack = FederatedRetrieverStack(base_stacks, federated_query_service=fqs)
         out = _run(stack.aretrieve("q", k=5))
@@ -121,6 +149,45 @@ class TestExpansion:
         )
         # n2 should appear exactly once (with the wiki-b base origin retained).
         assert keys.count("wiki-b::n2") == 1
+
+    def test_expands_with_real_project_storage_and_preserves_provenance(self, base_stacks):
+        store = InMemoryProjectStorage()
+        store.upsert_project_edge(
+            "project-1",
+            "wiki-a::n1",
+            "wiki-b::n2",
+            "cross_repo",
+            0.8,
+            provenance={
+                "source_relationship_type": "cross_repo_api_surface",
+                "surface": "GET /api/v1/users",
+                "matcher": "api_surface:rest",
+                "level": "L1",
+                "source_wiki_id": "wiki-a",
+                "target_wiki_id": "wiki-b",
+                "target_raw_node_id": "n2",
+            },
+        )
+        fqs = FederatedQueryService(
+            {
+                "wiki-a": _NodeService({"n1": {"node_id": "n1", "content": "producer"}}),
+                "wiki-b": _NodeService({"n2": {"node_id": "n2", "wiki_id": "wiki-b", "content": "consumer"}}),
+            },
+            project_id="project-1",
+            project_storage=store,
+        )
+        stack = FederatedRetrieverStack(base_stacks, federated_query_service=fqs, dampening=0.5)
+
+        out = _run(stack.aretrieve("users", k=5))
+        by_id = {doc.metadata["node_id"]: doc for doc in out}
+
+        assert "n2" in by_id
+        expanded = by_id["n2"]
+        assert expanded.metadata["project_node_id"] == "wiki-b::n2"
+        assert expanded.metadata["cross_repo_relationship_type"] == "cross_repo_api_surface"
+        assert expanded.metadata["cross_repo_surface"] == "GET /api/v1/users"
+        assert expanded.metadata["cross_repo_matcher"] == "api_surface:rest"
+        assert expanded.metadata["cross_repo_level"] == "L1"
 
 
 class TestDampeningClamp:

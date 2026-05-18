@@ -79,6 +79,10 @@ def export() -> None:
 
         schema["components"]["schemas"][model.__name__] = json_schema
 
+    raw_schema = json.dumps(schema)
+    raw_schema = raw_schema.replace("#/$defs/", "#/components/schemas/")
+    schema = json.loads(raw_schema)
+
     out = Path(__file__).resolve().parent.parent / "openapi.json"
     out.write_text(json.dumps(schema, indent=2) + "\n")
     print(f"Wrote {out}")

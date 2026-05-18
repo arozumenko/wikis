@@ -1434,6 +1434,20 @@ class PostgresWikiStorage:
         if isinstance(annotations, dict):
             annotations = json.dumps(annotations)
 
+        # Phase 1 (graph-quality roadmap): persist provenance + confidence
+        # so initial ``from_networkx`` import retains linker/parser
+        # attribution. Backfill a minimal AST provenance when nothing is
+        # set so downstream attribution never falls back to "unknown".
+        provenance = data.get("provenance")
+        if provenance is None:
+            created_by = data.get("created_by") or "ast"
+            provenance = {"source": str(created_by)}
+            rel_type_val = data.get("relationship_type")
+            if rel_type_val:
+                provenance["matcher"] = str(rel_type_val)
+        if isinstance(provenance, dict):
+            provenance = json.dumps(provenance)
+
         _s = self._strip_nul
         return {
             "source_id": _s(str(u)),
@@ -1441,6 +1455,7 @@ class PostgresWikiStorage:
             "rel_type": _s(data.get("relationship_type", "")),
             "edge_class": _s(data.get("edge_class", "structural")),
             "analysis_level": _s(data.get("analysis_level", "comprehensive")),
+            "confidence": _s(data.get("confidence", "EXTRACTED")),
             "weight": data.get("weight", 1.0),
             "raw_similarity": data.get("raw_similarity"),
             "source_file": _s(data.get("source_file", "")),
@@ -1448,6 +1463,7 @@ class PostgresWikiStorage:
             "language": _s(data.get("language", "")),
             "annotations": _s(annotations),
             "created_by": _s(data.get("created_by", "ast")),
+            "provenance": _s(provenance) if isinstance(provenance, str) else provenance,
         }
 
     def to_networkx(self) -> nx.MultiDiGraph:
@@ -1471,6 +1487,17 @@ class PostgresWikiStorage:
                         d["parameters"] = json.loads(params)
                     except (json.JSONDecodeError, TypeError):
                         pass
+                # api_surface is JSONB and normally arrives as list/dict.
+                # Defensive: if any driver returns it as a raw JSON string,
+                # decode it so downstream consumers (cross-language linker,
+                # project recompute) see the structured payload rather than
+                # treating the string as truthy and dropping every surface.
+                api_surface = d.get("api_surface")
+                if api_surface and isinstance(api_surface, str):
+                    try:
+                        d["api_surface"] = json.loads(api_surface)
+                    except (json.JSONDecodeError, TypeError):
+                        d["api_surface"] = None
                 G.add_node(nid, **d)
 
             # Edges

@@ -8,6 +8,8 @@ Run with:
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -30,6 +32,8 @@ async def client(tmp_path, monkeypatch):
     """FastAPI test client with in-memory SQLite and AUTH_ENABLED=false."""
     monkeypatch.setenv("AUTH_ENABLED", "false")
     monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("WIKI_STORAGE_BACKEND", "sqlite")
 
     engine, session_factory = await _make_session_factory()
     app = create_app()
@@ -265,6 +269,30 @@ class TestDeleteProject:
             )
             wiki = result.scalar_one_or_none()
         assert wiki is not None, "Wiki should not be deleted when project is deleted"
+
+    @pytest.mark.asyncio
+    async def test_delete_project_removes_project_graph_storage(self, client):
+        """Deleting a project removes its per-project SQLite graph DB."""
+        c, app, _sf = client
+        from app.core.storage.project_storage import SqliteProjectStorage, open_project_storage
+
+        create_resp = await c.post("/api/v1/projects", json={"name": "With Graph"})
+        project_id = create_resp.json()["id"]
+        store = open_project_storage(
+            project_id,
+            cache_dir=app.state.settings.cache_dir,
+            settings=app.state.settings,
+        )
+        assert isinstance(store, SqliteProjectStorage)
+        store.upsert_project_node(project_id, "n1", "wiki-1", {"symbol_name": "Config"})
+        db_path = store._db_path
+        store.close()
+        assert db_path and os.path.exists(db_path)
+
+        resp = await c.delete(f"/api/v1/projects/{project_id}")
+
+        assert resp.status_code == 200
+        assert not os.path.exists(db_path)
 
 
 # ---------------------------------------------------------------------------

@@ -26,6 +26,7 @@ fast no-op and returns ``{"status": "skipped"}``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable
@@ -40,7 +41,12 @@ from app.storage.base import ArtifactStorage
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["recompute_project", "mark_projects_for_wiki_stale", "maybe_enqueue_recompute"]
+__all__ = [
+    "recompute_project",
+    "mark_projects_for_wiki_stale",
+    "mark_project_stale",
+    "maybe_enqueue_recompute",
+]
 
 
 EventEmitter = Callable[[Any], Awaitable[None] | None]
@@ -84,6 +90,14 @@ def _features_from_graph(graph) -> dict[str, list[str]]:
             symbol_names.append(str(name))
 
         surfaces = data.get("api_surface") or []
+        # ``to_networkx`` (SQLite backend) leaves ``api_surface`` as the
+        # raw JSON string from the TEXT column — decode lazily so the
+        # scorer sees the same list[dict] shape regardless of source.
+        if isinstance(surfaces, str):
+            try:
+                surfaces = json.loads(surfaces) or []
+            except (json.JSONDecodeError, TypeError):
+                surfaces = []
         for surf in surfaces:
             key = None
             if isinstance(surf, dict):
@@ -167,7 +181,7 @@ async def recompute_project(
     ``pair_count``, ``edge_count``, and (when clustering ran)
     ``community_count``.
     """
-    from app.core.code_graph.cross_repo_linker import build_cross_repo_edges
+    from app.core.code_graph.cross_repo_linker import build_cross_repo_edges, make_project_node_id
     from app.core.code_graph.relatedness_scorer import score_repo_pair
     from app.core.feature_flags import get_feature_flags
     from app.core.storage.project_storage import open_project_storage
@@ -193,12 +207,6 @@ async def recompute_project(
     cap = max(int(getattr(flags, "project_max_wikis", 50) or 0), 0)
     if cap > 0:
         wiki_ids = wiki_ids[:cap]
-    if len(wiki_ids) < 2:
-        return {
-            "status": "skipped",
-            "reason": "fewer_than_two_wikis",
-            "wiki_count": len(wiki_ids),
-        }
 
     # --- Open project storage -----------------------------------------
     project_storage = open_project_storage(
@@ -206,6 +214,36 @@ async def recompute_project(
         cache_dir=getattr(settings, "cache_dir", None),
         settings=settings,
     )
+
+    try:
+        if project_storage.get_project_meta(project_id, "recompute_in_progress"):
+            return {"status": "skipped", "reason": "recompute_in_progress"}
+        project_storage.set_project_meta(project_id, "recompute_in_progress", True)
+    except Exception:
+        logger.debug("persist recompute_in_progress meta failed", exc_info=True)
+
+    try:
+        project_storage.clear_project_edges(project_id)
+        project_storage.clear_repo_relatedness(project_id)
+        project_storage.clear_project_nodes(project_id)
+    except Exception:
+        logger.debug("clear stale project graph rows failed", exc_info=True)
+
+    if len(wiki_ids) < 2:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            project_storage.set_project_meta(project_id, "communities", {})
+            project_storage.set_project_meta(project_id, "recomputed_at", now_iso)
+            project_storage.set_project_meta(project_id, "stale", False)
+            project_storage.set_project_meta(project_id, "recompute_in_progress", False)
+        except Exception:
+            logger.debug("persist fewer-than-two-wikis meta failed", exc_info=True)
+        return {
+            "status": "skipped",
+            "reason": "fewer_than_two_wikis",
+            "wiki_count": len(wiki_ids),
+            "recomputed_at": now_iso,
+        }
 
     # --- Per-wiki feature extraction ----------------------------------
     feature_map: dict[str, dict[str, list[str]]] = {}
@@ -224,15 +262,41 @@ async def recompute_project(
             logger.warning("recompute: failed to build components for %s", wid, exc_info=True)
             continue
         graph = getattr(comp, "code_graph", None)
+        # ``build_engine_components`` is shared with Ask/Research, which
+        # operate storage-native and therefore receive an empty NX graph.
+        # Project recompute needs the real graph for feature extraction
+        # and the merged-graph cross-repo linker — rehydrate from the
+        # unified storage handle when ``code_graph`` is trivially empty.
+        if (
+            (graph is None or graph.number_of_nodes() == 0)
+            and getattr(comp, "storage", None) is not None
+        ):
+            try:
+                graph = await asyncio.to_thread(comp.storage.to_networkx)
+                comp.code_graph = graph
+            except Exception:
+                logger.warning(
+                    "recompute: storage.to_networkx() failed for %s", wid, exc_info=True
+                )
         feature_map[wid] = _features_from_graph(graph)
 
         if merged_graph is not None and graph is not None:
             for nid, data in graph.nodes(data=True):
+                project_node_id = make_project_node_id(wid, str(nid))
                 tagged = dict(data)
                 tagged["wiki_id"] = wid
-                merged_graph.add_node(nid, **tagged)
+                tagged["raw_node_id"] = str(nid)
+                merged_graph.add_node(project_node_id, **tagged)
+                try:
+                    project_storage.upsert_project_node(project_id, project_node_id, wid, tagged)
+                except Exception:
+                    logger.debug("upsert_project_node failed", exc_info=True)
             for s, t, edata in graph.edges(data=True):
-                merged_graph.add_edge(s, t, **edata)
+                merged_graph.add_edge(
+                    make_project_node_id(wid, str(s)),
+                    make_project_node_id(wid, str(t)),
+                    **edata,
+                )
 
     # --- Pair scoring -------------------------------------------------
     pair_threshold = float(getattr(flags, "relatedness_threshold", 0.15) or 0.15)
@@ -295,11 +359,29 @@ async def recompute_project(
                 project_id=project_id,
             ),
         )
+        # Extract API surfaces from the merged graph so the cascade has
+        # real L1 evidence (without this every cross-repo run produced
+        # zero edges even when relatedness passed). Best-effort —
+        # surfaces_by_node defaults to ``{}`` on any failure.
+        surfaces_by_node: dict[str, list[dict]] = {}
+        try:
+            from app.core.code_graph.api_surface_extractor import (
+                extract_api_surfaces_for_graph,
+            )
+
+            surfaces_by_node = extract_api_surfaces_for_graph(merged_graph) or {}
+        except Exception:
+            logger.warning(
+                "recompute: extract_api_surfaces_for_graph failed",
+                exc_info=True,
+            )
+            surfaces_by_node = {}
         try:
             edge_rows = build_cross_repo_edges(
                 wiki_ids=wiki_ids,
                 merged_graph=merged_graph,
                 relatedness=relatedness,
+                surfaces_by_node=surfaces_by_node,
                 threshold=pair_threshold,
                 dampening=float(getattr(flags, "cross_repo_dampening", 0.7) or 0.7),
                 max_wikis=cap if cap > 0 else len(wiki_ids),
@@ -365,6 +447,7 @@ async def recompute_project(
     try:
         project_storage.set_project_meta(project_id, "recomputed_at", now_iso)
         project_storage.set_project_meta(project_id, "stale", False)
+        project_storage.set_project_meta(project_id, "recompute_in_progress", False)
     except Exception:
         logger.debug("persist recomputed_at meta failed", exc_info=True)
 
@@ -412,6 +495,46 @@ def mark_projects_for_wiki_stale(
             logger.debug(
                 "mark_projects_for_wiki_stale failed for %s", pid, exc_info=True
             )
+
+
+def mark_project_stale(
+    *,
+    project_id: str,
+    reason: str,
+    settings: Settings,
+) -> bool:
+    """Mark a single project as stale with a free-form ``reason``.
+
+    Used by lifecycle hooks (project metadata update, wiki added,
+    wiki removed) so the next read-time
+    :func:`maybe_enqueue_recompute` call enqueues a background
+    recompute. Returns ``True`` if the stale flag was written, ``False``
+    if project_graph storage is disabled or unavailable.
+    """
+    from app.core.feature_flags import get_feature_flags
+    from app.core.storage.project_storage import open_project_storage
+
+    flags = get_feature_flags()
+    if not flags.project_graph:
+        return False
+
+    try:
+        store = open_project_storage(
+            project_id,
+            cache_dir=getattr(settings, "cache_dir", None),
+            settings=settings,
+        )
+        store.set_project_meta(project_id, "stale", True)
+        store.set_project_meta(project_id, "stale_reason", reason)
+        return True
+    except Exception:
+        logger.debug(
+            "mark_project_stale failed for %s (reason=%s)",
+            project_id,
+            reason,
+            exc_info=True,
+        )
+        return False
 
 
 # ----------------------------------------------------------------------

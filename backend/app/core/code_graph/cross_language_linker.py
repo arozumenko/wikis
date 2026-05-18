@@ -58,6 +58,86 @@ def _locality_factor(g: nx.MultiDiGraph, src: str, tgt: str) -> float:
     return 1.0 if pa == pb else 0.7
 
 
+def _rest_surface_parts(surface: str) -> tuple[str, str] | None:
+    try:
+        method, path = str(surface or "").split(" ", 1)
+    except ValueError:
+        return None
+    if not method or not path.startswith("/"):
+        return None
+    return method.upper(), path
+
+
+def _rest_methods_by_node(
+    surfaces_by_node: Dict[str, List[APISurface]],
+) -> dict[tuple[str, str], set[str]]:
+    methods: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for node_id, surfaces in surfaces_by_node.items():
+        for surface in surfaces:
+            if surface.get("kind") != "rest":
+                continue
+            parts = _rest_surface_parts(surface.get("surface", ""))
+            if not parts:
+                continue
+            method, path = parts
+            if method != "*":
+                methods[(node_id, path)].add(method)
+    return methods
+
+
+def _skip_rest_path_only_pair(
+    *,
+    kind: str,
+    surface: str,
+    src: str,
+    tgt: str,
+    rest_methods: dict[tuple[str, str], set[str]],
+) -> bool:
+    if kind != "rest":
+        return False
+    parts = _rest_surface_parts(surface)
+    if not parts:
+        return False
+    method, path = parts
+    if method != "*":
+        return False
+    src_methods = rest_methods.get((src, path), set())
+    tgt_methods = rest_methods.get((tgt, path), set())
+    # The method-agnostic twin is for asymmetric contracts where one side
+    # only exposes a literal path. If both sides know verbs, method-specific
+    # surfaces should represent matches and prevent GET↔POST false links.
+    return bool(src_methods and tgt_methods)
+
+
+def _edge_specificity(attrs: dict) -> tuple[int, float]:
+    provenance = attrs.get("provenance") or {}
+    surface = str(provenance.get("surface") or "")
+    matcher = str(provenance.get("matcher") or "")
+    level = str(provenance.get("level") or "")
+
+    if level == "L0":
+        rank = 100
+    elif surface.startswith("ffi:") or matcher.endswith(":ffi"):
+        rank = 90
+    elif surface.startswith("grpc:") or matcher.endswith(":grpc"):
+        rank = 85
+    elif surface.startswith("graphql:") or matcher.endswith(":graphql"):
+        rank = 80
+    elif surface.startswith("obj:") or matcher.endswith(":obj"):
+        rank = 75
+    else:
+        rest_parts = _rest_surface_parts(surface)
+        if rest_parts and rest_parts[0] != "*":
+            rank = 70
+        elif rest_parts:
+            rank = 55
+        elif surface.startswith("name:") or matcher.endswith(":name"):
+            rank = 10
+        else:
+            rank = 40
+    return rank, float(attrs.get("weight", 0.0) or 0.0)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # L0 — Exact name + signature (parser-supplied cross-lang relationships)
 # ──────────────────────────────────────────────────────────────────────
@@ -112,6 +192,7 @@ def link_l1_api_surface(
         for s in surfaces:
             by_surface[(s["kind"], s["surface"])].append((node_id, s))
 
+    rest_methods = _rest_methods_by_node(surfaces_by_node)
     out: List[Tuple[str, str, dict]] = []
     for (kind, surface), nodes in by_surface.items():
         if len(nodes) < 2:
@@ -124,6 +205,14 @@ def link_l1_api_surface(
                 tgt, tgt_s = nodes[j]
                 if _node_language(g, src) == _node_language(g, tgt):
                     continue
+                if _skip_rest_path_only_pair(
+                    kind=kind,
+                    surface=surface,
+                    src=src,
+                    tgt=tgt,
+                    rest_methods=rest_methods,
+                ):
+                    continue
                 base = 0.7 * (src_s.get("weight_hint", 0.5) + tgt_s.get("weight_hint", 0.5)) / 2.0
                 weight = _clamp(base * _locality_factor(g, src, tgt) * specificity)
                 attrs = {
@@ -134,6 +223,66 @@ def link_l1_api_surface(
                         "source": "cross_language_linker",
                         "level": "L1",
                         "matcher": f"api_surface:{kind}",
+                        "surface": surface,
+                    },
+                }
+                out.append((src, tgt, attrs))
+    return out
+
+
+def link_api_surface_any_language(
+    g: nx.MultiDiGraph,
+    surfaces_by_node: Dict[str, List[APISurface]],
+    *,
+    edge_class: str = "cross_language",
+    relationship_type: str = "api_surface_any_language",
+    provenance_source: str = "cross_repo_linker",
+    provenance_level: str = "L1",
+) -> List[Tuple[str, str, dict]]:
+    """Variant of :func:`link_l1_api_surface` that does **not** require
+    the two endpoints to be in different languages.
+
+    Used by Phase 8 cross-repo linking, where two repos in the same
+    language (e.g. two Python services exposing ``POST /api/users``)
+    must still be paired by their shared API surface. The caller is
+    responsible for filtering out within-repo edges via the
+    ``wiki_id`` node attribute.
+    """
+    by_surface: Dict[Tuple[str, str], List[Tuple[str, APISurface]]] = defaultdict(list)
+    for node_id, surfaces in surfaces_by_node.items():
+        if not g.has_node(node_id):
+            continue
+        for s in surfaces:
+            by_surface[(s["kind"], s["surface"])].append((node_id, s))
+
+    rest_methods = _rest_methods_by_node(surfaces_by_node)
+    out: List[Tuple[str, str, dict]] = []
+    for (kind, surface), nodes in by_surface.items():
+        if len(nodes) < 2:
+            continue
+        specificity = 1.0 / math.log(1.0 + len(nodes))
+        for i in range(len(nodes)):
+            for j in range(i + 1, len(nodes)):
+                src, src_s = nodes[i]
+                tgt, tgt_s = nodes[j]
+                if _skip_rest_path_only_pair(
+                    kind=kind,
+                    surface=surface,
+                    src=src,
+                    tgt=tgt,
+                    rest_methods=rest_methods,
+                ):
+                    continue
+                base = 0.7 * (src_s.get("weight_hint", 0.5) + tgt_s.get("weight_hint", 0.5)) / 2.0
+                weight = _clamp(base * _locality_factor(g, src, tgt) * specificity)
+                attrs = {
+                    "relationship_type": relationship_type,
+                    "edge_class": edge_class,
+                    "weight": weight,
+                    "provenance": {
+                        "source": provenance_source,
+                        "level": provenance_level,
+                        "matcher": f"api_surface_any:{kind}",
                         "surface": surface,
                     },
                 }
@@ -285,12 +434,10 @@ def run_cross_language_linker(
     # L3 runs over the union of L0/L1/L2 results so far.
     edges.extend(link_l3_containment(g, list(edges)))
 
-    seen: set = set()
-    deduped: List[Tuple[str, str, dict]] = []
+    best_by_key: dict[tuple[str, str, Any], Tuple[str, str, dict]] = {}
     for src, tgt, attrs in edges:
         key = (src, tgt, attrs.get("relationship_type"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append((src, tgt, attrs))
-    return deduped
+        current = best_by_key.get(key)
+        if current is None or _edge_specificity(attrs) > _edge_specificity(current[2]):
+            best_by_key[key] = (src, tgt, attrs)
+    return list(best_by_key.values())
