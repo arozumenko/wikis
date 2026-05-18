@@ -38,6 +38,7 @@ import {
 } from '@mui/material';
 import {
   generateWikiMultiSource,
+  hashScanRequest,
   type AtlassianAuth,
   type GenerateWikiMultiSourceRequest,
   type GenerateWikiResponse,
@@ -231,12 +232,13 @@ export function AddSourceWizard({
     atlassian,
   ]);
 
-  // Scope hash for the cache check in StepScan — same JSON shape it
-  // hashes internally so a Back→Next on the same scope short-circuits.
+  // Scope hash for the cache check in StepScan. Uses the shared
+  // hashScanRequest helper (#217) so auth presence is included — toggling
+  // from no-PAT to paste-PAT invalidates the cached scan result.
   const currentScopeHash = useMemo<string | null>(() => {
     const req = buildScanRequest();
     if (!req) return null;
-    return JSON.stringify({ type: req.source_type, scope: req.scope });
+    return hashScanRequest(req);
   }, [buildScanRequest]);
 
   // ---------------------------------------------------------------------
