@@ -44,18 +44,34 @@ class WikiManagementService:
         status: str = "complete",
         requires_token: bool = False,
         error: str | None = None,
+        source_type: str | None = None,
+        source_scope: dict | None = None,
     ) -> None:
         """Upsert a wiki record into the database.
 
         Called at generation START (status='generating') and again on
         completion/failure so the record always exists for retry/404 recovery.
+
+        Args:
+            source_type: Connector type — "git", "confluence", or "jira".
+                         NULL in legacy rows is read as "git" by the service.
+            source_scope: Scope dict identifying the content origin (no credentials).
+                         For git: {"repo_url": ..., "branch": ...}.
+                         For Confluence: {"base_url": ..., "space_keys": [...]}.
+                         For Jira: {"base_url": ..., "jql": ...}.
+                         Credentials (access_token etc.) are NEVER stored here.
         """
+        import json as _json
+
         async with self.session_factory() as session:
             async with session.begin():
                 result = await session.execute(select(WikiRecord).where(WikiRecord.id == wiki_id))
                 record = result.scalar_one_or_none()
 
                 now = datetime.now()
+                # Serialize scope dict for storage (TEXT in SQLite, JSON in PG).
+                scope_serialized = _json.dumps(source_scope) if source_scope is not None else None
+
                 if record is None:
                     record = WikiRecord(
                         id=wiki_id,
@@ -72,6 +88,8 @@ class WikiManagementService:
                         status=status,
                         requires_token=1 if requires_token else 0,
                         error=error,
+                        source_type=source_type or "git",
+                        source_scope=scope_serialized,
                     )
                     session.add(record)
                 else:
@@ -95,6 +113,11 @@ class WikiManagementService:
                         # Only overwrite visibility when explicitly non-default or on fresh start
                         if visibility != "personal":
                             record.visibility = visibility
+                    # Update source_type / source_scope when provided.
+                    if source_type is not None:
+                        record.source_type = source_type
+                    if scope_serialized is not None:
+                        record.source_scope = scope_serialized
 
         logger.info("Registered wiki: %s (owner=%s, status=%s)", wiki_id, owner_id, status)
 

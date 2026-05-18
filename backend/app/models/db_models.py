@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy import Column, DateTime, Index, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import JSON
 
 
 class Base(DeclarativeBase):
@@ -30,6 +31,14 @@ class WikiRecord(Base):
     requires_token = Column(Integer, default=0)  # 1 if repo required an access token (Boolean as int for SQLite)
     error = Column(String, nullable=True)  # error message for failed generations
     description = Column(String, nullable=True)  # user-editable wiki description
+    # Source-toolkit fields (#189): identifies the connector used to generate this wiki.
+    # NULL in legacy rows is read as "git" by the service layer (backwards compat).
+    source_type = Column(String, nullable=True, default="git")  # git | confluence | jira
+    # Scope dict stored as JSON — e.g. {"repo_url": "...", "branch": "..."}
+    # or {"base_url": "...", "space_keys": [...]} for Confluence.
+    # Credentials (access_token etc.) are NEVER stored here — they live only
+    # in the in-memory SourceToolkit instance during generation.
+    source_scope = Column(JSON, nullable=True)
 
     __table_args__ = (Index("ix_wiki_owner_visibility", "owner_id", "visibility"),)
 

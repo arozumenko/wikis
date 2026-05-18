@@ -107,6 +107,10 @@ async def _add_missing_columns(engine: AsyncEngine) -> None:
         ("wiki", "requires_token", "INTEGER", "0"),
         ("wiki", "error", "VARCHAR", None),
         ("wiki", "description", "VARCHAR", None),
+        # #189: source-toolkit columns; NULL in existing rows reads as "git".
+        ("wiki", "source_type", "VARCHAR", "'git'"),
+        # JSON stored as TEXT in SQLite; PostgreSQL uses a native JSON column.
+        ("wiki", "source_scope", "TEXT", None),
     ]
 
     # All identifiers are hardcoded constants — no user input in SQL.
