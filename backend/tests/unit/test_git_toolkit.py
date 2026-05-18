@@ -454,7 +454,8 @@ def test_safe_url_strips_embedded_credentials():
 # ---------------------------------------------------------------------------
 
 
-def test_clone_timeout_raises_source_unavailable():
+@pytest.mark.asyncio
+async def test_clone_timeout_raises_source_unavailable():
     """When subprocess.run raises TimeoutExpired, _ensure_workdir must raise
     SourceUnavailableError with the safe (credential-free) URL in the message.
     """
@@ -465,7 +466,7 @@ def test_clone_timeout_raises_source_unavailable():
 
     with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["git", "clone"], timeout=75)):
         with pytest.raises(SourceUnavailableError, match="git clone timed out for"):
-            toolkit._ensure_workdir()
+            await toolkit._ensure_workdir()
 
 
 # ---------------------------------------------------------------------------
@@ -502,9 +503,12 @@ async def test_connection_does_not_block_event_loop(tmp_path: Path):
     tk2 = GitToolkit(repo_url="https://github.com/example/repo2.git")
 
     with patch("subprocess.run", side_effect=_fake_subprocess):
+        # _ensure_workdir is async (#214) and itself uses asyncio.to_thread
+        # for the subprocess calls. Awaiting both directly via gather is
+        # what proves the event loop is not blocked.
         await asyncio.gather(
-            asyncio.to_thread(tk1._ensure_workdir),
-            asyncio.to_thread(tk2._ensure_workdir),
+            tk1._ensure_workdir(),
+            tk2._ensure_workdir(),
         )
 
     assert len(call_records) == 2, "Expected exactly 2 git-clone calls (one per toolkit)"

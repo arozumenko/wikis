@@ -6,6 +6,7 @@ Supports remote URLs (GitHub, GitLab, Bitbucket, Azure DevOps) and local paths.
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import logging
 import shutil
@@ -310,19 +311,24 @@ class GitToolkit(SourceToolkit):
         """
         return _strip_url_credentials(self._repo_url)
 
-    def _ensure_workdir(self) -> None:
+    async def _ensure_workdir(self) -> None:
         """Resolve or clone the repository exactly once.
 
         For local paths this is a no-op (the path IS the working tree).
-        For remote URLs, we shallow-clone into a fresh temp directory.
+        For remote URLs, shallow-clone into a fresh temp directory.
+
+        All ``subprocess.run`` calls are offloaded to a worker thread via
+        ``asyncio.to_thread`` (#214) so the FastAPI event loop is never
+        blocked by blocking I/O. Combined with the per-call ``timeout=``
+        on each subprocess, the worker thread is guaranteed to release.
 
         Warning:
             This method is NOT safe for concurrent calls on the same instance.
-            Two coroutines calling ``_ensure_workdir`` concurrently (e.g. via
-            ``asyncio.to_thread``) can both pass the ``self._workdir is not None``
-            guard before either sets the attribute, resulting in a double-clone
-            race.  Current callers (``source_materializer.py``, scan service) are
-            all serial, so this is latent rather than active.  A proper fix
+            Two coroutines calling ``_ensure_workdir`` concurrently can both
+            pass the ``self._workdir is not None`` guard before either sets
+            the attribute, resulting in a double-clone race. Current callers
+            (``source_materializer.py``, scan service) are all serial, so
+            this is latent rather than active. A proper fix
             (``asyncio.Lock``) is tracked in a follow-up issue.
         """
         if self._workdir is not None:
@@ -339,7 +345,7 @@ class GitToolkit(SourceToolkit):
                 raise SourceNotFoundError(f"Local path does not exist: {resolved}")
             self._workdir = resolved
 
-            info = extract_git_metadata(resolved)
+            info = await asyncio.to_thread(extract_git_metadata, resolved)
             if info.is_git:
                 self._commit_sha = info.commit_hash
         else:
@@ -360,7 +366,8 @@ class GitToolkit(SourceToolkit):
             ]
             logger.debug("Cloning %s (branch: %s)", self._safe_url(), self._branch)
             try:
-                result = subprocess.run(  # noqa: S603
+                result = await asyncio.to_thread(
+                    subprocess.run,  # noqa: S603
                     cmd,
                     capture_output=True,
                     text=True,
@@ -386,7 +393,8 @@ class GitToolkit(SourceToolkit):
 
             # Read the commit SHA from the local clone.
             try:
-                rev_result = subprocess.run(  # noqa: S603
+                rev_result = await asyncio.to_thread(
+                    subprocess.run,  # noqa: S603
                     ["git", "rev-parse", "HEAD"],
                     cwd=self._workdir,
                     capture_output=True,
@@ -426,7 +434,7 @@ class GitToolkit(SourceToolkit):
             ``include``/``exclude`` patterns explicitly.  This keeps the toolkit
             composable — the filter policy lives with the caller.
         """
-        self._ensure_workdir()
+        await self._ensure_workdir()
         workdir = self._workdir
         assert workdir is not None  # noqa: S101 — guaranteed by _ensure_workdir
 
@@ -492,7 +500,7 @@ class GitToolkit(SourceToolkit):
         Args:
             pointer: An OriginPointer whose ``ref`` is the repo-relative path.
         """
-        self._ensure_workdir()
+        await self._ensure_workdir()
         workdir = self._workdir
         assert workdir is not None  # noqa: S101
 
@@ -541,7 +549,9 @@ class GitToolkit(SourceToolkit):
         auth_url = self._auth_url()
         cmd = ["git", "ls-remote", "--heads", auth_url]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)  # noqa: S603
+            result = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=30, check=False  # noqa: S603
+            )
         except subprocess.TimeoutExpired as exc:
             raise SourceUnavailableError(f"Timed out connecting to {self._safe_url()}") from exc
         except Exception as exc:
