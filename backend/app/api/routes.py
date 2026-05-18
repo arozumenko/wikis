@@ -152,15 +152,7 @@ async def generate_wiki(
 # ---------------------------------------------------------------------------
 
 
-@router.post(
-    "/sources/scan",
-    response_model=ScanResponse,
-    responses={
-        400: {"model": ErrorResponse},
-        422: {"model": ErrorResponse},
-        501: {"model": ErrorResponse},
-    },
-)
+@router.post("/sources/scan", response_model=ScanResponse)
 async def scan_source(
     request: ScanRequest,
     user: CurrentUser = Depends(get_current_user),
@@ -170,6 +162,21 @@ async def scan_source(
     Drives Step 3 (Scan) of the ingestion wizard (#208). Persists nothing:
     no ``WikiRecord``, no invocation registration, no token write. The
     response carries reachability + a connector-specific preview shape.
+
+    Errors (no ``responses=`` declaration intentionally — the 400 and 501
+    bodies don't match :class:`ErrorResponse`'s top-level shape and the
+    SPA codegen would otherwise produce wrong client types. A proper
+    error envelope lands with #211 once Atlassian scan settles the
+    response model across all source types.):
+
+    * ``400`` — ``{"detail": {"error": <message>, "reachable": <bool>}}``
+      for unreachable / auth-fail / invalid-scope.
+    * ``501`` — ``{"detail": <message>}`` for confluence/jira until #211.
+
+    TODO(follow-up): rate-limit / tmpdir-exhaustion guard. A malicious
+    authenticated user can fan out concurrent scans; each shallow clone
+    creates a tmpdir for the context-manager lifetime. Belongs at the
+    gateway / network policy layer rather than in this handler.
     """
     from app.services.source_scan_service import ScanError, SourceScanService
 
