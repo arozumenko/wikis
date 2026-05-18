@@ -6,9 +6,6 @@ import {
   CardActionArea,
   Chip,
   CircularProgress,
-  Dialog,
-  DialogContent,
-  DialogTitle,
   Grid,
   IconButton,
   InputAdornment,
@@ -32,12 +29,11 @@ import ShareIcon from '@mui/icons-material/Share';
 import { useNavigate, useOutletContext } from 'react-router-dom';
 import type { AppShellOutletContext } from '../components/AppShell';
 import { ConfirmDialog } from '../components/ConfirmDialog';
-import { GenerateForm } from '../components/GenerateForm';
+import { AddSourceWizard } from '../components/wizard/AddSourceWizard';
 import { ImportWikiDialog } from '../components/ImportWikiDialog';
 import { ProjectCard } from '../components/ProjectCard';
 import { CreateProjectDialog } from '../components/CreateProjectDialog';
-import { listWikis, deleteWiki, generateWikiMultiSource, updateWikiVisibility } from '../api/wiki';
-import type { GenerateWikiMultiSourceRequest } from '../api/wiki';
+import { listWikis, deleteWiki, updateWikiVisibility } from '../api/wiki';
 import { listProjects, type ProjectResponse } from '../api/project';
 import { ApiError } from '../api/client';
 import { useResume } from '../hooks/useResume';
@@ -96,7 +92,6 @@ export function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [searchUrl, setSearchUrl] = useState('');
-  const [submitting, setSubmitting] = useState(false);
   const [showGenerateModal, setShowGenerateModal] = useState(false);
   const [showCreateProjectDialog, setShowCreateProjectDialog] = useState(false);
   const [visibilityFilter, setVisibilityFilter] = useState<VisibilityFilter>('all');
@@ -709,46 +704,25 @@ export function DashboardPage() {
         })}
       </Grid>}
 
-      <Dialog
+      <AddSourceWizard
+        key={searchUrl.trim()}
         open={showGenerateModal}
         onClose={() => setShowGenerateModal(false)}
-        maxWidth="sm"
-        fullWidth
-      >
-        <DialogTitle>Generate Wiki</DialogTitle>
-        <DialogContent>
-          <GenerateForm
-            key={searchUrl.trim()}
-            disabled={submitting}
-            initialUrl={searchUrl.trim()}
-            onSubmitMultiSource={async (req: GenerateWikiMultiSourceRequest) => {
-              setSubmitting(true);
-              try {
-                const response = await generateWikiMultiSource(req);
-                setShowGenerateModal(false);
-                navigate(
-                  `/wiki/${response.wiki_id}?generating=true&invocation=${response.invocation_id}`,
-                );
-              } catch (err: unknown) {
-                // 409 Conflict — wiki already exists, navigate to it
-                if (err && typeof err === 'object' && 'status' in err && (err as { status: number }).status === 409) {
-                  const body = (err as { body?: { detail?: { wiki_id?: string } } }).body;
-                  const wikiId = body?.detail?.wiki_id;
-                  setShowGenerateModal(false);
-                  if (wikiId) {
-                    navigate(`/wiki/${wikiId}`);
-                  }
-                  // If no wiki_id, just close the modal — the existing wiki is visible on the dashboard
-                  return;
-                }
-                throw err;
-              } finally {
-                setSubmitting(false);
-              }
-            }}
-          />
-        </DialogContent>
-      </Dialog>
+        initialUrl={searchUrl.trim()}
+        onSuccess={(response) => {
+          setShowGenerateModal(false);
+          navigate(
+            `/wiki/${response.wiki_id}?generating=true&invocation=${response.invocation_id}`,
+          );
+        }}
+        onAlreadyExists={(existingWikiId) => {
+          // 409 — wiki already exists. Navigate to the existing wiki if
+          // the backend told us which one; otherwise just close (the
+          // dashboard card list will reflect reality on the next refetch).
+          setShowGenerateModal(false);
+          if (existingWikiId) navigate(`/wiki/${existingWikiId}`);
+        }}
+      />
 
       <ImportWikiDialog
         open={importDialogOpen}
