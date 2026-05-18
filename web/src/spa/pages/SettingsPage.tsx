@@ -26,6 +26,7 @@ import DeleteIcon from '@mui/icons-material/Delete';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import { IntegrationsTab } from '../components/IntegrationsTab';
 import { AccountTab } from '../components/AccountTab';
+import { ConnectionsPage } from './ConnectionsPage';
 
 const AUTH_URL = ''; // Same origin
 
@@ -126,6 +127,7 @@ export function SettingsPage() {
         <Tab label="Account" />
         <Tab label="API Keys" />
         <Tab label="Integrations" />
+        <Tab label="Connections" />
       </Tabs>
 
       {/* Account tab */}
@@ -212,6 +214,9 @@ export function SettingsPage() {
 
       {/* Integrations tab */}
       {tab === 2 && <IntegrationsTab />}
+
+      {/* Connections tab */}
+      {tab === 3 && <ConnectionsPage />}
 
       {/* Create dialog */}
       <Dialog open={showCreate} onClose={() => setShowCreate(false)}>

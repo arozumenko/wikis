@@ -8,6 +8,7 @@ import { RepoContextProvider } from './context/RepoContext';
 import { ProjectProvider } from './context/ProjectContext';
 import { useThemeMode } from './hooks/useThemeMode';
 import { createAppTheme } from './theme';
+import { OAuthCallback } from './pages/OAuthCallback';
 
 const DashboardPage = lazy(() =>
   import('./pages/DashboardPage').then((m) => ({ default: m.DashboardPage })),
@@ -39,27 +40,36 @@ export function App() {
       <CssBaseline />
       <ErrorBoundary>
         <BrowserRouter>
-          <AuthGuard>
-            <RepoContextProvider>
-              <Suspense fallback={<PageLoader />}>
-                <Routes>
-                  <Route element={<AppShellWithRepo mode={mode} onToggleTheme={toggleMode} />}>
-                    <Route index element={<DashboardPage />} />
-                    <Route path="wiki/:wikiId" element={<WikiViewerPage mode={mode} />} />
-                    <Route path="settings" element={<SettingsPage />} />
-                    <Route
-                      path="project/:projectId"
-                      element={
-                        <ProjectProvider>
-                          <ProjectPage />
-                        </ProjectProvider>
-                      }
-                    />
-                  </Route>
-                </Routes>
-              </Suspense>
-            </RepoContextProvider>
-          </AuthGuard>
+          {/* OAuth callback runs outside AuthGuard — the popup has no session cookie */}
+          <Routes>
+            <Route path="oauth/atlassian/callback" element={<OAuthCallback />} />
+            <Route
+              path="*"
+              element={
+                <AuthGuard>
+                  <RepoContextProvider>
+                    <Suspense fallback={<PageLoader />}>
+                      <Routes>
+                        <Route element={<AppShellWithRepo mode={mode} onToggleTheme={toggleMode} />}>
+                          <Route index element={<DashboardPage />} />
+                          <Route path="wiki/:wikiId" element={<WikiViewerPage mode={mode} />} />
+                          <Route path="settings" element={<SettingsPage />} />
+                          <Route
+                            path="project/:projectId"
+                            element={
+                              <ProjectProvider>
+                                <ProjectPage />
+                              </ProjectProvider>
+                            }
+                          />
+                        </Route>
+                      </Routes>
+                    </Suspense>
+                  </RepoContextProvider>
+                </AuthGuard>
+              }
+            />
+          </Routes>
         </BrowserRouter>
       </ErrorBoundary>
     </ThemeProvider>
