@@ -61,16 +61,12 @@ class WikiManagementService:
                          For Jira: {"base_url": ..., "jql": ...}.
                          Credentials (access_token etc.) are NEVER stored here.
         """
-        import json as _json
-
         async with self.session_factory() as session:
             async with session.begin():
                 result = await session.execute(select(WikiRecord).where(WikiRecord.id == wiki_id))
                 record = result.scalar_one_or_none()
 
                 now = datetime.now()
-                # Serialize scope dict for storage (TEXT in SQLite, JSON in PG).
-                scope_serialized = _json.dumps(source_scope) if source_scope is not None else None
 
                 if record is None:
                     record = WikiRecord(
@@ -89,7 +85,7 @@ class WikiManagementService:
                         requires_token=1 if requires_token else 0,
                         error=error,
                         source_type=source_type or "git",
-                        source_scope=scope_serialized,
+                        source_scope=source_scope,
                     )
                     session.add(record)
                 else:
@@ -116,8 +112,8 @@ class WikiManagementService:
                     # Update source_type / source_scope when provided.
                     if source_type is not None:
                         record.source_type = source_type
-                    if scope_serialized is not None:
-                        record.source_scope = scope_serialized
+                    if source_scope is not None:
+                        record.source_scope = source_scope
 
         logger.info("Registered wiki: %s (owner=%s, status=%s)", wiki_id, owner_id, status)
 

@@ -20,7 +20,7 @@ import {
 } from '@mui/material';
 import { Link } from 'react-router-dom';
 import { useConnections } from '../hooks/useConnections';
-import type { GenerateWikiMultiSourceRequest, WikiSourceType } from '../api/wiki';
+import type { AtlassianAuth, GenerateWikiMultiSourceRequest, WikiSourceType } from '../api/wiki';
 import type { components } from '../api/types.generated';
 
 // ---------------------------------------------------------------------------
@@ -806,17 +806,6 @@ function MultiSourceGenerateForm({
       )}
     </Box>
   );
-}
-
-// ---------------------------------------------------------------------------
-// AtlassianAuth type (used in submit handler above, defined here to keep it
-// co-located with usage and avoid importing from wiki.ts in a circular way)
-// ---------------------------------------------------------------------------
-
-interface AtlassianAuth {
-  access_token: string;
-  refresh_token: string | null;
-  client_id: string | null;
 }
 
 // ---------------------------------------------------------------------------

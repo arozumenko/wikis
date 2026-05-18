@@ -229,11 +229,28 @@ class WikiService:
             logger.warning(f"Failed to persist invocations: {e}")
 
     @staticmethod
+    def _canonicalize(obj: Any) -> Any:
+        """Recursively sort dict keys and homogeneous list values for stable hashing.
+
+        Ensures that ``space_keys=["A","B"]`` and ``space_keys=["B","A"]`` produce
+        identical JSON so the hash-based wiki ID is order-independent.
+        """
+        if isinstance(obj, dict):
+            return {k: WikiService._canonicalize(v) for k, v in sorted(obj.items())}
+        if isinstance(obj, list):
+            # Sort only homogeneous lists of primitives; leave mixed lists order-preserved.
+            if all(isinstance(x, (str, int, float, bool)) for x in obj):
+                return sorted(obj, key=str)
+            return [WikiService._canonicalize(x) for x in obj]
+        return obj
+
+    @staticmethod
     def _make_wiki_id(source_type: str, scope: dict[str, Any]) -> str:  # type: ignore[override]
         """Deterministic wiki ID from source_type + scope.
 
         Stable across runs: scope keys are sorted before hashing so insertion
-        order doesn't affect the result.
+        order doesn't affect the result.  List values (e.g. ``space_keys``) are
+        also sorted so ``["A","B"]`` and ``["B","A"]`` yield the same ID.
 
         Backwards-compat legacy ID
         --------------------------
@@ -242,7 +259,10 @@ class WikiService:
         DB but the old-style hash hits, the caller should fall back to the
         old hash.  See :meth:`generate` for the one-cycle migration helper.
         """
-        canonical = json.dumps({"source_type": source_type, "scope": scope}, sort_keys=True)
+        canonical = json.dumps(
+            WikiService._canonicalize({"source_type": source_type, "scope": scope}),
+            sort_keys=True,
+        )
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
     @staticmethod

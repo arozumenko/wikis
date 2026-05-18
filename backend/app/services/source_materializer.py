@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from app.core.sources.base import SourceToolkit
+    from app.core.sources.base import FileInfo, SourceToolkit
 
 logger = logging.getLogger(__name__)
 
@@ -86,19 +86,15 @@ class SourceMaterializer:
         written = 0
         errors = 0
 
-        # Collect file infos first (list_files is an async generator — no await).
-        file_infos = []
-        async for info in self._toolkit.list_files():
-            file_infos.append(info)
-
         logger.debug(
-            "Materializing %d files from %s toolkit into %s",
-            len(file_infos),
+            "Materializing files from %s toolkit into %s",
             self._toolkit.source_type,
             workdir,
         )
 
-        for info in file_infos:
+        # Stream — fetch and write each file immediately instead of accumulating
+        # the full file list in memory first (avoids a spike on large Confluence spaces).
+        async for info in self._toolkit.list_files():
             dest = self._resolve_dest(workdir, info)
             try:
                 content_obj = await self._toolkit.fetch_content(info.origin)
@@ -142,7 +138,7 @@ class SourceMaterializer:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _resolve_dest(self, workdir: Path, info: "SourceToolkit") -> Path:  # type: ignore[type-arg]
+    def _resolve_dest(self, workdir: Path, info: "FileInfo") -> Path:
         """Return the absolute destination Path for a FileInfo, inside *workdir*.
 
         Appends ``.md`` when language is ``"markdown"`` and the path doesn't
@@ -151,13 +147,6 @@ class SourceMaterializer:
         Raises:
             ValueError: If the resolved path would escape *workdir*.
         """
-        from app.core.sources.base import FileInfo  # avoid circular at module level
-
-        # info is actually a FileInfo but TYPE_CHECKING reference is SourceToolkit
-        # (pyright workaround) — cast at runtime.
-        if not isinstance(info, FileInfo):
-            raise TypeError(f"Expected FileInfo, got {type(info)!r}")
-
         raw_path = info.path
 
         # Append .md for markdown content that doesn't already have the extension.

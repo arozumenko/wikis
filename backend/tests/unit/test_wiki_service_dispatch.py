@@ -276,3 +276,126 @@ def test_token_never_logged(caplog: pytest.LogCaptureFixture) -> None:
         assert token not in record.getMessage(), (
             f"Raw token leaked into log record: {record.getMessage()!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. _canonicalize — list-value order-independence in wiki ID hashing
+# ---------------------------------------------------------------------------
+
+
+def test_make_wiki_id_list_order_independent() -> None:
+    """space_keys=["A","B"] and space_keys=["B","A"] must produce the same wiki ID.
+
+    This is the regression test for Fix 3: sort_keys=True only sorts dict keys,
+    not list values.  _canonicalize() recursively sorts homogeneous lists too.
+    """
+    id_ab = WikiService._make_wiki_id(
+        "confluence",
+        {"base_url": "https://acme.atlassian.net", "space_keys": ["A", "B"]},
+    )
+    id_ba = WikiService._make_wiki_id(
+        "confluence",
+        {"base_url": "https://acme.atlassian.net", "space_keys": ["B", "A"]},
+    )
+    assert id_ab == id_ba, (
+        f"List order must not affect wiki_id: {id_ab!r} != {id_ba!r}"
+    )
+
+
+def test_make_wiki_id_list_order_independent_three_keys() -> None:
+    """Three space_keys in any permutation must hash identically."""
+    from itertools import permutations
+
+    keys = ["ENG", "HR", "OPS"]
+    ids = {
+        WikiService._make_wiki_id(
+            "confluence",
+            {"base_url": "https://example.atlassian.net", "space_keys": list(perm)},
+        )
+        for perm in permutations(keys)
+    }
+    assert len(ids) == 1, f"Expected 1 unique ID, got {len(ids)}: {ids}"
+
+
+def test_canonicalize_preserves_heterogeneous_lists() -> None:
+    """Lists containing nested dicts/lists must not be sorted — order is preserved."""
+    obj = {"items": [{"z": 1}, {"a": 2}]}
+    result = WikiService._canonicalize(obj)
+    # Each element is a dict, so the list is heterogeneous and must NOT be reordered.
+    assert result["items"] == [{"z": 1}, {"a": 2}], (
+        "Heterogeneous list (containing dicts) must not be reordered"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. SourceToolkit ABC __aenter__/__aexit__ defaults — mock-toolkit dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_source_toolkit_default_context_manager_no_attribute_error() -> None:
+    """A SourceToolkit subclass that does NOT override __aenter__/__aexit__ must
+    still work inside 'async with source_toolkit:' without AttributeError.
+
+    This is the regression test for Fix 1: wiki_runner.py:128 uses
+    'async with source_toolkit:' for ALL source types, but ConfluenceToolkit
+    and JiraToolkit didn't implement the context-manager protocol.  The ABC
+    now provides no-op defaults.
+    """
+    from typing import AsyncIterator
+
+    from app.core.sources.base import FileContent, FileInfo, OriginPointer, SourceToolkit
+
+    class MinimalToolkit(SourceToolkit):
+        """Concrete subclass with all abstract methods but NO __aenter__/__aexit__."""
+
+        source_type = "minimal_test"
+
+        @classmethod
+        def from_config(cls, config: dict) -> "MinimalToolkit":
+            return cls()
+
+        async def list_files(
+            self,
+            include: list[str] | None = None,
+            exclude: list[str] | None = None,
+        ) -> AsyncIterator[FileInfo]:  # type: ignore[override]
+            return
+            yield  # pragma: no cover — makes this an async generator
+
+        async def fetch_content(self, pointer: OriginPointer) -> FileContent:
+            raise NotImplementedError  # pragma: no cover
+
+        async def test_connection(self) -> str:
+            return "ok"
+
+        def build_origin_pointer(
+            self,
+            path: str,
+            revision: str | None = None,
+            line_start: int | None = None,
+            line_end: int | None = None,
+        ) -> OriginPointer:
+            from datetime import datetime, timezone
+
+            return OriginPointer(
+                source_type=self.source_type,
+                ref=path,
+                url=f"minimal://{path}",
+                ingested_at=datetime.now(tz=timezone.utc),
+            )
+
+    toolkit = MinimalToolkit()
+
+    # This must NOT raise AttributeError — the ABC provides default no-ops.
+    entered: SourceToolkit | None = None
+    try:
+        async with toolkit as ctx:
+            entered = ctx
+    except AttributeError as exc:
+        pytest.fail(
+            f"'async with source_toolkit:' raised AttributeError for a toolkit "
+            f"that does not override __aenter__/__aexit__: {exc}"
+        )
+
+    assert entered is toolkit, "Default __aenter__ must return self"

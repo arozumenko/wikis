@@ -123,6 +123,9 @@ def main(argv: list[str] | None = None) -> int:
             source_toolkit = source_registry.create(source_type, source_config)
 
             tmpdir = Path(tempfile.mkdtemp(prefix="wikis_mat_"))
+            # Assign immediately so the cleanup block always sees the path,
+            # even if _materialize() raises before workdir_str is set.
+            _materializer_tmpdir = str(tmpdir)
 
             async def _materialize() -> str:
                 async with source_toolkit:
@@ -134,8 +137,6 @@ def main(argv: list[str] | None = None) -> int:
             repo_url_for_indexer = f"file://{workdir_str}"
             branch_for_indexer = "main"
             access_token_for_indexer = None
-            # Store tmpdir path for cleanup after generation finishes.
-            _materializer_tmpdir = workdir_str
         else:
             _materializer_tmpdir = None
 

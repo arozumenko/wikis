@@ -127,3 +127,11 @@ class SourceToolkit(abc.ABC):
             config: Credential and configuration values — no encryption assumed.
         """
         ...
+
+    async def __aenter__(self) -> "SourceToolkit":
+        """Async context entry. Default: no-op. Override for resource setup."""
+        return self
+
+    async def __aexit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        """Async context exit. Default: no-op. Override for resource cleanup."""
+        return None
