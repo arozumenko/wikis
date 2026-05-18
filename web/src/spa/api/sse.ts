@@ -266,21 +266,48 @@ function normalizeThinkingStep(payload: Record<string, unknown>): Record<string,
 
 /**
  * Stream wiki generation SSE events via fetch + ReadableStream.
- * Uses fetch instead of native EventSource to support Authorization headers.
- * Returns an object with a close() method for compatibility with existing callers.
+ *
+ * Uses fetch (not native EventSource) so we can attach Authorization headers
+ * and set ``Last-Event-ID`` on reconnect.
+ *
+ * #191: the stream survives transient drops — laptop sleep, brief offline
+ * blips, idle TCP timeouts. The backend (``/api/v1/invocations/{id}/stream``)
+ * honors ``Last-Event-ID`` for replay, so a reconnect resumes from the last
+ * event we saw rather than re-replaying the full history. Backoff doubles
+ * from 1s → 2s → 5s → 10s (capped) and resets to 1s on the first event of
+ * a successful (re)connect. ``close()`` is sticky: once called, no further
+ * reconnect attempts are made.
  */
 export function subscribeSSE(
   path: string,
   onEvent: (event: SSEEventData) => void,
   onError?: (error: Event | Error) => void,
 ): { close: () => void } {
-  const controller = new AbortController();
+  const BACKOFF_MS = [1000, 2000, 5000, 10000];
+  let closed = false;
+  let lastEventId: string | null = null;
+  let backoffIndex = 0;
+  let controller: AbortController | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  (async () => {
+  const scheduleReconnect = () => {
+    if (closed) return;
+    const delay = BACKOFF_MS[Math.min(backoffIndex, BACKOFF_MS.length - 1)];
+    backoffIndex += 1;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      void connect();
+    }, delay);
+  };
+
+  const connect = async (): Promise<void> => {
+    if (closed) return;
+    controller = new AbortController();
     try {
       const token = await getAuthToken();
       const headers: Record<string, string> = {};
       if (token) headers['Authorization'] = `Bearer ${token}`;
+      if (lastEventId) headers['Last-Event-ID'] = lastEventId;
 
       const resp = await fetch(`${API_BASE}${path}`, {
         headers,
@@ -288,7 +315,15 @@ export function subscribeSSE(
       });
 
       if (!resp.ok || !resp.body) {
+        // 404 = invocation gone/expired; do not retry (terminal).
+        // Other non-2xx → reconnect with backoff (server may be restarting).
+        if (resp.status === 404 || resp.status === 401 || resp.status === 403) {
+          onError?.(new Error(`HTTP ${resp.status}`));
+          closed = true;
+          return;
+        }
         onError?.(new Error(`HTTP ${resp.status}`));
+        scheduleReconnect();
         return;
       }
 
@@ -297,6 +332,8 @@ export function subscribeSSE(
       let buf = '';
       let eventType = '';
       let dataStr = '';
+      let eventIdField = '';
+      let firstEventSeen = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -312,11 +349,18 @@ export function subscribeSSE(
             eventType = line.slice(7).trim();
           } else if (line.startsWith('data: ')) {
             dataStr += (dataStr ? '\n' : '') + line.slice(6);
+          } else if (line.startsWith('id: ')) {
+            eventIdField = line.slice(4).trim();
           } else if (line === '') {
             if (eventType && dataStr) {
               try {
                 const raw = JSON.parse(dataStr) as Record<string, unknown>;
                 const { type, payload } = parseSSEData(eventType, raw);
+                if (eventIdField) lastEventId = eventIdField;
+                if (!firstEventSeen) {
+                  firstEventSeen = true;
+                  backoffIndex = 0;
+                }
                 onEvent({ type, ...payload } as SSEEventData);
               } catch {
                 /* skip malformed */
@@ -324,17 +368,33 @@ export function subscribeSSE(
             }
             eventType = '';
             dataStr = '';
+            eventIdField = '';
           }
         }
       }
+      // Stream ended cleanly (server closed). If we haven't been told to
+      // stop, treat it as a transient drop and reconnect — unlike a normal
+      // EventSource, fetch + ReadableStream gives no built-in resume.
+      if (!closed) scheduleReconnect();
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') {
-        onError?.(e as Error);
-      }
+      if ((e as Error).name === 'AbortError') return;
+      onError?.(e as Error);
+      if (!closed) scheduleReconnect();
     }
-  })();
+  };
 
-  return { close: () => controller.abort() };
+  void connect();
+
+  return {
+    close: () => {
+      closed = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      controller?.abort();
+    },
+  };
 }
 
 /**

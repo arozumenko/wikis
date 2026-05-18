@@ -40,6 +40,7 @@ import { listWikis, deleteWiki, generateWikiMultiSource, updateWikiVisibility } 
 import type { GenerateWikiMultiSourceRequest } from '../api/wiki';
 import { listProjects, type ProjectResponse } from '../api/project';
 import { ApiError } from '../api/client';
+import { useResume } from '../hooks/useResume';
 import type { components } from '../api/types.generated';
 
 type WikiSummary = components['schemas']['WikiSummary'];
@@ -140,6 +141,16 @@ export function DashboardPage() {
     const interval = setInterval(fetchWikis, 10000);
     return () => clearInterval(interval);
   }, [wikis, fetchWikis]);
+
+  // #191: refetch on resume (tab visible / window focus / online) so the
+  // dashboard cannot stay pinned to a stale cached status after sleep. The
+  // 10s polling above is gated on cached state — if the cache says
+  // everything is failed/complete, the poll never restarts. This trigger
+  // ignores cached state entirely and re-asks the backend.
+  useResume(() => {
+    fetchWikis();
+    if (visibilityFilter === 'projects') fetchProjects();
+  });
 
   // Filter wikis by search query
   const query = searchUrl.trim().toLowerCase();

@@ -254,3 +254,44 @@ class TestUpdateDescription:
         record = await service.update_description("w1", user_id="user-1", description=None)
         assert record is not None
         assert record.description is None
+
+
+# ---------------------------------------------------------------------------
+# mark_status — #191 reconciliation hook
+# ---------------------------------------------------------------------------
+
+
+class TestMarkStatus:
+    async def test_flips_status_only(self, service):
+        await service.register_wiki(
+            "w1", "https://github.com/a/b", "main", "Real Title", 7, owner_id="user-1"
+        )
+        ok = await service.mark_status("w1", status="failed", error="orphaned")
+        assert ok is True
+        record = await service.get_wiki_record("w1")
+        assert record is not None
+        # Status + error flipped, but the heavy fields (title, page_count,
+        # repo_url, owner) survive — that's why we don't reuse register_wiki
+        # for orphan recovery.
+        assert record.status == "failed"
+        assert record.error == "orphaned"
+        assert record.title == "Real Title"
+        assert record.page_count == 7
+        assert record.repo_url == "https://github.com/a/b"
+        assert record.owner_id == "user-1"
+
+    async def test_returns_false_for_missing_wiki(self, service):
+        ok = await service.mark_status("does-not-exist", status="failed")
+        assert ok is False
+
+    async def test_error_preserved_when_omitted(self, service):
+        # Marking "complete" without passing error keeps any existing error
+        # string — useful when reconciling a record that already had one.
+        await service.register_wiki(
+            "w1", "https://github.com/a/b", "main", "T", 1, owner_id="u", status="failed", error="boom"
+        )
+        await service.mark_status("w1", status="complete")
+        record = await service.get_wiki_record("w1")
+        assert record is not None
+        assert record.status == "complete"
+        assert record.error == "boom"  # not cleared (we only clear when explicitly passed)
