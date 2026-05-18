@@ -4426,7 +4426,7 @@ class OptimizedWikiGenerationAgent:
     _REPO_ROOT_PRIORITY_PATTERNS = (
         "README", "readme",
         "Dockerfile", "Containerfile", "docker-compose",
-        "package.json", "package-lock.json",
+        "package.json",
         "pyproject.toml", "setup.py", "setup.cfg", "requirements",
         "Makefile", "makefile", "GNUmakefile",
         "Justfile", "justfile", "Taskfile", "Earthfile",
@@ -4470,7 +4470,7 @@ class OptimizedWikiGenerationAgent:
             return []
 
         try:
-            entries = sorted(os.listdir(repo_root))
+            entries = os.listdir(repo_root)
         except OSError:
             return []
 
@@ -4480,6 +4480,9 @@ class OptimizedWikiGenerationAgent:
                     return i
             return len(self._REPO_ROOT_PRIORITY_PATTERNS)
 
+        # Priority bucket first, then alphabetic tie-break — the single
+        # sort with composite key replaces an earlier ``sorted()`` call
+        # whose work was always thrown away.
         entries.sort(key=lambda n: (_priority(n), n))
 
         from ..constants import DOCUMENTATION_EXTENSIONS as _DOC_EXT_MAP
