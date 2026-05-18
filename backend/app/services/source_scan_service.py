@@ -129,12 +129,13 @@ class SourceScanService:
             except (SourceAuthError, SourceNotFoundError, SourceUnavailableError) as exc:
                 raise ScanError(str(exc), reachable=False) from exc
 
-            # Shallow clone (depth=1, single-branch). Offloaded to a worker
-            # thread so a slow remote can't block the FastAPI event loop.
-            # The async context manager guarantees tmpdir cleanup via
-            # ``close()`` on exit, even if enumeration below raises.
+            # Shallow clone (depth=1, single-branch). The toolkit's async
+            # ``_ensure_workdir`` (#214) owns the asyncio.to_thread offloading
+            # internally, so callers just await it directly. The async
+            # context manager still guarantees tmpdir cleanup via ``close()``
+            # on exit, even if enumeration below raises.
             try:
-                await asyncio.to_thread(toolkit._ensure_workdir)  # noqa: SLF001
+                await toolkit._ensure_workdir()  # noqa: SLF001
             except (SourceAuthError, SourceNotFoundError, SourceUnavailableError) as exc:
                 raise ScanError(str(exc), reachable=False) from exc
 
