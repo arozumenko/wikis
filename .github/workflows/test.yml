@@ -12,10 +12,11 @@ on:
 
 jobs:
   # Fast unit tests — millisecond-scale, no FastAPI lifespan, no network.
-  # Runs in <1 min with pytest-xdist; keeps the merge-gate signal tight.
+  # pytest itself runs in <1 min via pytest-xdist; the budget also has to
+  # cover pip install on a cold runner (~3-4 min for the [dev] extras).
   backend-unit-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

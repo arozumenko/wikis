@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    from app.core.sources import install_redaction_filter
+
+    install_redaction_filter()
+
     from app.config import get_settings
     from app.db import create_tables, dispose_engine, get_engine, get_session_factory, init_db
     from app.services.ask_service import AskService
