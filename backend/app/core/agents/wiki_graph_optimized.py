@@ -4418,6 +4418,148 @@ class OptimizedWikiGenerationAgent:
 
         return collected
 
+    # #181 Bug B: filenames the page-content agent should see whenever
+    # retrieval comes up empty. Reading them direct from the clone (when
+    # available) anchors the LLM to the actual build / config / deploy
+    # surface of the repo, replacing the boilerplate "no source supplied"
+    # warning with citations of the files that genuinely exist.
+    _REPO_ROOT_PRIORITY_PATTERNS = (
+        "README", "readme",
+        "Dockerfile", "Containerfile", "docker-compose",
+        "package.json", "package-lock.json",
+        "pyproject.toml", "setup.py", "setup.cfg", "requirements",
+        "Makefile", "makefile", "GNUmakefile",
+        "Justfile", "justfile", "Taskfile", "Earthfile",
+        ".env",
+        "Procfile", "Vagrantfile", "Jenkinsfile",
+        "build", "install", "run", "deploy",
+        "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "Gemfile",
+        ".gitignore", ".dockerignore",
+        "vite.config", "webpack.config", "rollup.config", "next.config",
+        "tsconfig", "jsconfig",
+        "nginx.conf",
+    )
+
+    def _get_repo_root_anchor_docs(
+        self,
+        char_cap: int = 30_000,
+        max_files: int = 20,
+        file_size_cap: int = 100_000,
+    ) -> list[Document]:
+        """Last-resort context anchor for pages whose retrieval came up empty.
+
+        Reads top-level files from the cached repo clone (build/config/
+        deploy artifacts most often live at the repo root) and returns
+        them as Documents the page-content agent can cite.  Without this
+        the agent receives only the generic repo summary and writes
+        boilerplate "no source supplied" warnings when its retrieval
+        path can't anchor a page to specific code — particularly for
+        outline pages like "Development Environment Setup" on
+        non-Python repos (#181 Bug B).
+
+        The result is intentionally heterogeneous: a Dockerfile, a
+        package.json, and a README are each useful to the LLM, and
+        bundling them in a single fallback bundle is cheaper than
+        re-running the planner with stronger ``target_docs`` guidance.
+
+        Returns an empty list when the repo clone isn't on disk
+        (degrades silently to the existing empty-content fallback).
+        """
+        repo_root = self._safely_get_repo_root()
+        if not repo_root or not os.path.isdir(repo_root):
+            return []
+
+        try:
+            entries = sorted(os.listdir(repo_root))
+        except OSError:
+            return []
+
+        def _priority(name: str) -> int:
+            for i, pattern in enumerate(self._REPO_ROOT_PRIORITY_PATTERNS):
+                if name.startswith(pattern):
+                    return i
+            return len(self._REPO_ROOT_PRIORITY_PATTERNS)
+
+        entries.sort(key=lambda n: (_priority(n), n))
+
+        from ..constants import DOCUMENTATION_EXTENSIONS as _DOC_EXT_MAP
+
+        docs: list[Document] = []
+        total_chars = 0
+
+        for name in entries:
+            if len(docs) >= max_files or total_chars >= char_cap:
+                break
+            full = os.path.join(repo_root, name)
+            if not os.path.isfile(full):
+                continue
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            if size == 0 or size > file_size_cap:
+                continue
+            try:
+                with open(full, encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            if not content.strip():
+                continue
+            # Trim if including the whole file would blow the budget.
+            remaining = char_cap - total_chars
+            if len(content) > remaining:
+                content = content[:remaining]
+            total_chars += len(content)
+
+            ext = os.path.splitext(name)[1].lower()
+            doc_type = _DOC_EXT_MAP.get(ext) or 'repo_root_file'
+            docs.append(
+                Document(
+                    page_content=content,
+                    metadata={
+                        "source": name,
+                        "file_path": name,
+                        "rel_path": name,
+                        "symbol": name,
+                        "symbol_type": f"{doc_type}_document" if doc_type != 'repo_root_file' else 'repo_root_file',
+                        "node_type": doc_type,
+                        "chunk_type": "documentation",
+                        "language": "text",
+                        "is_documentation": True,
+                        # Mark so downstream formatters can hint the LLM
+                        # that these files are real and present.
+                        "repo_root_anchor": True,
+                    },
+                )
+            )
+
+        if docs:
+            logger.info(
+                "[REPO_ROOT_ANCHOR] Surfaced %d repo-root files as fallback context "
+                "(%d chars / ~%d tokens): %s",
+                len(docs),
+                total_chars,
+                total_chars // 4,
+                [d.metadata["source"] for d in docs],
+            )
+        return docs
+
+    def _safely_get_repo_root(self) -> str | None:
+        """Return the cloned-repo path or ``None`` when unavailable.
+
+        Centralized so callers don't repeat the ``getattr``/callable
+        guard dance.  Used by :meth:`_get_repo_root_anchor_docs` and
+        the existing :meth:`_fetch_explicit_target_docs` disk fallback.
+        """
+        getter = getattr(self.indexer, "get_repo_root", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
     def _get_relevant_content_for_page(self, page_spec: PageSpec, repo_url: str, repo_context: str) -> dict[str, Any]:
         """
         Get relevant content for page generation with proper context structure.
@@ -4620,6 +4762,19 @@ class OptimizedWikiGenerationAgent:
                     f"({total_tokens:,}/{CONTEXT_TOKEN_BUDGET:,} tokens, {utilization_pct:.1f}% utilized, "
                     f"{tokens_remaining:,} tokens remaining)"
                 )
+                # #181 Bug B: vector search returned nothing — without an
+                # anchor the LLM writes a boilerplate "no source supplied"
+                # warning.  Fall through to repo-root files instead.
+                if not relevant_docs:
+                    anchor_docs = self._get_repo_root_anchor_docs()
+                    if anchor_docs:
+                        logger.info(
+                            "[CONTENT_RETRIEVAL] Vector search returned 0 docs for page "
+                            "'%s' — anchoring with %d repo-root files",
+                            page_spec.page_name,
+                            len(anchor_docs),
+                        )
+                        return self._format_simple_context(anchor_docs, page_spec)
                 return self._format_simple_context(relevant_docs, page_spec)
             else:
                 # RANKED TRUNCATION: Include top-priority docs with full content, drop the rest
@@ -4648,6 +4803,23 @@ class OptimizedWikiGenerationAgent:
                 f"Retrieval FAILED for page '{page_name}': {e}. "
                 f"LLM will receive only repo summary — content quality will be degraded."
             )
+            # #181 Bug B: before falling back to the bare repo summary,
+            # try to surface repo-root files as a last-resort anchor.
+            # Even with retrieval broken, the cached clone is usually
+            # still on disk and reading top-level build / config /
+            # deploy files gives the LLM something concrete to cite.
+            try:
+                anchor_docs = self._get_repo_root_anchor_docs()
+            except Exception:  # pragma: no cover — defensive
+                anchor_docs = []
+            if anchor_docs:
+                logger.info(
+                    "[CONTENT_RETRIEVAL] Anchoring failed page '%s' with %d "
+                    "repo-root files instead of bare repo summary",
+                    page_name,
+                    len(anchor_docs),
+                )
+                return self._format_simple_context(anchor_docs, page_spec)
             return {
                 "content": repo_context,
                 "files": [],
