@@ -144,6 +144,46 @@ KNOWN_FILENAMES = {
     '.env.production': 'config',
 }
 
+# Subset of KNOWN_FILENAMES whose conventional ``<name>.<suffix>``
+# variants (Dockerfile.prod, Makefile.local, .env.staging, etc.) should
+# classify the same way.  Without this, ``Dockerfile.prod`` falls into
+# ``unknown`` and disappears from the graph entirely (#181 Bug A).
+# Entries here MUST also exist in KNOWN_FILENAMES.
+PREFIX_MATCH_FILENAMES = frozenset({
+    # Build systems — env/variant suffixes are common (Makefile.am,
+    # Makefile.local, Justfile.dev).
+    'Makefile', 'makefile', 'GNUmakefile',
+    'Justfile', 'justfile', 'Taskfile', 'Earthfile',
+    'Snakefile', 'Rakefile',
+    # Container / DevOps — the headline case: Dockerfile.prod /
+    # Dockerfile.dev / Containerfile.staging.
+    'Dockerfile', 'Containerfile', 'Vagrantfile', 'Procfile',
+    # CI/CD — Jenkinsfile.deploy, Jenkinsfile.test.
+    'Jenkinsfile',
+    # Env files — .env.staging, .env.test (variants beyond the explicit
+    # entries in KNOWN_FILENAMES).
+    '.env',
+})
+
+
+def classify_known_filename(name: str) -> str | None:
+    """Return the doc_type for ``name`` or ``None``.
+
+    Tries exact match in :data:`KNOWN_FILENAMES` first, then prefix-match
+    against entries in :data:`PREFIX_MATCH_FILENAMES` so common
+    environment-suffixed variants (``Dockerfile.prod``,
+    ``Makefile.local``, ``.env.staging``) classify identically to their
+    base form.
+    """
+    exact = KNOWN_FILENAMES.get(name)
+    if exact is not None:
+        return exact
+    for stem in PREFIX_MATCH_FILENAMES:
+        if name.startswith(stem + '.'):
+            return KNOWN_FILENAMES[stem]
+    return None
+
+
 # =============================================================================
 # Documentation Symbol Types
 # =============================================================================

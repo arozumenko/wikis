@@ -6,15 +6,35 @@ on:
     branches: [main]
 
 jobs:
-  backend-tests:
+  # Fast unit tests — millisecond-scale, no FastAPI lifespan, no network.
+  # Runs in <1 min with pytest-xdist; keeps the merge-gate signal tight.
+  backend-unit-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - run: pip install -e ".[dev]"
         working-directory: backend
-      - run: AUTH_ENABLED=false pytest tests/ -v --cov=app
+      - run: AUTH_ENABLED=false pytest tests/unit -q -n auto
+        working-directory: backend
+
+  # Integration + remaining tests with coverage.  Sharded across 4
+  # parallel jobs via pytest-xdist's ``--dist worksteal`` so a slow
+  # test in one worker doesn't pin the wall clock.  Drops 30-min
+  # serial → ~8-min parallel.  Excludes ``tests/unit`` (already
+  # gated by ``backend-unit-tests`` above) to avoid duplicate runs.
+  backend-integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -e ".[dev]"
+        working-directory: backend
+      - run: AUTH_ENABLED=false pytest tests/ --ignore=tests/unit -q -n auto --dist worksteal --cov=app --cov-report=term-missing
         working-directory: backend
 
   # Stress-runs the WikiService.shutdown regression-guard unit tests.
