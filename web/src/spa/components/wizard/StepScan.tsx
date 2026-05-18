@@ -9,7 +9,7 @@
  * git.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -29,6 +29,14 @@ import type { ScanRequest, ScanResponse } from '../../api/wiki';
 interface StepScanProps {
   buildScanRequest: () => ScanRequest | null;
   onScanComplete: (result: ScanResponse | null) => void;
+  /**
+   * If the container already holds a scan result whose scope matches the
+   * current ``buildScanRequest()`` payload, the step renders it directly
+   * without re-hitting the network. Prevents Back→Next from re-scanning
+   * a remote repo on every visit (Rio review on #216).
+   */
+  cachedResult?: ScanResponse | null;
+  cachedScopeHash?: string | null;
 }
 
 type ScanState =
@@ -45,21 +53,50 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-export function StepScan({ buildScanRequest, onScanComplete }: StepScanProps) {
+function hashRequest(req: ScanRequest | null): string | null {
+  if (!req) return null;
+  // Deterministic-enough fingerprint: source_type + sorted scope keys +
+  // auth presence. Skips token *values* deliberately — caching across
+  // auth-mode toggles is fine when the underlying scope is identical.
+  return JSON.stringify({ type: req.source_type, scope: req.scope });
+}
+
+export function StepScan({
+  buildScanRequest,
+  onScanComplete,
+  cachedResult,
+  cachedScopeHash,
+}: StepScanProps) {
   const [state, setState] = useState<ScanState>({ kind: 'idle' });
+  // C4 / Rio review: guard the post-await setState + onScanComplete calls
+  // so they no-op after unmount (user clicked Back / Skip mid-flight).
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const runScan = useCallback(async () => {
     const req = buildScanRequest();
     if (!req) {
-      setState({ kind: 'error', message: 'Configuration is invalid — go back and fix it.' });
+      if (mountedRef.current)
+        setState({ kind: 'error', message: 'Configuration is invalid — go back and fix it.' });
+      // C3: clear stale container result so Confirm can't show a previous
+      // preview after the new config has invalidated it.
+      onScanComplete(null);
       return;
     }
-    setState({ kind: 'loading' });
+    if (mountedRef.current) setState({ kind: 'loading' });
+    onScanComplete(null); // C3: also clear at start of any new scan attempt.
     try {
       const result = await scanSource(req);
+      if (!mountedRef.current) return;
       setState({ kind: 'success', result });
       onScanComplete(result);
     } catch (err) {
+      if (!mountedRef.current) return;
       if (err instanceof ApiError) {
         // 501 — unimplemented for this source type (Confluence / Jira until #211).
         if (err.status === 501) {
@@ -89,12 +126,28 @@ export function StepScan({ buildScanRequest, onScanComplete }: StepScanProps) {
     }
   }, [buildScanRequest, onScanComplete]);
 
-  // Auto-run on mount so the user sees a result without an extra click.
-  // Re-run is via the "Retry" button on error states.
-  //
-  // ``runScan`` is intentionally NOT in the dep array — toggling between
-  // steps would otherwise re-fire and hammer the backend.
+  // Auto-run on mount unless the container already has a fresh result for
+  // the same scope (Rio: Back→Next must not re-hit the network).
+  // ``runScan`` is intentionally NOT in the dep array — re-running on
+  // every re-render would hammer the backend.
   useEffect(() => {
+    const currentHash = hashRequest(buildScanRequest());
+    if (
+      currentHash &&
+      cachedScopeHash &&
+      cachedScopeHash === currentHash &&
+      cachedResult !== undefined
+    ) {
+      // Reuse the cached result. State must reflect it so Retry still works.
+      if (cachedResult) {
+        setState({ kind: 'success', result: cachedResult });
+      } else {
+        // Cached "no preview" (e.g. earlier 501) — render the unsupported
+        // affordance again so the user has a Skip option.
+        setState({ kind: 'unsupported', message: 'Preview not available for this source.' });
+      }
+      return;
+    }
     void runScan();
   }, []);
 

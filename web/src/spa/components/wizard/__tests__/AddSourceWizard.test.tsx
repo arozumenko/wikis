@@ -224,6 +224,110 @@ describe('AddSourceWizard', () => {
     );
   });
 
+  // -------------------------------------------------------------------
+  // Round-2 fixes (Rio review on PR #216)
+  // -------------------------------------------------------------------
+
+  it('Back is enabled on the Confirm step (C1)', async () => {
+    const user = userEvent.setup();
+    mockScanSource.mockResolvedValue({
+      source_type: 'git',
+      reachable: true,
+      preview: {
+        default_branch: null,
+        resolved_branch: 'main',
+        commit_hash: null,
+        file_count: 1,
+        top_paths: [],
+        size_bytes: 0,
+      },
+      warnings: [],
+    });
+    renderWizard();
+    await user.click(screen.getByTestId('connector-git'));
+    await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('scan-success');
+    await user.click(screen.getByTestId('wizard-next'));
+    // We're on Confirm now — Back must be present and enabled.
+    const back = screen.getByTestId('wizard-back');
+    expect(back).toBeEnabled();
+    await user.click(back);
+    // We should be back on Scan (not Configure), and the cached scan
+    // result must render without re-hitting the network (C7 / Rio).
+    expect(await screen.findByTestId('scan-success')).toBeInTheDocument();
+    expect(mockScanSource).toHaveBeenCalledTimes(1);
+  });
+
+  it('Dirty wizard prompts before closing (C5 — AC)', async () => {
+    const user = userEvent.setup();
+    const onClose = jest.fn();
+    renderWizard({ onClose });
+    // Pick a connector and type something so the wizard is dirty.
+    await user.click(screen.getByTestId('connector-git'));
+    await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
+    // Hit Cancel.
+    await user.click(screen.getByText('Cancel'));
+    // onClose must NOT have fired yet — the confirm-discard dialog must appear.
+    expect(onClose).not.toHaveBeenCalled();
+    expect(await screen.findByTestId('wizard-discard-confirm')).toBeInTheDocument();
+    // Keep editing dismisses the confirm and does not close.
+    await user.click(screen.getByTestId('wizard-discard-cancel'));
+    expect(onClose).not.toHaveBeenCalled();
+    // Cancel again, then confirm discard — now onClose fires.
+    await user.click(screen.getByText('Cancel'));
+    await user.click(screen.getByTestId('wizard-discard-confirm-button'));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('Connector-pick-only is not dirty — close without prompt', async () => {
+    const user = userEvent.setup();
+    const onClose = jest.fn();
+    renderWizard({ onClose });
+    // The wizard auto-opens on Git; picking the same connector and
+    // closing should not trigger the discard prompt.
+    await user.click(screen.getByText('Cancel'));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('wizard-discard-confirm')).not.toBeInTheDocument();
+  });
+
+  it('Skip-preview during an in-flight scan does not overwrite scanSkipped (C2)', async () => {
+    const user = userEvent.setup();
+    let resolveScan: ((value: import('../../../api/wiki').ScanResponse) => void) | null = null;
+    mockScanSource.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveScan = resolve;
+        }),
+    );
+    renderWizard();
+    await user.click(screen.getByTestId('connector-git'));
+    await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
+    await user.click(screen.getByTestId('wizard-next'));
+    // Skip while the scan is mid-flight.
+    await user.click(screen.getByTestId('wizard-skip-scan'));
+    expect(await screen.findByTestId('confirm-scan-skipped')).toBeInTheDocument();
+    // Now resolve the late scan — Confirm must STILL show the skipped notice,
+    // not the success stats.
+    resolveScan?.({
+      source_type: 'git',
+      reachable: true,
+      preview: {
+        default_branch: null,
+        resolved_branch: 'main',
+        commit_hash: null,
+        file_count: 42,
+        top_paths: [],
+        size_bytes: 0,
+      },
+      warnings: [],
+    });
+    // Give React a tick to apply any late state update.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.getByTestId('confirm-scan-skipped')).toBeInTheDocument();
+    expect(screen.queryByTestId('confirm-scan-stats')).not.toBeInTheDocument();
+  });
+
   it('Scan 501 (unsupported connector) lets the user continue to Confirm', async () => {
     // The wizard treats any 501 from /sources/scan as "preview not
     // available for this source yet" and surfaces a skip-to-Confirm

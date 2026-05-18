@@ -704,6 +704,15 @@ export function DashboardPage() {
         })}
       </Grid>}
 
+      {/*
+        ``key={searchUrl.trim()}`` carries over from the legacy GenerateForm
+        flow: when the user pastes a URL into the search box and opens the
+        wizard, the wizard remounts so ``initialUrl`` re-seeds the Git form.
+        In practice the search box is rarely typed in while the wizard is
+        open, so the remount blast radius is small. Follow-up to refactor
+        as a controlled prop without remount is tracked alongside the
+        discriminated-union work (#215).
+      */}
       <AddSourceWizard
         key={searchUrl.trim()}
         open={showGenerateModal}

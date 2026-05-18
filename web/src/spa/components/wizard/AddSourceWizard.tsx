@@ -27,6 +27,7 @@ import {
   Dialog,
   DialogActions,
   DialogContent,
+  DialogContentText,
   DialogTitle,
   Stack,
   Step,
@@ -87,9 +88,16 @@ export function AddSourceWizard({
     git: { ...INITIAL_FORM_DATA.git, repo_url: initialUrl ?? '' },
   }));
   const [scanResult, setScanResult] = useState<ScanResponse | null>(null);
+  // Hash of the scope that produced ``scanResult`` — drives the Back→Next
+  // cache in StepScan so a remote repo doesn't get re-cloned on every
+  // step-3 entry. Cleared when scope changes invalidate the cached preview.
+  const [scanResultHash, setScanResultHash] = useState<string | null>(null);
   const [scanSkipped, setScanSkipped] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // Rio C5 — confirm-on-dirty close dialog. Esc / backdrop / Cancel all
+  // route through this guard once the user has invested real work.
+  const [confirmDiscardOpen, setConfirmDiscardOpen] = useState(false);
 
   const { atlassian, connections, refreshAtlassianIfNeeded } = useConnections();
   const gitConnections = useMemo(
@@ -205,6 +213,14 @@ export function AddSourceWizard({
     atlassian,
   ]);
 
+  // Scope hash for the cache check in StepScan — same JSON shape it
+  // hashes internally so a Back→Next on the same scope short-circuits.
+  const currentScopeHash = useMemo<string | null>(() => {
+    const req = buildScanRequest();
+    if (!req) return null;
+    return JSON.stringify({ type: req.source_type, scope: req.scope });
+  }, [buildScanRequest]);
+
   // ---------------------------------------------------------------------
   // Step navigation
   // ---------------------------------------------------------------------
@@ -215,7 +231,55 @@ export function AddSourceWizard({
   const skipScan = () => {
     setScanSkipped(true);
     setScanResult(null);
+    setScanResultHash(null);
     setStep(3);
+  };
+
+  // ---------------------------------------------------------------------
+  // Dirty state + close guard (Rio C5 — #208 acceptance)
+  // ---------------------------------------------------------------------
+  //
+  // "Dirty" = the user has done anything past picking a connector that
+  // could be lost on accidental close. Step-0-only is not dirty; once
+  // they've typed in Configure or seen a scan, prompt before discarding.
+
+  const isDirty = useMemo(() => {
+    if (step > 1) return true;
+    if (step === 0) return false;
+    // step === 1 — compare against the initial form data for the picked
+    // connector. Avoids prompting on a connector pick alone.
+    if (formData.source_type === 'git') {
+      const g = formData.git;
+      const g0 = INITIAL_FORM_DATA.git;
+      return (
+        (g.repo_url || '') !== (initialUrl ?? '') ||
+        g.branch !== g0.branch ||
+        g.patSource !== g0.patSource ||
+        g.selectedPatId !== g0.selectedPatId ||
+        g.pastedPat !== g0.pastedPat
+      );
+    }
+    if (formData.source_type === 'confluence') {
+      return formData.confluence.space_keys.length > 0;
+    }
+    if (formData.source_type === 'jira') {
+      return formData.jira.jql !== INITIAL_FORM_DATA.jira.jql;
+    }
+    return false;
+  }, [step, formData, initialUrl]);
+
+  const requestClose = useCallback(() => {
+    if (submitting) return;
+    if (isDirty) {
+      setConfirmDiscardOpen(true);
+    } else {
+      onClose();
+    }
+  }, [submitting, isDirty, onClose]);
+
+  const confirmDiscard = () => {
+    setConfirmDiscardOpen(false);
+    onClose();
   };
 
   // ---------------------------------------------------------------------
@@ -316,7 +380,9 @@ export function AddSourceWizard({
   return (
     <Dialog
       open={open}
-      onClose={submitting ? undefined : onClose}
+      // Esc / backdrop / Cancel all route through requestClose so the
+      // confirm-discard dialog fires when the wizard is dirty (Rio C5).
+      onClose={requestClose}
       maxWidth="sm"
       fullWidth
       data-testid="add-source-wizard"
@@ -354,8 +420,16 @@ export function AddSourceWizard({
         {step === 2 && (
           <StepScan
             buildScanRequest={buildScanRequest}
+            cachedResult={scanResult}
+            cachedScopeHash={scanResultHash}
             onScanComplete={(result) => {
+              // C2 — ignore late callbacks once the user has moved on
+              // (Skip clicked or Back hit). The current step is the
+              // canonical source of truth for whether scan output is
+              // relevant.
+              if (step !== 2) return;
               setScanResult(result);
+              setScanResultHash(result ? currentScopeHash : null);
               setScanSkipped(false);
             }}
           />
@@ -373,7 +447,7 @@ export function AddSourceWizard({
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2 }}>
         <Stack direction="row" spacing={1} sx={{ flex: 1 }}>
-          {step > 0 && step < 3 && (
+          {step > 0 && (
             <Button onClick={goBack} disabled={submitting} data-testid="wizard-back">
               Back
             </Button>
@@ -384,7 +458,7 @@ export function AddSourceWizard({
             </Button>
           )}
         </Stack>
-        <Button onClick={onClose} disabled={submitting}>
+        <Button onClick={requestClose} disabled={submitting}>
           Cancel
         </Button>
         {step < 3 && step > 0 && (
@@ -408,6 +482,40 @@ export function AddSourceWizard({
           </Button>
         )}
       </DialogActions>
+
+      {/*
+        Confirm-discard dialog (Rio C5). Rendered inside the main Dialog so
+        focus management stays sane — MUI nests Dialogs by default.
+      */}
+      <Dialog
+        open={confirmDiscardOpen}
+        onClose={() => setConfirmDiscardOpen(false)}
+        maxWidth="xs"
+        data-testid="wizard-discard-confirm"
+      >
+        <DialogTitle>Discard changes?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            You'll lose the source configuration entered so far.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => setConfirmDiscardOpen(false)}
+            data-testid="wizard-discard-cancel"
+          >
+            Keep editing
+          </Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={confirmDiscard}
+            data-testid="wizard-discard-confirm-button"
+          >
+            Discard
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Dialog>
   );
 }
