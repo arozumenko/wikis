@@ -31,7 +31,13 @@ from app.core.sources.exceptions import (
     SourceUnavailableError,
 )
 from app.core.sources.git_toolkit import GitToolkit
-from app.models.api import ScanRequest
+from app.models.api import (
+    ConfluenceScanRequest,
+    GitScanRequest,
+    JiraScanRequest,
+    ScanRequest,
+)
+from pydantic import ValidationError
 from app.services.source_scan_service import ScanError, SourceScanService
 
 
@@ -89,8 +95,7 @@ def fake_repo():
 @pytest.mark.asyncio
 async def test_git_scan_happy_path(fake_repo) -> None:
     service = SourceScanService()
-    request = ScanRequest(
-        source_type="git",
+    request = GitScanRequest(
         scope={"repo_url": f"file://{fake_repo}", "branch": "main"},
         auth={"pat": None},
     )
@@ -132,8 +137,7 @@ async def test_local_path_rejected_when_allowlist_unset() -> None:
         service = SourceScanService()
         with pytest.raises(ScanError) as exc_info:
             await service.scan(
-                ScanRequest(
-                    source_type="git",
+                GitScanRequest(
                     scope={"repo_url": "file:///etc", "branch": "main"},
                 )
             )
@@ -152,8 +156,7 @@ async def test_bare_slash_local_path_also_gated() -> None:
         service = SourceScanService()
         with pytest.raises(ScanError):
             await service.scan(
-                ScanRequest(
-                    source_type="git",
+                GitScanRequest(
                     scope={"repo_url": "/etc", "branch": "main"},
                 )
             )
@@ -176,8 +179,7 @@ async def test_unreachable_url_raises_scan_error() -> None:
     ):
         with pytest.raises(ScanError) as exc_info:
             await service.scan(
-                ScanRequest(
-                    source_type="git",
+                GitScanRequest(
                     scope={"repo_url": "https://x/y", "branch": "main"},
                 )
             )
@@ -195,8 +197,7 @@ async def test_not_found_translates_to_scan_error() -> None:
     ):
         with pytest.raises(ScanError):
             await service.scan(
-                ScanRequest(
-                    source_type="git",
+                GitScanRequest(
                     scope={"repo_url": "https://x/y", "branch": "main"},
                 )
             )
@@ -226,8 +227,7 @@ async def test_clone_failure_cleans_up_tmpdir() -> None:
         ):
             with pytest.raises(ScanError):
                 await service.scan(
-                    ScanRequest(
-                        source_type="git",
+                    GitScanRequest(
                         scope={"repo_url": "https://x/y", "branch": "main"},
                     )
                 )
@@ -277,21 +277,28 @@ async def test_token_never_leaks_through_scan_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_repo_url_raises_scan_error() -> None:
-    service = SourceScanService()
-    with pytest.raises(ScanError):
-        await service.scan(ScanRequest(source_type="git", scope={}))
+async def test_missing_repo_url_raises_validation_error() -> None:
+    """Missing repo_url is now caught by Pydantic before the service is called.
+
+    GitScope.repo_url is a required field; constructing GitScanRequest without
+    it raises pydantic.ValidationError, not ScanError.  The route converts this
+    to a 422 automatically.
+    """
+    with pytest.raises(ValidationError):
+        GitScanRequest(scope={})
 
 
 @pytest.mark.asyncio
-async def test_non_string_repo_url_raises_scan_error() -> None:
-    """Non-string repo_url must surface as 400 / ScanError, not 500."""
-    service = SourceScanService()
-    with pytest.raises(ScanError) as exc_info:
-        await service.scan(
-            ScanRequest(source_type="git", scope={"repo_url": 123, "branch": "main"})
-        )
-    assert "non-empty string" in str(exc_info.value)
+async def test_non_string_repo_url_raises_validation_error() -> None:
+    """Non-string repo_url is rejected by Pydantic before the service is called.
+
+    Pydantic v2 does not coerce int to str in strict-mode models. GitScope
+    declares repo_url as ``str``, so passing an int raises ValidationError.
+    The route converts this to a 422.  This is the same user-visible behavior
+    as the old service-layer ScanError but caught earlier and more precisely.
+    """
+    with pytest.raises(ValidationError):
+        GitScanRequest(scope={"repo_url": 123, "branch": "main"})
 
 
 # ---------------------------------------------------------------------------
@@ -300,31 +307,34 @@ async def test_non_string_repo_url_raises_scan_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_space_keys_dict_elements_raise_scan_error() -> None:
-    """``space_keys`` containing dict elements must raise ScanError, not crash on set()."""
-    service = SourceScanService()
-    with pytest.raises(ScanError) as exc_info:
-        await service.scan(
-            ScanRequest(
-                source_type="confluence",
-                scope={
-                    "base_url": _CONFLUENCE_BASE,
-                    "space_keys": [{"key": "ENG"}],  # dict element, not a string
-                },
-                auth=_CONFLUENCE_AUTH,
-            )
+async def test_space_keys_dict_elements_raise_validation_error() -> None:
+    """``space_keys`` containing dict elements is rejected by Pydantic.
+
+    ConfluenceScope.space_keys is ``list[str]``; a dict element is not a str,
+    so Pydantic raises ValidationError before the service is called.
+    The route converts this to a 422.
+    """
+    with pytest.raises(ValidationError):
+        ConfluenceScanRequest(
+            scope={
+                "base_url": _CONFLUENCE_BASE,
+                "space_keys": [{"key": "ENG"}],  # dict element, not a string
+            },
+            auth=_CONFLUENCE_AUTH,
         )
-    assert "non-empty strings" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
 async def test_space_keys_empty_string_elements_raise_scan_error() -> None:
-    """Empty-string elements in ``space_keys`` must be rejected."""
+    """Empty-string elements in ``space_keys`` must be rejected.
+
+    Pydantic accepts list[str] with empty strings (they are valid str), so the
+    service-layer guard still catches this case and raises ScanError.
+    """
     service = SourceScanService()
     with pytest.raises(ScanError) as exc_info:
         await service.scan(
-            ScanRequest(
-                source_type="confluence",
+            ConfluenceScanRequest(
                 scope={
                     "base_url": _CONFLUENCE_BASE,
                     "space_keys": ["ENG", ""],  # empty string mixed in
@@ -341,33 +351,31 @@ async def test_space_keys_empty_string_elements_raise_scan_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_jql_raises_scan_error() -> None:
-    """Absent ``jql`` field must raise ScanError, not silently use a default."""
-    service = SourceScanService()
-    with pytest.raises(ScanError) as exc_info:
-        await service.scan(
-            ScanRequest(
-                source_type="jira",
-                scope={"base_url": _JIRA_BASE},  # no jql key
-                auth=_JIRA_AUTH,
-            )
+async def test_missing_jql_raises_validation_error() -> None:
+    """Absent ``jql`` is now caught by Pydantic before the service is called.
+
+    JiraScope.jql is a required field; constructing JiraScanRequest without it
+    raises pydantic.ValidationError.  The route converts this to a 422.
+    """
+    with pytest.raises(ValidationError):
+        JiraScanRequest(
+            scope={"base_url": _JIRA_BASE},  # no jql key
+            auth=_JIRA_AUTH,
         )
-    assert "non-empty string" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
-async def test_non_string_jql_raises_scan_error() -> None:
-    """Non-string ``jql`` must raise ScanError, not crash downstream."""
-    service = SourceScanService()
-    with pytest.raises(ScanError) as exc_info:
-        await service.scan(
-            ScanRequest(
-                source_type="jira",
-                scope={"base_url": _JIRA_BASE, "jql": 42},  # int, not string
-                auth=_JIRA_AUTH,
-            )
+async def test_non_string_jql_raises_validation_error() -> None:
+    """Non-string jql is rejected by Pydantic before the service is called.
+
+    Pydantic v2 does not coerce int to str. JiraScope declares jql as ``str``,
+    so passing an int raises ValidationError. The route converts this to a 422.
+    """
+    with pytest.raises(ValidationError):
+        JiraScanRequest(
+            scope={"base_url": _JIRA_BASE, "jql": 42},  # int, not string
+            auth=_JIRA_AUTH,
         )
-    assert "non-empty string" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -390,8 +398,7 @@ async def test_confluence_total_pages_none_when_any_count_unknown() -> None:
         return_value=mock_client,
     ):
         resp = await service.scan(
-            ScanRequest(
-                source_type="confluence",
+            ConfluenceScanRequest(
                 scope={"base_url": _CONFLUENCE_BASE},
                 auth=_CONFLUENCE_AUTH,
             )
@@ -432,8 +439,7 @@ async def test_confluence_total_pages_none_with_missing_totalsize() -> None:
         return_value=mock_client,
     ):
         resp = await service.scan(
-            ScanRequest(
-                source_type="confluence",
+            ConfluenceScanRequest(
                 scope={"base_url": _CONFLUENCE_BASE},
                 auth=_CONFLUENCE_AUTH,
             )
@@ -524,7 +530,7 @@ async def test_scan_budget_cancels_hung_scan(monkeypatch) -> None:
 
     with pytest.raises(ScanError) as exc_info:
         await service.scan(
-            ScanRequest(source_type="git", scope={"repo_url": "x", "branch": "main"})
+            GitScanRequest(scope={"repo_url": "x", "branch": "main"})
         )
     assert "budget" in str(exc_info.value)
     assert exc_info.value.reachable is False
@@ -591,8 +597,7 @@ async def test_confluence_scan_happy_path() -> None:
         return_value=mock_client,
     ):
         resp = await service.scan(
-            ScanRequest(
-                source_type="confluence",
+            ConfluenceScanRequest(
                 scope={"base_url": _CONFLUENCE_BASE},
                 auth=_CONFLUENCE_AUTH,
             )
@@ -630,8 +635,7 @@ async def test_confluence_scan_filters_to_requested_space_keys() -> None:
         return_value=mock_client,
     ):
         resp = await service.scan(
-            ScanRequest(
-                source_type="confluence",
+            ConfluenceScanRequest(
                 scope={"base_url": _CONFLUENCE_BASE, "space_keys": ["ENG"]},
                 auth=_CONFLUENCE_AUTH,
             )
@@ -657,8 +661,7 @@ async def test_confluence_invalid_token_raises_scan_error() -> None:
     ):
         with pytest.raises(ScanError) as exc_info:
             await service.scan(
-                ScanRequest(
-                    source_type="confluence",
+                ConfluenceScanRequest(
                     scope={"base_url": _CONFLUENCE_BASE},
                     auth=_CONFLUENCE_AUTH,
                 )
@@ -694,8 +697,7 @@ async def test_confluence_token_not_in_scan_error() -> None:
     ):
         with pytest.raises(ScanError) as exc_info:
             await service.scan(
-                ScanRequest(
-                    source_type="confluence",
+                ConfluenceScanRequest(
                     scope={"base_url": _CONFLUENCE_BASE},
                     auth={"access_token": secret},
                 )
@@ -743,8 +745,7 @@ async def test_jira_scan_happy_path() -> None:
         return_value=mock_client,
     ):
         resp = await service.scan(
-            ScanRequest(
-                source_type="jira",
+            JiraScanRequest(
                 scope={"base_url": _JIRA_BASE, "jql": "project = ENG ORDER BY created"},
                 auth=_JIRA_AUTH,
             )
@@ -773,8 +774,7 @@ async def test_jira_invalid_token_raises_scan_error() -> None:
     ):
         with pytest.raises(ScanError) as exc_info:
             await service.scan(
-                ScanRequest(
-                    source_type="jira",
+                JiraScanRequest(
                     scope={"base_url": _JIRA_BASE, "jql": "project = ENG"},
                     auth=_JIRA_AUTH,
                 )
@@ -799,8 +799,7 @@ async def test_jira_invalid_jql_raises_scan_error() -> None:
     ):
         with pytest.raises(ScanError) as exc_info:
             await service.scan(
-                ScanRequest(
-                    source_type="jira",
+                JiraScanRequest(
                     scope={"base_url": _JIRA_BASE, "jql": "NOT VALID JQL {{{{"},
                     auth=_JIRA_AUTH,
                 )
@@ -867,8 +866,7 @@ async def test_atlassian_401_refresh_retry_success() -> None:
         # stopping at the first raise.
         with pytest.raises(ScanError) as exc_info:
             await service.scan(
-                ScanRequest(
-                    source_type="confluence",
+                ConfluenceScanRequest(
                     scope={"base_url": _CONFLUENCE_BASE},
                     auth=_CONFLUENCE_AUTH,
                 )
@@ -911,8 +909,7 @@ async def test_atlassian_transparent_refresh_succeeds() -> None:
         return_value=mock_client,
     ):
         resp = await service.scan(
-            ScanRequest(
-                source_type="confluence",
+            ConfluenceScanRequest(
                 scope={"base_url": _CONFLUENCE_BASE},
                 auth=_CONFLUENCE_AUTH,
             )

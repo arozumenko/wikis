@@ -28,14 +28,129 @@ Backwards compatibility: the legacy flat fields (``repo_url``, ``branch``,
 ``access_token``) are still accepted and auto-normalised into the
 ``source_type`` / ``scope`` / ``auth`` shape by the model validator, so
 existing API consumers and the entire test suite continue to work.
+
+Discriminated-union scope/auth models (#215)
+--------------------------------------------
+``ScanRequest`` is a discriminated union keyed on ``source_type``.  Each
+variant pairs the correct scope + auth model:
+
+    GitScanRequest       scope: GitScope       auth: GitAuth
+    ConfluenceScanRequest scope: ConfluenceScope auth: AtlassianAuth
+    JiraScanRequest       scope: JiraScope       auth: AtlassianAuth
+
+Invalid combos (git + AtlassianAuth, confluence + GitScope, etc.) are
+rejected by Pydantic with a 422 before reaching any service code.
+
+``GenerateWikiRequest`` keeps ``scope: dict[str, Any]`` and
+``auth: dict[str, Any]`` so the legacy flat-field normalisation validator
+(``_normalize_legacy``) and all downstream subprocess serialisation code
+continue to work unchanged.  The typed scope/auth models defined here can
+be used directly when constructing ``GenerateWikiRequest`` via
+``model_validate`` — Pydantic coerces model instances into their dict
+representation automatically.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, model_validator
+
+# ---------------------------------------------------------------------------
+# Typed scope models (#215)
+# ---------------------------------------------------------------------------
+
+
+class GitScope(BaseModel):
+    """Scope for a git source."""
+
+    repo_url: str
+    branch: str = "main"
+
+
+class ConfluenceScope(BaseModel):
+    """Scope for a Confluence source."""
+
+    base_url: str
+    space_keys: list[str] = Field(default_factory=list)
+
+
+class JiraScope(BaseModel):
+    """Scope for a Jira source."""
+
+    base_url: str
+    jql: str
+
+
+# ---------------------------------------------------------------------------
+# Typed auth models (#215)
+# ---------------------------------------------------------------------------
+
+
+class GitAuth(BaseModel):
+    """Auth for a git source (optional PAT).
+
+    ``extra="forbid"`` ensures that AtlassianAuth fields (e.g. ``access_token``)
+    are rejected when paired with ``source_type="git"``, making the discriminated
+    union enforce valid combos at validation time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pat: str | None = None
+
+
+class AtlassianAuth(BaseModel):
+    """Auth for Confluence or Jira (OAuth2 access token + optional refresh).
+
+    ``extra="forbid"`` ensures that GitAuth fields (e.g. ``pat``) are rejected
+    when paired with ``source_type="confluence"`` or ``source_type="jira"``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    access_token: str
+    refresh_token: str | None = None
+    client_id: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Per-source-type ScanRequest variants (#215)
+# ---------------------------------------------------------------------------
+
+
+class GitScanRequest(BaseModel):
+    """Scan request for a git repository."""
+
+    source_type: Literal["git"] = "git"
+    scope: GitScope
+    auth: GitAuth = Field(default_factory=GitAuth)
+
+
+class ConfluenceScanRequest(BaseModel):
+    """Scan request for a Confluence instance."""
+
+    source_type: Literal["confluence"] = "confluence"
+    scope: ConfluenceScope
+    auth: AtlassianAuth
+
+
+class JiraScanRequest(BaseModel):
+    """Scan request for a Jira instance."""
+
+    source_type: Literal["jira"] = "jira"
+    scope: JiraScope
+    auth: AtlassianAuth
+
+
+# Discriminated union — FastAPI accepts this directly as a request body type.
+# ``source_type`` drives discrimination; invalid combos (e.g. git +
+# AtlassianAuth) are rejected by Pydantic with a 422 before any service code.
+ScanRequest = Annotated[
+    Union[GitScanRequest, ConfluenceScanRequest, JiraScanRequest],
+    Discriminator("source_type"),
+]
 
 # ---------------------------------------------------------------------------
 # Generate Wiki
@@ -167,25 +282,16 @@ class GenerateWikiResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Source scan / preview (#207)
+# Source scan / preview (#207, #215)
 # ---------------------------------------------------------------------------
 #
 # Validates a source configuration and returns a lightweight preview (default
 # branch, file count, top-level paths) without persisting anything. Drives
 # Step 3 of the source-ingestion wizard (#208). Auth material flows through
 # the request body — never stored.
-
-
-class ScanRequest(BaseModel):
-    """Validate a source and return a preview, no side effects.
-
-    Same ``source_type`` / ``scope`` / ``auth`` shape as :class:`GenerateWikiRequest`
-    so the wizard can reuse the form payload it would post to ``/wikis``.
-    """
-
-    source_type: Literal["git", "confluence", "jira"] = "git"
-    scope: dict[str, Any] = Field(default_factory=dict)
-    auth: dict[str, Any] = Field(default_factory=dict)
+#
+# ScanRequest is a discriminated union defined at the top of this module
+# (``GitScanRequest | ConfluenceScanRequest | JiraScanRequest``).
 
 
 class GitScanPreview(BaseModel):

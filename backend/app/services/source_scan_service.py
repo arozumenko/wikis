@@ -31,8 +31,11 @@ from app.core.sources.git_toolkit import GitToolkit
 from app.models.api import (
     ConfluenceScanPreview,
     ConfluenceSpaceInfo,
+    ConfluenceScanRequest,
     GitScanPreview,
+    GitScanRequest,
     JiraScanPreview,
+    JiraScanRequest,
     ScanRequest,
     ScanResponse,
 )
@@ -84,15 +87,14 @@ class SourceScanService:
                 reachable=False,
             ) from exc
 
-    async def _scan_git(self, request: ScanRequest) -> ScanResponse:
-        scope = request.scope or {}
-        repo_url = scope.get("repo_url")
-        if not isinstance(repo_url, str) or not repo_url:
+    async def _scan_git(self, request: GitScanRequest) -> ScanResponse:
+        # scope and auth are now typed models — Pydantic enforces non-empty
+        # strings and correct field names before we reach this point.
+        repo_url = request.scope.repo_url
+        if not repo_url:
             raise ScanError("scope.repo_url must be a non-empty string for git scans")
-        branch = scope.get("branch", "main")
-        if not isinstance(branch, str) or not branch:
-            raise ScanError("scope.branch must be a non-empty string")
-        token = (request.auth or {}).get("pat")
+        branch = request.scope.branch or "main"
+        token = request.auth.pat
 
         # Security gate: local paths must clear ALLOWED_LOCAL_PATHS before
         # the toolkit touches them. ``GitToolkit.from_config`` documents
@@ -181,7 +183,7 @@ class SourceScanService:
         )
 
 
-    async def _scan_confluence(self, request: ScanRequest) -> ScanResponse:
+    async def _scan_confluence(self, request: ConfluenceScanRequest) -> ScanResponse:
         """Scan a Confluence instance and return a space-level preview.
 
         Page-count strategy: ``GET /wiki/api/v2/spaces/{key}/pages?limit=1``
@@ -191,38 +193,29 @@ class SourceScanService:
         does return ``totalSize`` in its envelope.  If that field is missing (e.g.
         filtered by permissions), ``page_count`` is left as ``None`` so the UI can
         render ``"?"``.
+
+        scope.space_keys is validated as list[str] by ConfluenceScope; empty
+        list means "all spaces".  The C1 element-type check is still applied
+        here for robustness but Pydantic should already enforce it.
         """
-        scope = request.scope or {}
-        base_url = scope.get("base_url")
-        if not isinstance(base_url, str) or not base_url:
+        # Typed accessors — Pydantic enforces non-empty base_url + list[str]
+        # space_keys before we reach this point.
+        base_url = request.scope.base_url
+        if not base_url:
             raise ScanError(
                 "scope.base_url must be a non-empty string for confluence scans"
             )
-        space_keys_raw = scope.get("space_keys")
-        if isinstance(space_keys_raw, str):
-            requested_keys: list[str] = [
-                k.strip() for k in space_keys_raw.split(",") if k.strip()
-            ]
-        elif space_keys_raw is None:
-            requested_keys = []
-        else:
-            requested_keys = list(space_keys_raw)
-            # C1 — every element must be a non-empty string; reject dict/int/None
-            # payloads that would silently pass through set() or reach the API.
-            if not all(isinstance(k, str) and k for k in requested_keys):
-                raise ScanError(
-                    "scope.space_keys must be a list of non-empty strings"
-                )
-
-        auth = request.auth or {}
-        access_token = auth.get("access_token")
-        if not isinstance(access_token, str) or not access_token:
+        requested_keys: list[str] = list(request.scope.space_keys)
+        # C1 guard still applies: Pydantic validates list[str] but empty
+        # strings are allowed by the type system — reject them explicitly.
+        if not all(isinstance(k, str) and k for k in requested_keys):
             raise ScanError(
-                "auth.access_token must be a non-empty string for confluence scans",
-                reachable=False,
+                "scope.space_keys must be a list of non-empty strings"
             )
-        refresh_token: str | None = auth.get("refresh_token") or None
-        client_id: str | None = auth.get("client_id") or None
+
+        access_token: str = request.auth.access_token
+        refresh_token: str | None = request.auth.refresh_token or None
+        client_id: str | None = request.auth.client_id or None
 
         try:
             async with AtlassianClient(
@@ -270,7 +263,7 @@ class SourceScanService:
             preview=preview,
         )
 
-    async def _scan_jira(self, request: ScanRequest) -> ScanResponse:
+    async def _scan_jira(self, request: JiraScanRequest) -> ScanResponse:
         """Scan a Jira instance, validate JQL, and return an issue-count preview.
 
         Uses ``GET /rest/api/3/search`` with ``maxResults=3`` — the search
@@ -281,28 +274,23 @@ class SourceScanService:
         because the scan itself failed — the site may well be reachable, but
         reporting ``reachable=True`` when the preview cannot be computed would
         mislead the wizard into advancing to the next step.
+
+        scope.base_url and scope.jql are validated as non-empty strings by
+        JiraScope before we reach this point.
         """
-        scope = request.scope or {}
-        base_url = scope.get("base_url")
-        if not isinstance(base_url, str) or not base_url:
+        # Typed accessors — Pydantic enforces non-empty strings before we get here.
+        base_url = request.scope.base_url
+        if not base_url:
             raise ScanError(
                 "scope.base_url must be a non-empty string for jira scans"
             )
-        jql = scope.get("jql")
-        # C3 — mirror the repo_url / base_url guards: reject non-string and
-        # empty values explicitly rather than silently coercing them.
-        if not isinstance(jql, str) or not jql:
+        jql = request.scope.jql
+        if not jql:
             raise ScanError("scope.jql must be a non-empty string")
 
-        auth = request.auth or {}
-        access_token = auth.get("access_token")
-        if not isinstance(access_token, str) or not access_token:
-            raise ScanError(
-                "auth.access_token must be a non-empty string for jira scans",
-                reachable=False,
-            )
-        refresh_token: str | None = auth.get("refresh_token") or None
-        client_id: str | None = auth.get("client_id") or None
+        access_token: str = request.auth.access_token
+        refresh_token: str | None = request.auth.refresh_token or None
+        client_id: str | None = request.auth.client_id or None
 
         try:
             async with AtlassianClient(
