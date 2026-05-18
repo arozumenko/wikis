@@ -223,7 +223,8 @@ export function StepScan({
 
     // Git preview (#221)
     if (isGitPreview(state.result)) {
-      const gp = state.result.preview as GitScanPreview;
+      // isGitPreview narrows state.result.preview to GitScanPreview — no cast needed.
+      const gp = state.result.preview;
       return (
         <Box sx={{ mt: 1 }} data-testid="scan-success">
           {header}
@@ -294,7 +295,8 @@ export function StepScan({
 
     // Confluence preview (#221)
     if (isConfluencePreview(state.result)) {
-      const cp = state.result.preview as ConfluenceScanPreview;
+      // isConfluencePreview narrows state.result.preview to ConfluenceScanPreview — no cast needed.
+      const cp = state.result.preview;
       return (
         <Box sx={{ mt: 1 }} data-testid="scan-success">
           {header}
@@ -351,7 +353,8 @@ export function StepScan({
 
     // Jira preview (#221)
     if (isJiraPreview(state.result)) {
-      const jp = state.result.preview as JiraScanPreview;
+      // isJiraPreview narrows state.result.preview to JiraScanPreview — no cast needed.
+      const jp = state.result.preview;
       return (
         <Box sx={{ mt: 1 }} data-testid="scan-success">
           {header}

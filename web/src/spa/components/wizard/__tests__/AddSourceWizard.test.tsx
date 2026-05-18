@@ -509,4 +509,140 @@ describe('AddSourceWizard', () => {
     expect(screen.getByTestId('jira-issue-PROJ-2')).toBeInTheDocument();
     expect(screen.getByTestId('jira-issue-PROJ-3')).toBeInTheDocument();
   });
+
+  // -------------------------------------------------------------------
+  // PR #223 round-2 — Confirm-step buildPreviewSummary() for Confluence
+  // and Jira (Rio review: untested branches).
+  // -------------------------------------------------------------------
+
+  it('#223: Confirm step shows correct summary string for Confluence preview (total_pages known)', async () => {
+    // Drive wizard end-to-end: Confluence connector → Configure (add space
+    // key) → Scan (mocked to return Confluence preview) → Confirm.
+    // Assert the confirm-scan-stats Alert text matches buildPreviewSummary().
+    const user = userEvent.setup();
+
+    mockUseConnections.mockReturnValue({
+      connections: [],
+      atlassian: {
+        access_token: 'tok',
+        refresh_token: null,
+        site_name: 'mysite.atlassian.net',
+        accessible_resources: [{ id: 'r1', url: 'https://mysite.atlassian.net', name: 'My Site' }],
+      },
+      refreshAtlassianIfNeeded: mockRefreshAtlassianIfNeeded,
+    });
+
+    mockScanSource.mockResolvedValue({
+      source_type: 'confluence',
+      reachable: true,
+      preview: {
+        spaces: [
+          { key: 'ENG', name: 'Engineering', page_count: 80 },
+          { key: 'OPS', name: 'Ops', page_count: 40 },
+        ],
+        total_pages: 120,
+      },
+      warnings: [],
+    });
+
+    renderWizard();
+    await user.click(screen.getByTestId('connector-confluence'));
+    const spaceInput = await screen.findByTestId('space-keys-input');
+    await user.type(spaceInput, 'ENG');
+    await user.keyboard('{Enter}');
+    // Advance through Scan.
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('scan-success');
+    // Advance to Confirm.
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('step-confirm');
+
+    // buildPreviewSummary for confluence with 2 spaces and total_pages=120:
+    // "Preview: 2 spaces, 120 pages."
+    const statsAlert = screen.getByTestId('confirm-scan-stats');
+    expect(statsAlert).toHaveTextContent('Preview: 2 spaces, 120 pages.');
+  });
+
+  it('#223: Confirm step shows "?" for Confluence preview when total_pages is null', async () => {
+    const user = userEvent.setup();
+
+    mockUseConnections.mockReturnValue({
+      connections: [],
+      atlassian: {
+        access_token: 'tok',
+        refresh_token: null,
+        site_name: 'mysite.atlassian.net',
+        accessible_resources: [{ id: 'r1', url: 'https://mysite.atlassian.net', name: 'My Site' }],
+      },
+      refreshAtlassianIfNeeded: mockRefreshAtlassianIfNeeded,
+    });
+
+    mockScanSource.mockResolvedValue({
+      source_type: 'confluence',
+      reachable: true,
+      preview: {
+        spaces: [
+          { key: 'ENG', name: 'Engineering', page_count: null },
+          { key: 'OPS', name: 'Ops', page_count: null },
+        ],
+        // total_pages unknown — backend didn't enumerate everything.
+        total_pages: null,
+      },
+      warnings: [],
+    });
+
+    renderWizard();
+    await user.click(screen.getByTestId('connector-confluence'));
+    const spaceInput = await screen.findByTestId('space-keys-input');
+    await user.type(spaceInput, 'ENG');
+    await user.keyboard('{Enter}');
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('scan-success');
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('step-confirm');
+
+    // buildPreviewSummary for confluence with 2 spaces and total_pages=null:
+    // "Preview: 2 spaces, ? pages."
+    const statsAlert = screen.getByTestId('confirm-scan-stats');
+    expect(statsAlert).toHaveTextContent('Preview: 2 spaces, ? pages.');
+  });
+
+  it('#223: Confirm step shows correct summary string for Jira preview (JQL validated)', async () => {
+    const user = userEvent.setup();
+
+    mockUseConnections.mockReturnValue({
+      connections: [],
+      atlassian: {
+        access_token: 'tok',
+        refresh_token: null,
+        site_name: 'mysite.atlassian.net',
+        accessible_resources: [{ id: 'r1', url: 'https://mysite.atlassian.net', name: 'My Site' }],
+      },
+      refreshAtlassianIfNeeded: mockRefreshAtlassianIfNeeded,
+    });
+
+    mockScanSource.mockResolvedValue({
+      source_type: 'jira',
+      reachable: true,
+      preview: {
+        matching_issues: 47,
+        sample_issue_keys: ['PROJ-1', 'PROJ-2'],
+        jql_validated: true,
+      },
+      warnings: [],
+    });
+
+    renderWizard();
+    await user.click(screen.getByTestId('connector-jira'));
+    // JiraConfigure has a default JQL — just advance.
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('scan-success');
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('step-confirm');
+
+    // buildPreviewSummary for jira with matching_issues=47, jql_validated=true:
+    // "Preview: 47 matching issues, JQL validated."
+    const statsAlert = screen.getByTestId('confirm-scan-stats');
+    expect(statsAlert).toHaveTextContent('Preview: 47 matching issues, JQL validated.');
+  });
 });
