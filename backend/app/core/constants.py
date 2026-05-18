@@ -30,12 +30,22 @@ EMBEDDING_BATCH_SIZE = 64
 DOCUMENTATION_EXTENSIONS = {
     # Prose / markup
     '.md': 'markdown',
+    '.mdx': 'markdown',           # #118 — MDX (Docusaurus, Astro)
+    '.qmd': 'markdown',           # #118 — Quarto markdown
     '.rst': 'restructuredtext',
     '.txt': 'plaintext',
     '.adoc': 'asciidoc',
     '.doc': 'document',
     '.docx': 'document',
+    '.xlsx': 'spreadsheet',       # #118 phase 2 — LibreOffice → PDF → vision
+    '.pptx': 'presentation',      # #118 phase 2 — LibreOffice → PDF → vision
     '.pdf': 'pdf',
+    # Rendered images (#118) — extractor describes content via LLM vision
+    '.png': 'image',
+    '.jpg': 'image',
+    '.jpeg': 'image',
+    '.gif': 'image',
+    '.webp': 'image',
     # Web / data interchange
     '.html': 'html',
     '.htm': 'html',
@@ -133,6 +143,46 @@ KNOWN_FILENAMES = {
     '.env.development': 'config',
     '.env.production': 'config',
 }
+
+# Subset of KNOWN_FILENAMES whose conventional ``<name>.<suffix>``
+# variants (Dockerfile.prod, Makefile.local, .env.staging, etc.) should
+# classify the same way.  Without this, ``Dockerfile.prod`` falls into
+# ``unknown`` and disappears from the graph entirely (#181 Bug A).
+# Entries here MUST also exist in KNOWN_FILENAMES.
+PREFIX_MATCH_FILENAMES = frozenset({
+    # Build systems — env/variant suffixes are common (Makefile.am,
+    # Makefile.local, Justfile.dev).
+    'Makefile', 'makefile', 'GNUmakefile',
+    'Justfile', 'justfile', 'Taskfile', 'Earthfile',
+    'Snakefile', 'Rakefile',
+    # Container / DevOps — the headline case: Dockerfile.prod /
+    # Dockerfile.dev / Containerfile.staging.
+    'Dockerfile', 'Containerfile', 'Vagrantfile', 'Procfile',
+    # CI/CD — Jenkinsfile.deploy, Jenkinsfile.test.
+    'Jenkinsfile',
+    # Env files — .env.staging, .env.test (variants beyond the explicit
+    # entries in KNOWN_FILENAMES).
+    '.env',
+})
+
+
+def classify_known_filename(name: str) -> str | None:
+    """Return the doc_type for ``name`` or ``None``.
+
+    Tries exact match in :data:`KNOWN_FILENAMES` first, then prefix-match
+    against entries in :data:`PREFIX_MATCH_FILENAMES` so common
+    environment-suffixed variants (``Dockerfile.prod``,
+    ``Makefile.local``, ``.env.staging``) classify identically to their
+    base form.
+    """
+    exact = KNOWN_FILENAMES.get(name)
+    if exact is not None:
+        return exact
+    for stem in PREFIX_MATCH_FILENAMES:
+        if name.startswith(stem + '.'):
+            return KNOWN_FILENAMES[stem]
+    return None
+
 
 # =============================================================================
 # Documentation Symbol Types

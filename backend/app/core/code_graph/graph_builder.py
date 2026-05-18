@@ -215,6 +215,31 @@ from ..constants import (
     DOC_SYMBOL_TYPES, ARCHITECTURAL_SYMBOLS,
     DOCUMENTATION_EXTENSIONS as _DOC_EXTENSIONS_MAP,
     KNOWN_FILENAMES as _KNOWN_FILENAMES_MAP,
+    classify_known_filename as _classify_known_filename,
+)
+from ..extractors import (  # #118 — non-code ingestion
+    KNOWN_VISION_EXTENSIONS,
+    ExtractorRegistry,
+)
+
+
+# #119: Names of all languages handled by the BasicVisitorParser
+# family. Module-level constant so the lost-language diagnostic in
+# ``EnhancedUnifiedGraphBuilder.__init__`` and the
+# ``test_basic_visitor_langs_sync_with_factory`` test can both reach
+# it without instantiating the builder or importing the lang_configs
+# package (which would re-trigger the very failure mode the diagnostic
+# is designed to surface). Keep in sync with
+# ``app.core.parsers.lang_configs.build_basic_parsers()``; CI catches
+# drift via the sync-check test.
+_BASIC_VISITOR_LANGS = (
+    # Phase 1
+    "ruby", "php", "kotlin", "scala", "lua",
+    # Phase 2 — pure-config visitor fits
+    "swift", "dart", "powershell", "bash", "objc",
+    "verilog", "fortran", "julia", "pascal",
+    # Phase 2 — bespoke subclasses
+    "elixir", "r", "zig", "groovy",
 )
 
 # Log feature flag state at import time
@@ -398,7 +423,27 @@ class EnhancedUnifiedGraphBuilder:
     # Known filenames for extensionless / special-name files
     KNOWN_FILENAMES = _KNOWN_FILENAMES_MAP
     
-    def __init__(self, max_workers: int = 4, debug_mode: bool = False):
+    def __init__(
+        self,
+        max_workers: int = 4,
+        debug_mode: bool = False,
+        extractor_registry: "ExtractorRegistry | None" = None,
+    ):
+        # #118: registry of non-code document extractors. ``None`` keeps
+        # the legacy text-read path (markdown, yaml, plain text) — useful
+        # for tests + callers that don't need PDF/image ingestion.
+        # Production wires this via ``build_default_registry(llm=...)`` at
+        # graph-builder construction time so vision extractors get the
+        # project-configured LLM.
+        self._extractor_registry = extractor_registry
+        # #148: per-extension dedup for vision-eligible files that fall
+        # back to the legacy text-read path. Re-initialized at the top
+        # of each ``_parse_documentation_files`` call so a re-index
+        # (e.g. webhook-triggered) sees a fresh state — without this,
+        # if the operator fixed their LLM config between runs, the
+        # second run would still suppress the expected WARNING.
+        self._warned_legacy_vision_extensions: set[str] = set()
+
         # Tier 1: Rich parsers for comprehensive analysis
         self.rich_parsers = {
             'cpp': CppEnhancedParser(),
@@ -410,6 +455,42 @@ class EnhancedUnifiedGraphBuilder:
             'typescript': TypeScriptEnhancedParser(),
             'rust': RustVisitorParser(),
         }
+
+        # #119: Tier 1.5 — lightweight tree-sitter visitor parsers driven
+        # by per-language LanguageConfig. Same ParseResult shape as the
+        # rich parsers, so they slot into ``rich_parsers`` and the
+        # downstream dispatch at ``:699`` doesn't need to know they're
+        # shallower. These replace what used to be regex-based
+        # extraction in ``code_splitter`` for ruby/kotlin/scala and add
+        # tree-sitter coverage for php/lua.
+        #
+        # Failure mode: logs at ERROR (not WARNING) and names every
+        # language we lost. Ruby / Kotlin / Scala fall back to the
+        # regex ``basic_languages`` path; PHP and Lua have NO fallback
+        # and disappear entirely. Operators need the loud signal so
+        # they can react (typically: missing tree-sitter grammar wheel).
+        #
+        # The lost-language list is a **module-level literal** rather
+        # than imported from ``lang_configs`` — if the failure mode is
+        # an ImportError on the lang_configs package itself (e.g. a
+        # missing grammar raising at module load), a second import in
+        # the except branch would re-trigger the same failure and
+        # silently suppress the diagnostic. Lifting it to module scope
+        # also lets ``test_basic_visitor_langs_sync_with_factory``
+        # import it without instantiating the whole graph builder.
+        try:
+            from ..parsers.lang_configs import build_basic_parsers as _build_basic
+
+            self.rich_parsers.update(_build_basic())
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "[graph_builder] basic-visitor parsers FAILED to "
+                "initialise (%s) — the following languages will not "
+                "be parsed via tree-sitter: %s. Ruby/Kotlin/Scala fall "
+                "back to the regex code_splitter path; PHP and Lua "
+                "have no fallback and will be skipped entirely.",
+                exc, list(_BASIC_VISITOR_LANGS),
+            )
         
         # Configuration
         self.max_workers = max_workers
@@ -852,9 +933,12 @@ class EnhancedUnifiedGraphBuilder:
                 language = self.SUPPORTED_LANGUAGES.get(file_extension)
                 doc_type = self.DOCUMENTATION_EXTENSIONS.get(file_extension)
                 
-                # Fallback: check known filenames for extensionless / special files
+                # Fallback: check known filenames for extensionless /
+                # special files.  Uses prefix-match-aware classifier so
+                # ``Dockerfile.prod`` / ``Makefile.local`` classify
+                # alongside their base forms (#181 Bug A).
                 if not language and not doc_type:
-                    doc_type = self.KNOWN_FILENAMES.get(file_path.name)
+                    doc_type = _classify_known_filename(file_path.name)
                 
                 if language:
                     files_by_language[language].append(str(file_path))
@@ -1872,6 +1956,27 @@ class EnhancedUnifiedGraphBuilder:
                 if hasattr(relationship, 'annotations') and relationship.annotations:
                     rel_annotations = relationship.annotations.copy()
                 
+                # #119 — Map the Relationship.confidence float to the
+                # storage layer's confidence enum (``EXTRACTED`` /
+                # ``INFERRED``). The basic visitor parser emits 0.6 on
+                # name-only CALLS edges → ``INFERRED``. The deep
+                # parsers emit ≥ 0.7 across the board (verified across
+                # python/go/java/csharp/javascript/rust/cpp/typescript).
+                #
+                # Threshold ``< 0.7`` keeps every existing deep-parser
+                # edge at its prior storage value (the storage backends
+                # default missing-confidence-key writes to ``EXTRACTED``,
+                # see sqlite.py:847 and postgres.py:882). Without this
+                # threshold tuning, python_parser's pre-existing
+                # 0.7-tier edges (3 callsites, plus a conditional
+                # branch) would silently reclassify to INFERRED —
+                # which Rio's R2 review caught as a regression in the
+                # first fixup pass (Rio R3, second-round review).
+                rel_confidence = getattr(relationship, 'confidence', 1.0)
+                confidence_str = (
+                    'INFERRED' if rel_confidence < 0.7 else 'EXTRACTED'
+                )
+
                 # Collect edge for bulk addition
                 edge_data = {
                     'relationship_type': rel_type,
@@ -1879,6 +1984,7 @@ class EnhancedUnifiedGraphBuilder:
                     'target_file': target_file_name,
                     'analysis_level': 'comprehensive',
                     'annotations': rel_annotations,
+                    'confidence': confidence_str,
                     # Store metadata for deferred node creation
                     '_source_symbol': source_symbol,
                     '_target_symbol': target_symbol,
@@ -3039,20 +3145,120 @@ class EnhancedUnifiedGraphBuilder:
         """
         Process documentation files (markdown, text, etc.) with text chunking
         instead of symbol extraction.
+
+        #118: extension-registered extractors (PDF via LLM-vision, images
+        via LLM-vision, plain-text variants) intercept here before the
+        legacy text-read. Anything not in the registry falls through to
+        the old ``open(file_path, 'r')`` path so legacy formats keep
+        working.
         """
         results = {}
-        
+
+        # #148: reset per-extension WARNING dedup per index pass so a
+        # re-index after a config fix actually surfaces the warning
+        # again (instead of being permanently silenced by the prior
+        # pass on the same builder instance).
+        self._warned_legacy_vision_extensions = set()
+
         for file_path in file_paths:
             try:
-                # Read file content
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                
-                # Determine file type (extension first, then known filename)
                 file_extension = Path(file_path).suffix.lower()
                 doc_type = self.DOCUMENTATION_EXTENSIONS.get(file_extension)
                 if not doc_type:
-                    doc_type = self.KNOWN_FILENAMES.get(Path(file_path).name, 'text')
+                    # Prefix-match-aware lookup so suffixed conventional
+                    # names (Dockerfile.prod, Makefile.local) classify
+                    # the same as their base form (#181 Bug A).
+                    doc_type = _classify_known_filename(Path(file_path).name) or 'text'
+
+                # #118: try the registered extractor first; ``None``
+                # registry or no handler for this extension → legacy path.
+                content: str | None = None
+                extractor = (
+                    self._extractor_registry.get(file_extension)
+                    if self._extractor_registry is not None
+                    else None
+                )
+
+                # #148: a vision-eligible file with no registered
+                # extractor will produce binary-garbage source_text via
+                # the legacy open() path. WARN once per extension per
+                # index pass so operators see the actual cause (missing
+                # LLM config or missing pip extra) rather than just
+                # noticing useless content in the wiki after the fact.
+                if (
+                    extractor is None
+                    and file_extension in KNOWN_VISION_EXTENSIONS
+                    and file_extension not in self._warned_legacy_vision_extensions
+                ):
+                    self._warned_legacy_vision_extensions.add(file_extension)
+                    logger.warning(
+                        "[doc-extractor] %s files in this repo will be "
+                        "ingested via the legacy text-read path because "
+                        "no vision-based extractor is registered. The "
+                        "resulting source_text will be binary garbage. "
+                        "Configure LLM_API_KEY with a vision-capable "
+                        "model (Claude 3+, GPT-4o, Gemini 1.5+) and "
+                        "install the appropriate pip extra "
+                        "([vision] for images, [pdf] for PDFs) to fix. "
+                        "First affected file: %s",
+                        file_extension, file_path,
+                    )
+
+                if extractor is not None:
+                    extracted = extractor.extract(Path(file_path))
+                    if extracted is None:
+                        # WARNING (not INFO): a vision-based extractor
+                        # was registered but returned nothing. This is
+                        # the load-bearing signal for a misconfigured
+                        # LLM (wrong key, model without vision, rate
+                        # limited) — without WARNING-level visibility,
+                        # every PDF / image in the repo would silently
+                        # disappear from the index. The extractor's
+                        # internal WARNING (rate-limit, blank, etc.)
+                        # already tells operators *why*; this line tells
+                        # them *that it happened for this file*.
+                        logger.warning(
+                            "[doc-extractor] %s skipped: extractor "
+                            "%s returned no content (check earlier "
+                            "WARNINGs from app.core.extractors.* for "
+                            "the cause)",
+                            file_path, type(extractor).__name__,
+                        )
+                        continue
+                    content = extracted.text
+                    for warning in extracted.warnings:
+                        logger.warning("[doc-extractor] %s", warning)
+
+                if content is None:
+                    # #173: vision-eligible files without an extractor
+                    # must be SKIPPED, not read as UTF-8. The WARNING
+                    # above already tells operators that the
+                    # extension landed here because of missing LLM
+                    # config / pip extras — we previously logged that
+                    # warning *and then ingested the binary garbage
+                    # anyway*, which contaminates the index with
+                    # meaningless content chunks (a 1186-char "PNG
+                    # document" was the report that surfaced this).
+                    # The legacy text-read path remains correct for
+                    # genuinely textual extensions (markdown, yaml,
+                    # plaintext, etc.) — those are NOT in
+                    # ``KNOWN_VISION_EXTENSIONS``.
+                    if file_extension in KNOWN_VISION_EXTENSIONS:
+                        # The per-extension WARN above already told
+                        # the operator *that* this extension is
+                        # missing an extractor. The debug line
+                        # records *which file* was skipped so an
+                        # audit of "where did my PNGs go?" is
+                        # answerable without correlating against
+                        # ``ls`` — but at DEBUG so it doesn't fire
+                        # by default on a 500-image repo.
+                        logger.debug(
+                            "[doc-extractor] skipping vision file "
+                            "(no extractor): %s", file_path,
+                        )
+                        continue
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
                 
                 # Simple text chunking for documentation
                 chunks = self._chunk_text_content(content, file_path, doc_type)

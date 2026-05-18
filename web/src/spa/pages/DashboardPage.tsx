@@ -36,7 +36,8 @@ import { GenerateForm } from '../components/GenerateForm';
 import { ImportWikiDialog } from '../components/ImportWikiDialog';
 import { ProjectCard } from '../components/ProjectCard';
 import { CreateProjectDialog } from '../components/CreateProjectDialog';
-import { listWikis, deleteWiki, generateWiki, updateWikiVisibility } from '../api/wiki';
+import { listWikis, deleteWiki, generateWikiMultiSource, updateWikiVisibility } from '../api/wiki';
+import type { GenerateWikiMultiSourceRequest } from '../api/wiki';
 import { listProjects, type ProjectResponse } from '../api/project';
 import { ApiError } from '../api/client';
 import type { components } from '../api/types.generated';
@@ -709,10 +710,10 @@ export function DashboardPage() {
             key={searchUrl.trim()}
             disabled={submitting}
             initialUrl={searchUrl.trim()}
-            onSubmit={async (req) => {
+            onSubmitMultiSource={async (req: GenerateWikiMultiSourceRequest) => {
               setSubmitting(true);
               try {
-                const response = await generateWiki(req);
+                const response = await generateWikiMultiSource(req);
                 setShowGenerateModal(false);
                 navigate(
                   `/wiki/${response.wiki_id}?generating=true&invocation=${response.invocation_id}`,

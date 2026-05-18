@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -21,6 +22,52 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Statuses that mean "an operation is actively writing to this wiki's
+# .wiki.db right now" — both ``generate`` and ``incremental_refresh``
+# treat encountering one of these for the same ``wiki_id`` as a
+# conflict and reject the new request with a 409. ``"running"`` is the
+# incremental refresh's in-flight status; ``"generating"`` is the full
+# regen's.
+_IN_FLIGHT_STATUSES: frozenset[str] = frozenset({"running", "generating"})
+
+
+class IncrementalRefreshInProgressError(Exception):
+    """Raised by :meth:`WikiService.incremental_refresh` when another
+    incremental refresh OR full generate is already running for the
+    same wiki_id.
+
+    #140 idempotency guard: two concurrent runs against the same
+    ``.wiki.db`` race each other's content-hash updates and may produce
+    inconsistent state. The route translates this into a 409.
+    """
+
+    def __init__(self, wiki_id: str, in_progress_invocation_id: str) -> None:
+        self.wiki_id = wiki_id
+        self.in_progress_invocation_id = in_progress_invocation_id
+        super().__init__(
+            f"Incremental refresh already in progress for wiki {wiki_id} "
+            f"(invocation {in_progress_invocation_id})"
+        )
+
+
+class GenerateInProgressError(Exception):
+    """Raised by :meth:`WikiService.generate` when another generate or
+    incremental refresh is already running for the same wiki_id.
+
+    #145 symmetric guard to #140's incremental-side rejection. Both
+    code paths write to the same ``.wiki.db``; concurrent runs race
+    each other's writes. The route translates this into a 409.
+    """
+
+    def __init__(self, wiki_id: str, in_progress_invocation_id: str) -> None:
+        self.wiki_id = wiki_id
+        self.in_progress_invocation_id = in_progress_invocation_id
+        super().__init__(
+            f"Another operation is already running for wiki {wiki_id} "
+            f"(invocation {in_progress_invocation_id})"
+        )
+
+
 class WikiService:
     """Orchestrates wiki generation from repository analysis."""
 
@@ -30,6 +77,12 @@ class WikiService:
         self.wiki_management = wiki_management
         self._invocations: dict[str, Invocation] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        # #165 follow-up: set by ``shutdown()`` so concurrent
+        # ``cancel_invocation`` calls during the drain window can't
+        # cancel a task we're trying to await. Cancellation marks the
+        # asyncio.Task done while the worker thread keeps running —
+        # the exact race that caused the CI segfault.
+        self._shutting_down: bool = False
 
     @property
     def invocations(self) -> dict[str, Invocation]:
@@ -41,9 +94,84 @@ class WikiService:
         self._invocations.pop(inv_id, None)
         self._tasks.pop(inv_id, None)
 
+    def _find_in_flight_for_wiki(
+        self,
+        wiki_id: str,
+        blocked_statuses: frozenset[str] = _IN_FLIGHT_STATUSES,
+    ) -> "Invocation | None":
+        """Return the first in-memory invocation for ``wiki_id`` whose
+        status is in ``blocked_statuses``, or ``None`` if no conflict.
+
+        Shared between :meth:`generate` and :meth:`incremental_refresh`
+        so both endpoints enforce the same mutual-exclusion contract
+        (#140 + #145). The check is synchronous — callers MUST invoke
+        it before any ``await`` that could yield to a racing caller.
+        """
+        for inv in self._invocations.values():
+            # ``inv.id != ""`` guards against a defensive edge case:
+            # ``Invocation`` is a Pydantic model with ``id: str`` (no
+            # ``min_length`` constraint), so a malformed persisted
+            # payload could in theory deserialize with ``id=""``. We
+            # refuse to consider those as in-flight blockers — they'd
+            # always 409-lock the wiki without a usable id for the
+            # caller's response header.
+            if (
+                inv.wiki_id == wiki_id
+                and inv.status in blocked_statuses
+                and inv.id != ""
+            ):
+                return inv
+        return None
+
     async def persist_invocations(self) -> None:
         """Public wrapper — save all invocations to storage."""
         await self._persist_invocations()
+
+    async def shutdown(self, timeout: float = 30.0) -> None:
+        """Drain in-flight invocation tasks before the app shuts down.
+
+        Each entry in ``self._tasks`` is an ``asyncio.Task`` wrapping a
+        coroutine that internally calls ``asyncio.to_thread(...)`` to
+        offload CPU-heavy work (SQLite writes, FTS rebuilds) onto a
+        worker thread. If the event loop closes while one of those
+        tasks is still awaiting its thread, the asyncio side surfaces
+        a ``CancelledError`` **but the underlying OS thread keeps
+        running** — Python can't interrupt thread execution. That
+        thread continues touching the SQLite connection while the
+        fixture / lifespan tears the storage down underneath it,
+        which the SQLite C library handles by segfaulting.
+
+        We use ``asyncio.wait`` (not ``asyncio.wait_for(gather(...))``)
+        because the latter cancels its children on timeout — and that
+        cancellation is the exact failure mode we're guarding against
+        (the asyncio side returns but the worker thread keeps running
+        on shared state). ``asyncio.wait`` returns ``(done, pending)``
+        without cancelling so we can log + bail without re-introducing
+        the bug.
+
+        If the timeout fires we explicitly do **not** cancel the still-
+        pending tasks. Their threads need the storage / engine alive
+        for as long as they're still running; cancelling here would
+        only mask the leak, not fix it. The orphan threads will at
+        least see live state for the rest of the shutdown sequence.
+        """
+        # Mark the service as shutting down before snapshotting the
+        # pending set so a concurrent ``cancel_invocation`` call can't
+        # cancel a task we're about to await. Cancellation races
+        # shutdown — see the docstring above.
+        self._shutting_down = True
+        pending = [t for t in self._tasks.values() if not t.done()]
+        if not pending:
+            return
+        _, still_pending = await asyncio.wait(pending, timeout=timeout)
+        if still_pending:
+            logger.error(
+                "WikiService.shutdown timeout: %d task(s) still in-flight "
+                "after %.0fs — proceeding with shutdown anyway (worker "
+                "threads will continue against live state)",
+                len(still_pending),
+                timeout,
+            )
 
     INVOCATIONS_BUCKET = "wiki_registry"
     INVOCATIONS_KEY = "invocations.json"
@@ -58,9 +186,20 @@ class WikiService:
             for inv_id, inv_data in raw.items():
                 try:
                     inv = Invocation(**inv_data)
-                    if inv.status == "generating":
+                    # #146: any non-terminal status from a previous
+                    # process lifetime is by definition orphaned —
+                    # the task that was driving it is gone. Without
+                    # flipping these to "failed" the idempotency
+                    # guards (PR #144) see phantom in-flight entries
+                    # and 409-lock the wiki on the next request.
+                    # ``"generating"`` = full regen, ``"running"`` =
+                    # incremental refresh.
+                    if inv.status in ("generating", "running"):
+                        prior_status = inv.status
                         inv.status = "failed"
-                        inv.error = "Server restarted during generation"
+                        inv.error = (
+                            f"Server restarted during {prior_status}"
+                        )
                         inv.completed_at = datetime.now()
                     self._invocations[inv_id] = inv
                 except Exception:  # noqa: S110
@@ -90,8 +229,51 @@ class WikiService:
             logger.warning(f"Failed to persist invocations: {e}")
 
     @staticmethod
-    def _make_wiki_id(repo_url: str, branch: str) -> str:
-        """Deterministic wiki ID from repo URL + branch."""
+    def _canonicalize(obj: Any) -> Any:
+        """Recursively sort dict keys and homogeneous list values for stable hashing.
+
+        Ensures that ``space_keys=["A","B"]`` and ``space_keys=["B","A"]`` produce
+        identical JSON so the hash-based wiki ID is order-independent.
+        """
+        if isinstance(obj, dict):
+            return {k: WikiService._canonicalize(v) for k, v in sorted(obj.items())}
+        if isinstance(obj, list):
+            # Sort only homogeneous lists of primitives; leave mixed lists order-preserved.
+            if all(isinstance(x, (str, int, float, bool)) for x in obj):
+                return sorted(obj, key=str)
+            return [WikiService._canonicalize(x) for x in obj]
+        return obj
+
+    @staticmethod
+    def _make_wiki_id(source_type: str, scope: dict[str, Any]) -> str:  # type: ignore[override]
+        """Deterministic wiki ID from source_type + scope.
+
+        Stable across runs: scope keys are sorted before hashing so insertion
+        order doesn't affect the result.  List values (e.g. ``space_keys``) are
+        also sorted so ``["A","B"]`` and ``["B","A"]`` yield the same ID.
+
+        Backwards-compat legacy ID
+        --------------------------
+        Prior to #189, git wikis were identified by
+        ``sha256(f"{repo_url}:{branch}")[:16]``.  If the new hash misses the
+        DB but the old-style hash hits, the caller should fall back to the
+        old hash.  See :meth:`generate` for the one-cycle migration helper.
+        """
+        canonical = json.dumps(
+            WikiService._canonicalize({"source_type": source_type, "scope": scope}),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _make_legacy_git_wiki_id(repo_url: str, branch: str) -> str:
+        """Pre-#189 git wiki ID — used as a fallback during DB migration.
+
+        One-cycle migration helper: if the new-style ID isn't in the DB but
+        the old-style ID is, we reuse the old ID so the existing wiki record
+        and artifacts are preserved.  Remove this in a future cleanup PR once
+        all rows have been migrated.
+        """
         key = f"{repo_url}:{branch}"
         return hashlib.sha256(key.encode()).hexdigest()[:16]
 
@@ -101,12 +283,52 @@ class WikiService:
 
         from app.core.local_repo_provider import extract_git_metadata, is_local_path, make_local_wiki_id
 
-        if is_local_path(request.repo_url):
+        # --- Determine wiki_id from source_type + scope --------------------
+        if request.source_type == "git" and request.repo_url and is_local_path(request.repo_url):
             path = request.repo_url.removeprefix("file://")
             info = extract_git_metadata(Path(path).resolve())
             wiki_id = make_local_wiki_id(path, info.branch if info.is_git else None)
+        elif request.source_type == "git" and request.scope:
+            # New-style hash
+            wiki_id = self._make_wiki_id(request.source_type, request.scope)
+            # One-cycle migration: fall back to legacy ID if DB already has it.
+            if self.wiki_management:
+                legacy_id = self._make_legacy_git_wiki_id(
+                    request.scope.get("repo_url", request.repo_url or ""),
+                    request.scope.get("branch", request.branch or "main"),
+                )
+                if legacy_id != wiki_id:
+                    existing_legacy = await self.wiki_management.get_wiki_record(legacy_id)
+                    if existing_legacy:
+                        logger.info(
+                            "Reusing legacy wiki_id %s (new-style id would be %s)",
+                            legacy_id, wiki_id,
+                        )
+                        wiki_id = legacy_id
         else:
-            wiki_id = self._make_wiki_id(request.repo_url, request.branch)
+            # Non-git sources or legacy callers that didn't set scope.
+            repo_url_for_id = request.repo_url or ""
+            branch_for_id = request.branch or "main"
+            if request.scope:
+                wiki_id = self._make_wiki_id(request.source_type, request.scope)
+            else:
+                wiki_id = self._make_wiki_id(
+                    request.source_type,
+                    {"repo_url": repo_url_for_id, "branch": branch_for_id},
+                )
+
+        # #145: symmetric in-flight check. ``incremental_refresh`` already
+        # rejects when a generate is mid-flight (PR #144); this is the
+        # reverse direction. Both endpoints write to the same ``.wiki.db``
+        # — without this check, ``incremental_refresh running + generate
+        # called`` could race content_hash updates and corrupt FTS5/
+        # tsvector indices.
+        #
+        # Synchronous check before any ``await`` so two callers racing
+        # through this function can't both pass.
+        in_flight = self._find_in_flight_for_wiki(wiki_id)
+        if in_flight is not None:
+            raise GenerateInProgressError(wiki_id, in_flight.id)
 
         # Block duplicate generation — reject if a wiki is already complete or generating
         # Use raw DB lookup (no access control) to detect ANY user's wiki for this repo+branch
@@ -135,16 +357,23 @@ class WikiService:
         # Register wiki in DB immediately so failed/retried generations are trackable
         if self.wiki_management:
             try:
+                _title = request.wiki_title or (
+                    f"Wiki for {request.repo_url}"
+                    if request.source_type == "git"
+                    else f"Wiki from {request.source_type.capitalize()} ({request.scope.get('base_url', '')})"
+                )
                 await self.wiki_management.register_wiki(
                     wiki_id=wiki_id,
-                    repo_url=request.repo_url,
-                    branch=request.branch,
-                    title=request.wiki_title or f"Wiki for {request.repo_url}",
+                    repo_url=request.repo_url or "",
+                    branch=request.branch or "main",
+                    title=_title,
                     page_count=0,
                     owner_id=owner_id,
                     visibility=getattr(request, "visibility", "personal"),
                     status="generating",
                     requires_token=bool(request.access_token),
+                    source_type=request.source_type,
+                    source_scope=request.scope or None,
                 )
             except Exception as e:
                 logger.warning(f"Failed to pre-register wiki {wiki_id}: {e}")
@@ -242,11 +471,16 @@ class WikiService:
                     if isinstance(clone_cfg, _LPC) and clone_cfg.remote_url:
                         registry_url = clone_cfg.remote_url
                     registry_branch = clone_cfg.branch or request.branch
+                _reg_title = request.wiki_title or (
+                    f"Wiki for {request.repo_url}"
+                    if request.source_type == "git"
+                    else f"Wiki from {request.source_type.capitalize()} ({request.scope.get('base_url', '')})"
+                )
                 await self.wiki_management.register_wiki(
                     wiki_id=invocation.wiki_id,
                     repo_url=registry_url,
                     branch=registry_branch,
-                    title=request.wiki_title or f"Wiki for {request.repo_url}",
+                    title=_reg_title,
                     page_count=page_count,
                     owner_id=invocation.owner_id,
                     visibility=getattr(request, "visibility", "personal"),
@@ -254,6 +488,8 @@ class WikiService:
                     indexed_at=datetime.now(),
                     status="complete",
                     requires_token=bool(request.access_token),
+                    source_type=request.source_type,
+                    source_scope=request.scope or None,
                 )
 
             # Mark every project containing this wiki as stale so PR-15 can
@@ -408,9 +644,17 @@ class WikiService:
 
         payload = {
             "invocation_id": invocation.id,
+            # --- multi-source fields (new) ---
+            "source_type": request.source_type,
+            "scope": request.scope,
+            # auth dict intentionally excluded from logging (TokenRedactionFilter
+            # is the safety net; primary defence is not serialising tokens).
+            "auth": request.auth,
+            # --- legacy git fields (still used by wiki_runner for git source) ---
             "repo_url": request.repo_url,
             "branch": request.branch,
             "access_token": request.access_token,
+            # --- common fields ---
             "wiki_title": request.wiki_title,
             "include_research": request.include_research,
             "include_diagrams": request.include_diagrams,
@@ -580,6 +824,350 @@ class WikiService:
         )
         return await self.generate(request, owner_id=owner_id, force=True)
 
+    async def incremental_refresh(
+        self,
+        wiki_id: str,
+        parsed_nodes: list[dict[str, Any]],
+        management: "WikiManagementService",
+        owner_id: str = "",
+    ) -> tuple[Invocation, dict[str, Any]] | None:
+        """Run an incremental refresh on a wiki with caller-supplied parsed nodes.
+
+        Closes the #116 incremental-regen feature: change detection +
+        three-regime dispatch + SSE telemetry, all driven from a
+        pre-parsed node payload (same shape as ``/diff``).
+
+        Production note: the structural-regen handler is intentionally a
+        no-op fallback here — pages that would need a full single-page
+        regen are counted in ``stats.structural_failed`` rather than
+        actually regenerated. PR 5+ will wire ``make_agent_structural_handler``
+        once the agent-construction prerequisites (indexer + retriever +
+        LLM) are plumbed for the incremental path.
+
+        Returns ``(invocation, stats_dict)`` on success; ``None`` when
+        the wiki doesn't exist or its unified DB is missing.
+        """
+        # Ownership check is enforced at the route layer; we just need
+        # the record to look up repo_url + cache_key.
+        wiki_record = await management.get_wiki(wiki_id, user_id=owner_id or None)
+        if wiki_record is None:
+            return None
+
+        # #140: idempotency guard. Two concurrent runs on the same wiki
+        # race each other's content_hash updates + the trivial-patcher's
+        # in-memory page_bodies dicts diverge. Reject the second caller
+        # with the in-flight invocation_id so they can join the existing
+        # SSE stream instead of spawning a parallel run.
+        #
+        # Critical: check + register BEFORE any awaits so two callers
+        # racing through this function can't both pass. ``running``
+        # covers incremental refreshes; ``generating`` covers a full
+        # ``generate()`` on the same wiki — both write to the same
+        # ``.wiki.db``. Shared helper with :meth:`generate` (#145).
+        in_flight = self._find_in_flight_for_wiki(wiki_id)
+        if in_flight is not None:
+            raise IncrementalRefreshInProgressError(wiki_id, in_flight.id)
+
+        # Reserve the invocation slot atomically (no awaits between the
+        # guard check and this assignment) so a second caller racing
+        # through the check now hits a registered "running" entry and
+        # gets a 409. If the early-out branches below (missing cache key
+        # / db file) fire, we pop the reservation back out before
+        # returning None.
+        invocation = Invocation(
+            id=str(uuid4()),
+            wiki_id=wiki_id,
+            repo_url=wiki_record.repo_url,
+            branch=wiki_record.branch,
+            status="running",
+            owner_id=owner_id,
+        )
+        self._invocations[invocation.id] = invocation
+
+        from pathlib import Path as _Path
+
+        from app.core.agents.page_patcher import PagePatcher
+        from app.core.storage import open_storage
+        from app.services.incremental_regen import PageRegime  # noqa: F401
+        from app.services.incremental_regen_service import (
+            IncrementalRegenService,
+        )
+        from app.services.wiki_management import _derive_cache_key
+
+        cache_key = _derive_cache_key(
+            self.settings.cache_dir, wiki_record.repo_url, wiki_record.branch,
+        )
+        if not cache_key:
+            self._invocations.pop(invocation.id, None)
+            return None
+        db_path = _Path(self.settings.cache_dir) / f"{cache_key}.wiki.db"
+        if not db_path.exists():
+            self._invocations.pop(invocation.id, None)
+            return None
+
+        # Preload every page body into an in-memory dict so the
+        # orchestrator's sync callbacks don't need to bridge into
+        # async artifact I/O. The dict is the source of truth during
+        # the run; modified entries get flushed back at the end.
+        page_bodies: dict[str, str] = {}
+        artifact_keys: dict[str, str] = {}
+        existing = await self.storage.list_artifacts(
+            "wiki_artifacts", prefix=wiki_id,
+        )
+        for artifact_key in existing:
+            if not artifact_key.endswith(".md"):
+                continue
+            page_id = (
+                artifact_key.removeprefix(f"{wiki_id}/")
+                .removeprefix("wiki_pages/")
+                .removesuffix(".md")
+            )
+            try:
+                raw = await self.storage.download("wiki_artifacts", artifact_key)
+                page_bodies[page_id] = (
+                    raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                )
+                artifact_keys[page_id] = artifact_key
+            except FileNotFoundError:
+                continue
+        # Persist immediately so a process restart between this 202 and
+        # task completion doesn't strand the SSE stream — late-connecting
+        # clients can still reconnect via Last-Event-ID + replay.
+        await self._persist_invocations()
+        await invocation.emit(events.task_status(
+            invocation.id, "running", "Incremental refresh started",
+        ))
+
+        modified_bodies: dict[str, str] = {}
+
+        def _read(pid: str) -> str | None:
+            return page_bodies.get(pid)
+
+        def _write(pid: str, body: str) -> None:
+            page_bodies[pid] = body
+            modified_bodies[pid] = body
+
+        def _stub_structural(page) -> str:
+            # Fallback when agent construction fails. Logged at WARNING
+            # so partial-feature regressions show up in production logs.
+            # Returning a reason string (per #134's new contract) lets
+            # the orchestrator's structural_failure_reasons telemetry
+            # capture *why* the fallback fired.
+            logger.warning(
+                "[incremental_refresh] structural regen unavailable for "
+                "page %s (agent construction failed earlier in the run)",
+                page.page_id,
+            )
+            return "agent construction unavailable for this run"
+
+        # Page-event builders keyed by event_name. Each takes
+        # (invocation_id, page_id, page_title, **extras). The summary
+        # event has a different shape (no per-page IDs) so it's handled
+        # explicitly below.
+        _page_event_builders: dict[str, Any] = {
+            "page_unchanged": events.page_unchanged,
+            "page_patched": events.page_patched,
+            "page_edited": events.page_edited,
+            "page_regenerated": events.page_regenerated,
+            # #141: page_deleted now wired into the dispatcher.
+            "page_deleted": events.page_deleted,
+        }
+
+        def _emit(event_name: str, payload: dict[str, Any]) -> None:
+            if event_name == "incremental_summary":
+                invocation.emit_sync(events.incremental_summary(
+                    invocation.id, payload.get("stats", {}),
+                ))
+                return
+            builder = _page_event_builders.get(event_name)
+            if builder is None:
+                return
+            kwargs = {
+                k: v for k, v in payload.items()
+                if k not in {"page_id", "page_title"}
+            }
+            invocation.emit_sync(builder(
+                invocation.id,
+                payload["page_id"],
+                payload["page_title"],
+                **kwargs,
+            ))
+
+        # LLM for surgical edits. Use the project's configured one.
+        # Failing to construct an LLM is fatal for the edit regime but
+        # the orchestrator still handles trivial + structural regimes
+        # without it (the patcher's quality gate rejects on LLM error).
+        try:
+            from app.services.llm_factory import create_llm
+
+            llm = create_llm(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[incremental_refresh] LLM init failed; edit regime will "
+                "fall back to structural: %s",
+                exc,
+            )
+            llm = None
+
+        async def _run() -> None:
+            try:
+                storage = open_storage(
+                    repo_id=cache_key, db_path=str(db_path), readonly=False,
+                )
+                try:
+                    patcher = PagePatcher(llm) if llm is not None else None
+                    if patcher is None:
+                        # The orchestrator unconditionally constructs a
+                        # PagePatcher path; without an LLM we can't run
+                        # the edit regime. Fail the run loudly here.
+                        invocation.status = "failed"
+                        invocation.completed_at = datetime.now()
+                        await invocation.emit(events.task_status(
+                            invocation.id, "failed",
+                            "LLM unavailable — incremental refresh requires LLM",
+                        ))
+                        return
+
+                    # #142: build the production structural handler.
+                    # On any failure (agent construction error), fall
+                    # back to the stub so the trivial + edit regimes
+                    # still work for this run. The structural pages
+                    # will be counted as failed; the SSE summary lets
+                    # callers see what was missed.
+                    from app.services.agent_builder import (
+                        build_agent_for_incremental_refresh,
+                    )
+                    from app.services.structural_handler_factory import (
+                        make_agent_structural_handler,
+                    )
+
+                    agent = build_agent_for_incremental_refresh(
+                        wiki_record, storage, llm, self.settings,
+                    )
+                    if agent is not None:
+                        structural_handler = make_agent_structural_handler(
+                            agent,
+                            storage=storage,
+                            # TODO(#142-followup): thread the repo's
+                            # repository_analysis from storage.get_meta()
+                            # so structural prompts see the README-level
+                            # context full regen would inject.
+                            repository_context="",
+                            write_page_body=_write,
+                        )
+                    else:
+                        # Agent construction failed (embeddings, retriever,
+                        # or agent __init__). Emit a status_message so the
+                        # SPA can show "structural regime unavailable" —
+                        # without this signal, callers see a partial-
+                        # success summary that conflates "no structural
+                        # pages in plan" with "every structural page
+                        # silently failed because the deployment is mis-
+                        # configured".
+                        logger.warning(
+                            "[incremental_refresh] agent construction "
+                            "failed; structural regime will fail every page",
+                        )
+                        await invocation.emit(events.message(
+                            "warning",
+                            "Structural regen unavailable for this run "
+                            "(agent construction failed). Trivial + edit "
+                            "regimes will still run; any structural page "
+                            "will count as failed.",
+                        ))
+                        structural_handler = _stub_structural
+
+                    svc = IncrementalRegenService(
+                        storage=storage,
+                        page_patcher=patcher,
+                        read_page_body=_read,
+                        write_page_body=_write,
+                        structural_handler=structural_handler,
+                        progress_callback=_emit,
+                    )
+                    stats = await asyncio.to_thread(svc.run, parsed_nodes)
+                finally:
+                    try:
+                        storage.close()
+                    except Exception:  # noqa: S110 — best-effort close
+                        pass
+
+                # Flush modified bodies back to artifact storage.
+                for pid, body in modified_bodies.items():
+                    key = artifact_keys.get(
+                        pid,
+                        f"{wiki_id}/wiki_pages/{pid}.md",
+                    )
+                    try:
+                        await self.storage.upload(
+                            "wiki_artifacts", key, body.encode("utf-8"),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "[incremental_refresh] body flush failed for %s: %s",
+                            pid, exc,
+                        )
+
+                # Critical: flip the in-memory status off "running" BEFORE
+                # the persist in the finally block. Without this, the
+                # idempotency guard at the top of incremental_refresh
+                # would 409-lock the wiki forever — every subsequent
+                # refresh (and full generate, since the guard widened to
+                # include "generating") sees this phantom "running"
+                # entry. Mirrors _run_generation's terminal-state writes.
+                # #146: also set ``completed_at`` so the periodic
+                # ``_cleanup_old_invocations`` purge can reclaim memory
+                # for completed runs (without it the dict grows
+                # monotonically until process restart).
+                invocation.status = "complete"
+                invocation.completed_at = datetime.now()
+                await invocation.emit(events.task_status(
+                    invocation.id, "completed",
+                    "Incremental refresh complete",
+                ))
+            except Exception as exc:  # noqa: BLE001
+                invocation.status = "failed"
+                invocation.completed_at = datetime.now()
+                logger.exception(
+                    "[incremental_refresh] run failed for wiki %s", wiki_id,
+                )
+                await invocation.emit(events.task_status(
+                    invocation.id, "failed", str(exc),
+                ))
+            finally:
+                # Re-persist so the terminal status survives a restart.
+                await self._persist_invocations()
+
+        task = asyncio.create_task(_run())
+        self._tasks[invocation.id] = task
+
+        # Page-count denominator for the SPA progress bar. Use the
+        # actual wiki_pages row count, not the .md artifact count —
+        # the bucket can contain auxiliary files (README copies,
+        # changelogs) that aren't part of the plan.
+        try:
+            tmp_storage = open_storage(
+                repo_id=cache_key, db_path=str(db_path), readonly=True,
+            )
+            try:
+                wiki_page_count = len(tmp_storage.get_wiki_pages(wiki_id))
+            finally:
+                try:
+                    tmp_storage.close()
+                except Exception:  # noqa: S110 — best-effort close
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[incremental_refresh] wiki_page_count lookup failed; "
+                "falling back to body count: %s",
+                exc,
+            )
+            wiki_page_count = len(page_bodies)
+
+        # Pre-compute stats summary the route can include in its response
+        # *before* the background run completes. Final stats arrive via SSE.
+        return invocation, {"status": "running", "page_count": wiki_page_count}
+
     async def resume(self, wiki_id: str, management: WikiManagementService, owner_id: str = "") -> Invocation | None:
         """Resume a partial wiki generation, skipping already-completed pages."""
         from app.models.api import GenerateWikiRequest
@@ -629,6 +1217,18 @@ class WikiService:
         return invocation
 
     async def cancel_invocation(self, invocation_id: str) -> bool:
+        if self._shutting_down:
+            # #165 follow-up: refuse to cancel during shutdown drain.
+            # ``shutdown()`` is awaiting these tasks so their inner
+            # ``asyncio.to_thread()`` worker threads can finish
+            # against live storage; cancelling here would mark the
+            # asyncio.Task done while leaving the thread mid-write —
+            # the exact race we hardened against.
+            logger.info(
+                "cancel_invocation(%s) refused: service is shutting down",
+                invocation_id,
+            )
+            return False
         invocation = self._invocations.get(invocation_id)
         if not invocation or invocation.status != "generating":
             return False

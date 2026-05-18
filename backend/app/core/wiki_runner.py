@@ -87,10 +87,63 @@ def main(argv: list[str] | None = None) -> int:
         llm_low = create_llm(settings, tier="low")
         embeddings = create_embeddings(settings, **emb_overrides)
 
+        # ------------------------------------------------------------------
+        # Source dispatch (#189)
+        # ------------------------------------------------------------------
+        # For non-git sources (Confluence, Jira) we materialise the source
+        # into a local tmpdir via SourceMaterializer, then pass the tmpdir
+        # as a "file://" local URL to the existing indexer pipeline.
+        #
+        # For git sources we keep the original RepoProviderFactory path so
+        # there is zero behaviour change for the common case.
+        # ------------------------------------------------------------------
+        source_type = payload.get("source_type", "git")
+        scope = payload.get("scope") or {}
+        auth = payload.get("auth") or {}
+
+        _materializer_ctx = None  # track for cleanup in finally
+        repo_url_for_indexer = payload.get("repo_url") or scope.get("repo_url", "")
+        branch_for_indexer = payload.get("branch") or scope.get("branch", "main")
+        access_token_for_indexer = payload.get("access_token") or auth.get("pat")
+
+        if source_type != "git":
+            import asyncio
+            import tempfile
+            from pathlib import Path
+
+            from app.core.sources import registry as source_registry
+            from app.services.source_materializer import SourceMaterializer
+
+            _emit({"t": "progress", "phase": "materializing", "progress": 0.05,
+                   "message": f"Fetching content from {source_type} source…"})
+
+            # Build config dict: merge scope + auth.
+            # Credentials live only in-memory for the duration of this subprocess.
+            source_config = {**scope, **auth}
+            source_toolkit = source_registry.create(source_type, source_config)
+
+            tmpdir = Path(tempfile.mkdtemp(prefix="wikis_mat_"))
+            # Assign immediately so the cleanup block always sees the path,
+            # even if _materialize() raises before workdir_str is set.
+            _materializer_tmpdir = str(tmpdir)
+
+            async def _materialize() -> str:
+                async with source_toolkit:
+                    mat = SourceMaterializer(source_toolkit, tmpdir)
+                    workdir = await mat.materialize()
+                    return str(workdir)
+
+            workdir_str = asyncio.run(_materialize())
+            repo_url_for_indexer = f"file://{workdir_str}"
+            branch_for_indexer = "main"
+            access_token_for_indexer = None
+        else:
+            _materializer_tmpdir = None
+
         clone_config = RepoProviderFactory.from_url(
-            url=payload["repo_url"],
-            token=payload.get("access_token"),
-            branch=payload.get("branch") or "main",
+            url=repo_url_for_indexer,
+            token=access_token_for_indexer,
+            branch=branch_for_indexer,
         )
 
         def _progress(phase: str, progress: float, message: str) -> None:
@@ -138,6 +191,16 @@ def main(argv: list[str] | None = None) -> int:
             planner_type=payload["planner_type"],
             exclude_tests=payload.get("exclude_tests", False),
         )
+
+        # Clean up the materializer tmpdir now that generation is complete.
+        if _materializer_tmpdir:
+            import shutil as _shutil
+
+            try:
+                _shutil.rmtree(_materializer_tmpdir, ignore_errors=True)
+                log.debug("Cleaned up materializer tmpdir: %s", _materializer_tmpdir)
+            except Exception as _cleanup_exc:  # noqa: BLE001
+                log.warning("Failed to clean up materializer tmpdir %s: %s", _materializer_tmpdir, _cleanup_exc)
 
         # Normalize bytes → base64 so the dict survives JSON round-trip.
         for art in (result or {}).get("artifacts") or []:

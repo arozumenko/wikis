@@ -319,6 +319,62 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/wikis/{wiki_id}/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Diff Wiki
+         * @description Diff a fresh-parse payload against the indexed snapshot.
+         *
+         *     The caller supplies the freshly parsed nodes (id + content_hash + path);
+         *     the server compares them against the wiki's stored ``repo_nodes`` and
+         *     returns the resulting change set plus the wiki pages those changes
+         *     touch (via the ``page_symbols`` reverse index from #116 PR 1).
+         *
+         *     Read-only: no parsing, no LLM, no writes. PR 3 will wire the actual
+         *     re-parse loop on top of this primitive.
+         */
+        post: operations["diff_wiki_api_v1_wikis__wiki_id__diff_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/incremental-refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Incremental Refresh Wiki
+         * @description Trigger an incremental refresh on a previously-generated wiki.
+         *
+         *     The caller supplies pre-parsed nodes (same shape as ``/diff``).
+         *     The server diffs them against the indexed snapshot, dispatches each
+         *     affected page through the trivial / edit / structural regimes, and
+         *     streams progress over SSE.
+         *
+         *     Owner-only — same access model as ``/refresh`` since this surfaces
+         *     internal content_hash + node_id state through the per-page events.
+         */
+        post: operations["incremental_refresh_wiki_api_v1_wikis__wiki_id__incremental_refresh_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/wikis/{wiki_id}/visibility": {
         parameters: {
             query?: never;
@@ -563,6 +619,20 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * AffectedPageResponse
+         * @description One wiki page touched by the change set.
+         */
+        AffectedPageResponse: {
+            /** Page Id */
+            page_id: string;
+            /** Title */
+            title?: string | null;
+            /** Anchor Slug */
+            anchor_slug?: string | null;
+            /** Changes */
+            changes?: components["schemas"]["NodeChangeResponse"][];
+        };
+        /**
          * AskRequest
          * @description Request to ask a question about a wiki.
          */
@@ -586,6 +656,11 @@ export interface components {
              * @default 15
              */
             k: number;
+            /**
+             * Min Confidence
+             * @default null
+             */
+            min_confidence: string | null;
         };
         /**
          * AskResponse
@@ -639,6 +714,22 @@ export interface components {
              * @default
              */
             description: string;
+        };
+        /**
+         * ChangeSetResponse
+         * @description Aggregate change set — one entry per kind.
+         */
+        ChangeSetResponse: {
+            /** Added */
+            added?: components["schemas"]["NodeChangeResponse"][];
+            /** Modified */
+            modified?: components["schemas"]["NodeChangeResponse"][];
+            /** Moved */
+            moved?: components["schemas"]["NodeChangeResponse"][];
+            /** Deleted */
+            deleted?: components["schemas"]["NodeChangeResponse"][];
+            /** Total */
+            total: number;
         };
         /**
          * ChatMessage
@@ -735,6 +826,31 @@ export interface components {
             message: string | null;
         };
         /**
+         * DiffWikiRequest
+         * @description Body for ``POST /wikis/{wiki_id}/diff`` — supply the freshly parsed
+         *     nodes; the server diffs them against the indexed snapshot.
+         *
+         *     Capped at 50 000 nodes per request to bound the cost of the per-node
+         *     reverse-index lookup. The largest repos in our corpus parse to ~30k
+         *     architectural nodes; 50k gives ~1.5x headroom before PR 3 swaps in the
+         *     batched ``get_pages_citing_nodes`` query.
+         */
+        DiffWikiRequest: {
+            /** Parsed Nodes */
+            parsed_nodes?: components["schemas"]["ParsedNodeInput"][];
+        };
+        /**
+         * DiffWikiResponse
+         * @description Result of the diff endpoint — no writes occur.
+         */
+        DiffWikiResponse: {
+            /** Wiki Id */
+            wiki_id: string;
+            change_set: components["schemas"]["ChangeSetResponse"];
+            /** Affected Pages */
+            affected_pages?: components["schemas"]["AffectedPageResponse"][];
+        };
+        /**
          * ErrorResponse
          * @description Standard error response.
          */
@@ -751,16 +867,42 @@ export interface components {
         };
         /**
          * GenerateWikiRequest
-         * @description Request to generate a wiki from a repository.
+         * @description Request to generate a wiki from a repository or Atlassian source.
+         *
+         *     Preferred (new) shape
+         *     ---------------------
+         *     source_type + scope + auth — see module docstring for field shapes.
+         *
+         *     Backwards-compatible (legacy) shape
+         *     ------------------------------------
+         *     repo_url + branch + access_token — auto-normalized into the new shape
+         *     by the ``_normalize_legacy`` validator so old callers keep working.
          */
         GenerateWikiRequest: {
-            /** Repo Url */
-            repo_url: string;
+            /**
+             * Source Type
+             * @default git
+             * @enum {string}
+             */
+            source_type: "git" | "confluence" | "jira";
+            /** Scope */
+            scope?: {
+                [key: string]: unknown;
+            };
+            /** Auth */
+            auth?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Repo Url
+             * @default null
+             */
+            repo_url: string | null;
             /**
              * Branch
-             * @default main
+             * @default null
              */
-            branch: string;
+            branch: string | null;
             /**
              * Provider
              * @default github
@@ -807,6 +949,11 @@ export interface components {
              */
             embedding_model: string | null;
             /**
+             * Structure Planner
+             * @default null
+             */
+            structure_planner: ("agentic" | "graph_clustering") | null;
+            /**
              * Planner Type
              * @default null
              */
@@ -849,6 +996,38 @@ export interface components {
             services?: {
                 [key: string]: string;
             };
+        };
+        /**
+         * IncrementalRefreshRequest
+         * @description POST ``/wikis/{id}/incremental-refresh`` body.
+         *
+         *     Caller supplies pre-parsed nodes (same shape as ``/diff``). Capped at
+         *     50_000 nodes per request to bound the orchestrator's snapshot work.
+         */
+        IncrementalRefreshRequest: {
+            /** Parsed Nodes */
+            parsed_nodes?: components["schemas"]["ParsedNodeInput"][];
+        };
+        /**
+         * IncrementalRefreshResponse
+         * @description Initial response — actual progress flows over SSE.
+         *
+         *     The orchestrator runs asynchronously after this returns; subscribe
+         *     to ``/invocations/{invocation_id}/stream`` for ``page_unchanged``,
+         *     ``page_patched``, ``page_edited``, ``page_regenerated``, and the
+         *     final ``incremental_summary`` event with the run stats.
+         */
+        IncrementalRefreshResponse: {
+            /** Wiki Id */
+            wiki_id: string;
+            /** Invocation Id */
+            invocation_id: string;
+            /** Status */
+            status: string;
+            /** Page Count */
+            page_count: number;
+            /** Message */
+            message?: string | null;
         };
         /**
          * Invocation
@@ -916,6 +1095,27 @@ export interface components {
             model_context_limit?: number | null;
         };
         /**
+         * NodeChangeResponse
+         * @description One change in the response. Field population depends on ``kind``.
+         */
+        NodeChangeResponse: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "added" | "modified" | "deleted" | "moved";
+            /** Node Id */
+            node_id: string;
+            /** Old Hash */
+            old_hash?: string | null;
+            /** New Hash */
+            new_hash?: string | null;
+            /** Old Path */
+            old_path?: string | null;
+            /** New Path */
+            new_path?: string | null;
+        };
+        /**
          * PageListItem
          * @description A brief description of a single wiki page, used in list responses.
          */
@@ -953,6 +1153,25 @@ export interface components {
             links_to: string[];
             /** Linked From */
             linked_from: string[];
+        };
+        /**
+         * ParsedNodeInput
+         * @description One node from a fresh parse, supplied to the diff endpoint.
+         *
+         *     Only the three fields needed for change classification are required;
+         *     callers can pass the same dicts they would otherwise hand to
+         *     ``upsert_nodes_batch`` (extra keys are ignored).
+         */
+        ParsedNodeInput: {
+            /** Node Id */
+            node_id: string;
+            /** Content Hash */
+            content_hash?: string | null;
+            /**
+             * Rel Path
+             * @default
+             */
+            rel_path: string;
         };
         /**
          * ProjectAddWikiRequest
@@ -1233,6 +1452,11 @@ export interface components {
              * @default null
              */
             wiki_title: string | null;
+            /**
+             * Confidence
+             * @default null
+             */
+            confidence: string | null;
         };
         /**
          * UpdateWikiDescriptionRequest
@@ -2154,6 +2378,80 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["GenerateWikiResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    diff_wiki_api_v1_wikis__wiki_id__diff_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DiffWikiRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiffWikiResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    incremental_refresh_wiki_api_v1_wikis__wiki_id__incremental_refresh_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IncrementalRefreshRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IncrementalRefreshResponse"];
                 };
             };
             /** @description Validation Error */

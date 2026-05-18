@@ -50,6 +50,7 @@ dependencies = [
     # Auth
     "python-jose[cryptography]>=3.3.0",
     "httpx>=0.27.0",
+    "markdownify>=0.11.6",
     # MCP
     "mcp>=1.0.0",
     # SSE (also a transitive dep of mcp, declared explicitly for routes.py)
@@ -65,11 +66,33 @@ ollama = ["langchain-ollama>=0.3.0"]
 gemini = ["langchain-google-genai>=2.0.0"]
 bedrock = ["langchain-aws>=0.2.0"]
 all-providers = ["wikis-backend[ollama,gemini,bedrock]"]
+# #118 non-code file ingestion extras
+# vision: images (.png/.jpg/.gif/.webp) described via configured LLM
+vision = ["Pillow>=10.0.0"]
+# pdf: PDFs rendered to images then described via configured LLM
+# (pdfium2 is a self-contained wheel — no poppler / no system deps)
+pdf = ["pypdfium2>=4.20.0", "Pillow>=10.0.0"]
+# office: .docx/.xlsx/.pptx via LibreOffice headless → PDF → reuse [pdf]
+# pipeline. NO PIP DEPS — LibreOffice is a system binary. The Docker
+# image installs it via apt; macOS dev uses `brew install --cask
+# libreoffice`. This extra exists for parity (so `pip install -e
+# .[office]` doesn't 404) and pulls in [pdf] which IS needed.
+office = ["wikis-backend[pdf]"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23.0",
     "httpx>=0.27.0",
+    "respx>=0.21.0",
     "pytest-cov>=5.0",
+    # #165 follow-up: stress-runs race-prone integration suites in CI
+    # via the ``--count`` flag. Caught the segfault we just fixed by
+    # repeated execution rather than a single run.
+    "pytest-repeat>=0.9",
+    # #181 follow-up: parallelize the suite so CI doesn't spend ~30 min
+    # serializing tests that finish in milliseconds.  ``-n auto`` runs
+    # one worker per logical CPU; GitHub Actions Ubuntu runners are
+    # 4-vCPU which drops the wall clock to ~7-8 min.
+    "pytest-xdist>=3.5",
     "ruff>=0.4.0",
 ]
 

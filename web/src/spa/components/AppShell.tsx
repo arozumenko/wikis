@@ -3,7 +3,13 @@ import {
   AppBar,
   Avatar,
   Box,
+  Button,
   Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
   Divider,
   IconButton,
   Link as MuiLink,
@@ -11,6 +17,7 @@ import {
   ListItemText,
   Menu,
   MenuItem,
+  TextField,
   Toolbar,
   Tooltip,
   Typography,
@@ -39,6 +46,11 @@ interface AppShellProps {
     branch?: string;
     indexedAt?: string;
     commitHash?: string | null;
+    // #172: when the wiki was generated for a private repo, the
+    // refresh flow must re-prompt for a GitHub PAT so the
+    // backend can clone again. Otherwise ``git clone`` fails with
+    // ``could not read Username for github.com``.
+    requiresToken?: boolean;
   };
 }
 
@@ -102,20 +114,51 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
 
   const [showRefreshConfirm, setShowRefreshConfirm] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // #172: token prompt state. Private repos (``requires_token``)
+  // need a PAT to re-clone during refresh. The initial-generate
+  // flow shows the same prompt; the in-header refresh used to skip
+  // it, which made every refresh of a private wiki fail with
+  // ``git: could not read Username for github.com``.
+  const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
+  const [tokenInput, setTokenInput] = useState('');
 
-  const handleRefresh = useCallback(async () => {
-    if (!repoContext?.wikiId) return;
-    setShowRefreshConfirm(false);
-    setRefreshing(true);
-    try {
-      const resp = await refreshWiki(repoContext.wikiId);
-      // Reset before navigating — the stepper UI takes over from here
-      setRefreshing(false);
-      navigate(`/wiki/${repoContext.wikiId}?generating=true&invocation=${resp.invocation_id}`);
-    } catch {
-      setRefreshing(false);
+  const performRefresh = useCallback(
+    async (accessToken?: string) => {
+      if (!repoContext?.wikiId) return;
+      setTokenDialogOpen(false);
+      setShowRefreshConfirm(false);
+      setRefreshing(true);
+      try {
+        const resp = await refreshWiki(repoContext.wikiId, accessToken);
+        navigate(
+          `/wiki/${repoContext.wikiId}?generating=true&invocation=${resp.invocation_id}`,
+        );
+      } catch {
+        // swallow — UI surfaces failures via the wiki viewer SSE stream
+      } finally {
+        // Always clear the token state, whether the request
+        // succeeded or threw. Without this, a refresh failure would
+        // leave the PAT in React state and re-open the modal
+        // pre-filled — contradicting the dialog copy that says
+        // "the token is sent once for this refresh and not stored."
+        setRefreshing(false);
+        setTokenInput('');
+      }
+    },
+    [repoContext?.wikiId, navigate],
+  );
+
+  // Confirm-dialog "Refresh" click: if the wiki was generated for a
+  // private repo we MUST collect a PAT before kicking off the
+  // re-clone, otherwise the backend run will fail immediately.
+  const handleRefreshConfirm = useCallback(() => {
+    if (repoContext?.requiresToken) {
+      setShowRefreshConfirm(false);
+      setTokenDialogOpen(true);
+      return;
     }
-  }, [repoContext?.wikiId, navigate]);
+    performRefresh();
+  }, [repoContext?.requiresToken, performRefresh]);
 
   const parsed = repoContext?.repoUrl ? extractOwnerRepo(repoContext.repoUrl) : null;
 
@@ -382,9 +425,66 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
         title="Refresh Wiki"
         message="Re-index the repository and regenerate all wiki pages? This may take a few minutes."
         confirmLabel="Refresh"
-        onConfirm={handleRefresh}
+        onConfirm={handleRefreshConfirm}
         onCancel={() => setShowRefreshConfirm(false)}
       />
+
+      {/* #172: GitHub PAT prompt — only shown when the wiki was
+          generated for a private repo. Mirrors the modal used by
+          the retry-on-failed-generation flow in WikiViewerPage so
+          operators see the same UX in both refresh entry points. */}
+      <Dialog
+        open={tokenDialogOpen}
+        onClose={() => {
+          setTokenDialogOpen(false);
+          setTokenInput('');
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>GitHub access token required</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            This wiki was generated from a private repository. Provide a
+            GitHub personal access token with read access to re-clone
+            and refresh the wiki. The token is sent once for this
+            refresh and not stored.
+          </DialogContentText>
+          <TextField
+            label="GitHub token"
+            type="password"
+            value={tokenInput}
+            onChange={(e) => setTokenInput(e.target.value)}
+            fullWidth
+            autoFocus
+            autoComplete="off"
+            placeholder="ghp_…"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && tokenInput) {
+                e.preventDefault();
+                performRefresh(tokenInput);
+              }
+            }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              setTokenDialogOpen(false);
+              setTokenInput('');
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            disabled={!tokenInput}
+            onClick={() => performRefresh(tokenInput)}
+          >
+            Refresh
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <QuickSearch
         open={searchOpen}

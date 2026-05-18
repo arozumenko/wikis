@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -502,3 +501,1060 @@ async def test_search_wiki_blocks_inaccessible_wiki():
         srv._wiki_management = old_mgmt
         srv._page_index_cache = old_cache
         srv._session_factory = old_session_factory
+
+
+# ---------------------------------------------------------------------------
+# #120: get_graph_stats — confidence breakdown surface
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_graph_stats_returns_storage_stats_dict():
+    """get_graph_stats opens the wiki's unified DB and returns the
+    full stats dict including the new ``confidence_breakdown``."""
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.stats.return_value = {
+        "node_count": 42,
+        "edge_count": 100,
+        "confidence_breakdown": {
+            "extracted": 80,
+            "inferred": 18,
+            "ambiguous": 2,
+        },
+        "edge_types": {"calls": 50, "imports": 30, "inheritance": 20},
+        "languages": {"python": 30, "java": 12},
+        "symbol_types": {"class": 10, "function": 32},
+        "macro_clusters": 5,
+        "hub_count": 3,
+        "vec_available": True,
+        "embedding_dim": 384,
+        "db_size_mb": 1.23,
+    }
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt = srv._wiki_management
+    old_settings = srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+
+        with (
+            patch(
+                "app.services.wiki_management.derive_cache_key",
+                return_value="cachekey-123",
+            ),
+            patch("pathlib.Path.exists", return_value=True),
+            patch(
+                "app.core.storage.open_storage",
+                return_value=fake_storage,
+            ),
+        ):
+            result = await srv.get_graph_stats(wiki_id="wiki-1")
+
+        assert result["node_count"] == 42
+        assert result["edge_count"] == 100
+        # Confidence breakdown is the headline of this PR — make sure
+        # it makes it through unmolested.
+        assert result["confidence_breakdown"] == {
+            "extracted": 80, "inferred": 18, "ambiguous": 2,
+        }
+        # Storage was opened read-only and then closed.
+        fake_storage.close.assert_called_once()
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_graph_stats_unknown_wiki_returns_error():
+    """Wiki not found in management → error string, no storage open."""
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=None)
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt = srv._wiki_management
+    old_settings = srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+
+        result = await srv.get_graph_stats(wiki_id="missing")
+        assert "error" in result
+        assert "Wiki not found" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_graph_stats_no_cache_key_returns_error():
+    """Wiki record exists but ``_derive_cache_key`` couldn't resolve a
+    cache key — repo/branch combo not in ``cache_index.json``."""
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt = srv._wiki_management
+    old_settings = srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+
+        with patch(
+            "app.services.wiki_management.derive_cache_key",
+            return_value=None,
+        ):
+            result = await srv.get_graph_stats(wiki_id="wiki-1")
+        assert "error" in result
+        assert "no cached index" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_graph_stats_missing_db_file_returns_error():
+    """Rio R1 regression: the third error path. Cache key resolves
+    fine but the ``.wiki.db`` file isn't on disk (eviction, fresh
+    deploy, manual cleanup). Must return an error dict without
+    crashing on the missing file."""
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt = srv._wiki_management
+    old_settings = srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+
+        with (
+            patch(
+                "app.services.wiki_management.derive_cache_key",
+                return_value="cachekey-abc",
+            ),
+            patch("pathlib.Path.exists", return_value=False),
+        ):
+            result = await srv.get_graph_stats(wiki_id="wiki-1")
+        assert "error" in result
+        # Different message from the no-cache-key path; pinning
+        # ensures the two error reasons stay distinguishable.
+        assert "no unified DB on disk" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+# ---------------------------------------------------------------------------
+# #121 Phase 1: graph-native MCP tools — god_nodes / shortest_path /
+# get_community. All three share `_open_wiki_storage`, so we focus on
+# (a) plumbing each tool to its storage method, (b) input validation,
+# and (c) the wiki-not-found error path that exercises the shared
+# resolver. Storage-level behaviour is tested directly in
+# test_unified_db_graph_tools.py.
+# ---------------------------------------------------------------------------
+
+
+def _patch_open_storage(fake_storage: MagicMock):
+    """Return a context-manager stack that wires the shared
+    ``_open_wiki_storage`` helper to ``fake_storage``."""
+    return (
+        patch(
+            "app.services.wiki_management.derive_cache_key",
+            return_value="cachekey-123",
+        ),
+        patch("pathlib.Path.exists", return_value=True),
+        patch("app.core.storage.open_storage", return_value=fake_storage),
+    )
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_forwards_top_n_and_returns_storage_output():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.compute_god_nodes.return_value = {
+        "by_symbol_type": [
+            {"symbol_id": "n1", "name": "AuthService", "symbol_type": "class",
+             "rel_path": "auth/service.py", "degree": 42},
+        ],
+        "by_file": [
+            {"rel_path": "auth/service.py", "internal_arch": 5, "external_edges": 30},
+        ],
+    }
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.god_nodes(wiki_id="wiki-1", top_n=5)
+
+        fake_storage.compute_god_nodes.assert_called_once_with(top_n=5)
+        assert result["by_symbol_type"][0]["name"] == "AuthService"
+        fake_storage.close.assert_called_once()
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_rejects_out_of_range_top_n():
+    import mcp_server.server as srv
+
+    result = await srv.god_nodes(wiki_id="wiki-1", top_n=0)
+    assert "error" in result and "top_n" in result["error"]
+    result = await srv.god_nodes(wiki_id="wiki-1", top_n=201)
+    assert "error" in result and "top_n" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_forwards_args_and_returns_storage_output():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.shortest_path.return_value = {
+        "source": {"node_id": "a", "symbol_name": "AuthService",
+                   "rel_path": "auth.py", "symbol_type": "class"},
+        "target": {"node_id": "z", "symbol_name": "CacheManager",
+                   "rel_path": "cache.py", "symbol_type": "class"},
+        "path": [{"node_id": "a"}, {"node_id": "m"}, {"node_id": "z"}],
+        "edges": [
+            {"source_id": "a", "target_id": "m", "rel_type": "calls",
+             "confidence": "EXTRACTED"},
+            {"source_id": "m", "target_id": "z", "rel_type": "imports",
+             "confidence": "EXTRACTED"},
+        ],
+        "length": 2,
+    }
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.shortest_path(
+                wiki_id="wiki-1",
+                source_label="AuthService",
+                target_label="CacheManager",
+                max_depth=15,
+            )
+
+        fake_storage.shortest_path.assert_called_once_with(
+            source_label="AuthService",
+            target_label="CacheManager",
+            max_depth=15,
+        )
+        assert result["length"] == 2
+        assert len(result["path"]) == 3
+        fake_storage.close.assert_called_once()
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_rejects_invalid_max_depth():
+    import mcp_server.server as srv
+
+    result = await srv.shortest_path(
+        wiki_id="wiki-1", source_label="A", target_label="B", max_depth=0,
+    )
+    assert result == {"path": None, "reason": "invalid_max_depth"}
+    result = await srv.shortest_path(
+        wiki_id="wiki-1", source_label="A", target_label="B", max_depth=51,
+    )
+    assert result == {"path": None, "reason": "invalid_max_depth"}
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_returns_wiki_not_found():
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=None)
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        result = await srv.shortest_path(
+            wiki_id="missing", source_label="A", target_label="B",
+        )
+        assert "error" in result
+        assert "Wiki not found" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_community_forwards_macro_only():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.get_nodes_by_cluster.return_value = [
+        {"node_id": "n1", "symbol_name": "Foo", "macro_cluster": 3},
+        {"node_id": "n2", "symbol_name": "Bar", "macro_cluster": 3},
+    ]
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.get_community(wiki_id="wiki-1", macro_cluster=3)
+
+        fake_storage.get_nodes_by_cluster.assert_called_once_with(
+            macro=3, micro=None, limit=500,
+        )
+        assert result["macro_cluster"] == 3
+        assert result["micro_cluster"] is None
+        assert result["count"] == 2
+        assert len(result["nodes"]) == 2
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_community_forwards_macro_and_micro_with_custom_limit():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.get_nodes_by_cluster.return_value = []
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            await srv.get_community(
+                wiki_id="wiki-1", macro_cluster=5, micro_cluster=2, limit=100,
+            )
+
+        fake_storage.get_nodes_by_cluster.assert_called_once_with(
+            macro=5, micro=2, limit=100,
+        )
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_get_community_rejects_out_of_range_limit():
+    import mcp_server.server as srv
+
+    result = await srv.get_community(wiki_id="wiki-1", macro_cluster=3, limit=0)
+    assert "error" in result and "limit" in result["error"]
+    result = await srv.get_community(
+        wiki_id="wiki-1", macro_cluster=3, limit=2001,
+    )
+    assert "error" in result and "limit" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# #121 Phase 2: surprising_connections — verify the MCP tool forwards
+# parameters to storage and validates the input ranges. Storage-level
+# Jaccard scoring + ranking lives in test_unified_db_surprising_connections.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_forwards_args():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.compute_surprising_connections.return_value = {
+        "pairs": [
+            {
+                "cluster_a": 1, "cluster_b": 2,
+                "jaccard_distance": 1.0,
+                "context_a": ["frontend"], "context_b": ["backend"],
+                "edge_count": 2,
+                "sample_edges": [
+                    {"source_id": "F1", "target_id": "B1",
+                     "rel_type": "calls", "confidence": "EXTRACTED"},
+                ],
+            },
+        ],
+    }
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.surprising_connections(
+                wiki_id="wiki-1",
+                top_n=5,
+                sample_edges_per_pair=4,
+            )
+
+        # context_depth is pinned to 1 at the MCP layer for v1 — the
+        # MCP tool always forwards 1 regardless of caller input.
+        fake_storage.compute_surprising_connections.assert_called_once_with(
+            top_n=5, context_depth=1, sample_edges_per_pair=4,
+        )
+        assert result["pairs"][0]["cluster_a"] == 1
+        fake_storage.close.assert_called_once()
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_rejects_out_of_range_args():
+    import mcp_server.server as srv
+
+    for kwargs in (
+        {"top_n": 0},
+        {"top_n": 101},
+        {"sample_edges_per_pair": 0},
+        {"sample_edges_per_pair": 11},
+    ):
+        result = await srv.surprising_connections(wiki_id="wiki-1", **kwargs)
+        assert "error" in result, f"Expected error for {kwargs}, got {result}"
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_returns_wiki_not_found():
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=None)
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        result = await srv.surprising_connections(wiki_id="missing")
+        assert "error" in result
+        assert "Wiki not found" in result["error"]
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+# ---------------------------------------------------------------------------
+# #121 Phase 3: MCP resources — thin URI-addressable wrappers over the
+# graph-native tools. Verifies the resource templates are registered
+# with the correct URIs and that each handler delegates to its tool
+# with the wiki_id forwarded verbatim.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resources_registered_with_expected_uri_templates():
+    import mcp_server.server as srv
+
+    templates = await srv.mcp.list_resource_templates()
+    uris = {t.uriTemplate for t in templates}
+    assert "wikis://{wiki_id}/repo_stats" in uris
+    assert "wikis://{wiki_id}/surprising_connections" in uris
+
+
+@pytest.mark.asyncio
+async def test_repo_stats_resource_delegates_to_get_graph_stats():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.stats.return_value = {
+        "node_count": 7, "edge_count": 12,
+        "confidence_breakdown": {"extracted": 10, "inferred": 2, "ambiguous": 0},
+    }
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.repo_stats_resource(wiki_id="wiki-1")
+        # Resource is a thin pass-through — same shape as the tool.
+        assert result["node_count"] == 7
+        assert result["confidence_breakdown"]["extracted"] == 10
+        mock_mgmt.get_wiki.assert_awaited_once_with("wiki-1", user_id="test-user")
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_repo_stats_resource_raises_on_wiki_not_found():
+    """Resource handlers must raise on failure so FastMCP emits a
+    proper JSON-RPC error — returning ``{"error": ...}`` would surface
+    as a successful read with a malformed body."""
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=None)
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        with pytest.raises(ValueError, match="Wiki not found"):
+            await srv.repo_stats_resource(wiki_id="missing")
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_resource_uses_default_args():
+    import mcp_server.server as srv
+
+    fake_storage = MagicMock()
+    fake_storage.compute_surprising_connections.return_value = {
+        "pairs": [], "skipped_pairs": 0,
+    }
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=MagicMock(
+        repo_url="https://github.com/x/y", branch="main",
+    ))
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        p1, p2, p3 = _patch_open_storage(fake_storage)
+        with p1, p2, p3:
+            result = await srv.surprising_connections_resource(wiki_id="wiki-1")
+        # Default parameters from the tool propagate through the
+        # resource: top_n=10, context_depth=1, sample_edges_per_pair=3.
+        fake_storage.compute_surprising_connections.assert_called_once_with(
+            top_n=10, context_depth=1, sample_edges_per_pair=3,
+        )
+        assert result == {"pairs": [], "skipped_pairs": 0}
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_resource_raises_on_wiki_not_found():
+    import mcp_server.server as srv
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.get_wiki = AsyncMock(return_value=None)
+    mock_settings = MagicMock(cache_dir="/tmp/wiki-cache")  # noqa: S108
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt, old_settings = srv._wiki_management, srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._settings = mock_settings
+        with pytest.raises(ValueError, match="Wiki not found"):
+            await srv.surprising_connections_resource(wiki_id="missing")
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._settings = old_settings
+
+
+# ---------------------------------------------------------------------------
+# #121 follow-up: project-scoped graph-native tools + resources.
+# Mock the project_service + storage so we exercise the aggregation
+# logic (sorting, merging, attribution) without spinning up real DBs.
+# ---------------------------------------------------------------------------
+
+
+def _patch_project_open(handles_returner, skipped: int = 0):
+    """Patch ``_open_project_storages`` to return the handles produced
+    by ``handles_returner()``. The helper now returns
+    ``(handles, skipped, err)`` — pass ``skipped`` to simulate wikis
+    that were silently dropped (missing-on-disk DB etc.)."""
+    async def fake(project_id: str):
+        return handles_returner(), skipped, None
+    return patch("mcp_server.server._open_project_storages", side_effect=fake)
+
+
+def _make_storage(stats=None, god=None, path=None, surprises=None):
+    """Minimal MagicMock with the storage methods our project tools call."""
+    storage = MagicMock()
+    if stats is not None:
+        storage.stats.return_value = stats
+    if god is not None:
+        storage.compute_god_nodes.return_value = god
+    if path is not None:
+        storage.shortest_path.return_value = path
+    if surprises is not None:
+        storage.compute_surprising_connections.return_value = surprises
+    return storage
+
+
+# ── god_nodes_project ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_project_merges_and_ranks_globally():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(god={
+        "by_symbol_type": [
+            {"symbol_id": "n1", "name": "Heavy", "symbol_type": "class",
+             "rel_path": "a.py", "degree": 80},
+            {"symbol_id": "n2", "name": "Light", "symbol_type": "class",
+             "rel_path": "b.py", "degree": 5},
+        ],
+        "by_file": [
+            {"rel_path": "a.py", "internal_arch": 4, "external_edges": 12},
+        ],
+    })
+    w2 = _make_storage(god={
+        "by_symbol_type": [
+            {"symbol_id": "n3", "name": "Champion", "symbol_type": "class",
+             "rel_path": "x.py", "degree": 100},
+        ],
+        "by_file": [
+            {"rel_path": "x.py", "internal_arch": 8, "external_edges": 30},
+        ],
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1), ("w-2", w2)]):
+        result = await srv.god_nodes_project(project_id="p-1", top_n=2)
+
+    # Highest degree first; Champion from w-2 wins over Heavy from w-1.
+    assert [s["name"] for s in result["by_symbol_type"]] == ["Champion", "Heavy"]
+    assert result["by_symbol_type"][0]["wiki_id"] == "w-2"
+    assert result["by_symbol_type"][1]["wiki_id"] == "w-1"
+    # File ranking: x.py (30 edges) beats a.py (12 edges).
+    assert result["by_file"][0]["rel_path"] == "x.py"
+    assert result["by_file"][0]["wiki_id"] == "w-2"
+    assert result["wiki_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_project_top_n_caps_after_merge():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(god={
+        "by_symbol_type": [
+            {"symbol_id": f"n{i}", "name": f"S{i}", "symbol_type": "c",
+             "rel_path": "p.py", "degree": 100 - i}
+            for i in range(20)
+        ],
+        "by_file": [],
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1)]):
+        result = await srv.god_nodes_project(project_id="p-1", top_n=3)
+    assert len(result["by_symbol_type"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_project_rejects_out_of_range_top_n():
+    import mcp_server.server as srv
+    assert "error" in await srv.god_nodes_project(project_id="p-1", top_n=0)
+    assert "error" in await srv.god_nodes_project(project_id="p-1", top_n=201)
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_project_propagates_project_error():
+    import mcp_server.server as srv
+
+    async def fake(project_id: str):
+        return [], 0, "Project not found: missing. Use list_projects()..."
+
+    with patch("mcp_server.server._open_project_storages", side_effect=fake):
+        result = await srv.god_nodes_project(project_id="missing")
+    assert "error" in result
+    assert "Project not found" in result["error"]
+
+
+# ── shortest_path_project ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_project_returns_paths_sorted_by_length():
+    import mcp_server.server as srv
+
+    long_path = {
+        "source": {"node_id": "a"}, "target": {"node_id": "z"},
+        "source_candidates": 1, "target_candidates": 1,
+        "path": [{"node_id": "a"}, {"node_id": "m"}, {"node_id": "z"}],
+        "edges": [], "length": 2,
+    }
+    short_path = {
+        "source": {"node_id": "a"}, "target": {"node_id": "z"},
+        "source_candidates": 1, "target_candidates": 1,
+        "path": [{"node_id": "a"}, {"node_id": "z"}],
+        "edges": [], "length": 1,
+    }
+    w_long = _make_storage(path=long_path)
+    w_short = _make_storage(path=short_path)
+
+    with _patch_project_open(lambda: [("w-long", w_long), ("w-short", w_short)]):
+        result = await srv.shortest_path_project(
+            project_id="p-1", source_label="Foo", target_label="Bar",
+        )
+
+    assert [p["wiki_id"] for p in result["paths"]] == ["w-short", "w-long"]
+    assert result["missing"] == []
+    assert result["wiki_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_project_collects_missing_with_reasons():
+    import mcp_server.server as srv
+
+    found = {
+        "source": {"node_id": "a"}, "target": {"node_id": "b"},
+        "source_candidates": 1, "target_candidates": 1,
+        "path": [{"node_id": "a"}, {"node_id": "b"}],
+        "edges": [], "length": 1,
+    }
+    w_found = _make_storage(path=found)
+    w_miss = _make_storage(
+        path={"path": None, "reason": "source_not_found"},
+    )
+
+    with _patch_project_open(lambda: [("w-1", w_found), ("w-2", w_miss)]):
+        result = await srv.shortest_path_project(
+            project_id="p-1", source_label="X", target_label="Y",
+        )
+
+    assert len(result["paths"]) == 1
+    assert result["paths"][0]["wiki_id"] == "w-1"
+    assert result["missing"] == [
+        {"wiki_id": "w-2", "reason": "source_not_found"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_project_no_matches_returns_empty_paths():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(path={"path": None, "reason": "target_not_found"})
+    w2 = _make_storage(path={"path": None, "reason": "source_not_found"})
+
+    with _patch_project_open(lambda: [("w-1", w1), ("w-2", w2)]):
+        result = await srv.shortest_path_project(
+            project_id="p-1", source_label="X", target_label="Y",
+        )
+    assert result["paths"] == []
+    assert len(result["missing"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_project_rejects_invalid_max_depth():
+    import mcp_server.server as srv
+
+    for bad in (0, 51):
+        result = await srv.shortest_path_project(
+            project_id="p-1", source_label="X", target_label="Y", max_depth=bad,
+        )
+        assert "error" in result
+
+
+# ── surprising_connections_project ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_project_merges_and_ranks_by_jaccard():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(surprises={
+        "pairs": [
+            {"cluster_a": 1, "cluster_b": 2, "jaccard_distance": 0.5,
+             "context_a": ["a"], "context_b": ["b"], "edge_count": 1,
+             "sample_edges": []},
+        ],
+        "skipped_pairs": 0,
+    })
+    w2 = _make_storage(surprises={
+        "pairs": [
+            {"cluster_a": 5, "cluster_b": 6, "jaccard_distance": 1.0,
+             "context_a": ["x"], "context_b": ["y"], "edge_count": 3,
+             "sample_edges": []},
+        ],
+        "skipped_pairs": 2,
+    })
+
+    with _patch_project_open(lambda: [("w-low", w1), ("w-high", w2)]):
+        result = await srv.surprising_connections_project(
+            project_id="p-1", top_n=10,
+        )
+
+    # Distance 1.0 first (more surprising).
+    assert result["pairs"][0]["wiki_id"] == "w-high"
+    assert result["pairs"][0]["jaccard_distance"] == 1.0
+    assert result["pairs"][1]["wiki_id"] == "w-low"
+    # Sums the per-wiki skipped counters.
+    assert result["skipped_pairs_total"] == 2
+    assert result["wiki_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_project_rejects_out_of_range_args():
+    import mcp_server.server as srv
+
+    for kwargs in (
+        {"top_n": 0}, {"top_n": 101},
+        {"sample_edges_per_pair": 0}, {"sample_edges_per_pair": 11},
+    ):
+        result = await srv.surprising_connections_project(
+            project_id="p-1", **kwargs,
+        )
+        assert "error" in result, f"Expected error for {kwargs}, got {result}"
+
+
+# ── Resources ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_project_resources_registered():
+    import mcp_server.server as srv
+
+    templates = await srv.mcp.list_resource_templates()
+    uris = {t.uriTemplate for t in templates}
+    assert "wikis://projects/{project_id}/repo_stats" in uris
+    assert "wikis://projects/{project_id}/surprising_connections" in uris
+
+
+@pytest.mark.asyncio
+async def test_project_repo_stats_resource_aggregates_per_wiki():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(stats={
+        "node_count": 10, "edge_count": 20,
+        "confidence_breakdown": {"extracted": 18, "inferred": 2, "ambiguous": 0},
+    })
+    w2 = _make_storage(stats={
+        "node_count": 5, "edge_count": 15,
+        "confidence_breakdown": {"extracted": 12, "inferred": 2, "ambiguous": 1},
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1), ("w-2", w2)]):
+        result = await srv.project_repo_stats_resource(project_id="p-1")
+
+    assert result["wiki_count"] == 2
+    assert result["node_count"] == 15
+    assert result["edge_count"] == 35
+    assert result["confidence_breakdown"] == {
+        "extracted": 30, "inferred": 4, "ambiguous": 1,
+    }
+    assert len(result["per_wiki"]) == 2
+    assert {p["wiki_id"] for p in result["per_wiki"]} == {"w-1", "w-2"}
+
+
+@pytest.mark.asyncio
+async def test_project_repo_stats_resource_raises_on_project_not_found():
+    import mcp_server.server as srv
+
+    async def fake(project_id: str):
+        return [], 0, "Project not found: missing. ..."
+
+    with patch(
+        "mcp_server.server._open_project_storages", side_effect=fake,
+    ):
+        with pytest.raises(ValueError, match="Project not found"):
+            await srv.project_repo_stats_resource(project_id="missing")
+
+
+@pytest.mark.asyncio
+async def test_project_surprising_connections_resource_delegates_to_tool():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(surprises={
+        "pairs": [
+            {"cluster_a": 1, "cluster_b": 2, "jaccard_distance": 1.0,
+             "context_a": ["a"], "context_b": ["b"], "edge_count": 1,
+             "sample_edges": []},
+        ],
+        "skipped_pairs": 0,
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1)]):
+        result = await srv.project_surprising_connections_resource(
+            project_id="p-1",
+        )
+
+    assert result["pairs"][0]["wiki_id"] == "w-1"
+    assert result["wiki_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_project_surprising_connections_resource_raises_on_not_found():
+    import mcp_server.server as srv
+
+    async def fake(project_id: str):
+        return [], 0, "Project not found: missing."
+
+    with patch(
+        "mcp_server.server._open_project_storages", side_effect=fake,
+    ):
+        with pytest.raises(ValueError, match="Project not found"):
+            await srv.project_surprising_connections_resource(
+                project_id="missing",
+            )
+
+
+# ── wikis_skipped propagation (review fixup) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_god_nodes_project_surfaces_skipped_count():
+    """Round-2 reviewer Important: a partial project (one wiki has no
+    on-disk DB) used to disappear from the response. Now
+    ``wikis_skipped`` carries that signal so callers can distinguish
+    "project empty" from "all wikis dropped on disk read"."""
+    import mcp_server.server as srv
+
+    w1 = _make_storage(god={"by_symbol_type": [], "by_file": []})
+
+    with _patch_project_open(lambda: [("w-1", w1)], skipped=2):
+        result = await srv.god_nodes_project(project_id="p-1")
+    assert result["wikis_skipped"] == 2
+    assert result["wiki_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_shortest_path_project_surfaces_skipped_count():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(path={"path": None, "reason": "source_not_found"})
+
+    with _patch_project_open(lambda: [("w-1", w1)], skipped=3):
+        result = await srv.shortest_path_project(
+            project_id="p-1", source_label="X", target_label="Y",
+        )
+    assert result["wikis_skipped"] == 3
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_project_surfaces_skipped_count():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(surprises={"pairs": [], "skipped_pairs": 0})
+
+    with _patch_project_open(lambda: [("w-1", w1)], skipped=1):
+        result = await srv.surprising_connections_project(project_id="p-1")
+    assert result["wikis_skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_project_repo_stats_resource_surfaces_skipped_count():
+    import mcp_server.server as srv
+
+    w1 = _make_storage(stats={
+        "node_count": 1, "edge_count": 1,
+        "confidence_breakdown": {"extracted": 1, "inferred": 0, "ambiguous": 0},
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1)], skipped=4):
+        result = await srv.project_repo_stats_resource(project_id="p-1")
+    assert result["wikis_skipped"] == 4
+
+
+@pytest.mark.asyncio
+async def test_surprising_connections_project_handles_bad_types_in_sort():
+    """Round-2 reviewer Important: cast failures inside the sort key
+    used to propagate as unhandled exceptions. Safe casts should
+    push bad values to the back of the sort and keep the tool
+    responsive."""
+    import mcp_server.server as srv
+
+    w1 = _make_storage(surprises={
+        "pairs": [
+            {"cluster_a": "not-an-int", "cluster_b": 2,
+             "jaccard_distance": "bad", "context_a": [], "context_b": [],
+             "edge_count": "nope", "sample_edges": []},
+            {"cluster_a": 1, "cluster_b": 2,
+             "jaccard_distance": 0.9, "context_a": [], "context_b": [],
+             "edge_count": 5, "sample_edges": []},
+        ],
+        "skipped_pairs": 0,
+    })
+
+    with _patch_project_open(lambda: [("w-1", w1)]):
+        result = await srv.surprising_connections_project(project_id="p-1")
+
+    # Both pairs return, well-typed one ranks first.
+    assert len(result["pairs"]) == 2
+    assert result["pairs"][0]["jaccard_distance"] == 0.9

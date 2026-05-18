@@ -27,7 +27,13 @@ class _StubStack:
     def __init__(self, docs: list[_Doc]) -> None:
         self._docs = docs
 
-    def search_repository(self, query: str, k: int = 15) -> list[_Doc]:
+    def search_repository(
+        self,
+        query: str,
+        k: int = 15,
+        apply_expansion: bool = True,
+        min_confidence: str | None = None,
+    ) -> list[_Doc]:
         return list(self._docs)
 
 

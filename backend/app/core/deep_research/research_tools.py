@@ -235,6 +235,7 @@ def create_codebase_tools(
     graph_text_index: Any = None,  # GraphTextIndex (FTS5)
     repo_path: str | dict[str, str] | None = None,  # Path(s) to cloned repo(s) for direct file access
     query_service: Any = None,  # Pre-built GraphQueryService or MultiGraphQueryService (projects)
+    min_confidence: str | None = None,  # #120/#157: edge-confidence floor
 ) -> list:
     """
     Create custom tools for deep research.
@@ -694,13 +695,16 @@ def create_codebase_tools(
             if not target_node:
                 return f"Symbol '{symbol_name}' not found in code graph. Try using search_codebase first to find exact symbol names."
 
-            # Use service for bounded traversal (SPEC-1)
+            # Use service for bounded traversal (SPEC-1).
+            # #120/#157: closure-captured ``min_confidence`` flows
+            # through to the live agent path here.
             if query_service:
                 rels = query_service.get_relationships(
                     target_node,
                     direction="both",
                     max_depth=max_depth,
                     max_results=50,
+                    min_confidence=min_confidence,
                 )
 
                 lines = [f"# Relationships for `{symbol_name}`\n"]
@@ -1284,6 +1288,10 @@ def create_codebase_tools(
             return "Code graph not available for relationship analysis"
 
         try:
+            # Prefer exact node IDs when project-mode tools pass a namespaced
+            # project node ID; otherwise resolve by symbol name. Main's
+            # confidence floor is forwarded when the backing query service
+            # supports it.
             node_id = None
             if hasattr(query_service, "get_node"):
                 try:
@@ -1292,19 +1300,37 @@ def create_codebase_tools(
                 except Exception:
                     node_id = None
             if node_id:
-                rels = query_service.get_relationships(
-                    node_id,
-                    direction=direction,
-                    max_depth=max_depth,
-                    max_results=50,
-                )
+                try:
+                    rels = query_service.get_relationships(
+                        node_id,
+                        direction=direction,
+                        max_depth=max_depth,
+                        max_results=50,
+                        min_confidence=min_confidence,
+                    )
+                except TypeError:
+                    rels = query_service.get_relationships(
+                        node_id,
+                        direction=direction,
+                        max_depth=max_depth,
+                        max_results=50,
+                    )
             else:
-                node_id, rels = query_service.resolve_and_traverse(
-                    symbol_name,
-                    direction=direction,
-                    max_depth=max_depth,
-                    max_results=50,
-                )
+                try:
+                    node_id, rels = query_service.resolve_and_traverse(
+                        symbol_name,
+                        direction=direction,
+                        max_depth=max_depth,
+                        max_results=50,
+                        min_confidence=min_confidence,
+                    )
+                except TypeError:
+                    node_id, rels = query_service.resolve_and_traverse(
+                        symbol_name,
+                        direction=direction,
+                        max_depth=max_depth,
+                        max_results=50,
+                    )
 
             if not node_id:
                 return f"Symbol '{symbol_name}' not found. Try search_symbols first."

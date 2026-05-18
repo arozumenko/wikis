@@ -262,6 +262,19 @@ class FeatureFlags:
     #: dropped before the L0–L2 cascade runs.
     relatedness_threshold: float = 0.15
 
+    #: Remap Leiden-assigned cluster IDs to their best-matching IDs from
+    #: the previous run (#116 PR 4). Keeps page_id hashes stable when
+    #: cluster membership barely shifts. Disable to revert to the
+    #: pre-PR4 behavior where every regen renumbers clusters.
+    cluster_stability: bool = True
+
+    #: Jaccard similarity gate for cluster ID remap. Two clusters are
+    #: treated as "the same" iff their node sets share at least this
+    #: fraction of the union. 0.5 is the conventional choice (majority
+    #: preserved); lower values risk spurious matches, higher values
+    #: break IDs on minor churn. Tunable via WIKIS_CLUSTER_STABILITY_THRESHOLD.
+    cluster_stability_threshold: float = 0.5
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -304,4 +317,8 @@ def get_feature_flags() -> FeatureFlags:
         project_max_wikis=_env_int("WIKI_PROJECT_MAX_WIKIS", 50),
         cross_repo_dampening=_env_float("WIKI_CROSS_REPO_DAMPENING", 0.7),
         relatedness_threshold=_env_float("WIKI_RELATEDNESS_THRESHOLD", 0.15),
+        cluster_stability=_env_bool("WIKIS_CLUSTER_STABILITY"),
+        cluster_stability_threshold=_env_float(
+            "WIKIS_CLUSTER_STABILITY_THRESHOLD", 0.5,
+        ),
     )

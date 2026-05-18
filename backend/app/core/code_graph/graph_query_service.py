@@ -429,6 +429,7 @@ class GraphQueryService:
         direction: str = "both",
         max_depth: int = 2,
         max_results: int = 50,
+        min_confidence: str | None = None,
     ) -> list[RelationshipResult]:
         """Traverse graph relationships from a resolved node_id.
 
@@ -437,12 +438,24 @@ class GraphQueryService:
             direction: 'outgoing', 'incoming', or 'both'.
             max_depth: Maximum traversal hops.
             max_results: Cap on returned edges.
+            min_confidence: Optional edge-confidence floor (#120/#157).
+                ``None`` (default) → no filter, legacy behavior.
+                ``"EXTRACTED"`` → only edges with explicit parser
+                observation pass. ``"INFERRED"`` → also includes
+                name-only resolution. Edge labels are read from
+                ``edata.get("confidence")`` which was wired by
+                ``_add_relationships_bulk`` (PR #150). Missing labels
+                default to ``EXTRACTED`` for legacy-row compat.
 
         Returns:
             List of ``RelationshipResult`` sorted by hop distance.
         """
         if node_id not in self.graph:
             return []
+
+        # Imported here to avoid module-level cycle with anything that
+        # might consume ``graph_query_service`` at load time.
+        from app.core.confidence_filter import edge_passes_confidence
 
         results: list[RelationshipResult] = []
         visited: set[str] = {node_id}
@@ -471,6 +484,19 @@ class GraphQueryService:
             for src, tgt, edata, hop, other_node in edges:
                 if len(results) >= max_results:
                     break
+
+                # #120/#157: drop edges below the confidence floor.
+                # Applied BEFORE seen_edges check so a low-confidence
+                # edge can't cause the seen_edges dedup to swallow a
+                # subsequent high-confidence edge with the same
+                # (src, tgt, rel_type).
+                if not edge_passes_confidence(edata, min_confidence):
+                    # Still advance the frontier — there may be
+                    # high-confidence edges from this node downstream.
+                    if other_node not in visited:
+                        visited.add(other_node)
+                        frontier.append((other_node, depth + 1))
+                    continue
 
                 rel_type = str(edata.get("relationship_type", "") or edata.get("type", ""))
                 edge_key = (src, tgt, rel_type)
@@ -517,11 +543,15 @@ class GraphQueryService:
         max_results: int = 50,
         file_path: str = "",
         language: str = "",
+        min_confidence: str | None = None,
     ) -> tuple[str | None, list[RelationshipResult]]:
         """Resolve a symbol name and return its relationships.
 
         Combines ``resolve_symbol`` + ``get_relationships`` in one call.
         Returns ``(node_id, relationships)`` where ``node_id`` may be None.
+
+        ``min_confidence`` (#120/#157) is forwarded to
+        :meth:`get_relationships` and filters edges below the threshold.
         """
         node_id = self.resolve_symbol(symbol_name, file_path=file_path, language=language)
         if not node_id:
@@ -531,6 +561,7 @@ class GraphQueryService:
             direction=direction,
             max_depth=max_depth,
             max_results=max_results,
+            min_confidence=min_confidence,
         )
 
     # ------------------------------------------------------------------

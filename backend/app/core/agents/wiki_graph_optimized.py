@@ -37,6 +37,7 @@ from ..constants import (
     DOT_DIR_WHITELIST,
     EXPANSION_SYMBOL_TYPES,
     KNOWN_FILENAMES,
+    classify_known_filename,
 )
 from ..document_compressor import DocumentCompressor
 from ..document_ranker import DocumentRanker
@@ -57,6 +58,11 @@ from ..state.wiki_state import (
     WikiState,
     WikiStructureSpec,
     WikiStyle,
+)
+from ..storage.incremental import (
+    compute_anchor_slug,
+    compute_content_hash,
+    compute_page_id,
 )
 from ..token_counter import CONTEXT_TOKEN_BUDGET, get_token_counter
 
@@ -204,6 +210,20 @@ class OptimizedWikiGenerationAgent:
         # Cluster expansion state (lazy-opened)
         self._cluster_db = None       # UnifiedWikiDB instance (opened on first use)
         self._cluster_db_path = None  # Cached path for the unified DB file
+
+        # #116: resolved wiki_id, lazy + cached. Same derivation as export_wiki
+        # so wiki_pages rows we persist now line up with the artifact storage
+        # paths the exporter will use later.
+        self._resolved_wiki_id: str | None = None
+
+        # #116: persist-hook telemetry. _persist_page_metadata is fail-soft
+        # (a DB hiccup never breaks page generation), but PR 2's change
+        # detection silently degrades if rows are missing. These counters
+        # give us a single end-of-run log line ("N/M pages stored") so ops
+        # and PR 2 can detect partial persistence without grepping warnings.
+        self._persist_attempts = 0
+        self._persist_successes = 0
+        self._persist_failures = 0
 
         # Build code_graph
         self.graph = self._build_graph()
@@ -621,11 +641,54 @@ class OptimizedWikiGenerationAgent:
         # each sub-page comfortably fits within the context token budget.
         self._split_overloaded_pages(wiki_structure)
 
-        # Generate all pages at once (simplified - no batching)
+        # #116: reset persist counters at the start of every dispatch so
+        # finalize_wiki sees the counts for the current run only.
+        self._persist_attempts = 0
+        self._persist_successes = 0
+        self._persist_failures = 0
+
+        # #116: allocate stable page IDs for new wikis (id_scheme='stable_v1').
+        # When we can resolve a wiki_id, page IDs are sha256 of
+        # (wiki_id, macro_cluster, micro_cluster, primary_symbol_id, title)
+        # so they survive cluster-membership churn. When we can't, fall back
+        # to the legacy "{section}#{page}" scheme for safety. Slug uniqueness
+        # is enforced wiki-wide via compute_anchor_slug + a running set.
+        wiki_id = self._resolve_wiki_id()
+        used_slugs: set[str] = set()
+
         sends = []
         for section_idx, section in enumerate(wiki_structure.sections):
             for page_idx, page in enumerate(section.pages):
-                page_id = f"{section_idx}#{page_idx}"
+                metadata = getattr(page, "metadata", {}) or {}
+                macro = metadata.get("section_id", section_idx)
+                micro = metadata.get("page_id", page_idx)
+                cluster_node_ids = metadata.get("cluster_node_ids", []) or []
+                # Prefer the planner's PageRank-derived primary (deterministic
+                # given a stable graph); fall back to the first node in the
+                # ORDER BY-sorted cluster list. cluster_node_ids[0] alone was
+                # non-deterministic before storage sort landed — keep the
+                # belt-and-braces in case an older planner is still feeding us.
+                primary_symbol_id = (
+                    metadata.get("primary_symbol_id")
+                    or (cluster_node_ids[0] if cluster_node_ids else None)
+                )
+
+                if wiki_id:
+                    page_id = compute_page_id(
+                        wiki_id=wiki_id,
+                        macro_cluster=macro if isinstance(macro, int) else None,
+                        micro_cluster=micro if isinstance(micro, int) else None,
+                        primary_symbol_id=primary_symbol_id,
+                        title=page.page_name,
+                    )
+                    id_scheme = "stable_v1"
+                else:
+                    page_id = f"{section_idx}#{page_idx}"
+                    id_scheme = "legacy"
+
+                anchor_slug = compute_anchor_slug(page.page_name, used_slugs)
+                used_slugs.add(anchor_slug)
+
                 # Use Pydantic v2 model_dump for structured models; fallback to __dict__
                 page_spec_dict = (
                     page.model_dump()
@@ -640,6 +703,19 @@ class OptimizedWikiGenerationAgent:
                             "page_id": page_id,
                             "page_spec": page_spec_dict,
                             "repository_context": state["repository_context"],
+                            # #116 persistence inputs — passed through to
+                            # generate_page_content for wiki_pages + page_symbols upsert.
+                            "page_persist": {
+                                "wiki_id": wiki_id,
+                                "id_scheme": id_scheme,
+                                "anchor_slug": anchor_slug,
+                                "macro_cluster": macro if isinstance(macro, int) else None,
+                                "micro_cluster": micro if isinstance(micro, int) else None,
+                                "primary_symbol_id": primary_symbol_id,
+                                "section_index": section_idx,
+                                "page_index": page_idx,
+                                "cluster_node_ids": list(cluster_node_ids),
+                            },
                         },
                     )
                 )
@@ -730,8 +806,18 @@ class OptimizedWikiGenerationAgent:
                     chunks.append(current_chunk)
 
                 # Create sub-pages
+                parent_metadata = dict(getattr(page, "metadata", {}) or {})
                 for part_idx, chunk in enumerate(chunks, start=1):
                     suffix = f" (Part {part_idx})" if len(chunks) > 1 else ""
+                    # #116: inherit parent metadata so split sub-pages get a
+                    # populated page_symbols reverse index. Less accurate than
+                    # distributing cluster_node_ids per chunk (every sub-page
+                    # claims the full parent cluster) but vastly better than
+                    # leaving page_symbols empty — PR 2 change detection still
+                    # finds these pages when any cluster symbol changes.
+                    sub_metadata = dict(parent_metadata)
+                    sub_metadata["split_part"] = part_idx
+                    sub_metadata["split_total"] = len(chunks)
                     sub_page = PageSpec(
                         page_name=f"{page.page_name}{suffix}",
                         page_order=page.page_order * 100 + part_idx,
@@ -743,6 +829,7 @@ class OptimizedWikiGenerationAgent:
                         target_folders=list(getattr(page, "target_folders", []) or []),
                         key_files=list(getattr(page, "key_files", []) or []),
                         retrieval_query=getattr(page, "retrieval_query", ""),
+                        metadata=sub_metadata,
                     )
                     new_pages.append(sub_page)
 
@@ -865,6 +952,16 @@ class OptimizedWikiGenerationAgent:
                 except Exception:
                     pass  # never break generation for progress
 
+            # #116: persist wiki_pages row + page_symbols reverse index so
+            # future incremental runs (PR 2+) can find this page by symbol.
+            # Fail-soft: a storage hiccup here must not fail page generation.
+            self._persist_page_metadata(
+                page_id=page_id,
+                page_spec=page_spec,
+                generated_content=generated_content,
+                persist=state.get("page_persist", {}),
+            )
+
             return {
                 "wiki_pages": [
                     WikiPage(
@@ -918,6 +1015,20 @@ class OptimizedWikiGenerationAgent:
         """Finalize wiki generation and prepare for export"""
 
         logger.info("🏁 Finalizing wiki generation")
+        # #116: one-line persistence health line. Stays quiet on the happy
+        # path (skipped when nothing attempted); raises to WARNING when any
+        # page failed so PR 2's incremental path can detect partial state.
+        if self._persist_attempts > 0:
+            level = (
+                logging.WARNING if self._persist_failures else logging.INFO
+            )
+            logger.log(
+                level,
+                "[wiki_pages] persist summary: %d/%d pages stored (failures=%d)",
+                self._persist_successes,
+                self._persist_attempts,
+                self._persist_failures,
+            )
         if self.progress_callback:
             try:
                 self.progress_callback("storing", 0.92, "Finalizing wiki — assembling pages and diagrams...")
@@ -1695,6 +1806,252 @@ class OptimizedWikiGenerationAgent:
 
         except Exception as exc:
             logger.warning("[UNIFIED_DB] Failed to populate: %s", exc)
+
+    def _resolve_wiki_id(self) -> str | None:
+        """Derive ``{owner}--{repo}--{branch}`` from ``self.repository_url``.
+
+        Returns the same wiki_id that ``export_wiki`` will compute later, so
+        the ``wiki_pages`` rows we persist during page generation key cleanly
+        against the artifacts the exporter will write. Cached after first call.
+        Returns None when the URL can't be parsed — caller must handle that
+        case (skip persistence rather than crash).
+        """
+        if self._resolved_wiki_id is not None:
+            return self._resolved_wiki_id
+        try:
+            from ..artifact_export import normalize_wiki_id
+
+            repo_url = self.repository_url
+            if not repo_url:
+                return None
+            # Match the URL-parsing rules used in export_wiki below.
+            if "://" in repo_url:
+                path = repo_url.split("://", 1)[1].split("/", 1)[1]
+            elif "@" in repo_url and ":" in repo_url:
+                path = repo_url.split(":", 1)[1]
+            else:
+                path = repo_url
+            path = path.rstrip("/").removesuffix(".git")
+            if "/" not in path:
+                return None
+            self._resolved_wiki_id = normalize_wiki_id(
+                repository=path, branch=self.branch,
+            )
+            return self._resolved_wiki_id
+        except Exception as exc:
+            logger.warning("[wiki_pages] could not resolve wiki_id: %s", exc)
+            return None
+
+    def regenerate_single_page(
+        self,
+        page_id: str,
+        *,
+        repository_context: str,
+        config: RunnableConfig | None = None,
+    ) -> str | None:
+        """Regenerate one page from its persisted ``PageSpec``.
+
+        Reads ``page_spec_json`` from ``wiki_pages`` (stored by the
+        per-page persist hook), reconstructs the original
+        :class:`PageSpec`, then runs the same retrieval + simple-mode
+        LLM path that full wiki generation uses for one page.
+
+        **Quality-gated retries from the full pipeline are intentionally
+        skipped here** — structural regen is the "we don't know what
+        else to do" fallback, and an extra round of LLM retries doesn't
+        change the failure mode (low-quality input still produces
+        low-quality output). Callers needing maximum quality should
+        treat ``None`` as a signal to schedule a full ``/refresh``.
+
+        Returns the new markdown body, or ``None`` if the page has no
+        persisted spec (legacy wiki, missing row, deserialize failure,
+        LLM error, transient storage error). Callers should treat
+        ``None`` as "structural regen failed for this page" and fall
+        back accordingly.
+
+        Used by the #116 PR 3 structural-handler factory to satisfy the
+        ``edit-demoted-to-structural`` and primary-symbol-deleted
+        regimes without re-running the planner.
+        """
+        from ..state.wiki_state import PageSpec
+
+        db = self._open_cluster_db()
+        if db is None:
+            logger.warning(
+                "[regenerate_single_page] no cluster DB available for %s",
+                page_id,
+            )
+            return None
+
+        try:
+            page_row = db.get_wiki_page(page_id)
+        except Exception as exc:  # noqa: BLE001 — fail-soft on storage read
+            logger.warning(
+                "[regenerate_single_page] page %s: storage read failed: %s",
+                page_id, exc,
+            )
+            return None
+
+        if page_row is None:
+            logger.warning(
+                "[regenerate_single_page] page %s not in wiki_pages; "
+                "cannot reconstruct PageSpec",
+                page_id,
+            )
+            return None
+
+        spec_json = page_row.get("page_spec_json")
+        if not spec_json:
+            logger.warning(
+                "[regenerate_single_page] page %s has no page_spec_json "
+                "(legacy row?); structural regen falls back to caller",
+                page_id,
+            )
+            return None
+
+        try:
+            page_spec = PageSpec.model_validate_json(spec_json)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[regenerate_single_page] page %s: PageSpec deserialize "
+                "failed: %s",
+                page_id, exc,
+            )
+            return None
+
+        try:
+            relevant_content = self._get_relevant_content_for_page(
+                page_spec, self.repository_url, repository_context,
+            )
+            generated_content = self._generate_simple(
+                page_spec, relevant_content, repository_context,
+                config or {},  # type: ignore[arg-type]
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[regenerate_single_page] page %s: generation failed: %s",
+                page_id, exc, exc_info=True,
+            )
+            return None
+
+        # Re-run diagram sanitization (the original generate_page_content
+        # path does this; keep parity). Fail-soft on sanitizer errors —
+        # a bad Mermaid block shouldn't null out an otherwise-good page —
+        # but log loudly so ops can detect silent sanitizer regressions.
+        try:
+            from ..diagram_sanitizer import SanitizerConfig, sanitize_content
+
+            sanitized, _summary = sanitize_content(
+                generated_content, SanitizerConfig(),
+            )
+            generated_content = sanitized
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[regenerate_single_page] page %s: diagram sanitization "
+                "failed; emitting un-sanitized content: %s",
+                page_id, exc, exc_info=True,
+            )
+
+        return generated_content
+
+    def _persist_page_metadata(
+        self,
+        *,
+        page_id: str,
+        page_spec: PageSpec,
+        generated_content: str,
+        persist: dict[str, Any],
+    ) -> None:
+        """Record the wiki_pages + page_symbols rows for one rendered page.
+
+        Fail-soft by design: a DB error here must not bubble up and break
+        page generation. The data is for future incremental runs — if a row
+        is missing the next regen falls back to a full page render.
+        """
+        wiki_id = persist.get("wiki_id")
+        if not wiki_id:
+            # Couldn't resolve wiki_id at dispatch time — running with the
+            # legacy ID scheme. Skip persistence; pre-#116 callers don't
+            # expect these rows either.
+            return
+
+        db = self._open_cluster_db()
+        if db is None:
+            return
+
+        with self._progress_lock:
+            self._persist_attempts += 1
+
+        # Build (node_id, citation_kind) pairs from the planner's cluster
+        # membership. First node is the primary; rest are 'related'. We don't
+        # parse `<code_context>` markdown for 'referenced' rows yet — that
+        # arrives in PR 2 alongside change detection, where it's actually
+        # consumed. Until then the cluster set is enough to answer "which
+        # pages cite this node?".
+        symbols: list[tuple[str, str]] = []
+        cluster_node_ids = persist.get("cluster_node_ids") or []
+        primary = persist.get("primary_symbol_id")
+        for idx, node_id in enumerate(cluster_node_ids):
+            if not node_id:
+                continue
+            kind = "primary" if idx == 0 and node_id == primary else "related"
+            symbols.append((node_id, kind))
+
+        try:
+            # Atomic write: either both the page row and its symbol rows
+            # land, or neither does. Avoids an orphaned wiki_pages row whose
+            # missing citations are indistinguishable from "page cites nothing"
+            # for PR 2 change detection.
+            # #116 PR 3 structural-handler wiring: store the planner's
+            # PageSpec as JSON so regenerate_single_page can reconstruct
+            # the retrieval inputs (target_symbols, target_docs, etc.)
+            # without re-running the planner. Exclude `metadata` — that
+            # field carries cluster-membership state the planner uses
+            # internally but neither _get_relevant_content_for_page nor
+            # _generate_simple read it back. Skipping it can cut the
+            # stored JSON size by an order of magnitude on big clusters.
+            # Falls back to None when the spec isn't dumpable (legacy
+            # fixtures, etc.) — the structural handler then skips the
+            # page rather than crashing.
+            try:
+                page_spec_json = (
+                    page_spec.model_dump_json(exclude={"metadata"})
+                    if hasattr(page_spec, "model_dump_json")
+                    else None
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    "[wiki_pages] page_spec serialization failed for %s: %s",
+                    page_id, exc,
+                )
+                page_spec_json = None
+
+            db.upsert_wiki_page_with_symbols(
+                {
+                    "page_id": page_id,
+                    "wiki_id": wiki_id,
+                    "id_scheme": persist.get("id_scheme", "stable_v1"),
+                    "title": page_spec.page_name,
+                    "anchor_slug": persist.get("anchor_slug", ""),
+                    "content_hash": compute_content_hash(generated_content),
+                    "macro_cluster": persist.get("macro_cluster"),
+                    "micro_cluster": persist.get("micro_cluster"),
+                    "primary_symbol_id": persist.get("primary_symbol_id"),
+                    "section_index": persist.get("section_index", 0),
+                    "page_index": persist.get("page_index", 0),
+                    "page_spec_json": page_spec_json,
+                    "generated_at": datetime.utcnow().isoformat() + "Z",
+                },
+                symbols,
+            )
+            with self._progress_lock:
+                self._persist_successes += 1
+        except Exception as exc:
+            with self._progress_lock:
+                self._persist_failures += 1
+            logger.warning(
+                "[wiki_pages] persist failed for page_id=%s: %s", page_id, exc,
+            )
 
     def _open_cluster_db(self):
         """Open (or return cached) unified DB for cluster expansion."""
@@ -4061,6 +4418,151 @@ class OptimizedWikiGenerationAgent:
 
         return collected
 
+    # #181 Bug B: filenames the page-content agent should see whenever
+    # retrieval comes up empty. Reading them direct from the clone (when
+    # available) anchors the LLM to the actual build / config / deploy
+    # surface of the repo, replacing the boilerplate "no source supplied"
+    # warning with citations of the files that genuinely exist.
+    _REPO_ROOT_PRIORITY_PATTERNS = (
+        "README", "readme",
+        "Dockerfile", "Containerfile", "docker-compose",
+        "package.json",
+        "pyproject.toml", "setup.py", "setup.cfg", "requirements",
+        "Makefile", "makefile", "GNUmakefile",
+        "Justfile", "justfile", "Taskfile", "Earthfile",
+        ".env",
+        "Procfile", "Vagrantfile", "Jenkinsfile",
+        "build", "install", "run", "deploy",
+        "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "Gemfile",
+        ".gitignore", ".dockerignore",
+        "vite.config", "webpack.config", "rollup.config", "next.config",
+        "tsconfig", "jsconfig",
+        "nginx.conf",
+    )
+
+    def _get_repo_root_anchor_docs(
+        self,
+        char_cap: int = 30_000,
+        max_files: int = 20,
+        file_size_cap: int = 100_000,
+    ) -> list[Document]:
+        """Last-resort context anchor for pages whose retrieval came up empty.
+
+        Reads top-level files from the cached repo clone (build/config/
+        deploy artifacts most often live at the repo root) and returns
+        them as Documents the page-content agent can cite.  Without this
+        the agent receives only the generic repo summary and writes
+        boilerplate "no source supplied" warnings when its retrieval
+        path can't anchor a page to specific code — particularly for
+        outline pages like "Development Environment Setup" on
+        non-Python repos (#181 Bug B).
+
+        The result is intentionally heterogeneous: a Dockerfile, a
+        package.json, and a README are each useful to the LLM, and
+        bundling them in a single fallback bundle is cheaper than
+        re-running the planner with stronger ``target_docs`` guidance.
+
+        Returns an empty list when the repo clone isn't on disk
+        (degrades silently to the existing empty-content fallback).
+        """
+        repo_root = self._safely_get_repo_root()
+        if not repo_root or not os.path.isdir(repo_root):
+            return []
+
+        try:
+            entries = os.listdir(repo_root)
+        except OSError:
+            return []
+
+        def _priority(name: str) -> int:
+            for i, pattern in enumerate(self._REPO_ROOT_PRIORITY_PATTERNS):
+                if name.startswith(pattern):
+                    return i
+            return len(self._REPO_ROOT_PRIORITY_PATTERNS)
+
+        # Priority bucket first, then alphabetic tie-break — the single
+        # sort with composite key replaces an earlier ``sorted()`` call
+        # whose work was always thrown away.
+        entries.sort(key=lambda n: (_priority(n), n))
+
+        from ..constants import DOCUMENTATION_EXTENSIONS as _DOC_EXT_MAP
+
+        docs: list[Document] = []
+        total_chars = 0
+
+        for name in entries:
+            if len(docs) >= max_files or total_chars >= char_cap:
+                break
+            full = os.path.join(repo_root, name)
+            if not os.path.isfile(full):
+                continue
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            if size == 0 or size > file_size_cap:
+                continue
+            try:
+                with open(full, encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            if not content.strip():
+                continue
+            # Trim if including the whole file would blow the budget.
+            remaining = char_cap - total_chars
+            if len(content) > remaining:
+                content = content[:remaining]
+            total_chars += len(content)
+
+            ext = os.path.splitext(name)[1].lower()
+            doc_type = _DOC_EXT_MAP.get(ext) or 'repo_root_file'
+            docs.append(
+                Document(
+                    page_content=content,
+                    metadata={
+                        "source": name,
+                        "file_path": name,
+                        "rel_path": name,
+                        "symbol": name,
+                        "symbol_type": f"{doc_type}_document" if doc_type != 'repo_root_file' else 'repo_root_file',
+                        "node_type": doc_type,
+                        "chunk_type": "documentation",
+                        "language": "text",
+                        "is_documentation": True,
+                        # Mark so downstream formatters can hint the LLM
+                        # that these files are real and present.
+                        "repo_root_anchor": True,
+                    },
+                )
+            )
+
+        if docs:
+            logger.info(
+                "[REPO_ROOT_ANCHOR] Surfaced %d repo-root files as fallback context "
+                "(%d chars / ~%d tokens): %s",
+                len(docs),
+                total_chars,
+                total_chars // 4,
+                [d.metadata["source"] for d in docs],
+            )
+        return docs
+
+    def _safely_get_repo_root(self) -> str | None:
+        """Return the cloned-repo path or ``None`` when unavailable.
+
+        Centralized so callers don't repeat the ``getattr``/callable
+        guard dance.  Used by :meth:`_get_repo_root_anchor_docs` and
+        the existing :meth:`_fetch_explicit_target_docs` disk fallback.
+        """
+        getter = getattr(self.indexer, "get_repo_root", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
     def _get_relevant_content_for_page(self, page_spec: PageSpec, repo_url: str, repo_context: str) -> dict[str, Any]:
         """
         Get relevant content for page generation with proper context structure.
@@ -4263,6 +4765,19 @@ class OptimizedWikiGenerationAgent:
                     f"({total_tokens:,}/{CONTEXT_TOKEN_BUDGET:,} tokens, {utilization_pct:.1f}% utilized, "
                     f"{tokens_remaining:,} tokens remaining)"
                 )
+                # #181 Bug B: vector search returned nothing — without an
+                # anchor the LLM writes a boilerplate "no source supplied"
+                # warning.  Fall through to repo-root files instead.
+                if not relevant_docs:
+                    anchor_docs = self._get_repo_root_anchor_docs()
+                    if anchor_docs:
+                        logger.info(
+                            "[CONTENT_RETRIEVAL] Vector search returned 0 docs for page "
+                            "'%s' — anchoring with %d repo-root files",
+                            page_spec.page_name,
+                            len(anchor_docs),
+                        )
+                        return self._format_simple_context(anchor_docs, page_spec)
                 return self._format_simple_context(relevant_docs, page_spec)
             else:
                 # RANKED TRUNCATION: Include top-priority docs with full content, drop the rest
@@ -4291,6 +4806,23 @@ class OptimizedWikiGenerationAgent:
                 f"Retrieval FAILED for page '{page_name}': {e}. "
                 f"LLM will receive only repo summary — content quality will be degraded."
             )
+            # #181 Bug B: before falling back to the bare repo summary,
+            # try to surface repo-root files as a last-resort anchor.
+            # Even with retrieval broken, the cached clone is usually
+            # still on disk and reading top-level build / config /
+            # deploy files gives the LLM something concrete to cite.
+            try:
+                anchor_docs = self._get_repo_root_anchor_docs()
+            except Exception:  # pragma: no cover — defensive
+                anchor_docs = []
+            if anchor_docs:
+                logger.info(
+                    "[CONTENT_RETRIEVAL] Anchoring failed page '%s' with %d "
+                    "repo-root files instead of bare repo summary",
+                    page_name,
+                    len(anchor_docs),
+                )
+                return self._format_simple_context(anchor_docs, page_spec)
             return {
                 "content": repo_context,
                 "files": [],
@@ -4668,9 +5200,11 @@ class OptimizedWikiGenerationAgent:
         if ext in DOCUMENTATION_EXTENSIONS_SET:
             return True
 
-        # Check known filenames (Makefile, Dockerfile, etc.)
+        # Check known filenames (Makefile, Dockerfile, etc.) — also
+        # picks up suffixed variants like Dockerfile.prod via the
+        # prefix-match-aware classifier (#181 Bug A).
         filename = _P(file_path).name
-        if filename in KNOWN_FILENAMES:
+        if classify_known_filename(filename) is not None:
             return True
 
         # Check filename stem

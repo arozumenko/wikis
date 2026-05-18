@@ -89,15 +89,18 @@ class CoverageLedger:
 
     def _load_universe(self):
         """Load the full universe of architectural symbols and directories."""
-        conn = self.db.conn
-        rows = conn.execute(
-            "SELECT node_id, symbol_name, symbol_type, rel_path, is_doc "
-            "FROM repo_nodes WHERE is_architectural = 1"
-        ).fetchall()
+        # ``get_architectural_nodes`` returns full node dicts; the original
+        # raw query projected five columns to keep the payload light, but
+        # this is called once at construction time so the difference is
+        # negligible.  ``limit=None`` matches the original raw-SQL
+        # behaviour (no LIMIT) so very large repos aren't silently
+        # truncated.
+        rows = self.db.get_architectural_nodes(limit=None)
 
-        for row in rows:
-            node = dict(row)
-            nid = node["node_id"]
+        for node in rows:
+            nid = node.get("node_id")
+            if not nid:
+                continue
             self._all_symbols[nid] = node
 
             rel_path = node.get("rel_path") or ""
@@ -133,15 +136,16 @@ class CoverageLedger:
         -------
         CoverageReport
         """
-        # Filter to macro if requested
+        # Filter to macro if requested.  ``get_nodes_by_cluster`` returns
+        # all nodes in the macro (any micro); filter to architectural in
+        # Python since the protocol doesn't expose a combined predicate.
+        # ``limit=None`` matches the original raw-SQL behaviour.
         if macro_id is not None:
-            conn = self.db.conn
-            rows = conn.execute(
-                "SELECT node_id FROM repo_nodes "
-                "WHERE macro_cluster = ? AND is_architectural = 1",
-                (macro_id,),
-            ).fetchall()
-            scope_ids = {dict(r)["node_id"] for r in rows}
+            rows = self.db.get_nodes_by_cluster(macro_id, limit=None)
+            scope_ids = {
+                r["node_id"] for r in rows
+                if r.get("is_architectural") and r.get("node_id")
+            }
         else:
             scope_ids = set(self._all_symbols.keys())
 

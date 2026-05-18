@@ -322,12 +322,22 @@ async def get_wiki_page(wiki_id: str, page_id: str, offset: int = 0, limit: int 
 
 
 @mcp.tool()
-async def ask_codebase(wiki_id: str, question: str) -> dict[str, Any]:
+async def ask_codebase(
+    wiki_id: str,
+    question: str,
+    min_confidence: str | None = None,
+) -> dict[str, Any]:
     """Ask a natural language question about a codebase; returns an AI answer grounded in the wiki.
 
     Args:
         wiki_id: Wiki identifier from search_wikis().
         question: Question about the codebase — architecture, implementation details, how-tos.
+        min_confidence: Optional edge-confidence floor for graph expansion (#120/#157).
+            ``None`` (default) includes all edges. ``"EXTRACTED"`` keeps only direct
+            parser observations; ``"INFERRED"`` includes name-only resolution edges
+            (basic-tier languages like Ruby, PHP, Kotlin). Use this when answer
+            precision matters more than recall — INFERRED edges from lightweight
+            parsers can cite wrong call targets when symbol names collide.
     """
     if _ask_service:
         try:
@@ -335,7 +345,10 @@ async def ask_codebase(wiki_id: str, question: str) -> dict[str, Any]:
 
             from app.models.api import AskRequest
 
-            request = AskRequest(wiki_id=wiki_id, question=question)
+            request = AskRequest(
+                wiki_id=wiki_id, question=question,
+                min_confidence=min_confidence,
+            )
             result = await _ask_service.ask_sync(request)
             # Record QA interaction (direct await — no HTTP lifecycle)
             if result.recording and _qa_service:
@@ -446,7 +459,11 @@ async def list_projects(query: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-async def ask_project(project_id: str, question: str) -> dict[str, Any]:
+async def ask_project(
+    project_id: str,
+    question: str,
+    min_confidence: str | None = None,
+) -> dict[str, Any]:
     """Ask a question across all wikis in a project.
 
     Returns a cross-repo answer with source attribution per wiki.
@@ -454,6 +471,9 @@ async def ask_project(project_id: str, question: str) -> dict[str, Any]:
     Args:
         project_id: Project identifier from list_projects().
         question: Question about the codebase — architecture, implementation details, how-tos.
+        min_confidence: Optional edge-confidence floor for graph expansion (#120/#157).
+            See ``ask_codebase`` for the same parameter semantics. The filter
+            applies independently to each wiki's retriever in the project fan-out.
     """
     user_id = _current_user_id.get()
     if _ask_service:
@@ -462,7 +482,10 @@ async def ask_project(project_id: str, question: str) -> dict[str, Any]:
 
             from app.models.api import AskRequest
 
-            request = AskRequest(project_id=project_id, question=question)
+            request = AskRequest(
+                project_id=project_id, question=question,
+                min_confidence=min_confidence,
+            )
             result = await _ask_service.ask_sync(request, user_id=user_id)
             if result.recording and _qa_service:
                 try:
@@ -600,6 +623,662 @@ async def search_wiki(
             ],
         }
     return await _http_search_wiki(wiki_id, query, hop_depth, top_k)
+
+
+# ── Shared storage-open helper for graph-native MCP tools ────────────
+#
+# Resolves ``wiki_id`` → an open read-only ``WikiStorageProtocol``
+# handle, applying the same auth + cache-key derivation used by every
+# graph tool (``get_graph_stats``, ``god_nodes``, ``shortest_path``,
+# ``get_community``). Returns an error string instead of raising so
+# tools can forward it verbatim in their JSON response.
+
+
+async def _open_wiki_storage(wiki_id: str) -> tuple[Any, str | None]:
+    """Resolve ``wiki_id`` → open read-only storage handle.
+
+    Returns ``(storage, None)`` on success or ``(None, error_message)``
+    when the wiki is unknown / unowned / has no on-disk index.
+
+    Path-safety note: ``wiki_id`` is **never** joined into a filesystem
+    path directly. The on-disk DB path derives from the wiki record's
+    ``repo_url`` + ``branch`` via ``derive_cache_key`` — the
+    caller-supplied ``wiki_id`` is only used as a DB lookup key. A
+    malicious traversal string like ``../../etc/passwd`` fails the
+    ``get_wiki`` lookup and returns a not-found error. Preserve this
+    invariant: any future refactor that uses ``wiki_id`` in a path
+    join would reintroduce a traversal risk.
+    """
+    if not _wiki_management or not _settings:
+        return None, "graph tools unavailable in this deployment"
+
+    user_id = _current_user_id.get()
+    wiki_record = await _wiki_management.get_wiki(wiki_id, user_id=user_id)
+    if wiki_record is None:
+        return None, (
+            f"Wiki not found: {wiki_id}. Use search_wikis() to find "
+            f"available wiki IDs."
+        )
+
+    from pathlib import Path
+
+    from app.core.storage import open_storage
+    from app.services.wiki_management import derive_cache_key
+
+    # Aligned with ``_open_project_storages`` — both code paths must
+    # treat a null ``branch`` the same way, otherwise the same wiki
+    # resolves under different cache keys depending on which helper
+    # opens it. ``"main"`` matches the production default + the rest
+    # of the codebase's null-branch handling.
+    cache_key = derive_cache_key(
+        _settings.cache_dir, wiki_record.repo_url, wiki_record.branch or "main",
+    )
+    if not cache_key:
+        return None, f"Wiki {wiki_id} has no cached index."
+    db_path = Path(_settings.cache_dir) / f"{cache_key}.wiki.db"
+    if not db_path.exists():
+        return None, f"Wiki {wiki_id} has no unified DB on disk."
+
+    storage = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
+    return storage, None
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Cast ``value`` to ``int`` for sort keys / aggregation, falling
+    back to ``default`` on any TypeError / ValueError. Used in the
+    project-scoped aggregators because they merge results across N
+    storage backends and we don't want a single misbehaving wiki to
+    crash the whole sort. The fallback puts bad values at the back
+    of the ranking rather than mid-pack."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """``float`` analogue of :func:`_safe_int`."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+async def _open_project_storages(
+    project_id: str,
+) -> tuple[list[tuple[str, Any]], int, str | None]:
+    """Resolve ``project_id`` → list of ``(wiki_id, storage)`` for all
+    wikis the caller can see in the project, plus a count of wikis
+    skipped because their on-disk DB was missing or unopenable.
+
+    Returns ``(handles, skipped, None)`` on success. ``handles`` may
+    be empty if the project genuinely has no member wikis, OR if all
+    wikis were skipped — the ``skipped`` count lets callers
+    distinguish those cases without reading server logs.
+
+    Returns ``([], 0, error_message)`` only when the project itself
+    can't be loaded or the deployment lacks required services.
+
+    Caller MUST close each storage via ``_close_storage_quietly``.
+    """
+    if not _session_factory or not _settings:
+        return [], 0, "project graph tools unavailable in this deployment"
+
+    user_id = _current_user_id.get()
+
+    from pathlib import Path
+
+    from app.core.storage import open_storage
+    from app.services.project_service import ProjectService
+    from app.services.wiki_management import derive_cache_key
+
+    async with _session_factory() as session:
+        project_svc = ProjectService(session)
+        wikis = await project_svc.list_project_wikis(
+            project_id, user_id=user_id,
+        )
+    if wikis is None:
+        return [], 0, (
+            f"Project not found: {project_id}. Use list_projects() to find "
+            f"available project IDs."
+        )
+
+    handles: list[tuple[str, Any]] = []
+    skipped = 0
+    for w in wikis:
+        cache_key = derive_cache_key(
+            _settings.cache_dir, w.repo_url, w.branch or "main",
+        )
+        if not cache_key:
+            logger.warning(
+                "[project graph] wiki %s has no cached index — skipping",
+                w.id,
+            )
+            skipped += 1
+            continue
+        db_path = Path(_settings.cache_dir) / f"{cache_key}.wiki.db"
+        if not db_path.exists():
+            logger.warning(
+                "[project graph] wiki %s has no unified DB on disk — skipping",
+                w.id,
+            )
+            skipped += 1
+            continue
+        try:
+            storage = open_storage(
+                repo_id=cache_key, db_path=str(db_path), readonly=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — keep going on per-wiki failure
+            logger.warning(
+                "[project graph] wiki %s storage open failed: %s — skipping",
+                w.id, exc,
+            )
+            skipped += 1
+            continue
+        handles.append((w.id, storage))
+    return handles, skipped, None
+
+
+def _close_project_storages(handles: list[tuple[str, Any]]) -> None:
+    """Close every handle returned by ``_open_project_storages``."""
+    for _, storage in handles:
+        _close_storage_quietly(storage)
+
+
+def _close_storage_quietly(storage: Any) -> None:
+    if storage is None:
+        return
+    try:
+        storage.close()
+    except Exception:  # noqa: S110 — best-effort close
+        pass
+
+
+@mcp.tool()
+async def get_graph_stats(wiki_id: str) -> dict[str, Any]:
+    """Return summary statistics for a wiki's underlying code graph (#120).
+
+    Surfaces the ``confidence_breakdown`` over ``repo_edges`` so AI IDE
+    clients can decide whether to trust the graph's relationship edges
+    (``EXTRACTED`` = explicit parser observation, ``INFERRED`` =
+    name-only resolution, ``AMBIGUOUS`` = multiple candidates) before
+    asking follow-up questions.
+
+    Args:
+        wiki_id: Wiki identifier from search_wikis().
+
+    Returns:
+        Dict with ``node_count``, ``edge_count``, ``confidence_breakdown``
+        (``{extracted, inferred, ambiguous}``), ``edge_types`` (rel_type
+        → count), ``symbol_types``, ``languages``, ``macro_clusters``,
+        ``hub_count``, and ``embedding_dim``. Shape is stable — keys
+        always present even when counts are zero.
+    """
+    storage, err = await _open_wiki_storage(wiki_id)
+    if err:
+        return {"error": err}
+    try:
+        return storage.stats()
+    finally:
+        _close_storage_quietly(storage)
+
+
+# ── Graph-native MCP surface (#121 Phase 1) ──────────────────────────
+#
+# Three tools that answer structural graph questions deterministically
+# from the unified DB — no LLM, no retrieval. AI IDE clients use these
+# for "what calls X?", "shortest dependency chain between X and Y", and
+# "all nodes in cluster N" without paying retrieval cost. All three
+# share ``_open_wiki_storage`` so auth + cache-key lookup is
+# consistent with ``get_graph_stats``.
+
+
+@mcp.tool()
+async def god_nodes(wiki_id: str, top_n: int = 20) -> dict[str, Any]:
+    """Return the most-connected symbols and files in the wiki's graph.
+
+    Surfaces ``compute_god_nodes`` from the storage layer (§11.7 / B2)
+    so AI IDE clients can spot architectural hot-spots — classes
+    everything depends on, files with high cross-file fan-out — without
+    paying for retrieval or LLM cost.
+
+    Only architectural symbols (``is_architectural = 1``) are ranked by
+    degree; files are ranked by their cross-file outgoing edges.
+
+    Args:
+        wiki_id: Wiki identifier from ``search_wikis()``.
+        top_n: Number of top symbols / files to return (default 20,
+            max 200).
+
+    Returns:
+        Dict with ``by_symbol_type`` (top symbols by total degree) and
+        ``by_file`` (top files by external edges). Shape mirrors the
+        storage protocol's ``compute_god_nodes``. Returns
+        ``{"error": ...}`` when the wiki is unknown or has no index.
+    """
+    if not 1 <= top_n <= 200:
+        return {"error": f"top_n must be between 1 and 200, got {top_n}"}
+
+    storage, err = await _open_wiki_storage(wiki_id)
+    if err:
+        return {"error": err}
+    try:
+        return storage.compute_god_nodes(top_n=top_n)
+    finally:
+        _close_storage_quietly(storage)
+
+
+@mcp.tool()
+async def shortest_path(
+    wiki_id: str,
+    source_label: str,
+    target_label: str,
+    max_depth: int = 25,
+) -> dict[str, Any]:
+    """Undirected shortest path between two symbols in the graph (#121).
+
+    Resolves each label by ``symbol_name`` first then ``rel_path``
+    (deterministic, first match by ``node_id`` ASC). Treats edges as
+    undirected and returns the shortest hop-count path. Edge metadata
+    (``rel_type``, ``confidence``) is included for each hop. When
+    multiple edges exist between two consecutive nodes, the EXTRACTED
+    edge is preferred over INFERRED / AMBIGUOUS.
+
+    ``max_depth`` defaults to 25 (graph diameter on production
+    codebases is typically <20). Tighten it on dense graphs for
+    faster responses; loosen it only when you know the path is long.
+
+    Args:
+        wiki_id: Wiki identifier from ``search_wikis()``.
+        source_label: Symbol name or file path of the starting node.
+        target_label: Symbol name or file path of the destination.
+        max_depth: Maximum hops to search (1-50, default 25).
+
+    Returns:
+        On success::
+
+            {
+                "source": {"node_id", "symbol_name", "rel_path", "symbol_type"},
+                "target": {<same>},
+                "path": [<node>, ...],   # source first, target last
+                "edges": [{"source_id", "target_id", "rel_type", "confidence"}, ...],
+                "length": int,
+            }
+
+        On failure ``{"path": None, "reason": "..."}`` where reason
+        is one of ``source_not_found``, ``target_not_found``,
+        ``no_path_within_max_depth``, ``same_node``,
+        ``invalid_max_depth``.
+    """
+    if not 1 <= max_depth <= 50:
+        return {"path": None, "reason": "invalid_max_depth"}
+
+    storage, err = await _open_wiki_storage(wiki_id)
+    if err:
+        return {"error": err}
+    try:
+        return storage.shortest_path(
+            source_label=source_label,
+            target_label=target_label,
+            max_depth=max_depth,
+        )
+    finally:
+        _close_storage_quietly(storage)
+
+
+@mcp.tool()
+async def get_community(
+    wiki_id: str,
+    macro_cluster: int,
+    micro_cluster: int | None = None,
+    limit: int = 500,
+) -> dict[str, Any]:
+    """All nodes in a Leiden macro (optionally micro) community.
+
+    Communities are precomputed during graph build (``macro_cluster``
+    and ``micro_cluster`` columns on ``repo_nodes``). Pass only
+    ``macro_cluster`` to get every node in the macro community; add
+    ``micro_cluster`` to drill into a sub-cluster.
+
+    Args:
+        wiki_id: Wiki identifier from ``search_wikis()``.
+        macro_cluster: Macro cluster ID (integer from ``stats()``
+            ``macro_clusters`` or from a node's ``macro_cluster``).
+        micro_cluster: Optional sub-cluster within ``macro_cluster``.
+        limit: Maximum nodes to return (1-2000, default 500).
+
+    Returns:
+        Dict with ``macro_cluster``, ``micro_cluster`` (echoed),
+        ``count`` (returned), and ``nodes`` (list of node rows with
+        ``node_id``, ``symbol_name``, ``symbol_type``, ``rel_path``,
+        and other ``repo_nodes`` columns).
+    """
+    if not 1 <= limit <= 2000:
+        return {"error": f"limit must be between 1 and 2000, got {limit}"}
+
+    storage, err = await _open_wiki_storage(wiki_id)
+    if err:
+        return {"error": err}
+    try:
+        nodes = storage.get_nodes_by_cluster(
+            macro=macro_cluster,
+            micro=micro_cluster,
+            limit=limit,
+        )
+        return {
+            "macro_cluster": macro_cluster,
+            "micro_cluster": micro_cluster,
+            "count": len(nodes),
+            "nodes": nodes,
+        }
+    finally:
+        _close_storage_quietly(storage)
+
+
+@mcp.tool()
+async def surprising_connections(
+    wiki_id: str,
+    top_n: int = 10,
+    sample_edges_per_pair: int = 3,
+) -> dict[str, Any]:
+    """Find the most surprising cross-cluster edges in the graph (#121).
+
+    A connection between two macro communities is "surprising" when
+    their **contexts** — the set of top-level folder prefixes
+    containing their nodes — are highly disjoint. Quantified as
+    Jaccard distance over the prefix sets. ``frontend/`` linking to
+    ``backend/`` is more surprising than two ``backend/`` clusters
+    linking to each other.
+
+    Useful for AI IDE clients to surface "this edge crosses
+    architectural boundaries — worth a closer look" without paying
+    LLM cost or retrieval cost.
+
+    The ``context_depth`` knob is intentionally fixed to 1 (top-level
+    folder) for v1 — at deeper resolutions the signal shifts from
+    "architectural boundary crossed" to a much noisier file-proximity
+    metric that doesn't have a UI story yet. The storage method still
+    accepts the knob so a future MCP surface can expose it once that
+    UI exists.
+
+    Args:
+        wiki_id: Wiki identifier from ``search_wikis()``.
+        top_n: Maximum cluster-pairs to return (1-100, default 10).
+        sample_edges_per_pair: Example edges to include per pair
+            (1-10, default 3).
+
+    Returns:
+        Dict with ``pairs`` (list, sorted by ``jaccard_distance``
+        descending) and ``skipped_pairs`` (count of cross-cluster
+        pairs whose contexts were both empty — usually 0; non-zero
+        signals a pipeline issue with ``rel_path`` population). Each
+        pair has ``cluster_a`` / ``cluster_b`` (always
+        ``cluster_a < cluster_b``), ``jaccard_distance`` (0.0 - 1.0),
+        ``context_a`` / ``context_b`` (sorted prefix lists),
+        ``edge_count``, ``sample_edges``. Empty ``pairs`` list when
+        no cross-cluster edges exist.
+    """
+    if not 1 <= top_n <= 100:
+        return {"error": f"top_n must be between 1 and 100, got {top_n}"}
+    if not 1 <= sample_edges_per_pair <= 10:
+        return {
+            "error": (
+                f"sample_edges_per_pair must be between 1 and 10, "
+                f"got {sample_edges_per_pair}"
+            ),
+        }
+
+    storage, err = await _open_wiki_storage(wiki_id)
+    if err:
+        return {"error": err}
+    try:
+        return storage.compute_surprising_connections(
+            top_n=top_n,
+            # Pinned to 1 in v1 — see docstring rationale.
+            context_depth=1,
+            sample_edges_per_pair=sample_edges_per_pair,
+        )
+    finally:
+        _close_storage_quietly(storage)
+
+
+# ── Project-scoped graph-native MCP surface (#121 follow-up) ─────────
+#
+# Projects are a multi-repo construct: a project owns multiple wikis.
+# Retrieval + agent loops already fan out across member wikis via
+# ``MultiGraphQueryService`` (see ``multi_wiki_components.py``), but the
+# *deterministic* graph-native tools we shipped in #121 (``god_nodes``,
+# ``shortest_path``, ``surprising_connections``) were wiki-scoped only.
+# These three tools add project-scoped equivalents that aggregate
+# per-wiki results with explicit ``wiki_id`` attribution.
+#
+# ``get_community`` is intentionally NOT mirrored — cluster IDs are
+# wiki-local (cluster 3 in wiki A is unrelated to cluster 3 in wiki B),
+# so no useful aggregation exists at the project level. Callers should
+# pick a wiki first.
+#
+# Cross-wiki ``shortest_path`` (i.e. a path that genuinely crosses
+# repo boundaries via inferred frontend↔backend edges) is *not* what
+# this tool does — that would need synthetic cross-repo edges in the
+# graph build and is covered by the existing code-map feature
+# instead. The project ``shortest_path`` here runs the wiki-scoped
+# BFS against each member wiki independently and returns every
+# successful path so callers can see which repos contain the
+# endpoints.
+
+
+@mcp.tool()
+async def god_nodes_project(
+    project_id: str, top_n: int = 20,
+) -> dict[str, Any]:
+    """Return the most-connected symbols and files across a project (#121).
+
+    Runs ``compute_god_nodes`` against each member wiki, then merges
+    and re-ranks the results globally: top ``top_n`` symbols by
+    cross-wiki degree (with ``wiki_id`` attribution), top ``top_n``
+    files by cross-file outgoing edges. Drill into a specific repo
+    by calling wiki-scoped ``god_nodes`` after identifying the
+    interesting wiki here.
+
+    Args:
+        project_id: Project identifier from ``list_projects()``.
+        top_n: Top entries per axis (1-200, default 20).
+
+    Returns:
+        Dict with ``by_symbol_type`` (each entry has ``wiki_id``
+        plus the same fields as ``god_nodes.by_symbol_type``) and
+        ``by_file`` (each entry has ``wiki_id`` plus
+        ``rel_path / internal_arch / external_edges``). Wikis whose
+        on-disk DB is missing are silently skipped — fewer wikis,
+        not an error.
+    """
+    if not 1 <= top_n <= 200:
+        return {"error": f"top_n must be between 1 and 200, got {top_n}"}
+
+    handles, skipped, err = await _open_project_storages(project_id)
+    if err:
+        return {"error": err}
+    try:
+        all_symbols: list[dict[str, Any]] = []
+        all_files: list[dict[str, Any]] = []
+        for wid, storage in handles:
+            r = storage.compute_god_nodes(top_n=top_n)
+            for s in r.get("by_symbol_type", []):
+                all_symbols.append({"wiki_id": wid, **s})
+            for f in r.get("by_file", []):
+                all_files.append({"wiki_id": wid, **f})
+
+        all_symbols.sort(
+            key=lambda s: (
+                -_safe_int(s.get("degree", 0)),
+                str(s.get("wiki_id", "")),
+                str(s.get("symbol_id", "")),
+            ),
+        )
+        all_files.sort(
+            key=lambda f: (
+                -_safe_int(f.get("external_edges", 0)),
+                str(f.get("wiki_id", "")),
+                str(f.get("rel_path", "")),
+            ),
+        )
+
+        return {
+            "by_symbol_type": all_symbols[:top_n],
+            "by_file": all_files[:top_n],
+            "wiki_count": len(handles),
+            "wikis_skipped": skipped,
+        }
+    finally:
+        _close_project_storages(handles)
+
+
+@mcp.tool()
+async def shortest_path_project(
+    project_id: str,
+    source_label: str,
+    target_label: str,
+    max_depth: int = 25,
+) -> dict[str, Any]:
+    """Find undirected shortest paths matching the labels in any
+    member wiki of the project (#121).
+
+    Runs the wiki-scoped ``shortest_path`` BFS against each member
+    wiki. Returns every wiki that successfully resolved both labels,
+    sorted by path length ascending. Useful when the same
+    architectural symbol (e.g. ``AuthService``) exists in multiple
+    repos and you want to see all of them at once.
+
+    This is **not** cross-repo path finding — it cannot find a path
+    from a frontend symbol to a backend symbol because there are no
+    cross-wiki edges in the graph. For that use case, see the
+    existing code-map feature.
+
+    Args:
+        project_id: Project identifier from ``list_projects()``.
+        source_label: Symbol name or file path of the starting node.
+        target_label: Symbol name or file path of the destination.
+        max_depth: Maximum hops within each wiki (1-50, default 25).
+
+    Returns:
+        Dict with ``paths`` (list, sorted by ``length`` ascending; one
+        entry per wiki that resolved both labels — same shape as the
+        wiki-scoped ``shortest_path`` plus a ``wiki_id`` field),
+        ``missing`` (list of ``{wiki_id, reason}`` for wikis that
+        couldn't resolve the path), and ``wiki_count``. Empty
+        ``paths`` with non-empty ``missing`` means no wiki had both
+        endpoints connected within ``max_depth``.
+    """
+    if not 1 <= max_depth <= 50:
+        return {"error": f"max_depth must be between 1 and 50, got {max_depth}"}
+
+    handles, skipped, err = await _open_project_storages(project_id)
+    if err:
+        return {"error": err}
+    try:
+        paths: list[dict[str, Any]] = []
+        missing: list[dict[str, Any]] = []
+        for wid, storage in handles:
+            r = storage.shortest_path(
+                source_label=source_label,
+                target_label=target_label,
+                max_depth=max_depth,
+            )
+            if r.get("path") is None:
+                missing.append({"wiki_id": wid, "reason": r.get("reason", "")})
+            else:
+                paths.append({"wiki_id": wid, **r})
+        paths.sort(key=lambda p: (_safe_int(p.get("length", 0)), str(p["wiki_id"])))
+        return {
+            "paths": paths,
+            "missing": missing,
+            "wiki_count": len(handles),
+            "wikis_skipped": skipped,
+        }
+    finally:
+        _close_project_storages(handles)
+
+
+@mcp.tool()
+async def surprising_connections_project(
+    project_id: str,
+    top_n: int = 10,
+    sample_edges_per_pair: int = 3,
+) -> dict[str, Any]:
+    """Find the most surprising cross-cluster edges across a project (#121).
+
+    Runs ``compute_surprising_connections`` against each member wiki,
+    then merges and re-ranks the pairs globally by Jaccard distance
+    descending. Each returned pair carries ``wiki_id`` so callers
+    can see which repo contributed it. ``context_depth`` is pinned
+    to 1 (top-level folder) for the same v1 reasons as the
+    wiki-scoped tool.
+
+    Note: this surfaces edges that are surprising *within* a single
+    repo, ranked across the project. Cross-repo "surprising"
+    connections (e.g. a frontend Button calling a backend
+    AuthService directly) would need synthetic cross-wiki edges
+    that don't exist today.
+
+    Args:
+        project_id: Project identifier from ``list_projects()``.
+        top_n: Maximum pairs to return globally (1-100, default 10).
+        sample_edges_per_pair: Sample edges per pair (1-10, default 3).
+
+    Returns:
+        Dict with ``pairs`` (sorted by ``jaccard_distance`` desc;
+        each pair has ``wiki_id`` plus the same fields as the
+        wiki-scoped tool's pairs), ``skipped_pairs_total`` (sum
+        across wikis of pairs with two empty contexts), and
+        ``wiki_count``.
+    """
+    if not 1 <= top_n <= 100:
+        return {"error": f"top_n must be between 1 and 100, got {top_n}"}
+    if not 1 <= sample_edges_per_pair <= 10:
+        return {
+            "error": (
+                f"sample_edges_per_pair must be between 1 and 10, "
+                f"got {sample_edges_per_pair}"
+            ),
+        }
+
+    handles, skipped, err = await _open_project_storages(project_id)
+    if err:
+        return {"error": err}
+    try:
+        all_pairs: list[dict[str, Any]] = []
+        skipped_total = 0
+        for wid, storage in handles:
+            r = storage.compute_surprising_connections(
+                top_n=top_n,
+                context_depth=1,
+                sample_edges_per_pair=sample_edges_per_pair,
+            )
+            skipped_total += _safe_int(r.get("skipped_pairs", 0))
+            for p in r.get("pairs", []):
+                all_pairs.append({"wiki_id": wid, **p})
+
+        # Sort with safe casts so a future backend returning non-int
+        # cluster IDs or non-float jaccard scores can't crash the
+        # aggregator mid-sort. The sort still ranks by the
+        # primary signals; bad values just fall to the back.
+        all_pairs.sort(
+            key=lambda p: (
+                -_safe_float(p.get("jaccard_distance", 0)),
+                -_safe_int(p.get("edge_count", 0)),
+                str(p.get("wiki_id", "")),
+                _safe_int(p.get("cluster_a", 0)),
+                _safe_int(p.get("cluster_b", 0)),
+            ),
+        )
+        return {
+            "pairs": all_pairs[:top_n],
+            "skipped_pairs_total": skipped_total,
+            "wiki_count": len(handles),
+            "wikis_skipped": skipped,
+        }
+    finally:
+        _close_project_storages(handles)
 
 
 @mcp.tool()
@@ -856,6 +1535,142 @@ async def _http_search_project(project_id: str, query: str, hop_depth: int, top_
             return {"error": f"Project not found: {project_id}"}
         resp.raise_for_status()
         return resp.json()
+
+
+# ── Graph-native MCP resources (#121 Phase 3) ────────────────────────
+#
+# These are addressable, cacheable views over the same data exposed by
+# the graph-native tools (``get_graph_stats``, ``surprising_connections``).
+# Resources differ from tools in two ways that matter for AI IDE
+# clients:
+#   1. They have stable URIs so clients can subscribe / re-read on
+#      demand without re-discovering the tool surface.
+#   2. They are conventionally "list-and-read" rather than "call with
+#      args" — useful for pinning to a wiki and surfacing dashboards.
+#
+# ``wikis://open_questions`` from the original issue scope was
+# intentionally dropped (no backing data foundation today — would
+# require a new pipeline step). The two below cover the high-signal
+# use cases AI IDE clients have asked for.
+
+
+def _resource_or_raise(result: dict[str, Any]) -> dict[str, Any]:
+    """Translate a tool's ``{"error": str}`` payload into an exception.
+
+    MCP tools historically return ``{"error": "..."}`` on failure; the
+    FastMCP tool dispatcher wraps those into proper JSON-RPC error
+    responses. ``resources/read`` doesn't have the same wrapping —
+    returning an error dict would surface as a successful read with a
+    malformed body, and many clients treat HTTP 200 + content as
+    "success" and feed the dict to the LLM. Raising a ``ValueError``
+    lets FastMCP convert the failure into a JSON-RPC error the way
+    every other resource handler is expected to.
+    """
+    if isinstance(result, dict) and "error" in result:
+        raise ValueError(result["error"])
+    return result
+
+
+@mcp.resource("wikis://{wiki_id}/repo_stats")
+async def repo_stats_resource(wiki_id: str) -> dict[str, Any]:
+    """Graph statistics for a wiki, addressable by URI (#121 Phase 3).
+
+    Thin wrapper over ``get_graph_stats`` — same response shape, same
+    auth, same cache-key resolution. The resource form exists so MCP
+    clients can pin ``wikis://{wiki_id}/repo_stats`` in a dashboard /
+    sidebar without holding a tool-call slot.
+
+    Raises ``ValueError`` on wiki-not-found / missing-index so MCP
+    clients see a proper JSON-RPC error rather than an error-shaped
+    success payload.
+    """
+    return _resource_or_raise(await get_graph_stats(wiki_id=wiki_id))
+
+
+@mcp.resource("wikis://{wiki_id}/surprising_connections")
+async def surprising_connections_resource(wiki_id: str) -> dict[str, Any]:
+    """Top surprising cross-cluster edges, addressable by URI.
+
+    Thin wrapper over the ``surprising_connections`` tool with the
+    tool's defaults (``top_n=10``, ``sample_edges_per_pair=3``,
+    ``context_depth=1`` pinned inside the tool). Clients that need
+    different parameters should call the tool directly; this resource
+    exists for the common "show me what looks suspicious in this
+    codebase" case.
+
+    Per the issue: "top surprises, refreshed on each generation" —
+    we don't cache today; each ``resources/read`` re-runs the SQL +
+    Jaccard scoring. Two indexed queries plus per-pair sample
+    hydration is cheap (<100ms on typical repos), so a TTL cache
+    isn't justified for v1.
+
+    Raises ``ValueError`` on wiki-not-found / missing-index so MCP
+    clients see a proper JSON-RPC error rather than an error-shaped
+    success payload.
+    """
+    return _resource_or_raise(await surprising_connections(wiki_id=wiki_id))
+
+
+# ── Project-scoped MCP resources (#121 follow-up) ─────────────────────
+
+
+@mcp.resource("wikis://projects/{project_id}/repo_stats")
+async def project_repo_stats_resource(project_id: str) -> dict[str, Any]:
+    """Aggregated graph statistics for a project, addressable by URI.
+
+    Returns project-level totals (summed across member wikis) plus a
+    ``per_wiki`` breakdown so callers can see both the rolled-up view
+    and which repo contributed what. Wikis with no on-disk DB are
+    silently skipped (logged), so a partially-generated project still
+    returns useful aggregates.
+
+    Raises ``ValueError`` on project-not-found so MCP clients see a
+    proper JSON-RPC error.
+    """
+    handles, skipped, err = await _open_project_storages(project_id)
+    if err:
+        raise ValueError(err)
+    try:
+        per_wiki: list[dict[str, Any]] = []
+        total_nodes = 0
+        total_edges = 0
+        confidence_total = {"extracted": 0, "inferred": 0, "ambiguous": 0}
+        for wid, storage in handles:
+            s = storage.stats()
+            per_wiki.append({"wiki_id": wid, **s})
+            total_nodes += _safe_int(s.get("node_count", 0))
+            total_edges += _safe_int(s.get("edge_count", 0))
+            cb = s.get("confidence_breakdown") or {}
+            for k in confidence_total:
+                confidence_total[k] += _safe_int(cb.get(k, 0))
+        return {
+            "project_id": project_id,
+            "wiki_count": len(handles),
+            "wikis_skipped": skipped,
+            "node_count": total_nodes,
+            "edge_count": total_edges,
+            "confidence_breakdown": confidence_total,
+            "per_wiki": per_wiki,
+        }
+    finally:
+        _close_project_storages(handles)
+
+
+@mcp.resource("wikis://projects/{project_id}/surprising_connections")
+async def project_surprising_connections_resource(
+    project_id: str,
+) -> dict[str, Any]:
+    """Top surprising cross-cluster edges across a project, by URI.
+
+    Thin wrapper over the ``surprising_connections_project`` tool with
+    its defaults (``top_n=10``, ``sample_edges_per_pair=3``,
+    ``context_depth=1``). Raises ``ValueError`` on project-not-found
+    so MCP clients see a proper JSON-RPC error rather than an
+    error-shaped success payload.
+    """
+    return _resource_or_raise(
+        await surprising_connections_project(project_id=project_id),
+    )
 
 
 def main():

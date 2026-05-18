@@ -14,9 +14,10 @@ AI-powered documentation generator that turns any code repository into a browsab
 | Backend framework | FastAPI + uvicorn |
 | LLM orchestration | LangChain, LangGraph, deepagents |
 | LLM providers | OpenAI, Anthropic, Gemini, Ollama, AWS Bedrock (optional extras) |
-| Embeddings + search | FAISS, BM25, SQLite FTS5, sentence-transformers |
+| Embeddings + search | FAISS, BM25, SQLite FTS5 + sqlite-vec, PostgreSQL tsvector + pgvector, sentence-transformers |
 | Code parsing | tree-sitter-language-pack (14+ languages) |
 | Backend DB | SQLAlchemy async + aiosqlite (SQLite default) / asyncpg (PostgreSQL) |
+| Wiki storage | `WikiStorageProtocol` with two backends: sqlite-vec (`UnifiedWikiDB`, default) or pgvector — selected by `WIKI_STORAGE_BACKEND` |
 | MCP server | FastMCP (embedded HTTP at `:8000/mcp`; standalone stdio CLI) |
 | Frontend language | TypeScript 5.4 |
 | Frontend framework | Next.js 15 (App Router + React 18 SPA) |
@@ -44,25 +45,35 @@ wikis/
 │   │   ├── events.py         ← SSE event models
 │   │   ├── api/
 │   │   │   └── routes.py     ← HTTP handlers (thin — delegate to services)
-│   │   ├── core/             ← Wiki engine (45+ modules)
-│   │   │   ├── agents/       ← LangGraph wiki generation agents
-│   │   │   ├── code_graph/   ← NetworkX + SQLite FTS5 code index
+│   │   ├── core/             ← Wiki engine (40+ modules)
+│   │   │   ├── agents/       ← LangGraph wiki generation agents (`wiki_graph_optimized`)
+│   │   │   ├── code_graph/   ← Graph builder + unified FTS/vector index (SQLite or Postgres)
 │   │   │   ├── deep_research/← Multi-step agentic research engine
 │   │   │   ├── parsers/      ← tree-sitter for 14+ languages
 │   │   │   ├── repo_providers/← GitHub, GitLab, Bitbucket, Azure DevOps
-│   │   │   ├── wiki_structure_planner/ ← LLM-driven outline planner
-│   │   │   ├── retrievers.py ← Ensemble retrieval (FAISS + BM25 + reranking)
-│   │   │   └── vectorstore.py← FAISS index management
-│   │   ├── models/           ← Pydantic request/response/event models
+│   │   │   ├── storage/      ← `WikiStorageProtocol` + `sqlite.py` (UnifiedWikiDB) / `postgres.py`
+│   │   │   ├── wiki_structure_planner/ ← LLM outline + cluster planners
+│   │   │   ├── prompts/      ← LangChain prompt templates
+│   │   │   ├── state/        ← LangGraph state (`WikiState`)
+│   │   │   ├── multi_retriever.py / unified_retriever.py ← Ensemble retrieval (dense + sparse + reranking)
+│   │   │   ├── wiki_search_engine.py / project_search_engine.py ← FTS + graph re-ranking
+│   │   │   ├── wiki_page_index.py / wiki_page_search.py ← Wikilink graph + page search adapter
+│   │   │   ├── graph_clustering.py / cluster_expansion.py / cluster_planner.py ← Leiden pipeline
+│   │   │   ├── graph_topology.py ← Topology enrichment (hubs, density)
+│   │   │   └── feature_flags.py ← `WIKIS_CLUSTER_*` toggles
+│   │   ├── models/           ← Pydantic request/response/event/search models
 │   │   ├── services/         ← Business logic layer
-│   │   │   ├── wiki_service.py
+│   │   │   ├── wiki_service.py / wiki_management.py
 │   │   │   ├── ask_service.py
 │   │   │   ├── research_service.py
-│   │   │   ├── qa_service.py ← QA Knowledge Flywheel
-│   │   │   ├── qa_cache_manager.py
-│   │   │   ├── llm_factory.py← LLM + embeddings provider factory
-│   │   │   └── wiki_management.py
-│   │   └── storage/          ← S3 / local artifact storage abstraction
+│   │   │   ├── qa_service.py / qa_cache_manager.py ← QA Knowledge Flywheel + cache
+│   │   │   ├── project_service.py
+│   │   │   ├── export_service.py / import_service.py ← Wiki bundle export/import
+│   │   │   ├── toolkit_bridge.py ← Bridges core wiki toolkit to services
+│   │   │   ├── health_check.py
+│   │   │   ├── context_limits.py / context_overflow.py
+│   │   │   └── llm_factory.py← LLM + embeddings provider factory
+│   │   └── storage/          ← Artifact storage abstraction (local / S3) — distinct from `core/storage/`
 │   ├── mcp_server/
 │   │   └── server.py         ← FastMCP tools (wiki, ask, research)
 │   ├── scripts/
@@ -168,15 +179,19 @@ All vars live in `.env` at project root. Both services read it.
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `LLM_PROVIDER` | Yes | `openai` \| `anthropic` \| `gemini` \| `ollama` \| `bedrock` \| `github` \| `copilot` \| `custom` |
+| `LLM_PROVIDER` | Yes | `openai` \| `anthropic` \| `custom` \| `ollama` \| `gemini` \| `bedrock` \| `github` \| `copilot` |
 | `LLM_API_KEY` | Yes | API key for the chosen provider |
 | `LLM_MODEL` | Yes | Model name (e.g. `gpt-4o-mini`) |
 | `JWT_PRIVATE_KEY` | Yes (prod) | RS256 private key for web → backend auth |
 | `JWT_PUBLIC_KEY` | Yes (prod) | RS256 public key validated by backend |
 | `EMBEDDING_PROVIDER` | No | Defaults to `LLM_PROVIDER`; required for Anthropic |
-| `DATABASE_URL` | No | Empty = SQLite; set for PostgreSQL |
+| `DATABASE_URL` | No | App DB (users, projects, invocations). Empty = SQLite; set for PostgreSQL |
+| `WIKI_STORAGE_BACKEND` | No | `sqlite` (default — UnifiedWikiDB + sqlite-vec) or `postgres` (pgvector) |
+| `WIKI_STORAGE_DSN` | No | PostgreSQL DSN for wiki storage when backend = `postgres` |
 | `AUTH_ENABLED` | No | `false` disables JWT check (local dev only) |
-| `STORAGE_BACKEND` | No | `local` (default) or `s3` |
+| `STORAGE_BACKEND` | No | Artifact storage: `local` (default) or `s3` |
+| `LLM_MAX_CONCURRENCY` | No | Cap concurrent LLM calls (per process) |
+| `WIKIS_CLUSTER_*` | No | Feature flags for the Leiden clustering pipeline (default on) |
 
 Generate JWT keys:
 ```bash
@@ -298,13 +313,39 @@ Backend (:8000)
 repo URL
   → LocalRepositoryManager (clone / pull)
   → FilesystemIndexer (language detection, file filtering)
-  → tree-sitter parsers (14+ languages) + code_graph (NetworkX + FTS5)
-  → FAISS vector index (sentence-transformers embeddings)
-  → WikiStructurePlanner (LLM: generates page outline)
+  → tree-sitter parsers (14+ languages) → graph builder
+  → WikiStorageProtocol (UnifiedWikiDB / SQLite + sqlite-vec  OR  PostgreSQL + pgvector)
+  → graph topology enrichment (hubs, density) + Leiden clustering (cluster_expansion, coverage_ledger)
+  → WikiStructurePlanner (agent planner OR cluster planner — set by PLANNER_TYPE)
   → OptimizedWikiGenerationAgent (LangGraph: parallel page writer)
   → SSE progress events → SPA GenerationProgress component
-  → artifacts stored (local or S3)
+  → wiki page markdown + WikiPageIndex (wikilink graph) → artifact storage (local or S3)
 ```
+
+### Non-code file ingestion (#118)
+
+Beyond source code and markdown, the indexer ingests PDFs, images, and plain-text variants via the **DocumentExtractor** registry at `backend/app/core/extractors/`. Each extractor turns one file into a single text blob that flows through the same chunking + embedding + FTS5 pipeline as native markdown.
+
+**Vision-first design**: formats where text extraction loses critical visual context — tables, formulas, layouts, diagrams — are rendered to images and described by the project-configured multimodal LLM (Claude 3+, GPT-4o, Gemini 1.5+). Plain-text variants (`.mdx`, `.rst`, `.adoc`, `.qmd`) are read directly because there's no visual content to lose.
+
+| Extension | Extractor | Method | Extras |
+|-----------|-----------|--------|--------|
+| `.mdx` `.qmd` `.rst` `.adoc` | `PlainTextExtractor` | UTF-8 read | — |
+| `.png` `.jpg` `.jpeg` `.gif` `.webp` | `ImageExtractor` | LLM vision describe | `[vision]` (Pillow) |
+| `.pdf` | `PDFExtractor` | pdfium2 render → LLM vision per page | `[pdf]` (pypdfium2 + Pillow) |
+| `.docx` `.xlsx` `.pptx` | `OfficeExtractor` | LibreOffice headless → PDF → PDFExtractor | `[office]` + system `libreoffice` |
+| `.md` `.txt` `.yaml` `.toml` `…` | _(legacy text-read path)_ | `open(file, 'r')` | — |
+
+**Office system dep**: `OfficeExtractor` shells out to `soffice` (LibreOffice headless). The backend Docker image installs it via apt. Local-dev macOS users: `brew install --cask libreoffice`. Without it, `OfficeExtractor` fails to construct at registry-build time, logs the missing-binary WARNING, and `.docx/.xlsx/.pptx` files fall through to the legacy text-read path (binary garbage in `source_text`).
+
+**Cost handling**: every LLM call logs `[extractors.image]` / `[extractors.pdf]` at INFO with input/output token counts. No env-var gating — operators monitor the log stream. A 500-page scanned manual will spend tokens; grep for `[extractors.pdf]` to spot.
+
+**Adding a new extractor**:
+1. Implement the `DocumentExtractor` protocol in `app/core/extractors/`.
+2. Register in `build_default_registry()` (lazy import so the dep stays optional).
+3. Add the extension to `DOCUMENTATION_EXTENSIONS` (`constants.py`) and the `FilterManager` allowlist (`filter_manager.py`).
+4. Add the optional pip extras to `pyproject.toml`.
+5. Bottom-line wiring point: `EnhancedUnifiedGraphBuilder._parse_documentation_files` calls `registry.get(extension)` and falls back to the legacy text-read path when no handler is registered.
 
 ### Auth Cross-Service JWT
 
@@ -315,6 +356,57 @@ Backend auth.py → fetches JWKS from web :3000/api/auth/jwks → validates JWT
 LOCAL DEV: AUTH_ENABLED=false bypasses all JWT validation
 ```
 
+### Language Parsers (#119 — lightweight tier)
+
+Three tiers of parser coverage at `backend/app/core/parsers/`:
+
+| Tier | Parsers | Path | Approach |
+|------|---------|------|----------|
+| **Rich (deep)** | C++, C#, Go, Java, Python, JavaScript, TypeScript, Rust | `<lang>_parser.py` / `<lang>_visitor_parser.py` (1500–4000 LOC each) | Per-language type inference, field resolution, template instantiation |
+| **Basic (lightweight visitor)** | Ruby, PHP, Kotlin, Scala, Lua, Swift, Dart, PowerShell, Bash, Objective-C, Verilog, Fortran, Julia, Pascal | `basic_visitor.py` + `lang_configs/<lang>.py` (~30 LOC config each) | Generic tree-sitter visitor driven by per-language `LanguageConfig` (node-type strings for class/function/call/import + inheritance field/types + name fallbacks + name-chain drill-down) |
+| **Basic (bespoke subclass)** | Elixir, R, Zig, Groovy | `basic_visitor.py` subclass in `lang_configs/_special.py` | Same `BasicVisitorParser` two-pass design, but `_visit_structural` overridden where the grammar's shape doesn't fit pure config (Elixir: `call`-text discrimination for `defmodule`/`def`; R: backward parent-lookup on `binary_operator`; Zig: var-decl-with-struct-RHS pattern; Groovy: nested `command`/`unit`/`block` token-sequence walk) |
+| **Regex fallback** | (legacy / unsupported) | `code_splitter.py` | Last-resort extraction for languages without any tree-sitter coverage |
+
+All three tiers produce the same `Symbol` / `Relationship` / `ParseResult` shape so downstream graph builders, retrievers, and the wiki agent need zero special-casing.
+
+**Adding a new lightweight language**:
+1. Inspect the tree-sitter grammar — find node-type strings for class/function/import/call/inheritance (a 20-line introspection script is enough).
+2. Create `backend/app/core/parsers/lang_configs/<lang>.py` with a `LanguageConfig` instance.
+3. Re-export from `lang_configs/__init__.py`'s `build_basic_parsers()` factory.
+4. Add a `tests/fixtures/parsers/<lang>/hello.<ext>` fixture exercising class + methods + inheritance + calls.
+5. Add a test class to `tests/unit/test_basic_visitor_parser.py` following the existing per-language pattern.
+
+**Promotion path basic → deep**: when a language sees enough user demand to justify type inference / cross-file resolution (Ruby + PHP are the likely first candidates), write a full parser inheriting from `BaseParser` directly. The `LanguageConfig` can either retire or stay as a fallback for partial parses.
+
+### Edge Confidence Levels (#120)
+
+Every edge in `repo_edges` carries a `confidence` label that propagates from the parser's `Relationship.confidence` float through `graph_builder._add_relationships_bulk` (mapping at the storage write boundary: `< 0.7` → `"INFERRED"`, else `"EXTRACTED"`; AMBIGUOUS reserved for future per-target dedup work).
+
+| Label | When it's assigned | Trust signal |
+|-------|---------------------|--------------|
+| `EXTRACTED` | Parser observed the relationship directly. Deep parsers (Python/Java/Go/C#/JS/TS/Rust/C++) default to `confidence=1.0`; their explicit lookups like Python's `composition (is_instantiation)` at 0.9 also stay EXTRACTED. | High — graph algorithms can rely on these as-is. |
+| `INFERRED` | Name-only resolution (no type context, no cross-file disambiguation). Basic-tier visitor parsers (Ruby/PHP/Kotlin/Scala/Lua/Swift/Dart/PowerShell/Bash/Obj-C/Verilog/Fortran/Julia/Pascal/Elixir/R/Zig/Groovy) emit `confidence=0.6` for all CALLS edges. Python parser's "indirect call" tier (0.7) is the boundary case — it stays EXTRACTED because the threshold is `< 0.7`. | Medium — useful for graph topology + first-pass clustering, but UI consumers should disambiguate before quoting in user-facing answers. |
+| `AMBIGUOUS` | Reserved. No callsites today; introduced via the schema CHECK constraint for future "multiple plausible targets" handling. | Treat as `INFERRED` for any current downstream code. |
+
+**Where the label surfaces today**:
+- **Storage layer** — `repo_edges.confidence` column (TEXT NOT NULL DEFAULT 'EXTRACTED', CHECK constraint on the three values). Both SQLite + Postgres backends.
+- **`UnifiedWikiDB.stats()` / `PostgresWikiStorage.stats()`** — returns `confidence_breakdown: {extracted, inferred, ambiguous}`. Stable shape; keys always present even when zero.
+- **MCP tool `get_graph_stats(wiki_id)`** — exposes the full `stats()` dict to AI IDE clients.
+- **`SourceReference.confidence`** — optional field on citation responses. Default `None`; carries the underlying graph edge's confidence label when the retrieval path surfaced it. Propagated from cached QA records and live agent event streams in `ask_service` + `research_service`.
+
+**Surfaced as of #120 Phase 2** (#157):
+- `min_confidence` parameter on `ask_codebase` / `ask_project` MCP tools + `AskRequest` Pydantic model + `AskConfig` dataclass. Pydantic validator normalises case and rejects typos with a 422 (so unknown values can't silently behave like "no filter"). Two filter-application points share the rank-comparison helper in `app.core.confidence_filter`:
+  - **`UnifiedRetriever._get_expansion_neighbors`** filters edges during SQL-backed graph expansion in `search_repository`.
+  - **`GraphQueryService.get_relationships`** filters edges during the live agent path's NetworkX traversal. Used by the `get_relationships_tool` / `get_symbol_relationships` agent tools via `resolve_and_traverse`. This is the production path that the MCP `ask_codebase` request reaches.
+- `None` keeps the legacy "include all" behavior; `"EXTRACTED"` is the strictest (only direct parser observations); `"INFERRED"` allows name-only resolution edges too; `"AMBIGUOUS"` would also include reserved multi-target candidates. Case-insensitive; missing edge labels default to `EXTRACTED` (legacy-row compat — PR #150 wired the storage default).
+- **Frontier advances through dropped edges**: a low-confidence edge at depth 1 doesn't block visibility of higher-confidence edges at depth 2+. The filter rejects the edge from the result set but still enqueues its target for further traversal.
+
+**Not yet surfaced** (#120 Phase 3, tracked separately):
+- `SourceReference.confidence` is plumbed end-to-end via the cache path (when a prior recording had `confidence` in its `sources_json`), but live agent runs don't currently construct sources from retrieved `Document` metadata — the agent emits `answer` + `steps` only. Closing that gap requires the agent to extract structured sources from its tool outputs, which is its own scope.
+- `search_wiki` MCP tool's `min_confidence` param — the wikilink graph (`WikiPageIndex`) is in-memory and has no confidence column, so the filter would be a no-op there.
+- `search_graph` agent tool uses `_format_neighbors` (direct NetworkX walk) rather than `GraphQueryService` — bypasses the filter today. Smaller follow-up.
+- SPA citation chips rendering with confidence indicator — `CitationChips.tsx` / `SourceCitations.tsx` exist but aren't wired into any page; needs the SSE-source-collection-to-render pipeline plumbed end-to-end first.
+
 ### LLM Provider Pattern
 
 All providers implement `BaseLanguageModel` (LangChain). Add a new provider in `backend/app/services/llm_factory.py`:
@@ -324,13 +416,25 @@ All providers implement `BaseLanguageModel` (LangChain). Add a new provider in `
 
 ### MCP Server
 
-MCP tools are wired directly to backend services (no HTTP round-trip). Available tools:
-- `list_wikis` — list available wikis for the user
-- `get_wiki_page` — retrieve a specific wiki page
-- `ask` — Q&A against a wiki's knowledge base
-- `research` — deep multi-step research
+MCP tools are wired directly to backend services (no HTTP round-trip) in `app/main.py` via `set_services()`. 13 tools across discovery, Q&A, research, code mapping, and search:
 
-Connect from Claude Code: `http://localhost:8000/mcp`
+| Group | Tool | Purpose |
+|-------|------|---------|
+| Discovery | `search_wikis` | List/filter wikis the user can access |
+| Discovery | `list_wiki_pages` | Page index for a wiki |
+| Discovery | `get_wiki_page` | Fetch a wiki page (with offset/limit) |
+| Discovery | `list_projects` | List/filter projects |
+| Q&A | `ask_codebase` | Q&A against one wiki |
+| Q&A | `ask_project` | Q&A across all wikis in a project |
+| Research | `research_codebase` | Deep multi-step research over one wiki |
+| Research | `research_project` | Deep research across a project |
+| Mapping | `map_codebase` | Code map for a wiki (entry points → flow) |
+| Mapping | `map_project` | Code map across project entry points |
+| Search | `search_wiki` | FTS + wikilink graph re-rank over one wiki |
+| Search | `search_project` | FTS + graph search across project wikis |
+| Search | `get_page_neighbors` | Wikilink graph neighbors of a page |
+
+Connect from Claude Code: `http://localhost:8000/mcp` (streamable HTTP). Standalone stdio CLI: `wikis-mcp`.
 
 ---
 
@@ -369,3 +473,55 @@ All work via feature branches + PRs — no direct commits to `main`.
 - **tree-sitter-language-pack pinned at 0.9.1**: version-locked for parser compatibility
 - **Swagger UI**: `http://localhost:8000/docs` when backend is running
 - **Admin default credentials**: `admin@wikis.dev` / `changeme123` — change immediately
+
+---
+
+## Incremental wiki regeneration (#116)
+
+`POST /api/v1/wikis/{wiki_id}/incremental-refresh` takes a freshly-parsed
+node payload (same shape as `/diff`) and dispatches affected pages through
+three regimes:
+
+| Regime | Trigger | Action | LLM cost |
+|---|---|---|---|
+| **trivial** | only `MOVED` changes | regex rewrites `<code_context path="...">` | 0 |
+| **edit** | only `MODIFIED` changes | surgical LLM patch with quality gate | ~10–30% of full page |
+| **structural** | `ADDED`/`DELETED` or primary-symbol-deleted | full single-page regen via agent | full page |
+| **deleted** (#141) | all of a page's symbols deleted | drop the page row + artifact | 0 |
+
+Progress streams over SSE: `page_unchanged`, `page_patched`, `page_edited`,
+`page_regenerated`, `page_deleted`, `incremental_summary`. The SPA banner
+(`IncrementalRefreshBanner.tsx`) renders the regime counts.
+
+### Migration note: first run after deploy
+
+The incremental machinery (PRs #126–#143) introduced two new columns whose
+NULL state forces extra work on the first deployment:
+
+- **`repo_nodes.content_hash`** — sha256 of normalized source_text. NULL on
+  pre-PR1 rows. The change detector treats `NULL` as "hash unknown, assume
+  modified", so the first incremental run after deploy marks every
+  pre-existing node as modified. One-time cost; subsequent runs use the
+  populated hashes.
+
+- **`repo_nodes.embedding_content_hash`** — snapshot at last embed time.
+  NULL on pre-PR4 rows. `populate_embeddings` skips nodes whose
+  `embedding_content_hash` equals their `content_hash`; NULL forces re-embed.
+  First post-deploy embedding pass re-embeds everything once and stamps the
+  column, after which subsequent runs reuse.
+
+### Backfill query (optional, for operators)
+
+To shortcut the first-run re-embed cost on a large wiki, a one-off backfill
+sets `content_hash` for any row whose `source_text` is non-empty. The
+storage layer auto-hashes on next upsert, so any path that touches each
+file (full `/refresh`, incremental refresh, or this query) lands the hash:
+
+```sql
+-- SQLite. content_hash := sha256(normalize_for_hash(source_text))
+-- python -c "from app.core.storage.incremental import compute_content_hash; …"
+-- (run from Python so the normalization rules stay in one place).
+```
+
+Operators typically just trigger one `/refresh` after deploy and let the
+storage layer's auto-hash populate everything in one pass.

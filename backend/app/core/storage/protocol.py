@@ -96,13 +96,22 @@ class WikiStorageProtocol(Protocol):
         ...
 
     def get_nodes_by_cluster(
-        self, macro: int, micro: int | None = None, limit: int = 1000,
+        self, macro: int, micro: int | None = None, limit: int | None = 1000,
     ) -> list[dict[str, Any]]:
-        """Get all nodes in a macro (optionally micro) cluster."""
+        """Get all nodes in a macro (optionally micro) cluster.
+
+        Pass ``limit=None`` to disable the row cap (matches pre-protocol
+        raw SQL behaviour where the caller expected every row).
+        """
         ...
 
-    def get_architectural_nodes(self, limit: int = 5000) -> list[dict[str, Any]]:
-        """Get all nodes flagged ``is_architectural = 1``."""
+    def get_architectural_nodes(
+        self, limit: int | None = 5000,
+    ) -> list[dict[str, Any]]:
+        """Get all nodes flagged ``is_architectural = 1``.
+
+        Pass ``limit=None`` to disable the row cap.
+        """
         ...
 
     def get_all_nodes(self) -> list[dict[str, Any]]:
@@ -111,6 +120,50 @@ class WikiStorageProtocol(Protocol):
 
     def node_count(self) -> int:
         """Total number of nodes."""
+        ...
+
+    def refresh_fts_index(self) -> None:
+        """Rebuild the FTS index from ``repo_nodes`` (full refresh).
+
+        SQLite stores FTS5 as a standalone virtual table without triggers
+        on ``repo_nodes``, so the index goes stale after partial upserts.
+        Postgres uses a BEFORE INSERT OR UPDATE trigger so its FTS column
+        stays in sync automatically — this method is a no-op on Postgres.
+
+        Prefer :meth:`apply_incremental_node_writes` when you have an
+        explicit batch — it bundles the upsert + refresh so callers
+        cannot leave FTS stale.
+        """
+        ...
+
+    def apply_incremental_node_writes(self, nodes: list[dict[str, Any]]) -> None:
+        """Upsert a batch of nodes and refresh the FTS index in one call.
+
+        Closes the "did the author remember to call refresh_fts_index?"
+        footgun flagged by issue #131. Callers in [#116] PR 3+ should use
+        this for any partial node upsert path (the full ``from_networkx``
+        flow already rebuilds FTS as its last step, so it doesn't need
+        this).
+        """
+        ...
+
+    def fetch_indexed_node_meta(self) -> dict[str, dict[str, str | None]]:
+        """Return ``{node_id: {"content_hash": ..., "rel_path": ...}}``
+        for every indexed node.
+
+        Used by [#116] PR 2 change detection as the "previous state" the
+        detector diffs against. Combined into a single full-table scan so
+        the detector doesn't need a second batch lookup of paths — which
+        would hit SQLite's ``SQLITE_MAX_VARIABLE_NUMBER`` limit on large
+        wikis.
+
+        ``content_hash`` may be ``None`` for nodes indexed before PR 1
+        landed — callers treat those as "hash unknown", which forces a
+        re-parse comparison rather than a hash equality check.
+
+        Returns an empty dict for an unindexed wiki — callers must handle
+        that as "first generation, everything is new".
+        """
         ...
 
     # ==================================================================
@@ -476,6 +529,62 @@ class WikiStorageProtocol(Protocol):
         """Delete every row in the edges table (full replace before re-persist)."""
         ...
 
+    def reset_clusters(self) -> None:
+        """Clear ``macro_cluster``, ``micro_cluster``, ``is_hub``, and
+        ``hub_assignment`` on every node row.
+
+        Called before writing a fresh cluster-assignment pass so stale
+        values from a previous cached run don't survive.  On SQLite the
+        UPDATE runs in the current transaction — the caller is responsible
+        for invoking :meth:`commit` once subsequent cluster writes are
+        finished.  On Postgres the write is auto-committed.
+        """
+        ...
+
+    def get_hub_node_ids(self) -> list[str]:
+        """Return ``node_id`` values of all nodes flagged ``is_hub = 1``."""
+        ...
+
+    def get_clustered_architectural_nodes(
+        self,
+        exclude_tests: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return rows ``{node_id, macro_cluster, micro_cluster}`` for every
+        architectural node assigned to a macro cluster.
+
+        When *exclude_tests* is True, rows with ``is_test = 1`` are skipped.
+        Used by the cluster planner to build its
+        ``{macro → {micro → [node_ids]}}`` index from raw rows.
+        """
+        ...
+
+    def get_architectural_node_ids(
+        self,
+        exclude_tests: bool = False,
+        limit: int | None = 10_000,
+    ) -> list[str]:
+        """Return ``node_id`` values for all architectural nodes.
+
+        Lightweight projection used when only IDs are needed (e.g. populating
+        a NetworkX graph for PageRank).  When *exclude_tests* is True, rows
+        with ``is_test = 1`` are skipped.  Pass ``limit=None`` to disable
+        the row cap.
+        """
+        ...
+
+    def get_all_edges(
+        self,
+        limit: int | None = 500_000,
+    ) -> list[dict[str, Any]]:
+        """Return all edge rows with at minimum ``source_id``, ``target_id``,
+        ``rel_type``, ``weight``.
+
+        Used for bulk graph reconstruction (PageRank, topology analysis).
+        The *limit* parameter guards against OOM on very large repos; pass
+        ``None`` to disable.
+        """
+        ...
+
     # ── Language detection ───────────────────────────────────────────
 
     def detect_dominant_language(self, node_ids: list[str]) -> str | None:
@@ -545,5 +654,243 @@ class WikiStorageProtocol(Protocol):
                     ...
                 ],
             }
+        """
+        ...
+
+    def shortest_path(
+        self,
+        source_label: str,
+        target_label: str,
+        max_depth: int = 25,
+    ) -> dict[str, Any]:
+        """Undirected shortest path between two symbols (#121).
+
+        **Canonical entry point for undirected shortest-path queries
+        from MCP / IDE clients.** Implementations layer a Python BFS
+        with a visited set on top of a single SQL frontier-expansion
+        query per depth — frontier growth stays O(V+E) so the search
+        terminates quickly even on dense graphs at large
+        ``max_depth``.
+
+        For *directed* per-symbol traversal used by the agent loop
+        (e.g. "who calls X?"), use
+        :meth:`GraphQueryService.get_relationships` — that surface is
+        in-memory NetworkX, depth-bounded, and respects edge direction
+        and confidence filters. The two are intentionally separate so
+        each can evolve independently.
+
+        Label resolution: ``source_label`` and ``target_label`` are
+        matched against ``symbol_name`` first, then ``rel_path``;
+        within each table the lowest ``node_id`` wins. Implementations
+        also report the number of candidates so callers can detect
+        ambiguous matches.
+
+        ``max_depth`` defaults to 25 — graph diameter on production
+        codebases is typically well under 20. Callers can pass a
+        smaller value for faster responses on dense graphs.
+
+        Returns:
+            On success::
+
+                {
+                    "source": {"node_id", "symbol_name", "rel_path", "symbol_type"},
+                    "target": {<same>},
+                    "source_candidates": int,   # total labels matching source_label
+                    "target_candidates": int,   # ditto for target_label
+                    "path": [<node row>, ...],  # source first, target last
+                    "edges": [{"source_id", "target_id", "rel_type", "confidence"}, ...],
+                    "length": int,
+                }
+
+            ``source_candidates > 1`` (or ``target_candidates > 1``)
+            indicates the label was ambiguous and a different
+            resolution might yield a different path.
+
+            When either label cannot be resolved or no path is found
+            within ``max_depth``::
+
+                {"path": None, "reason": "..."}
+
+            ``reason`` is a short tag for programmatic handling:
+            ``source_not_found``, ``target_not_found``,
+            ``no_path_within_max_depth``, ``invalid_max_depth``.
+            Same-source-and-target is a success case (``length == 0``,
+            no ``reason``) so callers don't have to special-case it.
+        """
+        ...
+
+    def compute_surprising_connections(
+        self,
+        top_n: int = 10,
+        context_depth: int = 1,
+        sample_edges_per_pair: int = 3,
+    ) -> dict[str, Any]:
+        """Cross-cluster edge pairs ranked by surprise (#121 Phase 2).
+
+        A "surprising connection" is an edge between two macro
+        clusters whose **contexts** (the set of top-level folder
+        prefixes containing their nodes) are highly disjoint.
+        Quantified as Jaccard distance: ``1 - |A ∩ B| / |A ∪ B|``
+        over the two clusters' context sets.
+
+        Implementations should:
+          1. Aggregate cross-cluster edges per unordered cluster pair
+             ``(min, max)`` to count edges and gather a canonical
+             representative pair list (no double-counting).
+          2. For each cluster appearing in those pairs, compute the
+             context — the set of ``rel_path`` prefixes truncated to
+             ``context_depth`` segments. ``context_depth=1`` means
+             top-level folder names (e.g. ``frontend``, ``backend``).
+          3. Compute Jaccard distance per pair using cached contexts.
+          4. Return the top-``top_n`` pairs sorted by Jaccard distance
+             descending, each with up to
+             ``sample_edges_per_pair`` example edges + hydrated source
+             / target metadata so MCP clients have something concrete
+             to surface.
+
+        Args:
+            top_n: Maximum pairs to return.
+            context_depth: How many leading ``rel_path`` segments
+                count as the cluster's context (1 = top-level folder).
+            sample_edges_per_pair: How many example edges to include
+                per pair.
+
+        Returns:
+            Dict with:
+
+            * ``pairs`` — list sorted by ``jaccard_distance``
+              descending. Each pair has ``cluster_a``, ``cluster_b``
+              (always ``cluster_a < cluster_b``),
+              ``jaccard_distance`` (0.0 - 1.0), ``context_a``,
+              ``context_b`` (sorted prefix lists), ``edge_count``,
+              and ``sample_edges`` (list of ``{source_id, target_id,
+              rel_type, confidence, source_name, source_path,
+              target_name, target_path}``).
+            * ``skipped_pairs`` — count of cross-cluster pairs whose
+              two contexts were both empty (root-level files /
+              missing ``rel_path``). Normally 0; non-zero signals a
+              pipeline issue worth surfacing to operators rather
+              than a normal "nothing surprising" result. Use
+              ``len(pairs)`` for the user-facing count.
+
+            Empty ``pairs`` + ``skipped_pairs == 0`` means no
+            cross-cluster edges exist.
+        """
+        ...
+
+    # ==================================================================
+    # WIKI PAGES + source→page reverse index (#116 incremental regen)
+    # ==================================================================
+
+    def upsert_wiki_page(self, page: dict[str, Any]) -> None:
+        """Insert or replace a row in ``wiki_pages``.
+
+        ``page`` must include ``page_id`` and ``wiki_id``. All other columns
+        (``id_scheme``, ``title``, ``anchor_slug``, ``content_hash``,
+        ``macro_cluster``, ``micro_cluster``, ``primary_symbol_id``,
+        ``section_index``, ``page_index``, ``generated_at``) are optional and
+        fall back to schema defaults when omitted.
+        """
+        ...
+
+    def get_wiki_page(self, page_id: str) -> dict[str, Any] | None:
+        """Fetch one page row by its ``page_id``. Returns None if missing."""
+        ...
+
+    def get_wiki_pages(self, wiki_id: str) -> list[dict[str, Any]]:
+        """Return all page rows for a wiki, in (section_index, page_index) order."""
+        ...
+
+    def get_wiki_pages_by_cluster(
+        self,
+        wiki_id: str,
+        macro_cluster: int,
+        micro_cluster: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return page rows for a (macro, micro) cluster within a wiki.
+
+        Used by [#116] PR 2/3 to find pages affected by a cluster-level
+        change. When ``micro_cluster`` is None, every page in the macro
+        cluster is returned regardless of micro.
+        """
+        ...
+
+    def delete_wiki_pages(self, wiki_id: str) -> int:
+        """Remove all rows for a wiki from ``wiki_pages`` (cascades to
+        ``page_symbols``). Returns the number of rows deleted.
+        """
+        ...
+
+    def delete_wiki_page(self, page_id: str) -> bool:
+        """Remove a single ``wiki_pages`` row by primary key.
+
+        FK CASCADE on ``page_symbols.page_id`` removes its rows in the
+        same transaction. Returns True when a row was deleted, False
+        when no row existed for ``page_id`` (idempotent).
+
+        Used by #141's DELETED regime to drop pages whose entire cluster
+        vanished — the orchestrator needs a per-page primitive because
+        ``delete_wiki_pages(wiki_id)`` would also remove pages that are
+        still alive.
+        """
+        ...
+
+    def record_page_symbols(
+        self,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Persist the source→page reverse index for one page.
+
+        Args:
+            page_id: the wiki page these symbols belong to.
+            symbols: list of ``(node_id, citation_kind)`` tuples where
+                citation_kind is ``'primary'``, ``'referenced'``, or
+                ``'related'``.
+            replace: when True (default), all existing rows for ``page_id``
+                are deleted before inserting the new set — this is the
+                desired behaviour after a regen. When False, rows are
+                appended via INSERT OR IGNORE / ON CONFLICT DO NOTHING.
+        """
+        ...
+
+    def upsert_wiki_page_with_symbols(
+        self,
+        page: dict[str, Any],
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Atomically upsert a ``wiki_pages`` row and its ``page_symbols`` rows.
+
+        Equivalent to calling ``upsert_wiki_page(page)`` followed by
+        ``record_page_symbols(page['page_id'], symbols, replace=replace)``
+        inside a single transaction. If any step raises, both writes roll
+        back together so callers never observe a page with stale (or
+        missing) citations.
+
+        Used by the wiki generation agent's per-page persistence hook,
+        where partial writes would leave an orphaned page row whose
+        absence of citation entries is indistinguishable from a page that
+        legitimately cites nothing.
+        """
+        ...
+
+    def get_pages_citing_node(self, node_id: str) -> list[str]:
+        """Return the ``page_id``s of every page that cites ``node_id``.
+
+        Used by [#116] change detection to find which pages need regen
+        when an underlying symbol changes.
+        """
+        ...
+
+    def get_page_symbols(
+        self, page_id: str, citation_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return rows for one page: ``[{node_id, citation_kind}, ...]``.
+
+        When ``citation_kind`` is supplied, only that kind is returned.
         """
         ...

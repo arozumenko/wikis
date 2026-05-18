@@ -64,7 +64,14 @@ export async function middleware(request: NextRequest) {
   }
 
   // Unauthenticated user on protected page → redirect to /login
-  if (!sessionCookie && pathname !== '/login' && pathname !== '/logout') {
+  // /oauth/* paths are excluded: the popup callback lands here with no session
+  // cookie and must be allowed to mount its React component (OAuthCallback).
+  if (
+    !sessionCookie &&
+    pathname !== '/login' &&
+    pathname !== '/logout' &&
+    !pathname.startsWith('/oauth/')
+  ) {
     const loginUrl = new URL('/login', request.url);
     if (pathname !== '/') {
       loginUrl.searchParams.set('callbackUrl', pathname + request.nextUrl.search);

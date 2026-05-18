@@ -37,6 +37,9 @@ def _parse_sources_json(raw: str | None) -> list[SourceReference]:
             symbol=s.get("symbol"),
             symbol_type=s.get("symbol_type"),
             relevance_score=s.get("relevance_score"),
+            # #120: propagate edge-confidence if the upstream
+            # cache payload includes it. None when missing.
+            confidence=s.get("confidence"),
         )
         for s in json.loads(raw)
         if isinstance(s, dict)
@@ -138,7 +141,13 @@ class AskService:
             code_graph=components.code_graph,
             repo_analysis=components.repo_analysis,
             llm_client=components.llm,
-            config=AskConfig(similarity_threshold=self.settings.ask_similarity_threshold),
+            config=AskConfig(
+                similarity_threshold=self.settings.ask_similarity_threshold,
+                # #120/#157: propagate the per-request edge-confidence
+                # floor into AskConfig so retriever-level filtering
+                # kicks in during graph expansion.
+                min_confidence=request.min_confidence,
+            ),
             query_service=components.query_service,
         )
 
@@ -259,6 +268,10 @@ class AskService:
                                 relevance_score=s.get("relevance_score"),
                                 wiki_id=s.get("wiki_id"),
                                 wiki_title=s.get("wiki_title"),
+                                # #120: edge-confidence string propagated
+                                # from the retriever; None when the
+                                # source path didn't carry edge metadata.
+                                confidence=s.get("confidence"),
                             )
                         )
             elif event_type in ("ask_error", "task_failed"):

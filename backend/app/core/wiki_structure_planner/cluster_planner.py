@@ -262,10 +262,9 @@ class ClusterStructurePlanner:
         self._cluster_graph: Optional[nx.MultiDiGraph] = None
         self._central_k: Optional[int] = None
 
-        # Pre-compute test-exclusion SQL fragment once
-        flags = get_feature_flags()
-        self._exclude_tests = flags.exclude_tests
-        self._test_sql = " AND is_test = 0" if self._exclude_tests else ""
+        # Resolve test-exclusion flag once; passed to protocol methods that
+        # support an ``exclude_tests`` argument.
+        self._exclude_tests = get_feature_flags().exclude_tests
 
     # ── adaptive central-k ────────────────────────────────────────────
 
@@ -475,15 +474,9 @@ class ClusterStructurePlanner:
         Returns ``{macro_id: {micro_id: [node_ids]}}`` where every node_id
         belongs to a non-test architectural symbol.
         """
-        flags = get_feature_flags()
-        test_filter = self._test_sql
-
-        rows = self.db.conn.execute(
-            "SELECT node_id, macro_cluster, micro_cluster "
-            "FROM repo_nodes "
-            "WHERE macro_cluster IS NOT NULL AND is_architectural = 1"
-            + test_filter
-        ).fetchall()
+        rows = self.db.get_clustered_architectural_nodes(
+            exclude_tests=self._exclude_tests
+        )
 
         result: Dict[int, Dict[int, List[str]]] = {}
         for row in rows:
@@ -737,6 +730,16 @@ class ClusterStructurePlanner:
             target_folders = self._node_ids_to_folders(node_ids)
             target_docs = self._node_ids_to_doc_paths(node_ids)
 
+            # #116: primary symbol = PageRank champion; falls back to the
+            # first deterministically-ordered cluster member when PageRank
+            # produced no central. Feeds compute_page_id, so stability of
+            # this value across runs is what makes wikilinks survive regen.
+            primary_symbol_id = (
+                central_ids[0]
+                if central_ids
+                else (node_ids[0] if node_ids else None)
+            )
+
             pages.append(PageSpec(
                 page_name=page_name,
                 page_order=page_order,
@@ -753,6 +756,7 @@ class ClusterStructurePlanner:
                     "section_id": macro_id,
                     "page_id": micro_id,
                     "cluster_node_ids": list(node_ids),
+                    "primary_symbol_id": primary_symbol_id,
                 },
             ))
             page_order += 1
@@ -900,6 +904,12 @@ class ClusterStructurePlanner:
             target_folders = self._node_ids_to_folders(node_ids)
             target_docs = self._node_ids_to_doc_paths(node_ids)
 
+            primary_symbol_id = (
+                central_ids[0]
+                if central_ids
+                else (node_ids[0] if node_ids else None)
+            )
+
             pages.append(PageSpec(
                 page_name=page_name,
                 page_order=page_order,
@@ -916,6 +926,7 @@ class ClusterStructurePlanner:
                     "section_id": macro_id,
                     "page_id": micro_id,
                     "cluster_node_ids": list(node_ids),
+                    "primary_symbol_id": primary_symbol_id,
                 },
             ))
             page_order += 1
@@ -936,7 +947,10 @@ class ClusterStructurePlanner:
         Scoring: min(edge_count, 10) + has_docstring(2)
         Only architectural nodes are considered — methods, fields, etc. are excluded.
         """
-        nodes = self.db.get_nodes_by_cluster(macro=macro_id)
+        # ``limit=None``: the algorithm scores *every* candidate and then
+        # takes the top-N, so a silent cap on the input would bias scoring
+        # toward whichever rows the DB returns first.
+        nodes = self.db.get_nodes_by_cluster(macro=macro_id, limit=None)
         if not nodes:
             return []
 
@@ -1117,19 +1131,17 @@ class ClusterStructurePlanner:
 
         G = nx.MultiDiGraph()
 
-        # Add all architectural nodes (excluding test nodes when flag is on)
-        rows = self.db.conn.execute(
-            "SELECT node_id FROM repo_nodes WHERE is_architectural = 1"
-            + self._test_sql
-        ).fetchall()
-        for row in rows:
-            G.add_node(row["node_id"])
+        # Add all architectural nodes (excluding test nodes when flag is on).
+        # ``limit=None`` matches the original raw-SQL behaviour and avoids
+        # silently truncating large repos.
+        for node_id in self.db.get_architectural_node_ids(
+            exclude_tests=self._exclude_tests,
+            limit=None,
+        ):
+            G.add_node(node_id)
 
-        # Add all edges with weights
-        edge_rows = self.db.conn.execute(
-            "SELECT source_id, target_id, rel_type, weight FROM repo_edges"
-        ).fetchall()
-        for row in edge_rows:
+        # Add all edges with weights.  Same rationale for ``limit=None``.
+        for row in self.db.get_all_edges(limit=None):
             src, tgt = row["source_id"], row["target_id"]
             if src in G and tgt in G:
                 G.add_edge(
@@ -1290,6 +1302,12 @@ class ClusterStructurePlanner:
             target_symbols = self._node_ids_to_symbol_names(central_ids)
             key_files = self._node_ids_to_paths(node_ids)
 
+            primary_symbol_id = (
+                central_ids[0]
+                if central_ids
+                else (node_ids[0] if node_ids else None)
+            )
+
             pages.append(PageSpec(
                 page_name=f"{section_name} — Page {micro_id}",
                 page_order=page_order,
@@ -1306,6 +1324,7 @@ class ClusterStructurePlanner:
                     "section_id": macro_id,
                     "page_id": micro_id,
                     "cluster_node_ids": list(node_ids),
+                    "primary_symbol_id": primary_symbol_id,
                 },
             ))
             page_order += 1

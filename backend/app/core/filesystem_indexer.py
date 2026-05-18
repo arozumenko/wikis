@@ -56,6 +56,12 @@ class FilesystemRepositoryIndexer:
         github_username: str | None = None,
         embeddings: Any | None = None,
         progress_callback: Any | None = None,
+        # #118 — registry of non-code document extractors (PDF, images,
+        # plain-text variants). When None, only the legacy text-read path
+        # runs, so binary files produce useless blobs but don't crash.
+        # Callers build via ``build_default_registry(llm=...)`` and pass
+        # in the project-configured LLM for vision extractors.
+        extractor_registry: Any | None = None,
     ):
         """
         Initialize filesystem-based indexer with multi-provider support
@@ -93,7 +99,10 @@ class FilesystemRepositoryIndexer:
         # Initialize Enhanced Unified Graph Builder
         if EnhancedUnifiedGraphBuilder is None:
             raise ImportError("Enhanced Unified Graph Builder is required for filesystem indexing")
-        self.graph_builder = EnhancedUnifiedGraphBuilder(max_workers=max_workers)
+        self.graph_builder = EnhancedUnifiedGraphBuilder(
+            max_workers=max_workers,
+            extractor_registry=extractor_registry,
+        )
 
         # Initialize graph manager (for analysis stats only; persistent storage is via unified DB)
         self.graph_manager = GraphManager(cache_dir=cache_dir)

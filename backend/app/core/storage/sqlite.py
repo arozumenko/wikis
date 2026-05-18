@@ -56,6 +56,19 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+from ._helpers import warn_if_truncated as _shared_warn_if_truncated  # noqa: E402
+from .incremental import compute_content_hash  # noqa: E402
+
+
+def _warn_if_truncated(rows: list[Any], limit: int | None, method: str, **ctx: Any) -> None:
+    """Backend-scoped wrapper around the shared truncation warning helper.
+
+    Preserves ``app.core.storage.sqlite`` as the logger name on the
+    emitted record so operators can filter by backend.
+    """
+    _shared_warn_if_truncated(rows, limit, method, logger=logger, **ctx)
+
+
 # ---------------------------------------------------------------------------
 # Always enabled (no feature flag)
 # ---------------------------------------------------------------------------
@@ -144,6 +157,15 @@ CREATE TABLE IF NOT EXISTS repo_nodes (
     parameters      TEXT DEFAULT '',
     return_type     TEXT DEFAULT '',
 
+    -- Change detection (#116 incremental regen)
+    -- sha256 hex of normalize(source_text); NULL for pre-incremental rows
+    content_hash    TEXT DEFAULT NULL,
+    -- #116 PR 4: snapshot of content_hash at the time this node was last
+    -- embedded into repo_vec. populate_embeddings skips nodes whose
+    -- content_hash matches this value. NULL = never embedded (or pre-PR4
+    -- row — force re-embed once after deploy).
+    embedding_content_hash TEXT DEFAULT NULL,
+
     -- Classification
     is_architectural INTEGER DEFAULT 0,
     is_doc           INTEGER DEFAULT 0,
@@ -178,6 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_micro      ON repo_nodes(macro_cluster, mic
 CREATE INDEX IF NOT EXISTS idx_nodes_arch       ON repo_nodes(is_architectural) WHERE is_architectural = 1;
 CREATE INDEX IF NOT EXISTS idx_nodes_hub        ON repo_nodes(is_hub) WHERE is_hub = 1;
 CREATE INDEX IF NOT EXISTS idx_nodes_test       ON repo_nodes(is_test) WHERE is_test = 1;
+CREATE INDEX IF NOT EXISTS idx_nodes_hash       ON repo_nodes(content_hash) WHERE content_hash IS NOT NULL;
 """
 
 _SCHEMA_EDGES = """
@@ -250,6 +273,75 @@ CREATE TABLE IF NOT EXISTS wiki_meta (
     key    TEXT PRIMARY KEY,
     value  TEXT
 );
+"""
+
+# ---------------------------------------------------------------------------
+# #116 incremental regen — wiki page registry + source→page reverse index.
+#
+# These tables persist what was previously only an in-memory plan + an
+# artifact-storage .md file. They land additively in PR 1 with no behavior
+# change; PR 2+ read from them to drive change detection and three-regime
+# diff routing.
+#
+# id_scheme distinguishes:
+#   'legacy'     — pre-#116 wikis whose page_id is "{section_idx}#{page_idx}"
+#   'stable_v1'  — page_id is sha256(wiki_id|macro|micro|primary_symbol|title)[:16]
+# ---------------------------------------------------------------------------
+_SCHEMA_WIKI_PAGES = """
+CREATE TABLE IF NOT EXISTS wiki_pages (
+    page_id            TEXT PRIMARY KEY,
+    wiki_id            TEXT NOT NULL,
+    id_scheme          TEXT NOT NULL DEFAULT 'stable_v1'
+                       CHECK (id_scheme IN ('legacy','stable_v1')),
+    title              TEXT NOT NULL DEFAULT '',
+    anchor_slug        TEXT NOT NULL DEFAULT '',
+    content_hash       TEXT DEFAULT NULL,
+    macro_cluster      INTEGER DEFAULT NULL,
+    micro_cluster      INTEGER DEFAULT NULL,
+    primary_symbol_id  TEXT DEFAULT NULL,
+    section_index      INTEGER DEFAULT 0,
+    page_index         INTEGER DEFAULT 0,
+    -- #116 PR 2: git rev / source-state identifier for the repo snapshot
+    -- this page was generated against. Lets change detection fast-exit on
+    -- "repo unchanged since last regen" without diffing every node.
+    last_indexed_commit TEXT DEFAULT NULL,
+    -- #116 PR 3 structural-handler wiring: full PageSpec serialized as
+    -- JSON. Lets OptimizedWikiGenerationAgent.regenerate_single_page
+    -- reconstruct the original retrieval inputs (target_symbols,
+    -- target_docs, retrieval_query, etc.) without re-running the planner.
+    -- #138: CHECK enforces well-formed JSON so corruption surfaces at
+    -- write time, not when structural regen tries to deserialize.
+    page_spec_json     TEXT DEFAULT NULL
+                       CHECK (page_spec_json IS NULL OR json_valid(page_spec_json)),
+    generated_at       TEXT DEFAULT (datetime('now'))
+);
+"""
+
+_SCHEMA_WIKI_PAGES_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_pages_wiki        ON wiki_pages(wiki_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_slug ON wiki_pages(wiki_id, anchor_slug);
+CREATE INDEX IF NOT EXISTS idx_pages_primary     ON wiki_pages(primary_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_pages_cluster     ON wiki_pages(macro_cluster, micro_cluster);
+"""
+
+# Source→page reverse index. citation_kind:
+#   'primary'    — the symbol the page is "about" (1 per page, from planner)
+#   'referenced' — symbol cited in the rendered body (<code_context path=...>)
+#   'related'    — cluster member not cited (still belongs to the page's scope)
+_SCHEMA_PAGE_SYMBOLS = """
+CREATE TABLE IF NOT EXISTS page_symbols (
+    page_id       TEXT NOT NULL,
+    node_id       TEXT NOT NULL,
+    citation_kind TEXT NOT NULL
+                  CHECK (citation_kind IN ('primary','referenced','related')),
+    PRIMARY KEY (page_id, node_id, citation_kind),
+    FOREIGN KEY (page_id) REFERENCES wiki_pages(page_id) ON DELETE CASCADE
+);
+"""
+
+_SCHEMA_PAGE_SYMBOLS_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_page_symbols_node ON page_symbols(node_id);
+CREATE INDEX IF NOT EXISTS idx_page_symbols_kind ON page_symbols(citation_kind);
 """
 
 # sqlite-vec table — created only when the extension is available
@@ -401,6 +493,10 @@ class UnifiedWikiDB:
         cur.executescript(_SCHEMA_EDGES_INDEXES)
         cur.executescript(_SCHEMA_FTS5)
         cur.executescript(_SCHEMA_META)
+        cur.executescript(_SCHEMA_WIKI_PAGES)
+        cur.executescript(_SCHEMA_WIKI_PAGES_INDEXES)
+        cur.executescript(_SCHEMA_PAGE_SYMBOLS)
+        cur.executescript(_SCHEMA_PAGE_SYMBOLS_INDEXES)
 
         if self._vec_available:
             try:
@@ -444,6 +540,64 @@ class UnifiedWikiDB:
                 "ALTER TABLE repo_nodes ADD COLUMN api_surface TEXT DEFAULT NULL"
             )
             self.conn.commit()
+
+        # #116 incremental regen: content_hash for change detection.
+        # Existing rows stay NULL; backfilled lazily on next reindex of that file.
+        if "content_hash" not in cols:
+            logger.info("Migrating schema: adding content_hash column to repo_nodes")
+            cur.execute("ALTER TABLE repo_nodes ADD COLUMN content_hash TEXT DEFAULT NULL")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_hash "
+                "ON repo_nodes(content_hash) WHERE content_hash IS NOT NULL"
+            )
+            self.conn.commit()
+
+        # #116 PR 4: embedding_content_hash for skip-if-unchanged in
+        # populate_embeddings. Existing rows stay NULL → re-embedded once
+        # on next populate_embeddings call, then stamped.
+        if "embedding_content_hash" not in cols:
+            logger.info(
+                "Migrating schema: adding embedding_content_hash to repo_nodes"
+            )
+            cur.execute(
+                "ALTER TABLE repo_nodes "
+                "ADD COLUMN embedding_content_hash TEXT DEFAULT NULL"
+            )
+            self.conn.commit()
+
+        # #116 PR 2 prep: last_indexed_commit on wiki_pages for fast-exit
+        # change detection. Idempotent — only fires on legacy schemas that
+        # have wiki_pages but lack this column.
+        if "wiki_pages" in tables:
+            page_cols = {
+                row[1] for row in cur.execute("PRAGMA table_info(wiki_pages)")
+            }
+            if "last_indexed_commit" not in page_cols:
+                logger.info(
+                    "Migrating schema: adding last_indexed_commit to wiki_pages"
+                )
+                cur.execute(
+                    "ALTER TABLE wiki_pages ADD COLUMN last_indexed_commit TEXT DEFAULT NULL"
+                )
+                self.conn.commit()
+            # #116 PR 3 structural-handler wiring: page_spec_json.
+            # #138: CHECK json_valid added at ALTER time so legacy
+            # schemas that haven't yet seen the column also get the
+            # validity guard. Schemas that already added the column
+            # before PR will keep it unconstrained — recreating the
+            # table to retrofit the CHECK is heavier than the value;
+            # next full re-index picks up the constraint via the
+            # CREATE TABLE path.
+            if "page_spec_json" not in page_cols:
+                logger.info(
+                    "Migrating schema: adding page_spec_json to wiki_pages"
+                )
+                cur.execute(
+                    "ALTER TABLE wiki_pages ADD COLUMN page_spec_json TEXT "
+                    "DEFAULT NULL "
+                    "CHECK (page_spec_json IS NULL OR json_valid(page_spec_json))"
+                )
+                self.conn.commit()
 
         # §11.6 / B1: edge confidence column. ALTER TABLE in sqlite cannot
         # add a CHECK constraint after the fact, but the default + the
@@ -526,6 +680,7 @@ class UnifiedWikiDB:
             start_line, end_line,
             symbol_name, symbol_type, parent_symbol, analysis_level,
             source_text, docstring, signature, parameters, return_type,
+            content_hash,
             is_architectural, is_doc, is_test, chunk_type,
             macro_cluster, micro_cluster, is_hub, hub_assignment,
             api_surface
@@ -534,6 +689,7 @@ class UnifiedWikiDB:
             :start_line, :end_line,
             :symbol_name, :symbol_type, :parent_symbol, :analysis_level,
             :source_text, :docstring, :signature, :parameters, :return_type,
+            :content_hash,
             :is_architectural, :is_doc, :is_test, :chunk_type,
             :macro_cluster, :micro_cluster, :is_hub, :hub_assignment,
             :api_surface
@@ -568,6 +724,11 @@ class UnifiedWikiDB:
             if isinstance(params, (list, tuple)):
                 params = json.dumps(params)
 
+            source_text = n.get("source_text", "")
+            content_hash = n.get("content_hash")
+            if content_hash is None and source_text:
+                content_hash = compute_content_hash(source_text)
+
             # Phase 6: api_surface may arrive as list[dict] from
             # extract_api_surfaces_for_graph; serialize to JSON for
             # storage. Empty lists collapse to NULL so the column stays
@@ -590,11 +751,12 @@ class UnifiedWikiDB:
                     "symbol_type": symbol_type,
                     "parent_symbol": n.get("parent_symbol"),
                     "analysis_level": n.get("analysis_level", "comprehensive"),
-                    "source_text": n.get("source_text", ""),
+                    "source_text": source_text,
                     "docstring": n.get("docstring", ""),
                     "signature": n.get("signature", ""),
                     "parameters": params,
                     "return_type": n.get("return_type", ""),
+                    "content_hash": content_hash,
                     "is_architectural": is_arch,
                     "is_doc": is_doc,
                     "is_test": is_test,
@@ -622,30 +784,54 @@ class UnifiedWikiDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_nodes_by_cluster(self, macro: int, micro: int | None = None, limit: int = 1000) -> list[dict[str, Any]]:
-        """Get all nodes in a macro (optionally micro) cluster."""
+    def get_nodes_by_cluster(self, macro: int, micro: int | None = None, limit: int | None = 1000) -> list[dict[str, Any]]:
+        """Get all nodes in a macro (optionally micro) cluster.
+
+        Pass ``limit=None`` to disable the row cap.
+        """
         if micro is not None:
+            base_sql = "SELECT * FROM repo_nodes WHERE macro_cluster = ? AND micro_cluster = ?"
+            params: tuple[Any, ...] = (macro, micro)
+        else:
+            base_sql = "SELECT * FROM repo_nodes WHERE macro_cluster = ?"
+            params = (macro,)
+        if limit is not None:
+            rows = self.conn.execute(base_sql + " LIMIT ?", (*params, limit)).fetchall()
+        else:
+            rows = self.conn.execute(base_sql, params).fetchall()
+        result = [dict(r) for r in rows]
+        _warn_if_truncated(result, limit, "get_nodes_by_cluster", macro=macro, micro=micro)
+        return result
+
+    def get_architectural_nodes(self, limit: int | None = 5000) -> list[dict[str, Any]]:
+        """Get all architectural-level nodes (classes, functions, etc.).
+
+        Pass ``limit=None`` to disable the row cap.
+        """
+        if limit is not None:
             rows = self.conn.execute(
-                "SELECT * FROM repo_nodes WHERE macro_cluster = ? AND micro_cluster = ? LIMIT ?",
-                (macro, micro, limit),
+                "SELECT * FROM repo_nodes WHERE is_architectural = 1 LIMIT ?",
+                (limit,),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT * FROM repo_nodes WHERE macro_cluster = ? LIMIT ?",
-                (macro, limit),
+                "SELECT * FROM repo_nodes WHERE is_architectural = 1",
             ).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_architectural_nodes(self, limit: int = 5000) -> list[dict[str, Any]]:
-        """Get all architectural-level nodes (classes, functions, etc.)."""
-        rows = self.conn.execute(
-            "SELECT * FROM repo_nodes WHERE is_architectural = 1 LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        result = [dict(r) for r in rows]
+        _warn_if_truncated(result, limit, "get_architectural_nodes")
+        return result
 
     def node_count(self) -> int:
         return self.conn.execute("SELECT count(*) FROM repo_nodes").fetchone()[0]
+
+    def fetch_indexed_node_meta(self) -> dict[str, dict[str, str | None]]:
+        rows = self.conn.execute(
+            "SELECT node_id, content_hash, rel_path FROM repo_nodes"
+        ).fetchall()
+        return {
+            row[0]: {"content_hash": row[1], "rel_path": row[2] or ""}
+            for row in rows
+        }
 
     # ══════════════════════════════════════════════════════════════════
     # EDGE operations
@@ -821,6 +1007,24 @@ class UnifiedWikiDB:
         self.conn.commit()
         logger.debug("FTS5 index rebuilt (%d rows)", self.node_count())
 
+    def refresh_fts_index(self) -> None:
+        """Public alias for ``_populate_fts5`` — see protocol docstring.
+
+        Required by #116 PR 3+ after any incremental upsert path that
+        doesn't go through ``from_networkx`` (which already rebuilds FTS
+        as its last step). Cheap: a full rebuild of even thousands of
+        nodes runs in milliseconds.
+        """
+        self._populate_fts5()
+
+    def apply_incremental_node_writes(self, nodes: list[dict[str, Any]]) -> None:
+        """Bundle ``upsert_nodes_batch`` + ``refresh_fts_index`` so callers
+        cannot leave FTS stale. See protocol docstring + issue #131."""
+        if not nodes:
+            return
+        self._upsert_nodes_batch(nodes)
+        self._populate_fts5()
+
     def search_fts5(
         self,
         query: str,
@@ -958,17 +1162,36 @@ class UnifiedWikiDB:
         # SQLite trim() only strips spaces; use explicit whitespace chars
         _ws = " ' ' || char(9) || char(10) || char(13) "
         arch_filter = " AND is_architectural = 1" if architectural_only else ""
+        # #116 PR 4: skip nodes whose embedding is already up-to-date.
+        # A node is "fresh" iff embedding_content_hash equals content_hash.
+        # Anything else (NULL embedding_content_hash, NULL content_hash, or
+        # mismatched hashes) is re-embedded. content_hash is NULL only for
+        # pre-PR1 rows that haven't been re-upserted; those will be re-hashed
+        # and then re-embedded the next time their file is parsed.
+        skip_filter = (
+            " AND ("
+            "embedding_content_hash IS NULL "
+            "OR content_hash IS NULL "
+            "OR embedding_content_hash != content_hash"
+            ")"
+        )
         rows = self.conn.execute(
-            "SELECT node_id, source_text FROM repo_nodes "  # noqa: S608 — internal whitespace-trim query, _ws is a hardcoded SQLite expression
+            "SELECT node_id, source_text, content_hash FROM repo_nodes "  # noqa: S608 — internal whitespace-trim query, _ws is a hardcoded SQLite expression
             f"WHERE source_text IS NOT NULL AND length(trim(source_text, {_ws})) > 0"
             + arch_filter
+            + skip_filter
         ).fetchall()
 
-        batches: list[tuple[int, list[str], list[str]]] = []
+        batches: list[tuple[int, list[str], list[str], list[str | None]]] = []
         for i in range(0, len(rows), batch_size):
             batch = rows[i : i + batch_size]
             batches.append(
-                (i, [r["node_id"] for r in batch], [r["source_text"] for r in batch])
+                (
+                    i,
+                    [r["node_id"] for r in batch],
+                    [r["source_text"] for r in batch],
+                    [r["content_hash"] for r in batch],
+                )
             )
 
         total = 0
@@ -984,7 +1207,12 @@ class UnifiedWikiDB:
             len(rows), n_batches, batch_size, max_workers,
         )
 
-        def _embed_one(idx: int, node_ids: list[str], texts: list[str]):
+        def _embed_one(
+            idx: int,
+            node_ids: list[str],
+            texts: list[str],
+            hashes: list[str | None],
+        ):
             try:
                 vectors = embedding_fn(texts)
             except Exception as exc:
@@ -993,24 +1221,40 @@ class UnifiedWikiDB:
                     idx, idx + len(node_ids), exc,
                 )
                 return None
-            return list(zip(node_ids, vectors, strict=True))
+            return (
+                list(zip(node_ids, vectors, strict=True)),
+                list(zip(node_ids, hashes, strict=True)),
+            )
+
+        def _stamp_embedding_hashes(pairs: list[tuple[str, str | None]]) -> None:
+            """Persist the content_hash snapshot so the next regen skips
+            these nodes when their source is unchanged. Pre-PR1 rows with
+            NULL content_hash get NULL stamped — they'll be re-embedded
+            once after their next upsert backfills the hash."""
+            self.conn.executemany(
+                "UPDATE repo_nodes SET embedding_content_hash = ? "
+                "WHERE node_id = ?",
+                [(content_hash, node_id) for node_id, content_hash in pairs],
+            )
 
         completed_batches = 0
         if max_workers > 1 and len(batches) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = [
-                    pool.submit(_embed_one, idx, nids, texts)
-                    for idx, nids, texts in batches
+                    pool.submit(_embed_one, idx, nids, texts, hashes)
+                    for idx, nids, texts, hashes in batches
                 ]
                 for fut in as_completed(futures):
-                    pairs = fut.result()
-                    if pairs:
+                    result = fut.result()
+                    if result:
+                        vector_pairs, hash_pairs = result
                         # sqlite writes are not thread-safe — guarded by GIL
                         # and our connection runs in a single process; the
                         # write here is ok because executemany serialises.
-                        self.upsert_embeddings_batch(pairs)
-                        total += len(pairs)
+                        self.upsert_embeddings_batch(vector_pairs)
+                        _stamp_embedding_hashes(hash_pairs)
+                        total += len(vector_pairs)
                     completed_batches += 1
                     if completed_batches % log_every == 0:
                         elapsed = time.time() - t_start
@@ -1021,11 +1265,13 @@ class UnifiedWikiDB:
                             completed_batches, n_batches, total, rate,
                         )
         else:
-            for idx, nids, texts in batches:
-                pairs = _embed_one(idx, nids, texts)
-                if pairs:
-                    self.upsert_embeddings_batch(pairs)
-                    total += len(pairs)
+            for idx, nids, texts, hashes in batches:
+                result = _embed_one(idx, nids, texts, hashes)
+                if result:
+                    vector_pairs, hash_pairs = result
+                    self.upsert_embeddings_batch(vector_pairs)
+                    _stamp_embedding_hashes(hash_pairs)
+                    total += len(vector_pairs)
                 completed_batches += 1
                 if completed_batches % log_every == 0:
                     elapsed = time.time() - t_start
@@ -1502,6 +1748,17 @@ class UnifiedWikiDB:
         for row in self.conn.execute("SELECT rel_type, count(*) FROM repo_edges GROUP BY rel_type"):
             edge_types[row[0]] = row[1]
 
+        # #120: confidence distribution. Always returns the three
+        # known buckets (extracted/inferred/ambiguous) even when one
+        # is zero, so MCP / UI consumers can rely on a stable shape.
+        confidence_breakdown = {"extracted": 0, "inferred": 0, "ambiguous": 0}
+        for row in self.conn.execute(
+            "SELECT confidence, count(*) FROM repo_edges GROUP BY confidence"
+        ):
+            key = (row[0] or "EXTRACTED").lower()
+            if key in confidence_breakdown:
+                confidence_breakdown[key] = row[1]
+
         # Cluster counts
         macro_count = self.conn.execute(
             "SELECT count(DISTINCT macro_cluster) FROM repo_nodes WHERE macro_cluster IS NOT NULL"
@@ -1520,6 +1777,7 @@ class UnifiedWikiDB:
             "languages": langs,
             "symbol_types": types,
             "edge_types": edge_types,
+            "confidence_breakdown": confidence_breakdown,
             "macro_clusters": macro_count,
             "hub_count": hub_count,
             "vec_available": self._vec_available,
@@ -1889,6 +2147,85 @@ class UnifiedWikiDB:
         """Delete every row in the edges table."""
         self.conn.execute("DELETE FROM repo_edges")
 
+    def reset_clusters(self) -> None:
+        """Clear cluster + hub columns on every node row (fresh-pass reset)."""
+        self.conn.execute(
+            "UPDATE repo_nodes "
+            "SET macro_cluster = NULL, micro_cluster = NULL, "
+            "is_hub = 0, hub_assignment = NULL"
+        )
+
+    def get_hub_node_ids(self) -> list[str]:
+        """Return node_ids of all nodes flagged ``is_hub = 1``."""
+        rows = self.conn.execute(
+            "SELECT node_id FROM repo_nodes WHERE is_hub = 1"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_clustered_architectural_nodes(
+        self,
+        exclude_tests: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return {node_id, macro_cluster, micro_cluster} for clustered
+        architectural nodes."""
+        sql = (
+            "SELECT node_id, macro_cluster, micro_cluster "
+            "FROM repo_nodes "
+            "WHERE macro_cluster IS NOT NULL AND is_architectural = 1"
+        )
+        if exclude_tests:
+            sql += " AND is_test = 0"
+        # #116: deterministic order is load-bearing — the planner's
+        # cluster_node_ids list feeds compute_page_id via primary_symbol_id.
+        # Without ORDER BY the row order is undefined → page IDs shift on
+        # every regen, defeating the stable-ID scheme.
+        sql += " ORDER BY macro_cluster, micro_cluster, node_id"
+        rows = self.conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_architectural_node_ids(
+        self,
+        exclude_tests: bool = False,
+        limit: int | None = 10_000,
+    ) -> list[str]:
+        """Return node_ids of all architectural nodes (lightweight projection).
+
+        Pass ``limit=None`` to disable the row cap.
+        """
+        sql = "SELECT node_id FROM repo_nodes WHERE is_architectural = 1"
+        if exclude_tests:
+            sql += " AND is_test = 0"
+        if limit is not None:
+            rows = self.conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
+        else:
+            rows = self.conn.execute(sql).fetchall()
+        result = [r[0] for r in rows]
+        _warn_if_truncated(result, limit, "get_architectural_node_ids", exclude_tests=exclude_tests)
+        return result
+
+    def get_all_edges(
+        self,
+        limit: int | None = 500_000,
+    ) -> list[dict[str, Any]]:
+        """Return all edge rows (bounded by *limit* to guard against OOM).
+
+        Pass ``limit=None`` to disable the row cap.
+        """
+        if limit is not None:
+            rows = self.conn.execute(
+                "SELECT source_id, target_id, rel_type, weight "
+                "FROM repo_edges LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT source_id, target_id, rel_type, weight "
+                "FROM repo_edges",
+            ).fetchall()
+        result = [dict(r) for r in rows]
+        _warn_if_truncated(result, limit, "get_all_edges")
+        return result
+
     # ── Language detection ───────────────────────────────────────────
 
     def detect_dominant_language(self, node_ids: list[str]) -> str | None:
@@ -2083,6 +2420,547 @@ class UnifiedWikiDB:
             "by_symbol_type": [dict(r) for r in sym_rows],
             "by_file": [dict(r) for r in file_rows],
         }
+
+    # ── shortest_path (#121 Phase 1) ──────────────────────────────────
+    #
+    # This is the **canonical undirected shortest-path** entry point for
+    # MCP / IDE clients. It treats ``repo_edges`` as undirected and runs
+    # a layered Python BFS with a visited set so each node is expanded
+    # at most once — preventing the frontier explosion an earlier
+    # SQL-recursive-CTE draft suffered on dense graphs.
+    #
+    # For *directed* per-symbol traversal used by the LLM agent loop
+    # (e.g. "who calls X?"), see ``GraphQueryService.get_relationships``
+    # — that surface is in-memory NetworkX, depth-bounded, and respects
+    # edge direction and confidence filters.
+
+    _NODE_COLS_FOR_PATH = "node_id, symbol_name, rel_path, symbol_type"
+    _EDGE_COLS_FOR_PATH = "source_id, target_id, rel_type, confidence"
+    # SQLite's default SQLITE_LIMIT_VARIABLE_NUMBER is 999. We chunk
+    # frontier expansion below this to stay portable.
+    _BFS_FRONTIER_CHUNK = 500
+
+    def _resolve_label(self, label: str) -> tuple[dict[str, Any] | None, int]:
+        """Resolve ``label`` to a node row + total candidate count.
+
+        Returns ``(best, total_count)`` where ``best`` is the
+        ``node_id``-ASC-first row matching ``label`` and
+        ``total_count`` is how many rows matched in total. Callers can
+        flag the result as ambiguous when ``total_count > 1``.
+
+        Match strategy (first table with at least one hit wins):
+          1. Exact ``symbol_name`` match
+          2. ``rel_path`` match (file-path-as-label)
+
+        Each branch issues a ``COUNT(*)`` and a ``LIMIT 1`` query
+        rather than ``fetchall()``-ing the full match set — common
+        labels like ``__init__`` or ``main`` can match thousands of
+        rows in real codebases, and we only need the first plus the
+        cardinality.
+        """
+        for column in ("symbol_name", "rel_path"):
+            count = self.conn.execute(
+                f"SELECT COUNT(*) FROM repo_nodes WHERE {column} = ?",  # noqa: S608
+                (label,),
+            ).fetchone()[0]
+            if count:
+                row = self.conn.execute(
+                    f"SELECT {self._NODE_COLS_FOR_PATH} FROM repo_nodes "
+                    f"WHERE {column} = ? ORDER BY node_id ASC LIMIT 1",  # noqa: S608
+                    (label,),
+                ).fetchone()
+                if row is not None:
+                    return dict(row), int(count)
+        return None, 0
+
+    def _bfs_step_sqlite(
+        self,
+        *,
+        frontier: list[str],
+        tgt_id: str,
+        visited: set[str],
+        parents: dict[str, str],
+    ) -> list[str] | None:
+        """One BFS layer expansion.
+
+        Returns the next frontier list, or ``None`` once ``tgt_id`` has
+        been discovered (caller stops the outer loop on ``None``).
+        ``visited`` and ``parents`` are mutated in place.
+        """
+        frontier_set = set(frontier)
+        next_frontier: list[str] = []
+        for chunk_start in range(0, len(frontier), self._BFS_FRONTIER_CHUNK):
+            chunk = frontier[chunk_start : chunk_start + self._BFS_FRONTIER_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT source_id, target_id FROM repo_edges "
+                f"WHERE source_id IN ({placeholders}) "
+                f"   OR target_id IN ({placeholders})",  # noqa: S608
+                (*chunk, *chunk),
+            ).fetchall()
+            for row in rows:
+                a, b = row[0], row[1]
+                for parent_id, child_id in ((a, b), (b, a)):
+                    if parent_id not in frontier_set or child_id in visited:
+                        continue
+                    visited.add(child_id)
+                    parents[child_id] = parent_id
+                    next_frontier.append(child_id)
+                    if child_id == tgt_id:
+                        return None
+        return next_frontier
+
+    def shortest_path(
+        self,
+        source_label: str,
+        target_label: str,
+        max_depth: int = 25,
+    ) -> dict[str, Any]:
+        if max_depth < 1:
+            return {"path": None, "reason": "invalid_max_depth"}
+
+        source, src_candidates = self._resolve_label(source_label)
+        if source is None:
+            return {"path": None, "reason": "source_not_found"}
+        target, tgt_candidates = self._resolve_label(target_label)
+        if target is None:
+            return {"path": None, "reason": "target_not_found"}
+
+        src_id = source["node_id"]
+        tgt_id = target["node_id"]
+        if src_id == tgt_id:
+            return {
+                "source": source,
+                "target": target,
+                "source_candidates": src_candidates,
+                "target_candidates": tgt_candidates,
+                "path": [source],
+                "edges": [],
+                "length": 0,
+            }
+
+        # Layered Python BFS with a visited set. Each layer issues one
+        # SQL query (chunked if the frontier is large) to fetch every
+        # incident edge for the current frontier; we walk both
+        # directions to honour undirected semantics. Termination is
+        # O(V + E) — no frontier explosion, no LIKE-on-CSV cycle guard.
+        visited: set[str] = {src_id}
+        parents: dict[str, str] = {}
+        frontier: list[str] = [src_id]
+        found = False
+
+        for _depth in range(max_depth):
+            if not frontier:
+                break
+            next_frontier = self._bfs_step_sqlite(
+                frontier=frontier,
+                tgt_id=tgt_id,
+                visited=visited,
+                parents=parents,
+            )
+            if next_frontier is None:
+                found = True
+                break
+            frontier = next_frontier
+
+        if not found:
+            return {"path": None, "reason": "no_path_within_max_depth"}
+
+        # Reconstruct via parent map (target → … → source).
+        path_ids: list[str] = [tgt_id]
+        while path_ids[-1] != src_id:
+            path_ids.append(parents[path_ids[-1]])
+        path_ids.reverse()
+
+        # Hydrate nodes — preserve walk order.
+        node_rows = self.conn.execute(
+            f"SELECT {self._NODE_COLS_FOR_PATH} FROM repo_nodes "
+            f"WHERE node_id IN ({','.join('?' * len(path_ids))})",
+            path_ids,
+        ).fetchall()
+        node_by_id = {r["node_id"]: dict(r) for r in node_rows}
+        path_nodes = [node_by_id[nid] for nid in path_ids if nid in node_by_id]
+
+        # Edge details for each consecutive pair — direction unknown
+        # (we walked undirected); try both and prefer EXTRACTED.
+        edges: list[dict[str, Any]] = []
+        for a, b in zip(path_ids, path_ids[1:], strict=False):
+            edge_row = self.conn.execute(
+                f"SELECT {self._EDGE_COLS_FOR_PATH} FROM repo_edges "
+                "WHERE (source_id = ? AND target_id = ?) "
+                "   OR (source_id = ? AND target_id = ?) "
+                "ORDER BY CASE confidence WHEN 'EXTRACTED' THEN 0 "
+                "                         WHEN 'INFERRED'  THEN 1 "
+                "                         ELSE 2 END "
+                "LIMIT 1",
+                (a, b, b, a),
+            ).fetchone()
+            if edge_row is not None:
+                edges.append(dict(edge_row))
+
+        return {
+            "source": source,
+            "target": target,
+            "source_candidates": src_candidates,
+            "target_candidates": tgt_candidates,
+            "path": path_nodes,
+            "edges": edges,
+            "length": len(path_ids) - 1,
+        }
+
+    # ── surprising_connections (#121 Phase 2) ─────────────────────────
+
+    @staticmethod
+    def _path_prefix(rel_path: str, depth: int) -> str:
+        """Folder prefix at ``depth`` segments, stripping the
+        filename. Returns ``""`` for root-level files (no folder).
+
+        Example: ``("frontend/widgets/Btn.tsx", 1)`` → ``"frontend"``;
+        ``("frontend/widgets/Btn.tsx", 2)`` → ``"frontend/widgets"``;
+        ``("Btn.tsx", 1)`` → ``""`` (no folder).
+        """
+        if not rel_path:
+            return ""
+        parts = rel_path.split("/")
+        folders = parts[:-1]  # drop filename
+        if not folders:
+            return ""
+        return "/".join(folders[:depth])
+
+    def _fetch_cluster_contexts(
+        self, clusters: set[int], depth: int,
+    ) -> dict[int, set[str]]:
+        """Bulk-fetch per-cluster folder-prefix sets.
+
+        Avoids the N+1 round-trip pattern an earlier draft had when
+        each cluster was fetched individually. Chunked at
+        ``_BFS_FRONTIER_CHUNK`` (500) so the ``IN (?, ?, …)``
+        placeholder count stays comfortably under SQLite's default
+        ``SQLITE_LIMIT_VARIABLE_NUMBER`` of 999 — caller-side
+        ``top_n`` caps make this academic today (≤ ~200 distinct
+        clusters), but chunking costs nothing and eliminates the
+        class of failure.
+        """
+        contexts: dict[int, set[str]] = {c: set() for c in clusters}
+        if not clusters:
+            return contexts
+        cluster_list = list(clusters)
+        for chunk_start in range(0, len(cluster_list), self._BFS_FRONTIER_CHUNK):
+            chunk = cluster_list[chunk_start : chunk_start + self._BFS_FRONTIER_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                # Cluster IDs are integer bound parameters; only the
+                # placeholder shape (?, ?, …) is templated.
+                f"SELECT macro_cluster, rel_path FROM repo_nodes "  # noqa: S608
+                f"WHERE macro_cluster IN ({placeholders}) "
+                f"  AND rel_path IS NOT NULL AND rel_path != ''",
+                tuple(chunk),
+            ).fetchall()
+            for row in rows:
+                prefix = self._path_prefix(row["rel_path"], depth)
+                if prefix:
+                    contexts[int(row["macro_cluster"])].add(prefix)
+        return contexts
+
+    def compute_surprising_connections(
+        self,
+        top_n: int = 10,
+        context_depth: int = 1,
+        sample_edges_per_pair: int = 3,
+    ) -> dict[str, Any]:
+        # 1) Aggregate cross-cluster edges per unordered (lo, hi) pair.
+        #    CASE WHEN normalises direction so we don't double-count
+        #    (A→B) and (B→A) as different pairs.
+        pair_rows = self.conn.execute(
+            """
+            SELECT
+              CASE WHEN src.macro_cluster < tgt.macro_cluster
+                   THEN src.macro_cluster ELSE tgt.macro_cluster END AS c_lo,
+              CASE WHEN src.macro_cluster < tgt.macro_cluster
+                   THEN tgt.macro_cluster ELSE src.macro_cluster END AS c_hi,
+              COUNT(*) AS edge_count
+              FROM repo_edges e
+              JOIN repo_nodes src ON e.source_id = src.node_id
+              JOIN repo_nodes tgt ON e.target_id = tgt.node_id
+             WHERE src.macro_cluster IS NOT NULL
+               AND tgt.macro_cluster IS NOT NULL
+               AND src.macro_cluster != tgt.macro_cluster
+             GROUP BY c_lo, c_hi
+            """,
+        ).fetchall()
+
+        if not pair_rows:
+            return {"pairs": [], "skipped_pairs": 0}
+
+        # 2) Bulk-fetch contexts for every cluster appearing in pairs.
+        clusters = {int(r["c_lo"]) for r in pair_rows} | {
+            int(r["c_hi"]) for r in pair_rows
+        }
+        contexts = self._fetch_cluster_contexts(clusters, context_depth)
+
+        # 3) Score each pair by Jaccard distance. Pairs with two empty
+        # contexts (e.g. all root-level files) carry no signal — count
+        # them so the caller can distinguish "nothing surprising"
+        # (empty pairs / non-empty skipped) from "no cross-cluster
+        # edges" (zero raw pair rows).
+        scored: list[dict[str, Any]] = []
+        skipped = 0
+        for row in pair_rows:
+            c_lo, c_hi, edge_count = row["c_lo"], row["c_hi"], row["edge_count"]
+            ctx_lo = contexts.get(int(c_lo), set())
+            ctx_hi = contexts.get(int(c_hi), set())
+            union = ctx_lo | ctx_hi
+            if not union:
+                skipped += 1
+                continue
+            intersection = ctx_lo & ctx_hi
+            jaccard_distance = 1.0 - (len(intersection) / len(union))
+            scored.append(
+                {
+                    "cluster_a": int(c_lo),
+                    "cluster_b": int(c_hi),
+                    "jaccard_distance": jaccard_distance,
+                    "context_a": sorted(ctx_lo),
+                    "context_b": sorted(ctx_hi),
+                    "edge_count": int(edge_count),
+                },
+            )
+
+        # 4) Rank by surprise. Ties broken by edge_count desc then
+        #    (cluster_a, cluster_b) for determinism.
+        scored.sort(
+            key=lambda p: (
+                -p["jaccard_distance"],
+                -p["edge_count"],
+                p["cluster_a"],
+                p["cluster_b"],
+            ),
+        )
+        top = scored[:top_n]
+
+        # 5) Hydrate sample edges per top pair.
+        for pair in top:
+            sample = self.conn.execute(
+                """
+                SELECT e.source_id, e.target_id, e.rel_type, e.confidence,
+                       src.symbol_name AS source_name, src.rel_path AS source_path,
+                       tgt.symbol_name AS target_name, tgt.rel_path AS target_path
+                  FROM repo_edges e
+                  JOIN repo_nodes src ON e.source_id = src.node_id
+                  JOIN repo_nodes tgt ON e.target_id = tgt.node_id
+                 WHERE ((src.macro_cluster = ? AND tgt.macro_cluster = ?)
+                     OR (src.macro_cluster = ? AND tgt.macro_cluster = ?))
+                 ORDER BY CASE e.confidence
+                          WHEN 'EXTRACTED' THEN 0
+                          WHEN 'INFERRED'  THEN 1
+                          ELSE 2 END,
+                          e.source_id, e.target_id
+                 LIMIT ?
+                """,
+                (
+                    pair["cluster_a"], pair["cluster_b"],
+                    pair["cluster_b"], pair["cluster_a"],
+                    sample_edges_per_pair,
+                ),
+            ).fetchall()
+            pair["sample_edges"] = [dict(r) for r in sample]
+
+        return {"pairs": top, "skipped_pairs": skipped}
+
+    # ══════════════════════════════════════════════════════════════════
+    # WIKI PAGES + source→page reverse index (#116 incremental regen)
+    # ══════════════════════════════════════════════════════════════════
+
+    _WIKI_PAGE_COLUMNS = (
+        "page_id",
+        "wiki_id",
+        "id_scheme",
+        "title",
+        "anchor_slug",
+        "content_hash",
+        "macro_cluster",
+        "micro_cluster",
+        "primary_symbol_id",
+        "section_index",
+        "page_index",
+        "last_indexed_commit",
+        "page_spec_json",
+        "generated_at",
+    )
+
+    def upsert_wiki_page(self, page: dict[str, Any]) -> None:
+        self._upsert_wiki_page_no_commit(page)
+        self.conn.commit()
+
+    def _upsert_wiki_page_no_commit(self, page: dict[str, Any]) -> None:
+        """Execute the upsert without committing. Lets
+        ``upsert_wiki_page_with_symbols`` group two writes in one transaction.
+        """
+        if "page_id" not in page or "wiki_id" not in page:
+            raise ValueError("upsert_wiki_page: 'page_id' and 'wiki_id' are required")
+        row = {
+            "page_id": page["page_id"],
+            "wiki_id": page["wiki_id"],
+            "id_scheme": page.get("id_scheme", "stable_v1"),
+            "title": page.get("title", ""),
+            "anchor_slug": page.get("anchor_slug", ""),
+            "content_hash": page.get("content_hash"),
+            "macro_cluster": page.get("macro_cluster"),
+            "micro_cluster": page.get("micro_cluster"),
+            "primary_symbol_id": page.get("primary_symbol_id"),
+            "section_index": page.get("section_index", 0),
+            "page_index": page.get("page_index", 0),
+            "last_indexed_commit": page.get("last_indexed_commit"),
+            "page_spec_json": page.get("page_spec_json"),
+            "generated_at": page.get("generated_at"),
+        }
+        cols = ", ".join(self._WIKI_PAGE_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in self._WIKI_PAGE_COLUMNS)
+        # Native UPSERT keyed on the PRIMARY KEY. Using INSERT OR REPLACE
+        # would resolve a slug-uniqueness conflict by silently deleting the
+        # other page — we want that to bubble up as IntegrityError so
+        # callers learn to resolve slug collisions with compute_anchor_slug.
+        update_set = ", ".join(
+            f"{c} = excluded.{c}" for c in self._WIKI_PAGE_COLUMNS if c != "page_id"
+        )
+        self.conn.execute(
+            f"INSERT INTO wiki_pages ({cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT(page_id) DO UPDATE SET {update_set}",
+            row,
+        )
+
+    def get_wiki_page(self, page_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id = ?", (page_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_wiki_pages(self, wiki_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM wiki_pages WHERE wiki_id = ? "
+            "ORDER BY section_index ASC, page_index ASC",
+            (wiki_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_wiki_pages_by_cluster(
+        self,
+        wiki_id: str,
+        macro_cluster: int,
+        micro_cluster: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if micro_cluster is None:
+            rows = self.conn.execute(
+                "SELECT * FROM wiki_pages "
+                "WHERE wiki_id = ? AND macro_cluster = ? "
+                "ORDER BY section_index ASC, page_index ASC",
+                (wiki_id, macro_cluster),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM wiki_pages "
+                "WHERE wiki_id = ? AND macro_cluster = ? AND micro_cluster = ? "
+                "ORDER BY section_index ASC, page_index ASC",
+                (wiki_id, macro_cluster, micro_cluster),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_wiki_pages(self, wiki_id: str) -> int:
+        cur = self.conn.execute("DELETE FROM wiki_pages WHERE wiki_id = ?", (wiki_id,))
+        self.conn.commit()
+        return cur.rowcount or 0
+
+    def delete_wiki_page(self, page_id: str) -> bool:
+        # FK CASCADE on page_symbols.page_id cleans up the reverse index
+        # in the same transaction. Idempotent: missing rows return False
+        # instead of raising.
+        cur = self.conn.execute(
+            "DELETE FROM wiki_pages WHERE page_id = ?", (page_id,),
+        )
+        self.conn.commit()
+        return bool(cur.rowcount)
+
+    def record_page_symbols(
+        self,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        self._record_page_symbols_no_commit(page_id, symbols, replace=replace)
+        self.conn.commit()
+
+    def _record_page_symbols_no_commit(
+        self,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool,
+    ) -> None:
+        """Execute the symbol writes without committing. Pairs with
+        ``_upsert_wiki_page_no_commit`` for atomic combined writes.
+        """
+        if replace:
+            self.conn.execute("DELETE FROM page_symbols WHERE page_id = ?", (page_id,))
+        if symbols:
+            # ON CONFLICT DO NOTHING scopes the ignore to PK collisions only.
+            # Using INSERT OR IGNORE would silently swallow CHECK violations
+            # (e.g. invalid citation_kind) and corrupt the reverse index.
+            self.conn.executemany(
+                "INSERT INTO page_symbols (page_id, node_id, citation_kind) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (page_id, node_id, citation_kind) DO NOTHING",
+                [(page_id, node_id, kind) for node_id, kind in symbols],
+            )
+
+    def upsert_wiki_page_with_symbols(
+        self,
+        page: dict[str, Any],
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Single-transaction upsert of the page row + its symbol rows.
+
+        On any failure between the two writes we ROLLBACK so callers don't
+        end up with a wiki_pages row whose absent citations are
+        indistinguishable from "page has nothing to cite."
+        """
+        try:
+            self._upsert_wiki_page_no_commit(page)
+            self._record_page_symbols_no_commit(
+                page["page_id"], symbols, replace=replace,
+            )
+            self.conn.commit()
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:  # noqa: S110 — best-effort rollback
+                pass
+            raise
+
+    def get_pages_citing_node(self, node_id: str) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT page_id FROM page_symbols WHERE node_id = ?",
+            (node_id,),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_page_symbols(
+        self, page_id: str, citation_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if citation_kind is None:
+            rows = self.conn.execute(
+                "SELECT node_id, citation_kind FROM page_symbols WHERE page_id = ?",
+                (page_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT node_id, citation_kind FROM page_symbols "
+                "WHERE page_id = ? AND citation_kind = ?",
+                (page_id, citation_kind),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # Canonical storage-backend name.

@@ -2,17 +2,80 @@ name: Test
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+  # Manual button for ``backend-integration-tests`` — the full suite
+  # with coverage takes ~10 min and depends on FastAPI lifespan +
+  # provider health checks, so we don't gate every PR on it.  Click
+  # "Run workflow" from the Actions tab to fire it on demand.
+  workflow_dispatch:
 
 jobs:
-  backend-tests:
+  # Fast unit tests — millisecond-scale, no FastAPI lifespan, no network.
+  # pytest itself runs in <1 min via pytest-xdist; the budget also has to
+  # cover pip install on a cold runner (~3-4 min for the [dev] extras).
+  backend-unit-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - run: pip install -e ".[dev]"
         working-directory: backend
-      - run: AUTH_ENABLED=false pytest tests/ -v --cov=app
+      - run: AUTH_ENABLED=false pytest tests/unit -q -n auto
+        working-directory: backend
+
+  # Integration + remaining tests with coverage.  Parallelized via
+  # pytest-xdist's ``--dist worksteal`` so a slow test in one worker
+  # doesn't pin the wall clock — ~10 min wall on a 4-vCPU runner.
+  # Excludes ``tests/unit`` (already gated by ``backend-unit-tests``
+  # above) to avoid duplicate runs.
+  #
+  # Manual-trigger only.  These tests bring up FastAPI lifespan +
+  # provider health checks, which makes them too slow + flaky to gate
+  # every PR on.  Run them from the Actions tab via "Run workflow"
+  # (workflow_dispatch) when a change touches the FastAPI layer,
+  # LangGraph agents, or anything that interacts with cached
+  # artifacts on disk.
+  backend-integration-tests:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -e ".[dev]"
+        working-directory: backend
+      - run: AUTH_ENABLED=false pytest tests/ --ignore=tests/unit -q -n auto --dist worksteal --cov=app --cov-report=term-missing
+        working-directory: backend
+
+  # Stress-runs the WikiService.shutdown regression-guard unit tests.
+  # These exercise the asyncio.to_thread / cancellation interplay that
+  # caused the original CI segfault (#165) deterministically in <1s
+  # each, so repeating them in one Python process surfaces any
+  # scheduling regression without depending on the full FastAPI
+  # lifespan. An earlier draft included the integration suites + the
+  # lifespan-wiring test; those ran provider health checks on every
+  # iteration and timed out the runner on CI even though they were
+  # fast locally. The lifespan-wiring test still runs once in
+  # ``backend-tests`` above — only the repeated stress is scoped down.
+  backend-tests-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -e ".[dev]"
+        working-directory: backend
+      - name: Stress shutdown-race unit tests (50x)
+        run: |
+          AUTH_ENABLED=false pytest \
+            tests/test_wiki_service.py::TestWikiServiceShutdown \
+            -k "not lifespan_passes_configured" \
+            --count=50 -q
         working-directory: backend
 
   frontend-checks:
@@ -26,4 +89,11 @@ jobs:
       - run: npx tsc --noEmit
         working-directory: web
       - run: npm run lint
+        working-directory: web
+      # Regression guard for the Better-Auth api-key plugin × our
+      # schema remap (#170). Standalone tsx script because the
+      # Better-Auth packages are ESM-only and our Jest config is
+      # CJS-based — adding ESM transform support just for one test
+      # would expand the framework surface significantly.
+      - run: npm run test:integration
         working-directory: web

@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    from app.core.sources import install_redaction_filter
+
+    install_redaction_filter()
+
     from app.config import get_settings
     from app.db import create_tables, dispose_engine, get_engine, get_session_factory, init_db
     from app.services.ask_service import AskService
@@ -93,6 +97,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
 
     logger.info("Shutting down")
+    # Drain in-flight invocation tasks before disposing the SQLAlchemy
+    # engine. Without this, a background task that called
+    # ``asyncio.to_thread()`` for SQLite work would race the storage
+    # close on the main thread → SIGSEGV in CI. Production benefits
+    # too: clean shutdown lets the pending writes complete instead of
+    # being interrupted mid-FTS-rebuild.
+    try:
+        await app.state.wiki_service.shutdown(
+            timeout=settings.wiki_shutdown_timeout_s,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("wiki_service.shutdown raised — continuing teardown")
     await dispose_engine()
 
 

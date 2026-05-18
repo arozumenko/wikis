@@ -1,0 +1,315 @@
+"""SQLite-backend tests for the wiki_pages + page_symbols methods (#116 PR 1).
+
+The protocol promises both backends behave identically; we test SQLite here
+because it needs no infra. PostgreSQL behaviour is verified separately
+through the existing storage-protocol integration suite.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from app.core.unified_db import UnifiedWikiDB
+
+
+@pytest.fixture()
+def db(tmp_path):
+    d = UnifiedWikiDB(tmp_path / "wiki_pages.wiki.db", embedding_dim=8)
+    yield d
+    d.close()
+
+
+# ---------------------------------------------------------------------------
+# wiki_pages
+# ---------------------------------------------------------------------------
+
+
+def _page(page_id: str, wiki_id: str = "wiki-1", **overrides) -> dict:
+    base = {
+        "page_id": page_id,
+        "wiki_id": wiki_id,
+        "title": "Overview",
+        "anchor_slug": page_id,  # unique-per-wiki guaranteed by caller
+        "macro_cluster": 0,
+        "micro_cluster": 1,
+        "primary_symbol_id": "sym-1",
+        "section_index": 0,
+        "page_index": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestUpsertWikiPage:
+    def test_round_trip(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", title="Auth", anchor_slug="auth"))
+        row = db.get_wiki_page("p1")
+        assert row is not None
+        assert row["page_id"] == "p1"
+        assert row["wiki_id"] == "wiki-1"
+        assert row["title"] == "Auth"
+        assert row["anchor_slug"] == "auth"
+        assert row["id_scheme"] == "stable_v1"  # default
+
+    def test_replace_updates_in_place(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", title="Auth", anchor_slug="auth"))
+        db.upsert_wiki_page(
+            _page("p1", title="Authentication", anchor_slug="authentication")
+        )
+        row = db.get_wiki_page("p1")
+        assert row["title"] == "Authentication"
+        assert row["anchor_slug"] == "authentication"
+
+    def test_requires_page_id_and_wiki_id(self, db: UnifiedWikiDB) -> None:
+        with pytest.raises(ValueError):
+            db.upsert_wiki_page({"page_id": "p1"})
+        with pytest.raises(ValueError):
+            db.upsert_wiki_page({"wiki_id": "w1"})
+
+    def test_anchor_slug_unique_per_wiki(self, db: UnifiedWikiDB) -> None:
+        # Same slug allowed across wikis; collision within one wiki must error.
+        db.upsert_wiki_page(_page("p1", wiki_id="w1", anchor_slug="overview"))
+        db.upsert_wiki_page(_page("p2", wiki_id="w2", anchor_slug="overview"))
+        with pytest.raises(Exception):  # IntegrityError from UNIQUE index
+            db.upsert_wiki_page(_page("p3", wiki_id="w1", anchor_slug="overview"))
+
+
+class TestListAndDelete:
+    def test_get_wiki_pages_orders_by_indices(self, db: UnifiedWikiDB) -> None:
+        # Insert out of order; expect (section_index, page_index) sort on read.
+        db.upsert_wiki_page(_page("p_late", section_index=1, page_index=2, anchor_slug="late"))
+        db.upsert_wiki_page(_page("p_early", section_index=0, page_index=0, anchor_slug="early"))
+        db.upsert_wiki_page(_page("p_mid", section_index=0, page_index=1, anchor_slug="mid"))
+
+        ids = [r["page_id"] for r in db.get_wiki_pages("wiki-1")]
+        assert ids == ["p_early", "p_mid", "p_late"]
+
+    def test_get_wiki_pages_scopes_by_wiki(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", wiki_id="w1", anchor_slug="w1-overview"))
+        db.upsert_wiki_page(_page("p2", wiki_id="w2", anchor_slug="w2-overview"))
+        assert {r["page_id"] for r in db.get_wiki_pages("w1")} == {"p1"}
+        assert {r["page_id"] for r in db.get_wiki_pages("w2")} == {"p2"}
+
+    def test_delete_wiki_pages_cascades_to_symbols(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1"))
+        db.record_page_symbols("p1", [("n1", "primary"), ("n2", "referenced")])
+        # Sanity: rows present.
+        assert db.get_pages_citing_node("n1") == ["p1"]
+
+        deleted = db.delete_wiki_pages("wiki-1")
+        assert deleted == 1
+        assert db.get_wiki_page("p1") is None
+        # FK cascade — page_symbols rows gone too.
+        assert db.get_pages_citing_node("n1") == []
+
+    def test_delete_wiki_page_removes_single_row(self, db: UnifiedWikiDB) -> None:
+        """#141: per-page delete primitive used by the DELETED regime.
+        Leaves sibling pages intact and cascades to page_symbols."""
+        db.upsert_wiki_page(_page("p1", anchor_slug="p1"))
+        db.upsert_wiki_page(_page("p2", anchor_slug="p2"))
+        db.record_page_symbols("p1", [("n1", "primary")])
+        db.record_page_symbols("p2", [("n2", "primary")])
+
+        deleted = db.delete_wiki_page("p1")
+        assert deleted is True
+        assert db.get_wiki_page("p1") is None
+        # FK cascade — p1's symbols gone.
+        assert db.get_pages_citing_node("n1") == []
+        # Sibling untouched.
+        assert db.get_wiki_page("p2") is not None
+        assert db.get_pages_citing_node("n2") == ["p2"]
+
+    def test_delete_wiki_page_idempotent_on_missing(
+        self, db: UnifiedWikiDB,
+    ) -> None:
+        """Missing page returns False instead of raising — the DELETED
+        regime can be retried safely after a partial-failure run."""
+        assert db.delete_wiki_page("never-existed") is False
+
+
+# ---------------------------------------------------------------------------
+# page_symbols
+# ---------------------------------------------------------------------------
+
+
+class TestRecordPageSymbols:
+    def test_basic_insert(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1"))
+        db.record_page_symbols(
+            "p1",
+            [("sym-1", "primary"), ("sym-2", "referenced"), ("sym-3", "related")],
+        )
+        rows = db.get_page_symbols("p1")
+        assert {(r["node_id"], r["citation_kind"]) for r in rows} == {
+            ("sym-1", "primary"),
+            ("sym-2", "referenced"),
+            ("sym-3", "related"),
+        }
+
+    def test_replace_true_clears_old_rows(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1"))
+        db.record_page_symbols("p1", [("sym-old", "referenced")])
+        db.record_page_symbols("p1", [("sym-new", "referenced")])  # default replace=True
+
+        rows = db.get_page_symbols("p1")
+        assert len(rows) == 1
+        assert rows[0]["node_id"] == "sym-new"
+
+    def test_replace_false_appends(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1"))
+        db.record_page_symbols("p1", [("sym-1", "referenced")], replace=False)
+        db.record_page_symbols("p1", [("sym-2", "referenced")], replace=False)
+
+        rows = db.get_page_symbols("p1")
+        assert {r["node_id"] for r in rows} == {"sym-1", "sym-2"}
+
+    def test_replace_false_idempotent_on_duplicate(self, db: UnifiedWikiDB) -> None:
+        # The PK is (page_id, node_id, citation_kind). Re-recording the same
+        # tuple must not raise — ON CONFLICT DO NOTHING / INSERT OR IGNORE.
+        db.upsert_wiki_page(_page("p1"))
+        db.record_page_symbols("p1", [("sym-1", "primary")], replace=False)
+        db.record_page_symbols("p1", [("sym-1", "primary")], replace=False)
+        rows = db.get_page_symbols("p1")
+        assert len(rows) == 1
+
+    def test_filter_by_citation_kind(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1"))
+        db.record_page_symbols(
+            "p1",
+            [("sym-1", "primary"), ("sym-2", "referenced"), ("sym-3", "referenced")],
+        )
+
+        primary = db.get_page_symbols("p1", citation_kind="primary")
+        referenced = db.get_page_symbols("p1", citation_kind="referenced")
+        assert {r["node_id"] for r in primary} == {"sym-1"}
+        assert {r["node_id"] for r in referenced} == {"sym-2", "sym-3"}
+
+
+class TestGetByCluster:
+    def test_filters_by_macro_only(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", anchor_slug="a", macro_cluster=0, micro_cluster=1))
+        db.upsert_wiki_page(_page("p2", anchor_slug="b", macro_cluster=0, micro_cluster=2))
+        db.upsert_wiki_page(_page("p3", anchor_slug="c", macro_cluster=1, micro_cluster=1))
+
+        rows = db.get_wiki_pages_by_cluster("wiki-1", macro_cluster=0)
+        assert {r["page_id"] for r in rows} == {"p1", "p2"}
+
+    def test_filters_by_macro_and_micro(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", anchor_slug="a", macro_cluster=0, micro_cluster=1))
+        db.upsert_wiki_page(_page("p2", anchor_slug="b", macro_cluster=0, micro_cluster=2))
+
+        rows = db.get_wiki_pages_by_cluster("wiki-1", macro_cluster=0, micro_cluster=1)
+        assert [r["page_id"] for r in rows] == ["p1"]
+
+    def test_scopes_by_wiki(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", wiki_id="w1", anchor_slug="a", macro_cluster=0))
+        db.upsert_wiki_page(_page("p2", wiki_id="w2", anchor_slug="b", macro_cluster=0))
+        rows = db.get_wiki_pages_by_cluster("w1", macro_cluster=0)
+        assert [r["page_id"] for r in rows] == ["p1"]
+
+
+class TestLastIndexedCommit:
+    def test_round_trip(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(
+            _page("p1", anchor_slug="a", last_indexed_commit="abc123def")
+        )
+        row = db.get_wiki_page("p1")
+        assert row["last_indexed_commit"] == "abc123def"
+
+    def test_defaults_to_null_when_omitted(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", anchor_slug="a"))
+        row = db.get_wiki_page("p1")
+        assert row["last_indexed_commit"] is None
+
+
+class TestPageSpecJson:
+    """#116 structural-handler wiring stores the planner's PageSpec as
+    JSON so regenerate_single_page can reconstruct it without re-running
+    the planner."""
+
+    def test_round_trip(self, db: UnifiedWikiDB) -> None:
+        payload = '{"page_name": "Auth", "target_symbols": ["AuthService"]}'
+        db.upsert_wiki_page(_page("p1", anchor_slug="a", page_spec_json=payload))
+        row = db.get_wiki_page("p1")
+        assert row["page_spec_json"] == payload
+
+    def test_defaults_to_null_when_omitted(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page(_page("p1", anchor_slug="a"))
+        row = db.get_wiki_page("p1")
+        assert row["page_spec_json"] is None
+
+    def test_malformed_json_rejected_by_check(self, db: UnifiedWikiDB) -> None:
+        """#138: CHECK json_valid surfaces corruption at write time
+        instead of when structural regen tries to deserialize."""
+        with pytest.raises(Exception):  # sqlite3.IntegrityError
+            db.upsert_wiki_page(
+                _page("p1", anchor_slug="a", page_spec_json="{not json"),
+            )
+        # Verify the row didn't land.
+        assert db.get_wiki_page("p1") is None
+
+
+class TestAtomicWrite:
+    """upsert_wiki_page_with_symbols must roll back both writes on failure
+    so PR 2 change detection never sees a half-persisted page."""
+
+    def test_happy_path_persists_both(self, db: UnifiedWikiDB) -> None:
+        db.upsert_wiki_page_with_symbols(
+            _page("p1"),
+            [("sym-1", "primary"), ("sym-2", "related")],
+        )
+        assert db.get_wiki_page("p1") is not None
+        rows = db.get_page_symbols("p1")
+        assert {(r["node_id"], r["citation_kind"]) for r in rows} == {
+            ("sym-1", "primary"),
+            ("sym-2", "related"),
+        }
+
+    def test_invalid_citation_kind_rolls_back_page_row(
+        self, db: UnifiedWikiDB,
+    ) -> None:
+        # CHECK constraint on citation_kind will reject 'bogus'; the page
+        # row inserted earlier in the same transaction must roll back too.
+        with pytest.raises(Exception):
+            db.upsert_wiki_page_with_symbols(
+                _page("p1"),
+                [("sym-1", "bogus")],  # CHECK fails on this row
+            )
+        assert db.get_wiki_page("p1") is None
+        assert db.get_pages_citing_node("sym-1") == []
+
+    def test_slug_collision_rolls_back_symbols(self, db: UnifiedWikiDB) -> None:
+        # First page takes the slug; second insert with same slug must
+        # raise IntegrityError, and its symbols must not land in the DB.
+        db.upsert_wiki_page_with_symbols(
+            _page("p1", anchor_slug="overview"),
+            [("sym-shared", "primary")],
+        )
+        with pytest.raises(Exception):
+            db.upsert_wiki_page_with_symbols(
+                _page("p2", anchor_slug="overview"),  # UNIQUE collision
+                [("sym-shared", "related"), ("sym-other", "related")],
+            )
+        # p2 row didn't land.
+        assert db.get_wiki_page("p2") is None
+        # sym-other wasn't inserted (it was only on p2's symbols).
+        assert db.get_pages_citing_node("sym-other") == []
+        # p1's symbols survived intact.
+        assert "p1" in db.get_pages_citing_node("sym-shared")
+
+
+class TestReverseLookup:
+    def test_get_pages_citing_node_dedupes_across_kinds(self, db: UnifiedWikiDB) -> None:
+        # One node may appear as primary on one page and referenced on another.
+        db.upsert_wiki_page(_page("p1", anchor_slug="p1"))
+        db.upsert_wiki_page(_page("p2", anchor_slug="p2"))
+        db.record_page_symbols("p1", [("sym-1", "primary")])
+        db.record_page_symbols("p2", [("sym-1", "referenced")])
+
+        cited_by = db.get_pages_citing_node("sym-1")
+        assert sorted(cited_by) == ["p1", "p2"]
+
+    def test_get_pages_citing_node_returns_empty_for_unknown(
+        self, db: UnifiedWikiDB,
+    ) -> None:
+        assert db.get_pages_citing_node("missing") == []

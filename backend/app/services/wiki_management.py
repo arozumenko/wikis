@@ -44,11 +44,22 @@ class WikiManagementService:
         status: str = "complete",
         requires_token: bool = False,
         error: str | None = None,
+        source_type: str | None = None,
+        source_scope: dict | None = None,
     ) -> None:
         """Upsert a wiki record into the database.
 
         Called at generation START (status='generating') and again on
         completion/failure so the record always exists for retry/404 recovery.
+
+        Args:
+            source_type: Connector type — "git", "confluence", or "jira".
+                         NULL in legacy rows is read as "git" by the service.
+            source_scope: Scope dict identifying the content origin (no credentials).
+                         For git: {"repo_url": ..., "branch": ...}.
+                         For Confluence: {"base_url": ..., "space_keys": [...]}.
+                         For Jira: {"base_url": ..., "jql": ...}.
+                         Credentials (access_token etc.) are NEVER stored here.
         """
         async with self.session_factory() as session:
             async with session.begin():
@@ -56,6 +67,7 @@ class WikiManagementService:
                 record = result.scalar_one_or_none()
 
                 now = datetime.now()
+
                 if record is None:
                     record = WikiRecord(
                         id=wiki_id,
@@ -72,6 +84,8 @@ class WikiManagementService:
                         status=status,
                         requires_token=1 if requires_token else 0,
                         error=error,
+                        source_type=source_type or "git",
+                        source_scope=source_scope,
                     )
                     session.add(record)
                 else:
@@ -95,6 +109,11 @@ class WikiManagementService:
                         # Only overwrite visibility when explicitly non-default or on fresh start
                         if visibility != "personal":
                             record.visibility = visibility
+                    # Update source_type / source_scope when provided.
+                    if source_type is not None:
+                        record.source_type = source_type
+                    if source_scope is not None:
+                        record.source_scope = source_scope
 
         logger.info("Registered wiki: %s (owner=%s, status=%s)", wiki_id, owner_id, status)
 
@@ -371,11 +390,16 @@ class WikiManagementService:
         )
 
 
-def _derive_cache_key(cache_dir: str, repo_url: str, branch: str) -> str | None:
+def derive_cache_key(cache_dir: str, repo_url: str, branch: str) -> str | None:
     """Read cache_index.json and return the cache_key for this repo+branch, or None.
 
     The cache key is the opaque string stored in cache_index.json that maps a
     repo+branch identifier to its set of on-disk FAISS/BM25/graph cache files.
+
+    Public stable entry point. ``_derive_cache_key`` is kept as an alias
+    so existing internal callers continue to work; new callers (notably
+    the MCP graph tools in ``mcp_server.server``) should use this name
+    so they don't depend on a leading-underscore symbol.
 
     Args:
         cache_dir: Directory that contains ``cache_index.json``.
@@ -409,6 +433,14 @@ def _derive_cache_key(cache_dir: str, repo_url: str, branch: str) -> str | None:
     resolved = index.get("refs", {}).get(repo_identifier, repo_identifier)
     cache_key = index.get(resolved) or index.get(repo_identifier)
     return cache_key or None
+
+
+# Backwards-compat alias for the historical private name. Existing
+# internal callers (api/routes.py, wiki_service, export_service, and
+# several tests) reference ``_derive_cache_key`` — keep that import
+# path working while ``derive_cache_key`` is the canonical name for
+# new code (#121).
+_derive_cache_key = derive_cache_key
 
 
 def _cleanup_cache_files(cache_dir: str, repo_url: str, branch: str) -> None:

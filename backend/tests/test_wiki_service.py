@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -338,3 +340,386 @@ class TestWikiServiceRoutes:
         ):
             resp = await c.delete("/api/v1/invocations/inv-1")
             assert resp.status_code == 404
+
+
+class TestLoadPersistedInvocationsOrphanSweep:
+    """#146 Gap 1: ``load_persisted_invocations`` must flip ALL orphaned
+    non-terminal statuses (``"generating"`` AND ``"running"``) to
+    ``"failed"`` on startup. Before the fix, only ``"generating"`` was
+    swept — leaving stranded incremental refreshes to 409-lock the
+    wiki on the next request after a server restart.
+    """
+
+    @pytest.mark.asyncio
+    async def test_running_status_swept_on_load(self, storage) -> None:
+        # Pre-seed the persistence layer with a stranded "running"
+        # invocation (no live task — simulates a server restart
+        # mid-incremental-refresh).
+        #
+        # Use a created_at slightly in the past so the test doesn't
+        # depend on clock skew.
+        seeded = {
+            "stranded-inv-1": {
+                "id": "stranded-inv-1",
+                "wiki_id": "wiki-A",
+                "repo_url": "https://github.com/x/y",
+                "branch": "main",
+                "owner_id": "u1",
+                "status": "running",
+                "created_at": (datetime.now() - timedelta(minutes=10)).isoformat(),
+            },
+            "stranded-inv-2": {
+                "id": "stranded-inv-2",
+                "wiki_id": "wiki-B",
+                "repo_url": "https://github.com/x/y",
+                "branch": "main",
+                "owner_id": "u1",
+                "status": "generating",
+                "created_at": (datetime.now() - timedelta(minutes=10)).isoformat(),
+            },
+        }
+        raw = json.dumps(seeded).encode("utf-8")
+        await storage.upload(
+            WikiService.INVOCATIONS_BUCKET,
+            WikiService.INVOCATIONS_KEY,
+            raw,
+        )
+
+        service = WikiService(_settings(), storage)
+        await service.load_persisted_invocations()
+
+        # Both stranded entries flipped to "failed". Pre-fix, only the
+        # "generating" one would have been swept; "running" would have
+        # silently stayed in-flight and 409-locked the wiki.
+        for inv_id in ("stranded-inv-1", "stranded-inv-2"):
+            assert inv_id in service._invocations
+            inv = service._invocations[inv_id]
+            assert inv.status == "failed", (
+                f"{inv_id} still {inv.status!r} after sweep"
+            )
+            assert inv.completed_at is not None
+            assert "Server restarted" in (inv.error or "")
+
+    @pytest.mark.asyncio
+    async def test_terminal_statuses_not_touched_on_load(self, storage) -> None:
+        """Already-terminal statuses must NOT be flipped — they're
+        legitimate prior-run records that the cleanup-purge can later
+        reclaim. Without this guard, the sweep would clobber the
+        history of completed runs."""
+        seeded = {
+            "done-inv": {
+                "id": "done-inv",
+                "wiki_id": "wiki-C",
+                "repo_url": "https://github.com/x/y",
+                "branch": "main",
+                "owner_id": "u1",
+                "status": "complete",
+                "created_at": datetime.now().isoformat(),
+                "completed_at": datetime.now().isoformat(),
+            },
+            "failed-inv": {
+                "id": "failed-inv",
+                "wiki_id": "wiki-D",
+                "repo_url": "https://github.com/x/y",
+                "branch": "main",
+                "owner_id": "u1",
+                "status": "failed",
+                "created_at": datetime.now().isoformat(),
+                "completed_at": datetime.now().isoformat(),
+            },
+        }
+        raw = json.dumps(seeded).encode("utf-8")
+        await storage.upload(
+            WikiService.INVOCATIONS_BUCKET,
+            WikiService.INVOCATIONS_KEY,
+            raw,
+        )
+
+        service = WikiService(_settings(), storage)
+        await service.load_persisted_invocations()
+
+        assert service._invocations["done-inv"].status == "complete"
+        assert service._invocations["failed-inv"].status == "failed"
+
+
+class TestWikiServiceShutdown:
+    """Regression guard for CI segfault on fixture teardown.
+
+    The crash happened when ``pytest_asyncio`` closed the event loop
+    while a background task was still awaiting ``asyncio.to_thread()``
+    for SQLite work. Cancellation interrupts the await but leaves the
+    OS thread running against soon-to-be-closed storage.
+    ``WikiService.shutdown()`` must wait for the task — and through it,
+    the worker thread — to finish naturally before returning.
+    """
+
+    @pytest.mark.asyncio
+    async def test_shutdown_waits_for_to_thread_workers_to_finish(self, service):
+        """A task that internally calls ``asyncio.to_thread`` must be
+        awaited to completion — the thread keeps running even if the
+        asyncio.Task is cancelled, so we explicitly do NOT cancel.
+
+        Without ``shutdown()``, this exact pattern is what segfaults
+        in CI: shutdown returns, the loop closes, the OS thread keeps
+        writing to a connection that's already closed.
+        """
+        import time
+
+        thread_finished = False
+
+        def slow_thread_work():
+            # Tiny sleep simulates the SQLite FTS rebuild that
+            # actually segfaults in CI when interrupted mid-flight.
+            time.sleep(0.05)
+            nonlocal thread_finished
+            thread_finished = True
+
+        async def run_with_to_thread():
+            await asyncio.to_thread(slow_thread_work)
+
+        task = asyncio.create_task(run_with_to_thread())
+        service._tasks["test-invocation"] = task
+
+        # Shutdown should block until the to_thread worker drains.
+        shutdown_started = time.monotonic()
+        await service.shutdown(timeout=5.0)
+        elapsed = time.monotonic() - shutdown_started
+
+        assert task.done()
+        assert thread_finished, (
+            "shutdown() returned before the worker thread finished — "
+            "this is the exact race that causes CI segfaults"
+        )
+        # Shutdown must have actually waited, not returned instantly.
+        assert elapsed >= 0.04, (
+            f"shutdown returned in {elapsed:.3f}s — it should have "
+            f"waited for the ~0.05s worker thread to finish"
+        )
+
+    @pytest.mark.asyncio
+    async def test_shutdown_is_a_noop_when_no_tasks_pending(self, service):
+        """Should not raise or hang when there's nothing to drain."""
+        await service.shutdown(timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_cancel_pending_tasks(self, service):
+        """Cancelling would mark the task done but leave the inner
+        thread running — the bug we're guarding against. Verify
+        ``shutdown`` lets tasks complete instead of cancelling."""
+        completed = False
+
+        async def finish_naturally():
+            nonlocal completed
+            await asyncio.sleep(0.05)
+            completed = True
+
+        task = asyncio.create_task(finish_naturally())
+        service._tasks["nat"] = task
+
+        await service.shutdown(timeout=2.0)
+
+        assert task.done()
+        assert not task.cancelled(), (
+            "task was cancelled instead of awaited — the underlying "
+            "to_thread worker would still be running"
+        )
+        assert completed
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_cancel_to_thread_tasks(self, service):
+        """The QA + tech-lead review on PR #165 pointed out that the
+        first ``does_not_cancel`` test uses ``asyncio.sleep``, not
+        ``asyncio.to_thread`` — so it doesn't actually exercise the
+        case that segfaults in CI. This variant uses the real
+        to_thread pattern: verifies that the asyncio.Task completes
+        normally (not cancelled) AND the worker thread runs to
+        completion."""
+        import time
+
+        thread_finished = False
+
+        def slow_thread_work():
+            time.sleep(0.05)
+            nonlocal thread_finished
+            thread_finished = True
+
+        async def run_with_to_thread():
+            await asyncio.to_thread(slow_thread_work)
+
+        task = asyncio.create_task(run_with_to_thread())
+        service._tasks["tt"] = task
+
+        await service.shutdown(timeout=5.0)
+
+        assert task.done()
+        assert not task.cancelled(), (
+            "to_thread-wrapped task was cancelled — the worker thread "
+            "would still be running against soon-closed storage"
+        )
+        assert thread_finished
+
+    @pytest.mark.asyncio
+    async def test_shutdown_swallows_task_exceptions(self, service):
+        """``return_exceptions=True`` on the gather: shutdown should
+        not re-raise an error from one task and abandon the others."""
+
+        async def boom():
+            raise RuntimeError("simulated failure inside task")
+
+        async def slow_ok():
+            await asyncio.sleep(0.05)
+
+        task_bad = asyncio.create_task(boom())
+        task_good = asyncio.create_task(slow_ok())
+        service._tasks["bad"] = task_bad
+        service._tasks["good"] = task_good
+
+        # Must not raise.
+        await service.shutdown(timeout=2.0)
+
+        assert task_bad.done()
+        assert task_good.done()
+        # Consume the exception so pytest doesn't warn about an
+        # un-retrieved task exception.
+        assert task_bad.exception() is not None
+
+    @pytest.mark.asyncio
+    async def test_shutdown_logs_and_returns_on_timeout(
+        self, service, caplog,
+    ):
+        """A task that won't finish within the timeout should not
+        block shutdown forever — it logs and returns."""
+
+        async def never_finish():
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(never_finish())
+        service._tasks["wedged"] = task
+
+        with caplog.at_level("ERROR"):
+            await service.shutdown(timeout=0.1)
+
+        assert any(
+            "WikiService.shutdown timeout" in rec.message
+            for rec in caplog.records
+        )
+        # Clean up the still-pending task so pytest doesn't warn.
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_cancel_on_timeout(self, service):
+        """Reviewer-flagged Critical regression test: the timeout
+        path must NOT cancel still-pending tasks. An earlier draft
+        used ``asyncio.wait_for(gather(...))`` which cancelled the
+        children on timeout — reintroducing the original segfault.
+        """
+        async def slow():
+            await asyncio.sleep(0.5)
+
+        task = asyncio.create_task(slow())
+        service._tasks["slow"] = task
+
+        await service.shutdown(timeout=0.05)
+
+        # The task should still be pending — shutdown bailed without
+        # cancelling. Its worker thread (if any) is free to finish.
+        assert not task.done()
+        assert not task.cancelled()
+
+        # Clean up so pytest doesn't warn about a dangling task.
+        await task
+
+    @pytest.mark.asyncio
+    async def test_cancel_invocation_refused_during_shutdown(self, service):
+        """#165 follow-up: a concurrent ``DELETE /invocations/{id}``
+        during the shutdown drain window must NOT cancel a task that
+        ``shutdown()`` is awaiting. Cancellation marks the asyncio.Task
+        done while leaving the worker thread mid-write — the exact
+        race the shutdown drain exists to prevent."""
+        async def slow():
+            await asyncio.sleep(0.2)
+
+        task = asyncio.create_task(slow())
+        service._tasks["inv-1"] = task
+        service._invocations["inv-1"] = Invocation(
+            id="inv-1",
+            wiki_id="w",
+            repo_url="https://example.invalid",
+            branch="main",
+            status="generating",
+        )
+
+        # Simulate the drain window: shutdown has started, mid-await.
+        service._shutting_down = True
+
+        cancelled = await service.cancel_invocation("inv-1")
+        assert cancelled is False
+        assert not task.cancelled()
+        assert not task.done()
+
+        # Clean up so pytest doesn't warn.
+        await task
+
+    @pytest.mark.asyncio
+    async def test_cancel_invocation_works_normally_when_not_shutting_down(
+        self, service,
+    ):
+        """The shutdown guard must not break the happy path."""
+        async def slow():
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(slow())
+        service._tasks["inv-1"] = task
+        service._invocations["inv-1"] = Invocation(
+            id="inv-1",
+            wiki_id="w",
+            repo_url="https://example.invalid",
+            branch="main",
+            status="generating",
+        )
+
+        cancelled = await service.cancel_invocation("inv-1")
+        assert cancelled is True
+        # The cancel takes effect on the next loop turn.
+        await asyncio.sleep(0)
+        assert task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_sets_shutting_down_flag(self, service):
+        """The drain-vs-cancel guard depends on this flag being set
+        before pending tasks are snapshotted — verify the
+        invariant."""
+        assert service._shutting_down is False
+        await service.shutdown(timeout=1.0)
+        assert service._shutting_down is True
+
+    @pytest.mark.asyncio
+    async def test_lifespan_passes_configured_shutdown_timeout(
+        self, tmp_path, monkeypatch,
+    ):
+        """#165 follow-up: ``Settings.wiki_shutdown_timeout_s`` must
+        flow from env → Settings → lifespan → WikiService.shutdown.
+        Without this wiring the env knob is dead config."""
+        monkeypatch.setenv("WIKI_SHUTDOWN_TIMEOUT_S", "7")
+        monkeypatch.setenv("LLM_API_KEY", "test-key")
+        monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+
+        captured: list[float] = []
+
+        async def fake_shutdown(self, timeout: float = 30.0) -> None:
+            captured.append(timeout)
+
+        with patch.object(WikiService, "shutdown", fake_shutdown):
+            app = create_app()
+            async with app.router.lifespan_context(app):
+                pass  # Lifespan startup + teardown only — shutdown
+                # fires on context exit.
+
+        assert captured == [7.0], (
+            f"expected lifespan to forward configured timeout to "
+            f"WikiService.shutdown, got {captured}"
+        )

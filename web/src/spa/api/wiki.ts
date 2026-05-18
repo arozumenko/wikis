@@ -3,6 +3,51 @@ import type { components } from './types.generated';
 
 type GenerateWikiRequest = components['schemas']['GenerateWikiRequest'];
 type GenerateWikiResponse = components['schemas']['GenerateWikiResponse'];
+
+// ---------------------------------------------------------------------------
+// Multi-source wiki generation (POST /api/v1/wikis — new API shape, #117/#189)
+// ---------------------------------------------------------------------------
+
+export type WikiSourceType = 'git' | 'confluence' | 'jira';
+
+export interface GitScope {
+  repo_url: string;
+  branch: string;
+}
+
+export interface ConfluenceScope {
+  base_url: string;
+  space_keys: string[];
+}
+
+export interface JiraScope {
+  base_url: string;
+  jql: string;
+}
+
+export interface GitAuth {
+  pat: string | null;
+}
+
+export interface AtlassianAuth {
+  access_token: string;
+  refresh_token: string | null;
+  client_id: string | null;
+}
+
+export interface GenerateWikiMultiSourceRequest {
+  source_type: WikiSourceType;
+  scope: GitScope | ConfluenceScope | JiraScope;
+  auth: GitAuth | AtlassianAuth;
+  wiki_title?: string;
+  structure_planner?: 'agentic' | 'graph_clustering';
+}
+
+export const generateWikiMultiSource = (req: GenerateWikiMultiSourceRequest) =>
+  apiRequest<GenerateWikiResponse>('/api/v1/wikis', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  });
 type AskRequest = components['schemas']['AskRequest'];
 type AskResponse = components['schemas']['AskResponse'];
 type ResearchRequest = components['schemas']['ResearchRequest'];

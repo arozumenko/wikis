@@ -606,6 +606,7 @@ class ResearchService:
                         symbol=s.get("symbol"),
                         symbol_type=s.get("symbol_type") or s.get("type"),
                         relevance_score=s.get("relevance_score"),
+                        confidence=s.get("confidence"),  # #120
                     )
                     for s in raw_sources
                     if isinstance(s, dict)

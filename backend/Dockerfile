@@ -1,6 +1,16 @@
 FROM python:3.11-slim
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ curl git libsqlite3-dev && rm -rf /var/lib/apt/lists/*
+# Base build deps + #118 phase 2 Office extractor system dep (LibreOffice).
+# libreoffice-core + writer/calc/impress give us .docx/.xlsx/.pptx → PDF
+# headless conversion (~500MB image bloat, acceptable for docs-heavy
+# repo ingestion which is the headline feature this image enables).
+# The OfficeExtractor degrades soft if soffice is missing, so dropping
+# these packages later just disables Office ingestion without breaking
+# the rest of the backend.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ curl git libsqlite3-dev \
+        libreoffice-core libreoffice-writer libreoffice-calc libreoffice-impress \
+    && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml .
 RUN pip install --no-cache-dir -e ".[dev,all-providers]"
 COPY . .

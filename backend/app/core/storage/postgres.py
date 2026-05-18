@@ -31,6 +31,7 @@ import networkx as nx
 from sqlalchemy import (
     Column,
     Float,
+    ForeignKeyConstraint,
     Index,
     Integer,
     MetaData,
@@ -49,107 +50,17 @@ from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Compatibility layer for raw conn.execute(SQL, (params,)) callers
-# ---------------------------------------------------------------------------
-
-class _CompatRow:
-    """Row wrapper supporting both index access ``row[0]`` and dict ``row['col']``."""
-
-    __slots__ = ("_values", "_keys")
-
-    def __init__(self, keys: tuple, values: tuple):
-        self._keys = keys
-        self._values = values
-
-    def __getitem__(self, idx):
-        if isinstance(idx, str):
-            try:
-                return self._values[self._keys.index(idx)]
-            except ValueError:
-                raise KeyError(idx) from None
-        return self._values[idx]
-
-    def keys(self):
-        return self._keys
-
-    def __iter__(self):
-        return iter(self._values)
-
-    def __len__(self):
-        return len(self._values)
+from ._helpers import warn_if_truncated as _shared_warn_if_truncated  # noqa: E402
+from .incremental import compute_content_hash  # noqa: E402
 
 
-class _CompatResultSet:
-    """Thin result proxy returned by ``_ConnCompat.execute``."""
+def _warn_if_truncated(rows: list[Any], limit: int | None, method: str, **ctx: Any) -> None:
+    """Backend-scoped wrapper around the shared truncation warning helper.
 
-    __slots__ = ("_rows",)
-
-    def __init__(self, rows: list[_CompatRow]):
-        self._rows = rows
-
-    def fetchall(self):
-        return self._rows
-
-    def fetchone(self):
-        return self._rows[0] if self._rows else None
-
-
-class _ConnCompat:
-    """Makes a SQLAlchemy engine quack like a :class:`sqlite3.Connection`.
-
-    Translates ``?``-placeholder SQL into ``:pN``-named-parameter SQL,
-    sets ``search_path`` to the repository schema, and wraps result rows
-    so they support both integer-index and dict-key access.
-
-    Only used by legacy callers that still pass ``db.conn``.
+    Preserves ``app.core.storage.postgres`` as the logger name on the
+    emitted record so operators can filter by backend.
     """
-
-    def __init__(self, engine: Engine, schema: str):
-        self._engine = engine
-        self._schema = schema
-
-    # noinspection PyMethodMayBeStatic
-    def _adapt(self, sql: str, params: tuple | list | None):
-        """Convert ``?`` placeholders → ``:p0, :p1, …`` and build param dict."""
-        if params is None:
-            return sql, {}
-        named: dict[str, Any] = {}
-        idx = 0
-        parts: list[str] = []
-        for ch in sql:
-            if ch == "?":
-                name = f"p{idx}"
-                parts.append(f":{name}")
-                named[name] = params[idx]
-                idx += 1
-            else:
-                parts.append(ch)
-        return "".join(parts), named
-
-    def execute(self, sql: str, params=None):
-        adapted_sql, named_params = self._adapt(sql, params)
-        with self._engine.begin() as conn:
-            conn.execute(text(f"SET search_path TO {self._schema}, public"))
-            result = conn.execute(text(adapted_sql), named_params)
-            # DML statements (UPDATE/INSERT/DELETE without RETURNING) produce a
-            # Result with ``returns_rows == False``.  SQLAlchemy auto-closes
-            # those, so calling ``.fetchall()`` raises "This result object does
-            # not return rows.  It has been closed automatically."
-            if not result.returns_rows:
-                return _CompatResultSet([])
-            keys = tuple(result.keys())
-            rows = [_CompatRow(keys, tuple(r)) for r in result.fetchall()]
-            return _CompatResultSet(rows)
-
-    def commit(self) -> None:
-        """No-op: every :meth:`execute` already commits via ``engine.begin()``.
-
-        Kept for API parity with :class:`sqlite3.Connection` so legacy
-        callers (``persist_clusters`` etc.) work unchanged.
-        """
-        return None
+    _shared_warn_if_truncated(rows, limit, method, logger=logger, **ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +115,9 @@ def _define_tables(
     schema: str | None,
     embedding_dim: int,
     vec_available: bool,
-) -> tuple[Table, Table, Table, Table | None]:
-    """Define SQLAlchemy Table objects for nodes, edges, metadata, and optionally vectors."""
+) -> tuple[Table, Table, Table, Table | None, Table, Table]:
+    """Define SQLAlchemy Table objects for nodes, edges, metadata, vectors,
+    wiki_pages, and page_symbols."""
 
     nodes = Table(
         "repo_nodes",
@@ -225,6 +137,11 @@ def _define_tables(
         Column("signature", Text, server_default=""),
         Column("parameters", Text, server_default=""),
         Column("return_type", Text, server_default=""),
+        # #116 incremental regen: sha256 hex of normalize(source_text)
+        Column("content_hash", Text),
+        # #116 PR 4: snapshot of content_hash at last embedding; lets
+        # populate_embeddings skip nodes whose source is unchanged.
+        Column("embedding_content_hash", Text),
         Column("is_architectural", Integer, server_default="0"),
         Column("is_doc", Integer, server_default="0"),
         Column("is_test", Integer, server_default="0"),
@@ -283,7 +200,49 @@ def _define_tables(
             schema=schema,
         )
 
-    return nodes, edges, meta, vec_table
+    # #116 incremental regen — wiki page registry + source→page reverse index.
+    # See the matching DDL comment block in storage/sqlite.py for semantics.
+    wiki_pages = Table(
+        "wiki_pages",
+        metadata,
+        Column("page_id", Text, primary_key=True),
+        Column("wiki_id", Text, nullable=False),
+        Column("id_scheme", Text, nullable=False, server_default="stable_v1"),
+        Column("title", Text, nullable=False, server_default=""),
+        Column("anchor_slug", Text, nullable=False, server_default=""),
+        Column("content_hash", Text),
+        Column("macro_cluster", Integer),
+        Column("micro_cluster", Integer),
+        Column("primary_symbol_id", Text),
+        Column("section_index", Integer, server_default="0"),
+        Column("page_index", Integer, server_default="0"),
+        # #116 PR 2: git rev / source-state identifier for the repo snapshot
+        # this page was generated against. Fast-exit on "repo unchanged".
+        Column("last_indexed_commit", Text),
+        # #116 PR 3 structural-handler wiring: planner's PageSpec as JSON.
+        Column("page_spec_json", Text),
+        Column("generated_at", Text),
+        schema=schema,
+    )
+
+    # Match SQLite: FK to wiki_pages with ON DELETE CASCADE so
+    # delete_wiki_pages cleans up the reverse index automatically. Without
+    # this, dropping a wiki on Postgres leaves orphan page_symbols rows.
+    page_symbols = Table(
+        "page_symbols",
+        metadata,
+        Column("page_id", Text, primary_key=True),
+        Column("node_id", Text, primary_key=True),
+        Column("citation_kind", Text, primary_key=True),
+        ForeignKeyConstraint(
+            ["page_id"],
+            [f"{schema}.wiki_pages.page_id"] if schema else ["wiki_pages.page_id"],
+            ondelete="CASCADE",
+        ),
+        schema=schema,
+    )
+
+    return nodes, edges, meta, vec_table, wiki_pages, page_symbols
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -336,7 +295,14 @@ class PostgresWikiStorage:
         self._vec_available = _PGVECTOR_AVAILABLE
         self._sa_meta = MetaData()
 
-        self._nodes, self._edges, self._meta_table, self._vec_table = _define_tables(
+        (
+            self._nodes,
+            self._edges,
+            self._meta_table,
+            self._vec_table,
+            self._wiki_pages,
+            self._page_symbols,
+        ) = _define_tables(
             self._sa_meta, self._schema, embedding_dim, self._vec_available,
         )
 
@@ -461,6 +427,141 @@ class PostgresWikiStorage:
                     END IF;
                 END $$;
             """))
+
+            # #116 incremental regen — backfill content_hash + page tables
+            # on legacy schemas. New schemas already have these via create_all.
+            conn.execute(text(f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_nodes'
+                          AND column_name = 'content_hash'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_nodes ADD COLUMN content_hash TEXT;
+                    END IF;
+                    -- #116 PR 4: embedding_content_hash for skip-if-unchanged.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_nodes'
+                          AND column_name = 'embedding_content_hash'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_nodes
+                            ADD COLUMN embedding_content_hash TEXT;
+                    END IF;
+                    -- #116 PR 2 prep: last_indexed_commit on wiki_pages.
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = '{schema}' AND table_name = 'wiki_pages'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'wiki_pages'
+                          AND column_name = 'last_indexed_commit'
+                    ) THEN
+                        ALTER TABLE {schema}.wiki_pages
+                            ADD COLUMN last_indexed_commit TEXT;
+                    END IF;
+                    -- #116 PR 3 structural-handler wiring: page_spec_json.
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = '{schema}' AND table_name = 'wiki_pages'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'wiki_pages'
+                          AND column_name = 'page_spec_json'
+                    ) THEN
+                        ALTER TABLE {schema}.wiki_pages
+                            ADD COLUMN page_spec_json TEXT;
+                    END IF;
+                    -- #138: validate JSON well-formedness at write time
+                    -- so corruption surfaces during the upsert instead
+                    -- of when structural regen tries to deserialize.
+                    -- Idempotent: only fires when the constraint is missing.
+                    --
+                    -- ``NOT VALID`` adds the constraint without scanning
+                    -- existing rows — new INSERTs/UPDATEs are validated
+                    -- but legacy corrupt rows (if any) stay accessible.
+                    -- This is the safer migration default: a botched
+                    -- earlier write should not block the deploy. After
+                    -- a clean-up run, an operator can promote it with
+                    --   ALTER TABLE … VALIDATE CONSTRAINT …;
+                    -- to gain the existing-row guarantee.
+                    --
+                    -- The EXCEPTION block stays as a defensive net for
+                    -- any other DDL-time failure (privileges, locked
+                    -- table) — it RAISEs WARNING (not NOTICE) so the
+                    -- message hits server logs by default + most
+                    -- driver-side handlers (psycopg2 conn.notices /
+                    -- psycopg3 notice handlers). NOTICE is below the
+                    -- default log_min_messages threshold and gets
+                    -- silently swallowed in most deploy configurations.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'wiki_pages_page_spec_json_chk'
+                          AND connamespace = '{schema}'::regnamespace
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE {schema}.wiki_pages
+                                ADD CONSTRAINT wiki_pages_page_spec_json_chk
+                                CHECK (page_spec_json IS NULL
+                                       OR (page_spec_json::json IS NOT NULL))
+                                NOT VALID;
+                        EXCEPTION WHEN undefined_table THEN
+                            -- Table genuinely missing; first-run init
+                            -- handles the column + constraint via the
+                            -- main DDL path. Safe to skip.
+                            NULL;
+                        WHEN OTHERS THEN
+                            RAISE WARNING 'wiki_pages_page_spec_json_chk migration skipped: %', SQLERRM;
+                        END;
+                    END IF;
+                    -- page tables / CHECK constraints
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'wiki_pages_id_scheme_chk'
+                          AND connamespace = '{schema}'::regnamespace
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE {schema}.wiki_pages
+                                ADD CONSTRAINT wiki_pages_id_scheme_chk
+                                CHECK (id_scheme IN ('legacy','stable_v1'));
+                        EXCEPTION WHEN undefined_table THEN
+                            -- create_all() not yet run (shouldn't happen, but safe)
+                            NULL;
+                        END;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'page_symbols_kind_chk'
+                          AND connamespace = '{schema}'::regnamespace
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE {schema}.page_symbols
+                                ADD CONSTRAINT page_symbols_kind_chk
+                                CHECK (citation_kind IN ('primary','referenced','related'));
+                        EXCEPTION WHEN undefined_table THEN
+                            NULL;
+                        END;
+                    END IF;
+                    -- #116: FK with ON DELETE CASCADE so delete_wiki_pages
+                    -- cleans up the page_symbols reverse index. Idempotent.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'page_symbols_page_id_fkey'
+                          AND connamespace = '{schema}'::regnamespace
+                    ) THEN
+                        BEGIN
+                            ALTER TABLE {schema}.page_symbols
+                                ADD CONSTRAINT page_symbols_page_id_fkey
+                                FOREIGN KEY (page_id)
+                                REFERENCES {schema}.wiki_pages(page_id)
+                                ON DELETE CASCADE;
+                        EXCEPTION WHEN undefined_table THEN
+                            NULL;
+                        END;
+                    END IF;
+                END $$;
+            """))
         indexes = [
             f"CREATE INDEX IF NOT EXISTS idx_nodes_path ON {schema}.repo_nodes(rel_path)",
             f"CREATE INDEX IF NOT EXISTS idx_nodes_name ON {schema}.repo_nodes(symbol_name)",
@@ -472,12 +573,20 @@ class PostgresWikiStorage:
             f"CREATE INDEX IF NOT EXISTS idx_nodes_arch ON {schema}.repo_nodes(is_architectural) WHERE is_architectural = 1",
             f"CREATE INDEX IF NOT EXISTS idx_nodes_hub ON {schema}.repo_nodes(is_hub) WHERE is_hub = 1",
             f"CREATE INDEX IF NOT EXISTS idx_nodes_test ON {schema}.repo_nodes(is_test) WHERE is_test = 1",
+            f"CREATE INDEX IF NOT EXISTS idx_nodes_hash ON {schema}.repo_nodes(content_hash) WHERE content_hash IS NOT NULL",
             f"CREATE INDEX IF NOT EXISTS idx_edges_source ON {schema}.repo_edges(source_id)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_target ON {schema}.repo_edges(target_id)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_type ON {schema}.repo_edges(rel_type)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_class ON {schema}.repo_edges(edge_class)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_weight ON {schema}.repo_edges(weight)",
             f"CREATE INDEX IF NOT EXISTS idx_edges_confidence ON {schema}.repo_edges(confidence)",
+            # #116 wiki_pages + page_symbols
+            f"CREATE INDEX IF NOT EXISTS idx_pages_wiki ON {schema}.wiki_pages(wiki_id)",
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_slug ON {schema}.wiki_pages(wiki_id, anchor_slug)",
+            f"CREATE INDEX IF NOT EXISTS idx_pages_primary ON {schema}.wiki_pages(primary_symbol_id)",
+            f"CREATE INDEX IF NOT EXISTS idx_pages_cluster ON {schema}.wiki_pages(macro_cluster, micro_cluster)",
+            f"CREATE INDEX IF NOT EXISTS idx_page_symbols_node ON {schema}.page_symbols(node_id)",
+            f"CREATE INDEX IF NOT EXISTS idx_page_symbols_kind ON {schema}.page_symbols(citation_kind)",
         ]
         with self._engine.begin() as conn:
             for ddl in indexes:
@@ -491,15 +600,6 @@ class PostgresWikiStorage:
     def db_path(self) -> Path:
         """Sentinel path for PostgreSQL backend."""
         return Path(f"postgres:{self._schema}")
-
-    @property
-    def conn(self):
-        """Return a compatibility wrapper that quacks like sqlite3.Connection.
-
-        Used by ``shared_expansion.py`` and ``language_heuristics.py`` which
-        still call ``db.conn.execute(SQL, (params,))``.
-        """
-        return _ConnCompat(self._engine, self._schema)
 
     @property
     def vec_available(self) -> bool:
@@ -613,6 +713,10 @@ class PostgresWikiStorage:
             api_surface = json.dumps(api_surface)
 
         _s = self._strip_nul
+        source_text = _s(n.get("source_text", ""))
+        content_hash = n.get("content_hash")
+        if content_hash is None and source_text:
+            content_hash = compute_content_hash(source_text)
         return {
             "node_id": _s(n["node_id"]),
             "rel_path": _s(rel_path),
@@ -624,11 +728,12 @@ class PostgresWikiStorage:
             "symbol_type": _s(symbol_type),
             "parent_symbol": _s(n.get("parent_symbol")),
             "analysis_level": _s(n.get("analysis_level", "comprehensive")),
-            "source_text": _s(n.get("source_text", "")),
+            "source_text": source_text,
             "docstring": _s(n.get("docstring", "")),
             "signature": _s(n.get("signature", "")),
             "parameters": _s(params),
             "return_type": _s(n.get("return_type", "")),
+            "content_hash": content_hash,
             "is_architectural": is_arch,
             "is_doc": is_doc,
             "is_test": is_test,
@@ -704,31 +809,45 @@ class PostgresWikiStorage:
             return [self._row_to_dict(r) for r in rows]
 
     def get_nodes_by_cluster(
-        self, macro: int, micro: int | None = None, limit: int = 1000,
+        self, macro: int, micro: int | None = None, limit: int | None = 1000,
     ) -> list[dict[str, Any]]:
+        """Pass ``limit=None`` to disable the row cap."""
         with self._engine.connect() as conn:
             if micro is not None:
+                base_sql = (
+                    f"SELECT * FROM {self._schema}.repo_nodes "
+                    "WHERE macro_cluster = :macro AND micro_cluster = :micro"
+                )
+                params: dict[str, Any] = {"macro": macro, "micro": micro}
+            else:
+                base_sql = (
+                    f"SELECT * FROM {self._schema}.repo_nodes WHERE macro_cluster = :macro"
+                )
+                params = {"macro": macro}
+            if limit is not None:
+                params["lim"] = limit
+                rows = conn.execute(text(base_sql + " LIMIT :lim"), params).fetchall()
+            else:
+                rows = conn.execute(text(base_sql), params).fetchall()
+            result = [self._row_to_dict(r) for r in rows]
+            _warn_if_truncated(result, limit, "get_nodes_by_cluster", macro=macro, micro=micro)
+            return result
+
+    def get_architectural_nodes(self, limit: int | None = 5000) -> list[dict[str, Any]]:
+        """Pass ``limit=None`` to disable the row cap."""
+        with self._engine.connect() as conn:
+            if limit is not None:
                 rows = conn.execute(
-                    text(
-                        f"SELECT * FROM {self._schema}.repo_nodes "
-                        "WHERE macro_cluster = :macro AND micro_cluster = :micro LIMIT :lim"
-                    ),
-                    {"macro": macro, "micro": micro, "lim": limit},
+                    text(f"SELECT * FROM {self._schema}.repo_nodes WHERE is_architectural = 1 LIMIT :lim"),
+                    {"lim": limit},
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    text(f"SELECT * FROM {self._schema}.repo_nodes WHERE macro_cluster = :macro LIMIT :lim"),
-                    {"macro": macro, "lim": limit},
+                    text(f"SELECT * FROM {self._schema}.repo_nodes WHERE is_architectural = 1"),
                 ).fetchall()
-            return [self._row_to_dict(r) for r in rows]
-
-    def get_architectural_nodes(self, limit: int = 5000) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                text(f"SELECT * FROM {self._schema}.repo_nodes WHERE is_architectural = 1 LIMIT :lim"),
-                {"lim": limit},
-            ).fetchall()
-            return [self._row_to_dict(r) for r in rows]
+            result = [self._row_to_dict(r) for r in rows]
+            _warn_if_truncated(result, limit, "get_architectural_nodes")
+            return result
 
     def get_all_nodes(self) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
@@ -742,6 +861,39 @@ class PostgresWikiStorage:
             return conn.execute(
                 text(f"SELECT count(*) FROM {self._schema}.repo_nodes"),
             ).scalar() or 0
+
+    def refresh_fts_index(self) -> None:
+        """No-op on Postgres — the BEFORE INSERT OR UPDATE trigger set up
+        by ``_create_fts_infrastructure`` keeps ``fts_doc`` in sync on
+        every row write. Implemented to satisfy the protocol so callers
+        can stay backend-agnostic."""
+        return None
+
+    def apply_incremental_node_writes(self, nodes: list[dict[str, Any]]) -> None:
+        """Bundle ``upsert_nodes_batch`` + ``refresh_fts_index``.
+
+        Postgres keeps FTS in sync via trigger, so ``refresh_fts_index``
+        is a no-op here — but we still call it through the bundle for
+        consistency with the SQLite path and so PR 3's incremental
+        writer can stay backend-agnostic.
+        """
+        if not nodes:
+            return
+        self.upsert_nodes_batch(nodes)
+        self.refresh_fts_index()
+
+    def fetch_indexed_node_meta(self) -> dict[str, dict[str, str | None]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT node_id, content_hash, rel_path "
+                    f"FROM {self._schema}.repo_nodes"
+                ),
+            ).fetchall()
+        return {
+            row[0]: {"content_hash": row[1], "rel_path": row[2] or ""}
+            for row in rows
+        }
 
     # ==================================================================
     # EDGE operations
@@ -982,18 +1134,49 @@ class PostgresWikiStorage:
     ) -> None:
         if not self._vec_available or not embeddings or self._vec_table is None:
             return
-
-        rows = [{"nid": nid, "emb": str(vec)} for nid, vec in embeddings]
-
         with self._engine.begin() as conn:
-            conn.execute(
-                text(
-                    f"INSERT INTO {self._schema}.repo_vec (node_id, embedding) "
-                    "VALUES (:nid, :emb) "
-                    "ON CONFLICT (node_id) DO UPDATE SET embedding = EXCLUDED.embedding"
-                ),
-                rows,
-            )
+            self._upsert_embeddings_in_conn(conn, embeddings)
+
+    def _upsert_embeddings_in_conn(
+        self,
+        conn,
+        embeddings: list[tuple[str, list[float]]],
+    ) -> None:
+        """Execute the vector upsert on an existing connection. Pairs with
+        ``_stamp_embedding_hashes_in_conn`` for atomic combined writes."""
+        if not embeddings:
+            return
+        rows = [{"nid": nid, "emb": str(vec)} for nid, vec in embeddings]
+        conn.execute(
+            text(
+                f"INSERT INTO {self._schema}.repo_vec (node_id, embedding) "
+                "VALUES (:nid, :emb) "
+                "ON CONFLICT (node_id) DO UPDATE SET embedding = EXCLUDED.embedding"
+            ),
+            rows,
+        )
+
+    def _stamp_embedding_hashes_in_conn(
+        self,
+        conn,
+        pairs: list[tuple[str, str | None]],
+    ) -> None:
+        """Persist content_hash snapshots on an existing connection.
+
+        Paired with ``_upsert_embeddings_in_conn`` inside one
+        ``engine.begin()`` block so a partial failure rolls both back.
+        Without this pairing, a stamp failure after a successful vector
+        upsert would force a wasteful re-embed on the next regen.
+        """
+        if not pairs:
+            return
+        conn.execute(
+            text(
+                f"UPDATE {self._schema}.repo_nodes "
+                "SET embedding_content_hash = :h WHERE node_id = :nid"
+            ),
+            [{"nid": nid, "h": h} for nid, h in pairs],
+        )
 
     def populate_embeddings(
         self,
@@ -1015,18 +1198,27 @@ class PostgresWikiStorage:
                 max_workers = 1
 
         with self._engine.connect() as conn:
-            # Fetch all nodes; use source_text with fallback to
-            # docstring / symbol_name so that nodes with empty
+            # Fetch nodes that need (re-)embedding; use source_text with
+            # fallback to docstring / symbol_name so that nodes with empty
             # source_text still get an embedding vector.
-            arch_filter = " WHERE is_architectural = 1" if architectural_only else ""
+            #
+            # #116 PR 4: skip nodes whose embedding is already up-to-date
+            # (embedding_content_hash matches the current content_hash).
+            arch_filter = " AND is_architectural = 1" if architectural_only else ""
             rows = conn.execute(
                 text(
-                    f"SELECT node_id, source_text, docstring, symbol_name "
-                    f"FROM {self._schema}.repo_nodes" + arch_filter
+                    f"SELECT node_id, source_text, docstring, symbol_name, content_hash "
+                    f"FROM {self._schema}.repo_nodes "
+                    "WHERE ("
+                    "embedding_content_hash IS NULL "
+                    "OR content_hash IS NULL "
+                    "OR embedding_content_hash IS DISTINCT FROM content_hash"
+                    ")"
+                    + arch_filter
                 ),
             ).fetchall()
 
-        embeddable: list[tuple[str, str]] = []
+        embeddable: list[tuple[str, str, str | None]] = []
         for r in rows:
             txt = (r[1] or "").strip()
             if not txt:
@@ -1034,12 +1226,19 @@ class PostgresWikiStorage:
             if not txt:
                 txt = (r[3] or "").strip()  # symbol_name
             if txt:
-                embeddable.append((r[0], txt))
+                embeddable.append((r[0], txt, r[4]))  # node_id, text, content_hash
 
-        batches: list[tuple[int, list[str], list[str]]] = []
+        batches: list[tuple[int, list[str], list[str], list[str | None]]] = []
         for i in range(0, len(embeddable), batch_size):
             batch = embeddable[i: i + batch_size]
-            batches.append((i, [nid for nid, _ in batch], [t for _, t in batch]))
+            batches.append(
+                (
+                    i,
+                    [nid for nid, _, _ in batch],
+                    [t for _, t, _ in batch],
+                    [h for _, _, h in batch],
+                )
+            )
 
         total = 0
         n_batches = len(batches)
@@ -1051,7 +1250,12 @@ class PostgresWikiStorage:
             len(embeddable), n_batches, batch_size, max_workers,
         )
 
-        def _embed_one(idx: int, node_ids: list[str], texts: list[str]):
+        def _embed_one(
+            idx: int,
+            node_ids: list[str],
+            texts: list[str],
+            hashes: list[str | None],
+        ):
             try:
                 vectors = embedding_fn(texts)
             except Exception as exc:
@@ -1060,21 +1264,42 @@ class PostgresWikiStorage:
                     idx, idx + len(node_ids), exc,
                 )
                 return None
-            return list(zip(node_ids, vectors, strict=True))
+            return (
+                list(zip(node_ids, vectors, strict=True)),
+                list(zip(node_ids, hashes, strict=True)),
+            )
+
+        def _flush_batch(
+            vector_pairs: list[tuple[str, list[float]]],
+            hash_pairs: list[tuple[str, str | None]],
+        ) -> None:
+            """Atomic vector upsert + content-hash stamp in one transaction.
+
+            A partial failure (network blip between the two SQL statements)
+            would otherwise leave vectors written with a stale
+            embedding_content_hash, forcing a redundant re-embed next
+            regen.
+            """
+            if not vector_pairs and not hash_pairs:
+                return
+            with self._engine.begin() as conn:
+                self._upsert_embeddings_in_conn(conn, vector_pairs)
+                self._stamp_embedding_hashes_in_conn(conn, hash_pairs)
 
         completed_batches = 0
         if max_workers > 1 and len(batches) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = [
-                    pool.submit(_embed_one, idx, nids, texts)
-                    for idx, nids, texts in batches
+                    pool.submit(_embed_one, idx, nids, texts, hashes)
+                    for idx, nids, texts, hashes in batches
                 ]
                 for fut in as_completed(futures):
-                    pairs = fut.result()
-                    if pairs:
-                        self.upsert_embeddings_batch(pairs)
-                        total += len(pairs)
+                    result = fut.result()
+                    if result:
+                        vector_pairs, hash_pairs = result
+                        _flush_batch(vector_pairs, hash_pairs)
+                        total += len(vector_pairs)
                     completed_batches += 1
                     if completed_batches % log_every == 0:
                         elapsed = time.time() - t_start
@@ -1085,11 +1310,12 @@ class PostgresWikiStorage:
                             completed_batches, n_batches, total, rate,
                         )
         else:
-            for idx, nids, texts in batches:
-                pairs = _embed_one(idx, nids, texts)
-                if pairs:
-                    self.upsert_embeddings_batch(pairs)
-                    total += len(pairs)
+            for idx, nids, texts, hashes in batches:
+                result = _embed_one(idx, nids, texts, hashes)
+                if result:
+                    vector_pairs, hash_pairs = result
+                    _flush_batch(vector_pairs, hash_pairs)
+                    total += len(vector_pairs)
                 completed_batches += 1
                 if completed_batches % log_every == 0:
                     elapsed = time.time() - t_start
@@ -1586,6 +1812,23 @@ class PostgresWikiStorage:
             ):
                 edge_types[row[0]] = row[1]
 
+            # #120: confidence distribution. Always returns the three
+            # known buckets (extracted/inferred/ambiguous) even when
+            # one is zero, so MCP / UI consumers can rely on a stable
+            # shape. Mirrors the sqlite backend.
+            confidence_breakdown: dict[str, int] = {
+                "extracted": 0, "inferred": 0, "ambiguous": 0,
+            }
+            for row in conn.execute(
+                text(
+                    f"SELECT confidence, count(*) FROM {self._schema}.repo_edges "
+                    "GROUP BY confidence"
+                ),
+            ):
+                key = (row[0] or "EXTRACTED").lower()
+                if key in confidence_breakdown:
+                    confidence_breakdown[key] = row[1]
+
             macro_count = conn.execute(
                 text(
                     f"SELECT count(DISTINCT macro_cluster) FROM {self._schema}.repo_nodes "
@@ -1603,6 +1846,7 @@ class PostgresWikiStorage:
             "languages": langs,
             "symbol_types": types,
             "edge_types": edge_types,
+            "confidence_breakdown": confidence_breakdown,
             "macro_clusters": macro_count,
             "hub_count": hub_count,
             "vec_available": self._vec_available,
@@ -2015,6 +2259,96 @@ class PostgresWikiStorage:
         with self._engine.begin() as conn:
             conn.execute(text(f"DELETE FROM {self._edges}"))
 
+    def reset_clusters(self) -> None:
+        """Clear cluster + hub columns on every node row (fresh-pass reset)."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"UPDATE {self._nodes} "
+                    f"SET macro_cluster = NULL, micro_cluster = NULL, "
+                    f"is_hub = 0, hub_assignment = NULL"
+                )
+            )
+
+    def get_hub_node_ids(self) -> list[str]:
+        """Return node_ids of all nodes flagged ``is_hub = 1``."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(f"SELECT node_id FROM {self._nodes} WHERE is_hub = 1")
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_clustered_architectural_nodes(
+        self,
+        exclude_tests: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return {node_id, macro_cluster, micro_cluster} for clustered
+        architectural nodes."""
+        sql = (
+            f"SELECT node_id, macro_cluster, micro_cluster "
+            f"FROM {self._nodes} "
+            f"WHERE macro_cluster IS NOT NULL AND is_architectural = 1"
+        )
+        if exclude_tests:
+            sql += " AND is_test = 0"
+        # #116: deterministic order — see sqlite.py:get_clustered_architectural_nodes
+        # for the reasoning. Page IDs depend on cluster_node_ids[0] stability.
+        sql += " ORDER BY macro_cluster, micro_cluster, node_id"
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(sql)).fetchall()
+        return [
+            {"node_id": r[0], "macro_cluster": r[1], "micro_cluster": r[2]}
+            for r in rows
+        ]
+
+    def get_architectural_node_ids(
+        self,
+        exclude_tests: bool = False,
+        limit: int | None = 10_000,
+    ) -> list[str]:
+        """Return node_ids of all architectural nodes (lightweight projection).
+
+        Pass ``limit=None`` to disable the row cap.
+        """
+        sql = f"SELECT node_id FROM {self._nodes} WHERE is_architectural = 1"
+        if exclude_tests:
+            sql += " AND is_test = 0"
+        with self._engine.connect() as conn:
+            if limit is not None:
+                rows = conn.execute(
+                    text(sql + " LIMIT :limit"), {"limit": limit},
+                ).fetchall()
+            else:
+                rows = conn.execute(text(sql)).fetchall()
+        result = [r[0] for r in rows]
+        _warn_if_truncated(result, limit, "get_architectural_node_ids", exclude_tests=exclude_tests)
+        return result
+
+    def get_all_edges(
+        self,
+        limit: int | None = 500_000,
+    ) -> list[dict[str, Any]]:
+        """Return all edge rows (bounded by *limit* to guard against OOM).
+
+        Pass ``limit=None`` to disable the row cap.
+        """
+        base_sql = (
+            f"SELECT source_id, target_id, rel_type, weight FROM {self._edges}"
+        )
+        with self._engine.connect() as conn:
+            if limit is not None:
+                rows = conn.execute(
+                    text(base_sql + " LIMIT :limit"), {"limit": limit},
+                ).fetchall()
+            else:
+                rows = conn.execute(text(base_sql)).fetchall()
+        result = [
+            {"source_id": r[0], "target_id": r[1], "rel_type": r[2], "weight": r[3]}
+            for r in rows
+        ]
+        _warn_if_truncated(result, limit, "get_all_edges")
+        return result
+
     # ── Language detection ───────────────────────────────────────────
 
     def detect_dominant_language(self, node_ids: list[str]) -> str | None:
@@ -2205,3 +2539,536 @@ class PostgresWikiStorage:
             "by_symbol_type": [dict(r) for r in sym_rows],
             "by_file": [dict(r) for r in file_rows],
         }
+
+    # ── shortest_path (#121 Phase 1) ──────────────────────────────────
+    #
+    # Canonical undirected shortest-path entry point. See the sqlite
+    # backend for the architectural note; both share the layered-BFS
+    # algorithm with a visited set, just expressed in their native SQL
+    # dialect (Postgres uses ``ANY(:ids)`` instead of IN-placeholders).
+
+    _NODE_COLS_FOR_PATH = "node_id, symbol_name, rel_path, symbol_type"
+    _EDGE_COLS_FOR_PATH = "source_id, target_id, rel_type, confidence"
+
+    def _resolve_label(
+        self, conn, label: str,
+    ) -> tuple[dict[str, Any] | None, int]:
+        # Two indexed point queries — see sqlite backend for the
+        # rationale; we don't fetchall() the full match set because
+        # common labels (e.g. __init__, main) can match thousands of
+        # rows in real codebases.
+        for column in ("symbol_name", "rel_path"):
+            count = conn.execute(
+                text(f"SELECT COUNT(*) FROM {self._nodes} WHERE {column} = :label"),
+                {"label": label},
+            ).scalar() or 0
+            if count:
+                row = conn.execute(
+                    text(
+                        f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
+                        f"WHERE {column} = :label ORDER BY node_id ASC LIMIT 1"
+                    ),
+                    {"label": label},
+                ).mappings().fetchone()
+                if row is not None:
+                    return dict(row), int(count)
+        return None, 0
+
+    def _bfs_step_postgres(
+        self,
+        *,
+        conn,
+        frontier: list[str],
+        tgt_id: str,
+        visited: set[str],
+        parents: dict[str, str],
+    ) -> list[str] | None:
+        """One BFS layer expansion. Returns ``None`` once ``tgt_id`` is
+        discovered so the caller can stop without nested breaks.
+        ``visited`` and ``parents`` are mutated in place."""
+        rows = conn.execute(
+            text(
+                f"SELECT source_id, target_id FROM {self._edges} "
+                "WHERE source_id = ANY(:ids) OR target_id = ANY(:ids)"
+            ),
+            {"ids": frontier},
+        ).mappings().fetchall()
+        frontier_set = set(frontier)
+        next_frontier: list[str] = []
+        for row in rows:
+            a, b = row["source_id"], row["target_id"]
+            for parent_id, child_id in ((a, b), (b, a)):
+                if parent_id not in frontier_set or child_id in visited:
+                    continue
+                visited.add(child_id)
+                parents[child_id] = parent_id
+                next_frontier.append(child_id)
+                if child_id == tgt_id:
+                    return None
+        return next_frontier
+
+    def shortest_path(
+        self,
+        source_label: str,
+        target_label: str,
+        max_depth: int = 25,
+    ) -> dict[str, Any]:
+        if max_depth < 1:
+            return {"path": None, "reason": "invalid_max_depth"}
+
+        with self._engine.connect() as conn:
+            source, src_candidates = self._resolve_label(conn, source_label)
+            if source is None:
+                return {"path": None, "reason": "source_not_found"}
+            target, tgt_candidates = self._resolve_label(conn, target_label)
+            if target is None:
+                return {"path": None, "reason": "target_not_found"}
+
+            src_id = source["node_id"]
+            tgt_id = target["node_id"]
+            if src_id == tgt_id:
+                return {
+                    "source": source,
+                    "target": target,
+                    "source_candidates": src_candidates,
+                    "target_candidates": tgt_candidates,
+                    "path": [source],
+                    "edges": [],
+                    "length": 0,
+                }
+
+            visited: set[str] = {src_id}
+            parents: dict[str, str] = {}
+            frontier: list[str] = [src_id]
+            found = False
+
+            for _depth in range(max_depth):
+                if not frontier:
+                    break
+                next_frontier = self._bfs_step_postgres(
+                    conn=conn,
+                    frontier=frontier,
+                    tgt_id=tgt_id,
+                    visited=visited,
+                    parents=parents,
+                )
+                if next_frontier is None:
+                    found = True
+                    break
+                frontier = next_frontier
+
+            if not found:
+                return {"path": None, "reason": "no_path_within_max_depth"}
+
+            path_ids: list[str] = [tgt_id]
+            while path_ids[-1] != src_id:
+                path_ids.append(parents[path_ids[-1]])
+            path_ids.reverse()
+
+            node_rows = conn.execute(
+                text(
+                    f"SELECT {self._NODE_COLS_FOR_PATH} FROM {self._nodes} "
+                    "WHERE node_id = ANY(:ids)"
+                ),
+                {"ids": path_ids},
+            ).mappings().fetchall()
+            node_by_id = {r["node_id"]: dict(r) for r in node_rows}
+            path_nodes = [node_by_id[nid] for nid in path_ids if nid in node_by_id]
+
+            edges: list[dict[str, Any]] = []
+            for a, b in zip(path_ids, path_ids[1:], strict=False):
+                edge_row = conn.execute(
+                    text(
+                        f"SELECT {self._EDGE_COLS_FOR_PATH} FROM {self._edges} "
+                        "WHERE (source_id = :a AND target_id = :b) "
+                        "   OR (source_id = :b AND target_id = :a) "
+                        "ORDER BY CASE confidence "
+                        "         WHEN 'EXTRACTED' THEN 0 "
+                        "         WHEN 'INFERRED'  THEN 1 "
+                        "         ELSE 2 END "
+                        "LIMIT 1"
+                    ),
+                    {"a": a, "b": b},
+                ).mappings().fetchone()
+                if edge_row is not None:
+                    edges.append(dict(edge_row))
+
+            return {
+                "source": source,
+                "target": target,
+                "source_candidates": src_candidates,
+                "target_candidates": tgt_candidates,
+                "path": path_nodes,
+                "edges": edges,
+                "length": len(path_ids) - 1,
+            }
+
+    # ── surprising_connections (#121 Phase 2) ─────────────────────────
+
+    @staticmethod
+    def _path_prefix(rel_path: str, depth: int) -> str:
+        """Folder prefix at ``depth`` segments, stripping the filename.
+        See sqlite backend for examples."""
+        if not rel_path:
+            return ""
+        parts = rel_path.split("/")
+        folders = parts[:-1]
+        if not folders:
+            return ""
+        return "/".join(folders[:depth])
+
+    def _fetch_cluster_contexts(
+        self, conn, clusters: set[int], depth: int,
+    ) -> dict[int, set[str]]:
+        """Bulk-fetch per-cluster folder-prefix sets — single
+        ``= ANY(:cs)`` query instead of one round-trip per cluster."""
+        if not clusters:
+            return {}
+        rows = conn.execute(
+            text(
+                f"SELECT macro_cluster, rel_path FROM {self._nodes} "
+                "WHERE macro_cluster = ANY(:cs) "
+                "  AND rel_path IS NOT NULL "
+                "  AND rel_path <> ''"
+            ),
+            {"cs": list(clusters)},
+        ).mappings().fetchall()
+        contexts: dict[int, set[str]] = {c: set() for c in clusters}
+        for row in rows:
+            prefix = self._path_prefix(row["rel_path"], depth)
+            if prefix:
+                contexts[int(row["macro_cluster"])].add(prefix)
+        return contexts
+
+    def compute_surprising_connections(
+        self,
+        top_n: int = 10,
+        context_depth: int = 1,
+        sample_edges_per_pair: int = 3,
+    ) -> dict[str, Any]:
+        with self._engine.connect() as conn:
+            pair_rows = conn.execute(
+                text(
+                    f"""
+                    SELECT
+                      CASE WHEN src.macro_cluster < tgt.macro_cluster
+                           THEN src.macro_cluster ELSE tgt.macro_cluster END AS c_lo,
+                      CASE WHEN src.macro_cluster < tgt.macro_cluster
+                           THEN tgt.macro_cluster ELSE src.macro_cluster END AS c_hi,
+                      COUNT(*) AS edge_count
+                      FROM {self._edges} e
+                      JOIN {self._nodes} src ON e.source_id = src.node_id
+                      JOIN {self._nodes} tgt ON e.target_id = tgt.node_id
+                     WHERE src.macro_cluster IS NOT NULL
+                       AND tgt.macro_cluster IS NOT NULL
+                       AND src.macro_cluster <> tgt.macro_cluster
+                     GROUP BY c_lo, c_hi
+                    """
+                ),
+            ).mappings().fetchall()
+
+            if not pair_rows:
+                return {"pairs": [], "skipped_pairs": 0}
+
+            clusters = {int(r["c_lo"]) for r in pair_rows} | {
+                int(r["c_hi"]) for r in pair_rows
+            }
+            contexts = self._fetch_cluster_contexts(
+                conn, clusters, context_depth,
+            )
+
+            scored: list[dict[str, Any]] = []
+            skipped = 0
+            for row in pair_rows:
+                c_lo, c_hi = int(row["c_lo"]), int(row["c_hi"])
+                ctx_lo = contexts.get(c_lo, set())
+                ctx_hi = contexts.get(c_hi, set())
+                union = ctx_lo | ctx_hi
+                if not union:
+                    skipped += 1
+                    continue
+                intersection = ctx_lo & ctx_hi
+                jaccard_distance = 1.0 - (len(intersection) / len(union))
+                scored.append(
+                    {
+                        "cluster_a": c_lo,
+                        "cluster_b": c_hi,
+                        "jaccard_distance": jaccard_distance,
+                        "context_a": sorted(ctx_lo),
+                        "context_b": sorted(ctx_hi),
+                        "edge_count": int(row["edge_count"]),
+                    },
+                )
+
+            scored.sort(
+                key=lambda p: (
+                    -p["jaccard_distance"],
+                    -p["edge_count"],
+                    p["cluster_a"],
+                    p["cluster_b"],
+                ),
+            )
+            top = scored[:top_n]
+
+            for pair in top:
+                sample = conn.execute(
+                    text(
+                        f"""
+                        SELECT e.source_id, e.target_id, e.rel_type, e.confidence,
+                               src.symbol_name AS source_name, src.rel_path AS source_path,
+                               tgt.symbol_name AS target_name, tgt.rel_path AS target_path
+                          FROM {self._edges} e
+                          JOIN {self._nodes} src ON e.source_id = src.node_id
+                          JOIN {self._nodes} tgt ON e.target_id = tgt.node_id
+                         WHERE ((src.macro_cluster = :a AND tgt.macro_cluster = :b)
+                             OR (src.macro_cluster = :b AND tgt.macro_cluster = :a))
+                         ORDER BY CASE e.confidence
+                                  WHEN 'EXTRACTED' THEN 0
+                                  WHEN 'INFERRED'  THEN 1
+                                  ELSE 2 END,
+                                  e.source_id, e.target_id
+                         LIMIT :lim
+                        """
+                    ),
+                    {
+                        "a": pair["cluster_a"],
+                        "b": pair["cluster_b"],
+                        "lim": sample_edges_per_pair,
+                    },
+                ).mappings().fetchall()
+                pair["sample_edges"] = [dict(r) for r in sample]
+
+            return {"pairs": top, "skipped_pairs": skipped}
+
+    # ==================================================================
+    # WIKI PAGES + source→page reverse index (#116 incremental regen)
+    # ==================================================================
+
+    _WIKI_PAGE_COLUMNS = (
+        "page_id",
+        "wiki_id",
+        "id_scheme",
+        "title",
+        "anchor_slug",
+        "content_hash",
+        "macro_cluster",
+        "micro_cluster",
+        "primary_symbol_id",
+        "section_index",
+        "page_index",
+        "last_indexed_commit",
+        "page_spec_json",
+        "generated_at",
+    )
+
+    def upsert_wiki_page(self, page: dict[str, Any]) -> None:
+        with self._engine.begin() as conn:
+            self._upsert_wiki_page_in_conn(conn, page)
+
+    def _upsert_wiki_page_in_conn(self, conn, page: dict[str, Any]) -> None:
+        """Execute the upsert on an existing connection (no transaction
+        management). Lets ``upsert_wiki_page_with_symbols`` group two writes
+        in a single transaction.
+        """
+        if "page_id" not in page or "wiki_id" not in page:
+            raise ValueError("upsert_wiki_page: 'page_id' and 'wiki_id' are required")
+        _s = self._strip_nul
+        row = {
+            "page_id": _s(page["page_id"]),
+            "wiki_id": _s(page["wiki_id"]),
+            "id_scheme": _s(page.get("id_scheme", "stable_v1")),
+            "title": _s(page.get("title", "")),
+            "anchor_slug": _s(page.get("anchor_slug", "")),
+            "content_hash": _s(page.get("content_hash")),
+            "macro_cluster": page.get("macro_cluster"),
+            "micro_cluster": page.get("micro_cluster"),
+            "primary_symbol_id": _s(page.get("primary_symbol_id")),
+            "section_index": page.get("section_index", 0),
+            "page_index": page.get("page_index", 0),
+            "last_indexed_commit": _s(page.get("last_indexed_commit")),
+            "page_spec_json": _s(page.get("page_spec_json")),
+            "generated_at": _s(page.get("generated_at")),
+        }
+        cols = ", ".join(self._WIKI_PAGE_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in self._WIKI_PAGE_COLUMNS)
+        update_set = ", ".join(
+            f"{c} = EXCLUDED.{c}" for c in self._WIKI_PAGE_COLUMNS if c != "page_id"
+        )
+        sql = text(
+            f"INSERT INTO {self._schema}.wiki_pages ({cols}) "
+            f"VALUES ({placeholders}) "
+            f"ON CONFLICT (page_id) DO UPDATE SET {update_set}"
+        )
+        conn.execute(sql, row)
+
+    def get_wiki_page(self, page_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text(f"SELECT * FROM {self._schema}.wiki_pages WHERE page_id = :pid"),
+                {"pid": page_id},
+            ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def get_wiki_pages(self, wiki_id: str) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT * FROM {self._schema}.wiki_pages "
+                    "WHERE wiki_id = :wid "
+                    "ORDER BY section_index ASC, page_index ASC"
+                ),
+                {"wid": wiki_id},
+            ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_wiki_pages_by_cluster(
+        self,
+        wiki_id: str,
+        macro_cluster: int,
+        micro_cluster: int | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            if micro_cluster is None:
+                rows = conn.execute(
+                    text(
+                        f"SELECT * FROM {self._schema}.wiki_pages "
+                        "WHERE wiki_id = :wid AND macro_cluster = :macro "
+                        "ORDER BY section_index ASC, page_index ASC"
+                    ),
+                    {"wid": wiki_id, "macro": macro_cluster},
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text(
+                        f"SELECT * FROM {self._schema}.wiki_pages "
+                        "WHERE wiki_id = :wid AND macro_cluster = :macro "
+                        "AND micro_cluster = :micro "
+                        "ORDER BY section_index ASC, page_index ASC"
+                    ),
+                    {"wid": wiki_id, "macro": macro_cluster, "micro": micro_cluster},
+                ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def delete_wiki_pages(self, wiki_id: str) -> int:
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    f"DELETE FROM {self._schema}.wiki_pages WHERE wiki_id = :wid"
+                ),
+                {"wid": wiki_id},
+            )
+        return result.rowcount or 0
+
+    def delete_wiki_page(self, page_id: str) -> bool:
+        # FK with ON DELETE CASCADE on page_symbols.page_id cleans up
+        # the reverse index in the same transaction. Idempotent: missing
+        # rows return False instead of raising.
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    f"DELETE FROM {self._schema}.wiki_pages WHERE page_id = :pid"
+                ),
+                {"pid": page_id},
+            )
+        return bool(result.rowcount)
+
+    def record_page_symbols(
+        self,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        with self._engine.begin() as conn:
+            self._record_page_symbols_in_conn(conn, page_id, symbols, replace=replace)
+
+    def _record_page_symbols_in_conn(
+        self,
+        conn,
+        page_id: str,
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool,
+    ) -> None:
+        """Execute the symbol writes on an existing connection. Pairs with
+        ``_upsert_wiki_page_in_conn`` for atomic combined writes.
+        """
+        _s = self._strip_nul
+        if replace:
+            conn.execute(
+                text(
+                    f"DELETE FROM {self._schema}.page_symbols "
+                    "WHERE page_id = :pid"
+                ),
+                {"pid": page_id},
+            )
+        if symbols:
+            rows = [
+                {
+                    "page_id": _s(page_id),
+                    "node_id": _s(node_id),
+                    "citation_kind": _s(kind),
+                }
+                for node_id, kind in symbols
+            ]
+            conn.execute(
+                text(
+                    f"INSERT INTO {self._schema}.page_symbols "
+                    "(page_id, node_id, citation_kind) "
+                    "VALUES (:page_id, :node_id, :citation_kind) "
+                    "ON CONFLICT (page_id, node_id, citation_kind) DO NOTHING"
+                ),
+                rows,
+            )
+
+    def upsert_wiki_page_with_symbols(
+        self,
+        page: dict[str, Any],
+        symbols: list[tuple[str, str]],
+        *,
+        replace: bool = True,
+    ) -> None:
+        """Single-transaction upsert of the page row + its symbol rows.
+
+        ``self._engine.begin()`` provides the transaction boundary; if
+        either write raises, SQLAlchemy rolls back automatically.
+        """
+        with self._engine.begin() as conn:
+            self._upsert_wiki_page_in_conn(conn, page)
+            self._record_page_symbols_in_conn(
+                conn, page["page_id"], symbols, replace=replace,
+            )
+
+    def get_pages_citing_node(self, node_id: str) -> list[str]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT DISTINCT page_id FROM {self._schema}.page_symbols "
+                    "WHERE node_id = :nid"
+                ),
+                {"nid": node_id},
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_page_symbols(
+        self, page_id: str, citation_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            if citation_kind is None:
+                rows = conn.execute(
+                    text(
+                        f"SELECT node_id, citation_kind "
+                        f"FROM {self._schema}.page_symbols WHERE page_id = :pid"
+                    ),
+                    {"pid": page_id},
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text(
+                        f"SELECT node_id, citation_kind "
+                        f"FROM {self._schema}.page_symbols "
+                        "WHERE page_id = :pid AND citation_kind = :kind"
+                    ),
+                    {"pid": page_id, "kind": citation_kind},
+                ).fetchall()
+        return [self._row_to_dict(r) for r in rows]

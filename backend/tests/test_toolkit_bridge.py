@@ -10,6 +10,7 @@ from app.services.toolkit_bridge import (
     ComponentCache,
     EngineComponents,
     _load_cached_artifacts,
+    _load_legacy_artifacts,
     build_engine_components,
 )
 from app.storage.local import LocalArtifactStorage
@@ -220,6 +221,223 @@ def _make_db_session_mock(fake_record):
     mock_session_factory = MagicMock()
     mock_session_factory.return_value = ctx_manager
     return mock_session_factory
+
+
+def _write_legacy_cache(
+    tmp_path,
+    cache_key: str,
+    repo_identifier: str,
+    *,
+    register_index: bool = True,
+    nodes: list[tuple[str, dict]] | None = None,
+):
+    """Create a pre-UnifiedDB layout (.code_graph.gz + .fts5.db) on disk.
+
+    Used to verify that ``_load_legacy_artifacts`` rehydrates ask/research
+    engine state when no ``.wiki.db`` exists for a wiki — the failure mode
+    that motivated #237.
+    """
+    import gzip
+    import json
+    import pickle
+    from pathlib import Path
+
+    import networkx as nx
+
+    cache_dir = Path(tmp_path)
+    graph = nx.DiGraph()
+    if nodes is None:
+        nodes = [("pkg.module.func", {"name": "func", "type": "function"})]
+    for node_id, attrs in nodes:
+        graph.add_node(node_id, **attrs)
+
+    graph_file = cache_dir / f"{cache_key}.code_graph.gz"
+    with gzip.open(graph_file, "wb") as fh:
+        pickle.dump(graph, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+    if register_index:
+        index_path = cache_dir / "cache_index.json"
+        index = {
+            "graphs": {f"{repo_identifier}:combined": cache_key},
+            "refs": {},
+        }
+        # Bookkeep ``refs`` for the bare ``repo:branch`` pointer when the
+        # identifier is commit-scoped, mirroring real cache_index.json.
+        parts = repo_identifier.split(":")
+        if len(parts) == 3:
+            index["refs"][f"{parts[0]}:{parts[1]}"] = repo_identifier
+        index_path.write_text(json.dumps(index))
+
+    return graph_file
+
+
+class TestLoadLegacyArtifacts:
+    """#237 — legacy ``.code_graph.gz`` fallback when no ``.wiki.db`` exists."""
+
+    def test_loads_graph_and_query_service_from_legacy_artifacts(self, tmp_path):
+        _write_legacy_cache(tmp_path, "abc123", "onetest-ai/core:main:ca9addbd")
+
+        components = EngineComponents()
+        ok = _load_legacy_artifacts(
+            components, tmp_path, "onetest-ai/core:main:ca9addbd"
+        )
+
+        assert ok is True
+        assert components.code_graph is not None
+        assert components.code_graph.number_of_nodes() == 1
+        assert components.query_service is not None
+        assert components.graph_manager is not None
+
+    def test_returns_false_when_no_legacy_artifacts_exist(self, tmp_path):
+        components = EngineComponents()
+        ok = _load_legacy_artifacts(components, tmp_path, "owner/repo:main")
+
+        assert ok is False
+        assert components.code_graph is None
+        assert components.query_service is None
+
+    def test_returns_false_for_empty_graph(self, tmp_path):
+        """Empty pickled graph should not satisfy the fallback."""
+        _write_legacy_cache(
+            tmp_path,
+            "empty999",
+            "owner/empty:main:deadbeef",
+            nodes=[],  # no nodes
+        )
+
+        components = EngineComponents()
+        ok = _load_legacy_artifacts(
+            components, tmp_path, "owner/empty:main:deadbeef"
+        )
+
+        assert ok is False
+        assert components.code_graph is None
+
+    def test_load_cached_artifacts_falls_back_when_no_wiki_db(self, tmp_path):
+        """The public entry point ``_load_cached_artifacts`` should invoke
+        the legacy fallback when cache_index has no ``unified_db`` entry.
+
+        This is the exact scenario reported for onetest-ai/core: index lists
+        only ``graphs`` + ``refs`` + ``fts5``, no ``unified_db`` key.
+        """
+        _write_legacy_cache(tmp_path, "abc123", "onetest-ai/core:main:ca9addbd")
+
+        components = EngineComponents()
+        _load_cached_artifacts(
+            components,
+            str(tmp_path),
+            "wiki-onetest",
+            "onetest-ai/core:main:ca9addbd",
+        )
+
+        # Legacy path wired up — ask/research tools now have a working
+        # query_service even though no unified DB ever existed for this
+        # wiki.
+        assert components.code_graph is not None
+        assert components.code_graph.number_of_nodes() == 1
+        assert components.query_service is not None
+        # No retriever_stack (UnifiedRetriever requires .wiki.db).  This
+        # asymmetry is intentional and documented in the helper.
+        assert components.retriever_stack is None
+        assert components.storage is None
+
+    def test_falls_back_when_refs_point_at_different_commit_than_on_disk(
+        self, tmp_path
+    ):
+        """Rio's finding #2: real onetest-ai/core scenario — cache_index
+        ``refs`` says ``8c210362`` but ``graphs`` only registers
+        ``ca9addbd``.  ``load_graph_by_repo_name`` returns None because the
+        canonicalized key doesn't match any ``graphs`` entry; the cache-
+        index scan must rescue us.
+        """
+        import json
+
+        # Write artifacts under the OLD commit hash
+        _write_legacy_cache(
+            tmp_path,
+            "old-commit-key",
+            "owner/repo:main:ca9addbd",
+            register_index=False,
+        )
+        # Cache index points the bare ref at a DIFFERENT commit
+        (tmp_path / "cache_index.json").write_text(
+            json.dumps(
+                {
+                    "graphs": {"owner/repo:main:ca9addbd:combined": "old-commit-key"},
+                    "refs": {"owner/repo:main": "owner/repo:main:8c210362"},
+                }
+            )
+        )
+
+        components = EngineComponents()
+        # _load_cached_artifacts is called with the bare ref (matches
+        # production: ``_extract_repo_identifier`` returns
+        # ``owner/repo:branch``).
+        _load_cached_artifacts(
+            components, str(tmp_path), "wiki-x", "owner/repo:main"
+        )
+
+        assert components.code_graph is not None
+        assert components.code_graph.number_of_nodes() == 1
+        assert components.query_service is not None
+
+    def test_fts_index_passed_to_query_service_only_when_open(self, tmp_path):
+        """Rio's finding #1: if FTS load fails inside
+        ``load_graph_by_repo_name`` the index instance exists but
+        ``is_open=False``.  We must not hand that to GraphQueryService."""
+        _write_legacy_cache(tmp_path, "no-fts-key", "owner/repo:main:abcd1234")
+        # NB: ``_write_legacy_cache`` writes only ``.code_graph.gz`` — no
+        # ``.fts5.db`` companion — so the FTS load inside GraphManager
+        # silently fails and leaves ``is_open=False``.
+
+        components = EngineComponents()
+        ok = _load_legacy_artifacts(
+            components, tmp_path, "owner/repo:main:abcd1234"
+        )
+        assert ok is True
+        # The query_service was created — confirm its fts attribute is
+        # None rather than a closed GraphTextIndex.
+        assert components.query_service is not None
+        assert components.query_service.fts is None
+
+    def test_load_cached_artifacts_falls_back_when_wiki_db_missing_on_disk(
+        self, tmp_path
+    ):
+        """If cache_index.unified_db points at a wiki.db that's been
+        cleaned off disk, the loader should still fall back to legacy
+        artifacts rather than leaving the wiki broken."""
+        import json
+
+        # Write legacy graph artifacts
+        _write_legacy_cache(
+            tmp_path,
+            "legacy-key",
+            "owner/repo:main:abcd1234",
+            register_index=False,  # we'll write a custom index below
+        )
+
+        # Custom index: unified_db points to a key whose .wiki.db file does
+        # NOT exist on disk (cache eviction scenario).
+        index_path = tmp_path / "cache_index.json"
+        index_path.write_text(
+            json.dumps(
+                {
+                    "graphs": {"owner/repo:main:abcd1234:combined": "legacy-key"},
+                    "refs": {"owner/repo:main": "owner/repo:main:abcd1234"},
+                    "unified_db": {"owner/repo:main:abcd1234": "nonexistent-key"},
+                }
+            )
+        )
+
+        components = EngineComponents()
+        _load_cached_artifacts(
+            components, str(tmp_path), "wiki-x", "owner/repo:main:abcd1234"
+        )
+
+        # Fell through to legacy fallback
+        assert components.code_graph is not None
+        assert components.code_graph.number_of_nodes() == 1
+        assert components.query_service is not None
 
 
 class TestBuildEngineComponentsDescription:

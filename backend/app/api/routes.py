@@ -41,6 +41,13 @@ from app.models import (
     WikiSummary,
 )
 from app.models.api import (
+    AffectedPageResponse,
+    ChangeSetResponse,
+    DiffWikiRequest,
+    DiffWikiResponse,
+    IncrementalRefreshRequest,
+    IncrementalRefreshResponse,
+    NodeChangeResponse,
     ProjectAddWikiRequest,
     ProjectCreateRequest,
     ProjectListResponse,
@@ -92,6 +99,7 @@ async def generate_wiki(
     user: CurrentUser = Depends(get_current_user),
     service: WikiService = Depends(get_wiki_service),
 ) -> GenerateWikiResponse:
+    from app.services.wiki_service import GenerateInProgressError
     from app.services.wiki_service_errors import WikiAlreadyExistsError
 
     try:
@@ -100,6 +108,22 @@ async def generate_wiki(
         raise HTTPException(  # noqa: B904
             status_code=409,
             detail={"error": str(e), "wiki_id": e.wiki_id},
+        )
+    except GenerateInProgressError as exc:
+        # #145: another generate or incremental_refresh is mid-flight
+        # for this wiki. Surface the in-flight invocation_id so the
+        # caller can subscribe to its SSE stream instead of spawning
+        # a racing run that would corrupt the shared ``.wiki.db``.
+        # ``X-In-Flight-Invocation-Id``'s value may reference either a
+        # generate OR an incremental refresh (the helper checks both
+        # statuses) — callers shouldn't assume the operation type
+        # from the header alone; fetch the invocation to learn more.
+        raise HTTPException(  # noqa: B904
+            status_code=409,
+            detail=str(exc),
+            headers={
+                "X-In-Flight-Invocation-Id": exc.in_progress_invocation_id,
+            },
         )
     return GenerateWikiResponse(
         wiki_id=invocation.wiki_id,
@@ -259,22 +283,29 @@ async def list_wikis(
         except Exception:  # noqa: S110
             pass
 
-        # Find the most relevant invocation — prefer "generating" over terminal
+        # Find the most relevant invocation — prefer an in-progress
+        # run (generating or running) over a terminal one.
         best_inv = None
         for inv in service.invocations.values():
             if inv.wiki_id == wiki.wiki_id:
-                if inv.status == "generating":
+                if inv.status in ("generating", "running"):
                     best_inv = inv
                     break
                 if best_inv is None:
                     best_inv = inv
         if best_inv:
             wiki.invocation_id = best_inv.id
-            # Only override DB status if the invocation is still generating.
-            # DB is source of truth for terminal states.
-            if best_inv.status == "generating":
+            # Only override DB status if the invocation is still in
+            # progress. DB is source of truth for terminal states.
+            # ``generating`` = full re-generation;
+            # ``running``    = incremental refresh.
+            # #175: keep this branch in lock-step with the matching
+            # block in ``get_wiki`` so the dashboard and the viewer
+            # never disagree on whether a refresh is live.
+            if best_inv.status in ("generating", "running"):
                 wiki.status = best_inv.status
                 wiki.progress = best_inv.progress
+                wiki.error = None
 
     # Add active/failed invocations not yet in completed list
     for inv in service.invocations.values():
@@ -364,13 +395,19 @@ async def get_wiki(
     wiki_record = await management.get_wiki(wiki_id, user_id=user_id)
     wiki_meta = WikiManagementService._record_to_summary(wiki_record, user_id) if wiki_record else None
 
-    # Check for active invocation — prefer "generating" over terminal states
+    # Check for active invocation — prefer any in-progress run
+    # (``generating`` = full regen, ``running`` = incremental refresh)
+    # over terminal states. Without breaking on both, a stale
+    # terminal invocation that happens to come earlier in dict
+    # iteration order would shadow a live ``running`` one. Mirrors
+    # ``list_wikis`` so the two endpoints can't disagree on which
+    # invocation is "active" for the same wiki (#175).
     active_invocation = None
     for inv in service.invocations.values():
         if inv.wiki_id == wiki_id:
-            if inv.status == "generating":
+            if inv.status in ("generating", "running"):
                 active_invocation = inv
-                break  # generating is always the most relevant
+                break
             if active_invocation is None:
                 active_invocation = inv  # keep first match as fallback
 
@@ -380,7 +417,11 @@ async def get_wiki(
 
     # If DB has a record in a non-complete state (new: registered at generation start),
     # serve it immediately so the UI gets repo details + status without needing an active invocation.
-    if wiki_meta and wiki_meta.status in ("generating", "failed", "partial", "cancelled") and not active_invocation:
+    # ``running`` is included defensively (#175 review) — today only
+    # ``WikiService.generate`` writes status to the DB and it only
+    # uses ``generating``, but if a future code path ever persists
+    # ``running``, this guard keeps the response shape consistent.
+    if wiki_meta and wiki_meta.status in ("generating", "running", "failed", "partial", "cancelled") and not active_invocation:
         return {
             "wiki_id": wiki_id,
             "repo_url": wiki_meta.repo_url,
@@ -416,9 +457,13 @@ async def get_wiki(
                     wiki_meta = WikiManagementService._record_to_summary(wiki_record, user_id) if wiki_record else None
                 except Exception:  # noqa: S110
                     pass
-            # Still generating or failed — return minimal info so the UI
+            # Still in progress or failed — return minimal info so the UI
             # can show repo details and offer a retry button (backward compat for pre-migration wikis).
-            if not wiki_meta and active_invocation.status in ("generating", "failed", "partial", "cancelled"):
+            # #175: includes ``running`` (incremental refresh) alongside
+            # ``generating`` (full re-generation).
+            if not wiki_meta and active_invocation.status in (
+                "generating", "running", "failed", "partial", "cancelled",
+            ):
                 return {
                     "wiki_id": wiki_id,
                     "repo_url": active_invocation.repo_url,
@@ -513,12 +558,25 @@ async def get_wiki(
     }
     if active_invocation:
         response["invocation_id"] = active_invocation.id
-        # Only let the in-memory invocation override DB status if it is still generating.
-        # DB is the source of truth for terminal states (complete/failed/partial).
-        # Without this guard, a stale failed invocation from a prior attempt (within 1hr TTL)
-        # would shadow a successful retry and display "failed" after page refresh.
-        if active_invocation.status == "generating":
+        # Only let the in-memory invocation override DB status if a
+        # run is *still in progress*. DB is the source of truth for
+        # terminal states (complete/failed/partial).
+        #
+        # ``generating``: full re-generation via ``WikiService.generate``
+        # ``running``:    incremental refresh via
+        #                 ``WikiService.incremental_refresh``
+        #
+        # #175: also clear ``error`` and update ``progress``. Without
+        # this, the dashboard (which already applied the override) and
+        # the wiki viewer would disagree when a refresh runs after a
+        # prior failure — the viewer would show ``status='generating'``
+        # but ALSO surface the stale ``error`` string from the failed
+        # attempt, confusing the SPA's render logic. Keep these in
+        # lock-step with ``list_wikis`` below.
+        if active_invocation.status in ("generating", "running"):
             response["status"] = active_invocation.status
+            response["progress"] = active_invocation.progress
+            response["error"] = None
     return response
 
 
@@ -823,6 +881,197 @@ async def refresh_wiki(
         invocation_id=invocation.id,
         status=invocation.status,
         message=f"Refresh started. Track via GET /api/v1/invocations/{invocation.id}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# #116 PR 2 — incremental regen diagnostics (no LLM, no writes)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/wikis/{wiki_id}/diff", response_model=DiffWikiResponse)
+async def diff_wiki(
+    wiki_id: str,
+    body: DiffWikiRequest,
+    request: Request,
+    user: CurrentUser = Depends(get_current_user),
+    management: WikiManagementService = Depends(get_wiki_management),
+) -> DiffWikiResponse:
+    """Diff a fresh-parse payload against the indexed snapshot.
+
+    The caller supplies the freshly parsed nodes (id + content_hash + path);
+    the server compares them against the wiki's stored ``repo_nodes`` and
+    returns the resulting change set plus the wiki pages those changes
+    touch (via the ``page_symbols`` reverse index from #116 PR 1).
+
+    Read-only: no parsing, no LLM, no writes. PR 3 will wire the actual
+    re-parse loop on top of this primitive.
+    """
+    from app.core.storage import open_storage
+    from app.services.change_detector import ChangeDetector
+    from app.services.wiki_management import _derive_cache_key
+
+    # Auth check — wiki must exist AND caller must be the owner. The diff
+    # surface exposes content_hash + node_id internals; that's an
+    # implementation detail of the repo, not shareable user data, so we
+    # don't honor the wiki's shared-visibility flag for this endpoint
+    # (unlike /search). Mirrors the /refresh guard.
+    user_id = user.id if user else None
+    wiki = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+    if wiki.owner_id and wiki.owner_id != user_id:
+        raise HTTPException(403, "Only the wiki owner can diff the index")
+
+    settings = request.app.state.settings
+
+    # Resolve the wiki's unified DB. We open read-only; the detector only
+    # reads from repo_nodes + page_symbols.
+    cache_key = _derive_cache_key(settings.cache_dir, wiki.repo_url, wiki.branch)
+    if not cache_key:
+        raise HTTPException(
+            404,
+            f"Unified DB not found for wiki {wiki_id} — index may be stale or evicted",
+        )
+    from pathlib import Path as _Path
+
+    db_path = _Path(settings.cache_dir) / f"{cache_key}.wiki.db"
+    # cache_index entry can survive the underlying file being deleted
+    # (manual cleanup, full disk, etc.). Treat that as the same 404 as
+    # "no cache_index entry" rather than crashing with 500 in open_storage.
+    if not db_path.exists():
+        raise HTTPException(
+            404,
+            f"Unified DB file missing at {db_path.name} — index may be stale or evicted",
+        )
+    storage = open_storage(repo_id=cache_key, db_path=str(db_path), readonly=True)
+
+    try:
+        detector = ChangeDetector(storage)
+        change_set = detector.detect_changes(
+            [n.model_dump() for n in body.parsed_nodes]
+        )
+        affected = detector.affected_pages(change_set)
+
+        # Enrich affected pages with title + slug from wiki_pages where we
+        # have them. Pages predating #116 won't have rows here and just get
+        # title=None — callers fall back to displaying page_id directly.
+        page_titles: dict[str, dict[str, str]] = {}
+        for page in affected:
+            row = storage.get_wiki_page(page.page_id)
+            if row:
+                page_titles[page.page_id] = {
+                    "title": row.get("title") or "",
+                    "anchor_slug": row.get("anchor_slug") or "",
+                }
+    finally:
+        try:
+            storage.close()
+        except Exception:  # noqa: S110 — best-effort close
+            pass
+
+    def _to_response(change) -> NodeChangeResponse:
+        return NodeChangeResponse(
+            kind=change.kind.value,
+            node_id=change.node_id,
+            old_hash=change.old_hash,
+            new_hash=change.new_hash,
+            old_path=change.old_path,
+            new_path=change.new_path,
+        )
+
+    return DiffWikiResponse(
+        wiki_id=wiki_id,
+        change_set=ChangeSetResponse(
+            added=[_to_response(c) for c in change_set.added],
+            modified=[_to_response(c) for c in change_set.modified],
+            moved=[_to_response(c) for c in change_set.moved],
+            deleted=[_to_response(c) for c in change_set.deleted],
+            total=change_set.total,
+        ),
+        affected_pages=[
+            AffectedPageResponse(
+                page_id=p.page_id,
+                title=page_titles.get(p.page_id, {}).get("title") or None,
+                anchor_slug=page_titles.get(p.page_id, {}).get("anchor_slug") or None,
+                changes=[_to_response(c) for c in p.changes],
+            )
+            for p in affected
+        ],
+    )
+
+
+@router.post(
+    "/wikis/{wiki_id}/incremental-refresh",
+    response_model=IncrementalRefreshResponse,
+    status_code=202,
+)
+async def incremental_refresh_wiki(
+    wiki_id: str,
+    body: IncrementalRefreshRequest,
+    user: CurrentUser = Depends(get_current_user),
+    service: WikiService = Depends(get_wiki_service),
+    management: WikiManagementService = Depends(get_wiki_management),
+) -> IncrementalRefreshResponse:
+    """Trigger an incremental refresh on a previously-generated wiki.
+
+    The caller supplies pre-parsed nodes (same shape as ``/diff``).
+    The server diffs them against the indexed snapshot, dispatches each
+    affected page through the trivial / edit / structural regimes, and
+    streams progress over SSE.
+
+    Owner-only — same access model as ``/refresh`` since this surfaces
+    internal content_hash + node_id state through the per-page events.
+    """
+    user_id = user.id if user else None
+    wiki_record = await management.get_wiki(wiki_id, user_id=user_id)
+    if wiki_record is None:
+        raise HTTPException(404, f"Wiki not found: {wiki_id}")
+    if wiki_record.owner_id and wiki_record.owner_id != user_id:
+        raise HTTPException(
+            403, "Only the wiki owner can incrementally refresh",
+        )
+
+    from app.services.wiki_service import IncrementalRefreshInProgressError
+
+    try:
+        result = await service.incremental_refresh(
+            wiki_id,
+            [n.model_dump() for n in body.parsed_nodes],
+            management,
+            owner_id=user_id or "",
+        )
+    except IncrementalRefreshInProgressError as exc:
+        # #140: surface the in-flight invocation_id so the caller can
+        # join the existing SSE stream instead of retrying blindly.
+        # #145: header renamed to ``X-In-Flight-Invocation-Id`` for
+        # parity with the symmetric guard on /generate — the value may
+        # reference an incremental refresh OR a generate, so the
+        # per-endpoint name (``X-Incremental-...``) was misleading.
+        # No prior consumers existed; the rename is safe.
+        raise HTTPException(
+            409,
+            detail=str(exc),
+            headers={"X-In-Flight-Invocation-Id": exc.in_progress_invocation_id},
+        ) from exc
+
+    if result is None:
+        raise HTTPException(
+            404,
+            f"Wiki {wiki_id} unindexed or unified DB missing — "
+            "run /refresh first to bootstrap the incremental state",
+        )
+
+    invocation, summary = result
+    return IncrementalRefreshResponse(
+        wiki_id=wiki_id,
+        invocation_id=invocation.id,
+        status=summary["status"],
+        page_count=summary["page_count"],
+        message=(
+            f"Incremental refresh started. Track via "
+            f"GET /api/v1/invocations/{invocation.id}/stream"
+        ),
     )
 
 

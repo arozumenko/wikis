@@ -43,6 +43,13 @@ class AskConfig:
     max_search_results: int = 20
     enable_graph_analysis: bool = True
     similarity_threshold: float = 0.75  # EmbeddingsFilter threshold (0.0 = disabled)
+    # #120/#157: minimum edge-confidence label for graph expansion.
+    # ``None`` (default) → no filter; ``"EXTRACTED"`` → only direct
+    # parser observations; ``"INFERRED"`` → also include name-only
+    # resolution edges (basic-tier languages). Threading this from
+    # the MCP layer lets AI clients decide how much to trust the
+    # graph's relationship edges per request.
+    min_confidence: str | None = None
 
 
 class AskEngine:
@@ -171,6 +178,8 @@ class AskEngine:
                 graph_text_index=fts_index,
                 similarity_threshold=self.config.similarity_threshold,
                 query_service=self.query_service,
+                # #120/#157: per-request edge-confidence floor.
+                min_confidence=self.config.min_confidence,
             )
         finally:
             # Restore original env

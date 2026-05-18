@@ -136,7 +136,66 @@ export type SSEEventData =
       to_model?: string;
     })
   | ({ type: 'tool_start' } & ToolStartEvent)
-  | ({ type: 'tool_end' } & ToolEndEvent);
+  | ({ type: 'tool_end' } & ToolEndEvent)
+  // #116 PR 5: incremental refresh events. Per-page (one per regime)
+  // plus a summary at the end of the run.
+  | ({ type: 'page_unchanged' } & {
+      progressToken?: string;
+      _pageId?: string;
+      _pageTitle?: string;
+      timestamp?: string;
+    })
+  | ({ type: 'page_patched' } & {
+      progressToken?: string;
+      _pageId?: string;
+      _pageTitle?: string;
+      citationCount?: number;
+      timestamp?: string;
+    })
+  | ({ type: 'page_edited' } & {
+      progressToken?: string;
+      _pageId?: string;
+      _pageTitle?: string;
+      diffRatio?: number;
+      timestamp?: string;
+    })
+  | ({ type: 'page_regenerated' } & {
+      progressToken?: string;
+      _pageId?: string;
+      _pageTitle?: string;
+      demotedFromEdit?: boolean;
+      timestamp?: string;
+    })
+  | ({ type: 'page_deleted' } & {
+      progressToken?: string;
+      _pageId?: string;
+      _pageTitle?: string;
+      timestamp?: string;
+    })
+  | ({ type: 'incremental_summary' } & {
+      progressToken?: string;
+      stats: IncrementalRegenStats;
+      timestamp?: string;
+    });
+
+/**
+ * Shape of the summary event payload — matches the Python
+ * `IncrementalRegenStats.as_dict()` keys.
+ */
+export interface IncrementalRegenStats {
+  total_pages: number;
+  unchanged: number;
+  trivial_patched: number;
+  edit_applied: number;
+  edit_demoted_to_structural: number;
+  structural_regenerated: number;
+  structural_failed: number;
+  /** #141: pages whose entire cluster vanished. */
+  deleted: number;
+  /** #134: per-page reasons captured from the StructuralHandler. */
+  structural_failure_reasons: string[];
+  avg_diff_ratio: number;
+}
 
 export type ResearchSSEEvent =
   | ({ type: 'research_start' } & { session_id: string; question: string; timestamp: string })

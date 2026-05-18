@@ -10,10 +10,12 @@ services:
 
   app:
     volumes:
-      - ./web/src:/app/src
-      - ./web/public:/app/public
+      - ./web:/app
+      - /app/node_modules
+      - /app/.next
     command: >
       sh -c "cd /app &&
+        npm install &&
         ./scripts/prisma-prepare.sh &&
         npx prisma generate &&
         npx prisma migrate deploy 2>/dev/null || true &&
