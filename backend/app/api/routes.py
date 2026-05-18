@@ -53,6 +53,8 @@ from app.models.api import (
     ProjectListResponse,
     ProjectResponse,
     ProjectUpdateRequest,
+    ScanRequest,
+    ScanResponse,
     UpdateWikiDescriptionRequest,
 )
 from app.models.invocation import Invocation
@@ -143,6 +145,56 @@ async def generate_wiki(
         status=invocation.status,
         message=f"Generation started. Track via GET /api/v1/invocations/{invocation.id}",
     )
+
+
+# ---------------------------------------------------------------------------
+# Source scan (#207) — validates + previews without persistence
+# ---------------------------------------------------------------------------
+
+
+@router.post("/sources/scan", response_model=ScanResponse)
+async def scan_source(
+    request: ScanRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> ScanResponse:
+    """Validate a source configuration and return a preview.
+
+    Drives Step 3 (Scan) of the ingestion wizard (#208). Persists nothing:
+    no ``WikiRecord``, no invocation registration, no token write. The
+    response carries reachability + a connector-specific preview shape.
+
+    Errors (no ``responses=`` declaration intentionally — the 400 and 501
+    bodies don't match :class:`ErrorResponse`'s top-level shape and the
+    SPA codegen would otherwise produce wrong client types. A proper
+    error envelope lands with #211 once Atlassian scan settles the
+    response model across all source types.):
+
+    * ``400`` — ``{"detail": {"error": <message>, "reachable": <bool>}}``
+      for unreachable / auth-fail / invalid-scope.
+    * ``501`` — ``{"detail": <message>}`` for confluence/jira until #211.
+
+    TODO(follow-up): rate-limit / tmpdir-exhaustion guard. A malicious
+    authenticated user can fan out concurrent scans; each shallow clone
+    creates a tmpdir for the context-manager lifetime. Belongs at the
+    gateway / network policy layer rather than in this handler.
+    """
+    from app.services.source_scan_service import ScanError, SourceScanService
+
+    service = SourceScanService()
+    try:
+        return await service.scan(request)
+    except ScanError as exc:
+        # User-visible failures: unreachable URL, auth failure, invalid scope.
+        # The toolkit layer already redacts tokens from these messages via
+        # ``GitToolkit._sanitise`` + ``TokenRedactionFilter``.
+        raise HTTPException(  # noqa: B904
+            status_code=400,
+            detail={"error": str(exc), "reachable": exc.reachable},
+        )
+    except NotImplementedError as exc:
+        # Confluence / Jira scan lands in #211; the wizard surfaces this
+        # as a "preview not yet supported for this source" affordance.
+        raise HTTPException(status_code=501, detail=str(exc))  # noqa: B904
 
 
 @router.get("/invocations/{invocation_id}", response_model=Invocation)

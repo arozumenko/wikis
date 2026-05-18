@@ -167,6 +167,48 @@ class GenerateWikiResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Source scan / preview (#207)
+# ---------------------------------------------------------------------------
+#
+# Validates a source configuration and returns a lightweight preview (default
+# branch, file count, top-level paths) without persisting anything. Drives
+# Step 3 of the source-ingestion wizard (#208). Auth material flows through
+# the request body — never stored.
+
+
+class ScanRequest(BaseModel):
+    """Validate a source and return a preview, no side effects.
+
+    Same ``source_type`` / ``scope`` / ``auth`` shape as :class:`GenerateWikiRequest`
+    so the wizard can reuse the form payload it would post to ``/wikis``.
+    """
+
+    source_type: Literal["git", "confluence", "jira"] = "git"
+    scope: dict[str, Any] = Field(default_factory=dict)
+    auth: dict[str, Any] = Field(default_factory=dict)
+
+
+class GitScanPreview(BaseModel):
+    """Preview returned for ``source_type == "git"``."""
+
+    default_branch: str | None = None
+    resolved_branch: str
+    commit_hash: str | None = None
+    file_count: int
+    top_paths: list[str]
+    size_bytes: int
+
+
+class ScanResponse(BaseModel):
+    """Result of a source scan. ``preview`` shape varies by ``source_type``."""
+
+    source_type: str
+    reachable: bool
+    preview: GitScanPreview | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Ask (Q&A)
 # ---------------------------------------------------------------------------
 
