@@ -68,7 +68,7 @@ export function GitConfigure({ data, onChange, urlError, disabled }: GitConfigur
 
       {data.patSource === 'stored' && gitConnections.length === 0 && (
         <Alert severity="info" sx={{ mt: 1 }} data-testid="git-no-pat-alert">
-          No stored Git PATs found. Switch to &ldquo;Paste token&rdquo; above to
+          No stored Git PATs found. Switch to &ldquo;Paste token once&rdquo; above to
           provide a token without storing it.
         </Alert>
       )}
