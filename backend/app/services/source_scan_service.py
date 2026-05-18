@@ -20,13 +20,22 @@ from app.core.local_repo_provider import (
     is_local_path,
     validate_local_path,
 )
+from app.core.sources._atlassian import AtlassianClient
 from app.core.sources.exceptions import (
     SourceAuthError,
+    SourceConnectionError,
     SourceNotFoundError,
     SourceUnavailableError,
 )
 from app.core.sources.git_toolkit import GitToolkit
-from app.models.api import GitScanPreview, ScanRequest, ScanResponse
+from app.models.api import (
+    ConfluenceScanPreview,
+    ConfluenceSpaceInfo,
+    GitScanPreview,
+    JiraScanPreview,
+    ScanRequest,
+    ScanResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,22 +65,24 @@ class SourceScanService:
     async def scan(self, request: ScanRequest) -> ScanResponse:
         """Dispatch to the per-source-type scanner under a total-time budget."""
         if request.source_type == "git":
-            try:
-                return await asyncio.wait_for(
-                    self._scan_git(request), timeout=self._SCAN_BUDGET_SEC
-                )
-            except asyncio.TimeoutError as exc:
-                raise ScanError(
-                    f"Scan exceeded the {self._SCAN_BUDGET_SEC:.0f}s budget — "
-                    "the source may be slow or unreachable",
-                    reachable=False,
-                ) from exc
-        # Atlassian connectors land in a follow-up (#211). Surface as 501 at
-        # the route so the wizard's Step 3 can render a "preview not
-        # supported for this source yet" affordance.
-        raise NotImplementedError(
-            f"Scan not implemented for source_type={request.source_type!r}"
-        )
+            scanner = self._scan_git(request)
+        elif request.source_type == "confluence":
+            scanner = self._scan_confluence(request)
+        elif request.source_type == "jira":
+            scanner = self._scan_jira(request)
+        else:
+            raise NotImplementedError(
+                f"Scan not implemented for source_type={request.source_type!r}"
+            )
+
+        try:
+            return await asyncio.wait_for(scanner, timeout=self._SCAN_BUDGET_SEC)
+        except asyncio.TimeoutError as exc:
+            raise ScanError(
+                f"Scan exceeded the {self._SCAN_BUDGET_SEC:.0f}s budget — "
+                "the source may be slow or unreachable",
+                reachable=False,
+            ) from exc
 
     async def _scan_git(self, request: ScanRequest) -> ScanResponse:
         scope = request.scope or {}
@@ -168,6 +179,183 @@ class SourceScanService:
             preview=preview,
             warnings=warnings,
         )
+
+
+    async def _scan_confluence(self, request: ScanRequest) -> ScanResponse:
+        """Scan a Confluence instance and return a space-level preview.
+
+        Page-count strategy: ``GET /wiki/api/v2/spaces/{key}/pages?limit=1``
+        does not return a reliable total in the v2 API — the v2 cursor-based
+        pagination omits ``total_size``.  We fall back to the v1 CQL content
+        search (``GET /wiki/rest/api/content/search`` with ``cqlcontext``), which
+        does return ``totalSize`` in its envelope.  If that field is missing (e.g.
+        filtered by permissions), ``page_count`` is left as ``None`` so the UI can
+        render ``"?"``.
+        """
+        scope = request.scope or {}
+        base_url = scope.get("base_url")
+        if not isinstance(base_url, str) or not base_url:
+            raise ScanError(
+                "scope.base_url must be a non-empty string for confluence scans"
+            )
+        space_keys_raw = scope.get("space_keys")
+        if isinstance(space_keys_raw, str):
+            requested_keys: list[str] = [
+                k.strip() for k in space_keys_raw.split(",") if k.strip()
+            ]
+        elif space_keys_raw is None:
+            requested_keys = []
+        else:
+            requested_keys = list(space_keys_raw)
+
+        auth = request.auth or {}
+        access_token = auth.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise ScanError(
+                "auth.access_token must be a non-empty string for confluence scans",
+                reachable=False,
+            )
+        refresh_token: str | None = auth.get("refresh_token") or None
+        client_id: str | None = auth.get("client_id") or None
+
+        try:
+            async with AtlassianClient(
+                base_url=base_url,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                client_id=client_id,
+            ) as client:
+                # Fetch spaces — filter to requested keys when provided.
+                spaces_data = await client.get(
+                    "/wiki/rest/api/space",
+                    params={"limit": 250, "type": "global"},
+                )
+                all_spaces = spaces_data.get("results", [])
+
+                if requested_keys:
+                    key_set = set(requested_keys)
+                    all_spaces = [s for s in all_spaces if s.get("key") in key_set]
+
+                space_infos: list[ConfluenceSpaceInfo] = []
+                for space in all_spaces:
+                    key = space.get("key", "")
+                    name = space.get("name", key)
+                    page_count = await _confluence_page_count(client, key)
+                    space_infos.append(
+                        ConfluenceSpaceInfo(key=key, name=name, page_count=page_count)
+                    )
+
+        except SourceAuthError as exc:
+            raise ScanError(str(exc), reachable=False) from exc
+        except (SourceNotFoundError, SourceUnavailableError, SourceConnectionError) as exc:
+            raise ScanError(str(exc), reachable=False) from exc
+
+        total_pages = sum(
+            s.page_count for s in space_infos if s.page_count is not None
+        )
+        preview = ConfluenceScanPreview(spaces=space_infos, total_pages=total_pages)
+        return ScanResponse(
+            source_type="confluence",
+            reachable=True,
+            preview=preview,
+        )
+
+    async def _scan_jira(self, request: ScanRequest) -> ScanResponse:
+        """Scan a Jira instance, validate JQL, and return an issue-count preview.
+
+        Uses ``GET /rest/api/3/search`` with ``maxResults=3`` — the search
+        endpoint validates JQL and returns ``total`` even when only a small
+        slice of issues is requested.  A JQL syntax error surfaces as a 400
+        from Jira, which the AtlassianClient maps to ``SourceConnectionError``
+        (HTTP 4xx catchall). We re-raise that as ``ScanError(reachable=False)``
+        because the scan itself failed — the site may well be reachable, but
+        reporting ``reachable=True`` when the preview cannot be computed would
+        mislead the wizard into advancing to the next step.
+        """
+        scope = request.scope or {}
+        base_url = scope.get("base_url")
+        if not isinstance(base_url, str) or not base_url:
+            raise ScanError(
+                "scope.base_url must be a non-empty string for jira scans"
+            )
+        jql: str = scope.get("jql") or "ORDER BY created DESC"
+
+        auth = request.auth or {}
+        access_token = auth.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise ScanError(
+                "auth.access_token must be a non-empty string for jira scans",
+                reachable=False,
+            )
+        refresh_token: str | None = auth.get("refresh_token") or None
+        client_id: str | None = auth.get("client_id") or None
+
+        try:
+            async with AtlassianClient(
+                base_url=base_url,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                client_id=client_id,
+            ) as client:
+                data = await client.get(
+                    "/rest/api/3/search",
+                    params={
+                        "jql": jql,
+                        "maxResults": 3,
+                        "fields": "summary",
+                    },
+                )
+        except SourceAuthError as exc:
+            raise ScanError(str(exc), reachable=False) from exc
+        except (
+            SourceNotFoundError,
+            SourceUnavailableError,
+            SourceConnectionError,
+        ) as exc:
+            # SourceConnectionError covers Jira's 400 for invalid JQL — the
+            # AtlassianClient maps all 4xx (other than 401/403/404) to this
+            # exception.  We treat a failed scan as reachable=False: the wizard
+            # should not advance to the next step when the preview is absent.
+            raise ScanError(str(exc), reachable=False) from exc
+
+        total = data.get("total", 0)
+        sample_keys = [issue["key"] for issue in data.get("issues", [])]
+        preview = JiraScanPreview(
+            matching_issues=total,
+            sample_issue_keys=sample_keys,
+            jql_validated=True,
+        )
+        return ScanResponse(
+            source_type="jira",
+            reachable=True,
+            preview=preview,
+        )
+
+
+async def _confluence_page_count(client: AtlassianClient, space_key: str) -> int | None:
+    """Return the total page count for *space_key* or ``None`` when unavailable.
+
+    Uses the v1 CQL content search which reliably returns ``totalSize`` in its
+    envelope.  ``limit=1`` minimises data transfer — we only need the count.
+    """
+    try:
+        data = await client.get(
+            "/wiki/rest/api/content/search",
+            params={
+                "cql": f'space.key="{space_key}" AND type=page',
+                "limit": 1,
+            },
+        )
+    except (SourceNotFoundError, SourceUnavailableError, SourceConnectionError):
+        return None
+
+    total = data.get("totalSize")
+    if total is None:
+        return None
+    try:
+        return int(total)
+    except (TypeError, ValueError):
+        return None
 
 
 def _enumerate(workdir: Path, cap: int) -> tuple[int, int, bool]:
