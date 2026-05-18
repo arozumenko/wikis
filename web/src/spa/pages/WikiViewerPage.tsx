@@ -348,7 +348,15 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
         setGenEvents((prev) => [
           ...prev,
           // Keep legacy shape so GenerationProgress recognises it as an error event
-          { type: 'error', event: 'error', error: 'Connection lost', recoverable: true },
+          {
+            type: 'error',
+            event: 'error',
+            error: 'Connection lost',
+            recoverable: true,
+            error_type: null,
+            model_limit: null,
+            suggested_actions: null,
+          },
         ]);
       },
     );

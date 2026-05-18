@@ -147,6 +147,7 @@ function LegacyGenerateForm({
     (e: React.FormEvent) => {
       e.preventDefault();
       onSubmit({
+        source_type: 'git',
         repo_url: repoUrl,
         branch,
         provider,
@@ -157,6 +158,7 @@ function LegacyGenerateForm({
         force_rebuild_index: false,
         llm_model: null,
         embedding_model: null,
+        structure_planner: plannerType === 'agent' ? 'agentic' : 'graph_clustering',
         visibility: 'personal',
         planner_type: plannerType,
         exclude_tests: isCluster ? excludeTests : null,
