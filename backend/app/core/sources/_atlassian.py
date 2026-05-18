@@ -1,0 +1,202 @@
+"""Shared HTTP client for Atlassian Cloud APIs (Confluence + Jira).
+
+Handles OAuth 2.0 token refresh and rate-limit retry so the individual
+toolkit modules stay focused on API shape, not transport concerns.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import httpx
+
+from app.core.sources.exceptions import (
+    SourceAuthError,
+    SourceConnectionError,
+    SourceNotFoundError,
+    SourceUnavailableError,
+)
+
+logger = logging.getLogger(__name__)
+
+_REFRESH_URL = "https://auth.atlassian.com/oauth/token"
+_MAX_RATE_LIMIT_RETRIES = 3
+_DEFAULT_RETRY_AFTER = 5  # seconds
+
+
+class AtlassianClient:
+    """Async HTTP client for Atlassian Cloud REST APIs.
+
+    Wraps httpx.AsyncClient with:
+    - OAuth 2.0 Bearer auth
+    - Automatic retry on HTTP 429 (up to 3 attempts, honouring Retry-After)
+    - Automatic token refresh on HTTP 401 (one retry after refresh)
+    - Consistent exception mapping across all status codes
+
+    Usage::
+
+        async with AtlassianClient(base_url, access_token) as client:
+            data = await client.get("/wiki/rest/api/space", params={"limit": 1})
+
+    Args:
+        base_url: Tenant URL, e.g. ``"https://example.atlassian.net"`` (no trailing slash).
+        access_token: Current OAuth 2.0 access token.
+        refresh_token: Refresh token for automatic re-auth (optional).
+        client_id: OAuth 2.0 client ID — required when *refresh_token* is set.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        access_token: str,
+        refresh_token: str | None = None,
+        client_id: str | None = None,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._access_token = access_token
+        self._refresh_token = refresh_token
+        self._client_id = client_id
+        self._client: httpx.AsyncClient | None = None
+
+    async def __aenter__(self) -> "AtlassianClient":
+        self._client = httpx.AsyncClient(timeout=30.0)
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._access_token}",
+            "Accept": "application/json",
+        }
+
+    async def _refresh(self) -> None:
+        """POST to Atlassian token endpoint and update stored tokens.
+
+        Atlassian rotates the refresh token on every use — store the new one.
+        Raises SourceAuthError on any failure.
+        """
+        if not self._refresh_token or not self._client_id:
+            raise SourceAuthError("Token refresh requires refresh_token and client_id")
+
+        try:
+            resp = await self._client.post(  # type: ignore[union-attr]
+                _REFRESH_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": self._client_id,
+                    "refresh_token": self._refresh_token,
+                },
+            )
+        except httpx.ConnectError as exc:
+            raise SourceAuthError(f"Atlassian token refresh failed: {exc}") from exc
+
+        if resp.status_code != 200:
+            raise SourceAuthError(
+                f"Atlassian token refresh failed: HTTP {resp.status_code}"
+            )
+
+        body = resp.json()
+        self._access_token = body["access_token"]
+        # Atlassian rotates refresh tokens — keep the new one
+        if "refresh_token" in body:
+            self._refresh_token = body["refresh_token"]
+
+    async def _raw_get(self, path: str, params: dict[str, Any] | None) -> httpx.Response:
+        url = f"{self._base_url}{path}"
+        return await self._client.get(  # type: ignore[union-attr]
+            url,
+            params=params,
+            headers=self._auth_headers(),
+        )
+
+    @staticmethod
+    def _map_error(resp: httpx.Response, path: str) -> None:
+        """Raise the appropriate SourceError for non-2xx status codes."""
+        code = resp.status_code
+        if code == 400:
+            raise SourceConnectionError(
+                f"Bad request (400) for {path} — check CQL/JQL or configuration"
+            )
+        if code == 404:
+            raise SourceNotFoundError(path)
+        if code >= 500:
+            raise SourceUnavailableError(
+                f"Atlassian server error {code} for {path}"
+            )
+
+    # ------------------------------------------------------------------
+    # Public
+    # ------------------------------------------------------------------
+
+    async def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """GET ``{base_url}{path}`` and return the decoded JSON body.
+
+        Retry up to 3 times on HTTP 429 (rate limited), honouring Retry-After.
+        Refresh tokens automatically on HTTP 401, then retry once.
+
+        Args:
+            path: API path, e.g. ``"/wiki/rest/api/space"``.
+            params: Optional query parameters.
+
+        Returns:
+            Decoded JSON response body.
+
+        Raises:
+            SourceAuthError: 401 that cannot be resolved by token refresh.
+            SourceNotFoundError: 404.
+            SourceUnavailableError: 429 exhausted or 5xx.
+            SourceConnectionError: 400 or network error.
+        """
+        assert self._client is not None, "AtlassianClient must be used as an async context manager"  # noqa: S101
+
+        # --- rate-limit retry loop ---
+        for attempt in range(_MAX_RATE_LIMIT_RETRIES):
+            try:
+                resp = await self._raw_get(path, params)
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError) as exc:
+                raise SourceConnectionError(f"Network error reaching Atlassian: {exc}") from exc
+
+            if resp.status_code == 429:
+                if attempt == _MAX_RATE_LIMIT_RETRIES - 1:
+                    raise SourceUnavailableError(
+                        f"Atlassian rate limit exceeded after {_MAX_RATE_LIMIT_RETRIES} attempts for {path}"
+                    )
+                retry_after = int(resp.headers.get("Retry-After", _DEFAULT_RETRY_AFTER))
+                logger.warning("Rate limited by Atlassian; waiting %ds (attempt %d)", retry_after, attempt + 1)
+                await asyncio.sleep(retry_after)
+                continue
+
+            if resp.status_code == 401:
+                # Try refresh exactly once
+                can_refresh = bool(self._refresh_token and self._client_id)
+                if not can_refresh:
+                    raise SourceAuthError("Atlassian authentication failed and no refresh token available")
+                try:
+                    await self._refresh()
+                except SourceAuthError:
+                    raise
+                # Retry with new token
+                try:
+                    resp = await self._raw_get(path, params)
+                except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError) as exc:
+                    raise SourceConnectionError(f"Network error reaching Atlassian: {exc}") from exc
+                if resp.status_code == 401:
+                    raise SourceAuthError("Atlassian authentication failed after token refresh")
+                # Fall through to error-mapping below
+
+            self._map_error(resp, path)
+            # 2xx — success
+            return resp.json()
+
+        # Unreachable — loop exits via return or raise above
+        raise SourceUnavailableError(f"Atlassian request failed after retries for {path}")
