@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import socket
+import subprocess
 import tempfile
+import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from app.core.sources import GitToolkit, OriginPointer, registry
-from app.core.sources.exceptions import SourceAuthError, SourceNotFoundError
+from app.core.sources.exceptions import SourceAuthError, SourceNotFoundError, SourceUnavailableError
 
 
 # ---------------------------------------------------------------------------
@@ -443,3 +447,73 @@ def test_safe_url_strips_embedded_credentials():
     safe = toolkit._safe_url()
     assert "ghp_xxx" not in safe
     assert "github.com" in safe
+
+
+# ---------------------------------------------------------------------------
+# 18. subprocess timeout — git clone raises SourceUnavailableError
+# ---------------------------------------------------------------------------
+
+
+def test_clone_timeout_raises_source_unavailable():
+    """When subprocess.run raises TimeoutExpired, _ensure_workdir must raise
+    SourceUnavailableError with the safe (credential-free) URL in the message.
+    """
+    toolkit = GitToolkit(
+        repo_url="https://github.com/example/slow-repo.git",
+        branch="main",
+    )
+
+    with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["git", "clone"], timeout=75)):
+        with pytest.raises(SourceUnavailableError, match="git clone timed out for"):
+            toolkit._ensure_workdir()
+
+
+# ---------------------------------------------------------------------------
+# 19. Concurrency proof — _ensure_workdir does not block the event loop
+# ---------------------------------------------------------------------------
+
+_SIMULATED_DURATION = 0.15  # seconds each fake clone sleeps
+_OVERLAP_THRESHOLD = 0.05   # ≥50 ms overlap proves threads ran concurrently
+
+
+@pytest.mark.asyncio
+async def test_connection_does_not_block_event_loop(tmp_path: Path):
+    """Two concurrent asyncio.to_thread calls must overlap by ≥50 ms.
+
+    Proof that _ensure_workdir (and by extension any blocking subprocess call
+    wrapped in asyncio.to_thread) does not starve the event loop: both calls
+    must run concurrently on the thread pool rather than serialising.
+    """
+    # Records (start, end) only for the slow git-clone calls.
+    call_records: list[tuple[float, float]] = []
+
+    def _fake_subprocess(cmd, *args, **kwargs):
+        if "clone" in cmd:
+            # Simulate a slow network clone so the two threads must overlap.
+            t0 = time.monotonic()
+            time.sleep(_SIMULATED_DURATION)
+            call_records.append((t0, time.monotonic()))
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        # git rev-parse HEAD — instant, returns a fake SHA.
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="deadbeef\n", stderr="")
+
+    # Two separate toolkit instances so _ensure_workdir runs once each.
+    tk1 = GitToolkit(repo_url="https://github.com/example/repo1.git")
+    tk2 = GitToolkit(repo_url="https://github.com/example/repo2.git")
+
+    with patch("subprocess.run", side_effect=_fake_subprocess):
+        await asyncio.gather(
+            asyncio.to_thread(tk1._ensure_workdir),
+            asyncio.to_thread(tk2._ensure_workdir),
+        )
+
+    assert len(call_records) == 2, "Expected exactly 2 git-clone calls (one per toolkit)"
+
+    first_start, first_end = min(call_records, key=lambda r: r[0])
+    second_start, _ = max(call_records, key=lambda r: r[0])
+
+    overlap = first_end - second_start
+    assert overlap >= _OVERLAP_THRESHOLD, (
+        f"Threads did not overlap: first ended at {first_end:.3f}, "
+        f"second started at {second_start:.3f}, overlap={overlap:.3f}s"
+    )

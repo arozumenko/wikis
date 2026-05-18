@@ -315,6 +315,15 @@ class GitToolkit(SourceToolkit):
 
         For local paths this is a no-op (the path IS the working tree).
         For remote URLs, we shallow-clone into a fresh temp directory.
+
+        Warning:
+            This method is NOT safe for concurrent calls on the same instance.
+            Two coroutines calling ``_ensure_workdir`` concurrently (e.g. via
+            ``asyncio.to_thread``) can both pass the ``self._workdir is not None``
+            guard before either sets the attribute, resulting in a double-clone
+            race.  Current callers (``source_materializer.py``, scan service) are
+            all serial, so this is latent rather than active.  A proper fix
+            (``asyncio.Lock``) is tracked in a follow-up issue.
         """
         if self._workdir is not None:
             return
@@ -351,7 +360,17 @@ class GitToolkit(SourceToolkit):
             ]
             logger.debug("Cloning %s (branch: %s)", self._safe_url(), self._branch)
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
+                result = subprocess.run(  # noqa: S603
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=75,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise SourceUnavailableError(
+                    f"git clone timed out for {self._safe_url()}"
+                ) from exc
             except Exception as exc:
                 raise SourceUnavailableError(self._sanitise(f"git clone failed: {exc}")) from exc
 
@@ -366,14 +385,19 @@ class GitToolkit(SourceToolkit):
             self._workdir = Path(tmpdir)
 
             # Read the commit SHA from the local clone.
-            rev_result = subprocess.run(  # noqa: S603
-                ["git", "rev-parse", "HEAD"],
-                cwd=self._workdir,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if rev_result.returncode == 0:
+            try:
+                rev_result = subprocess.run(  # noqa: S603
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=self._workdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning("git rev-parse HEAD timed out for %s; SHA will be unknown", self._safe_url())
+                rev_result = None
+            if rev_result is not None and rev_result.returncode == 0:
                 self._commit_sha = rev_result.stdout.strip()
 
     # ------------------------------------------------------------------
