@@ -16,10 +16,14 @@ from app.core.sources.exceptions import (
     SourceNotFoundError,
     SourceUnavailableError,
 )
+from app.core.sources.git_toolkit import GitToolkit
 from app.core.sources.registry import ToolkitRegistry, registry
+
+registry.register(GitToolkit)
 
 __all__ = [
     "SourceToolkit",
+    "GitToolkit",
     "FileInfo",
     "FileContent",
     "OriginPointer",
