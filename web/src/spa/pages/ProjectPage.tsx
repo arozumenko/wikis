@@ -16,6 +16,8 @@ import {
   Grid,
   IconButton,
   Snackbar,
+  Tab,
+  Tabs,
   TextField,
   Tooltip,
   Typography,
@@ -48,6 +50,8 @@ import {
   listProjectWikis,
   type ProjectResponse,
 } from '../api/project';
+import { AddSourceWizard } from '../components/wizard/AddSourceWizard';
+import type { GenerateWikiResponse } from '../api/wiki';
 import { subscribeAskSSE, subscribeResearchSSE } from '../api/sse';
 import type { ToolCallRecord, TodoItem } from '../api/sse';
 import { listWikis } from '../api/wiki';
@@ -111,9 +115,16 @@ function extractOwnerRepo(url: string): string {
   return url;
 }
 
+/** Tab identifiers for the project page. */
+type ProjectTab = 'overview' | 'ingestion';
+
 export function ProjectPage() {
-  const { projectId } = useParams<{ projectId: string }>();
+  const { projectId, tab: tabParam } = useParams<{ projectId: string; tab?: string }>();
   const navigate = useNavigate();
+
+  // Derive active tab from URL param; default to 'overview'.
+  const activeTab: ProjectTab = tabParam === 'ingestion' ? 'ingestion' : 'overview';
+
   const [project, setProject] = useState<ProjectResponse | null>(null);
   const [wikis, setWikis] = useState<WikiSummary[]>([]);
   const [allWikis, setAllWikis] = useState<WikiSummary[]>([]);
@@ -140,6 +151,9 @@ export function ProjectPage() {
 
   const [snackMessage, setSnackMessage] = useState<string | null>(null);
   const [snackSeverity, setSnackSeverity] = useState<'success' | 'error'>('error');
+
+  // Ingestion tab — snack for link errors (non-fatal; user still navigates).
+  const [ingestionLinkError, setIngestionLinkError] = useState<string | null>(null);
 
   // Q&A state — mirrors WikiViewerPage pattern exactly
   const [chatTurns, setChatTurns] = useState<QATurn[]>([]);
@@ -321,6 +335,44 @@ export function ProjectPage() {
       }
     },
     [project, showSnack],
+  );
+
+  // Ingestion tab handlers
+  // -----------------------------------------------------------------------
+  // handleIngestionSuccess — called by the inline wizard after generation
+  // starts. Links the new wiki to the project, then navigates to the wiki
+  // with the generating indicator query params (same shape as the dashboard).
+  // If the link call fails we still navigate — the wiki was created, the
+  // user can add it to the project manually from the dashboard.
+  const handleIngestionSuccess = useCallback(
+    async (response: GenerateWikiResponse) => {
+      if (projectId) {
+        try {
+          await addWikiToProject(projectId, response.wiki_id);
+        } catch {
+          setIngestionLinkError(
+            'Wiki generation started but it could not be automatically linked to this project. You can add it manually from the Wikis tab.',
+          );
+        }
+      }
+      const params = new URLSearchParams({ generating: 'true' });
+      if (response.invocation_id) params.set('invocation', response.invocation_id);
+      navigate(`/wiki/${response.wiki_id}?${params.toString()}`);
+    },
+    [projectId, navigate],
+  );
+
+  // handleIngestionAlreadyExists — 409: navigate to the existing wiki.
+  // We don't try to link because the wiki might already be in the project
+  // or the user may have just submitted a duplicate. Either way, navigating
+  // there is the correct UX.
+  const handleIngestionAlreadyExists = useCallback(
+    (existingWikiId: string | null) => {
+      if (existingWikiId) {
+        navigate(`/wiki/${existingWikiId}`);
+      }
+    },
+    [navigate],
   );
 
   // Shared SSE event handler for thinking_step events (identical to WikiViewerPage)
@@ -726,7 +778,43 @@ export function ProjectPage() {
 
       {projectId && <RecomputeWidget projectId={projectId} isOwner={isOwner} />}
 
-      {/* Wiki grid */}
+      {/* Tab bar */}
+      <Tabs
+        value={activeTab}
+        onChange={(_e, val: ProjectTab) => {
+          if (val === 'ingestion') {
+            navigate(`/project/${projectId}/ingestion`);
+          } else {
+            navigate(`/project/${projectId}`);
+          }
+        }}
+        sx={{ mb: 3, borderBottom: 1, borderColor: 'divider' }}
+      >
+        <Tab label="Overview" value="overview" />
+        {isOwner && <Tab label="Ingestion" value="ingestion" data-testid="tab-ingestion" />}
+      </Tabs>
+
+      {/* Ingestion tab content */}
+      {activeTab === 'ingestion' && isOwner && (
+        <Box sx={{ maxWidth: 600 }}>
+          {ingestionLinkError && (
+            <Alert severity="warning" sx={{ mb: 2 }} onClose={() => setIngestionLinkError(null)}>
+              {ingestionLinkError}
+            </Alert>
+          )}
+          <AddSourceWizard
+            open
+            inline
+            onClose={() => navigate(`/project/${projectId}`)}
+            onSuccess={(response) => void handleIngestionSuccess(response)}
+            onAlreadyExists={handleIngestionAlreadyExists}
+          />
+        </Box>
+      )}
+
+      {/* Overview tab — wiki grid + AskBar */}
+      {activeTab === 'overview' && (
+        <>
       {wikis.length === 0 && !isOwner ? (
         <Alert severity="info">
           No wikis in this project yet.
@@ -893,6 +981,8 @@ export function ProjectPage() {
           onSubmit={handleAsk}
           placeholder="Ask a question across all project wikis…"
         />
+      )}
+        </>
       )}
 
       {/* Edit Description Modal */}

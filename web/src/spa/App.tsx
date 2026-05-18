@@ -62,6 +62,14 @@ export function App() {
                               </ProjectProvider>
                             }
                           />
+                          <Route
+                            path="project/:projectId/:tab"
+                            element={
+                              <ProjectProvider>
+                                <ProjectPage />
+                              </ProjectProvider>
+                            }
+                          />
                         </Route>
                       </Routes>
                     </Suspense>

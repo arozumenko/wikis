@@ -23,6 +23,7 @@
 
 import { useCallback, useMemo, useState } from 'react';
 import {
+  Box,
   Button,
   Dialog,
   DialogActions,
@@ -33,6 +34,7 @@ import {
   Step,
   StepLabel,
   Stepper,
+  Typography,
 } from '@mui/material';
 import {
   generateWikiMultiSource,
@@ -67,6 +69,16 @@ interface AddSourceWizardProps {
    * conflict as an inline error message and stays open.
    */
   onAlreadyExists?: (existingWikiId: string | null) => void;
+  /**
+   * When true the wizard renders as a plain Box instead of an MUI Dialog.
+   * Use this when mounting the wizard inline on a page (e.g. the Project
+   * Ingestion tab) rather than as a modal overlay.
+   *
+   * The ``open`` prop is still respected — when ``inline=true`` and
+   * ``open=false`` the component renders nothing, keeping the same
+   * contract as the dialog variant for callers that gate on open.
+   */
+  inline?: boolean;
 }
 
 const URL_PATTERN = /^(https?:\/\/|git@|file:\/\/|\/)/;
@@ -81,6 +93,7 @@ export function AddSourceWizard({
   initialUrl,
   onSuccess,
   onAlreadyExists,
+  inline = false,
 }: AddSourceWizardProps) {
   const [step, setStep] = useState<WizardStepIndex>(0);
   const [formData, setFormData] = useState<WizardFormData>(() => ({
@@ -377,6 +390,173 @@ export function AddSourceWizard({
     (step === 2) || // Scan step always allows advance — preview is optional
     (step === 3); // Confirm uses Submit button, not Next
 
+  // ---------------------------------------------------------------------
+  // Shared step content — rendered inside either the Dialog or the
+  // inline Box wrapper. Kept as a fragment so neither parent adds extra
+  // DOM layers.
+  // ---------------------------------------------------------------------
+
+  const stepContent = (
+    <>
+      <Stepper activeStep={step} sx={{ mb: 2 }}>
+        {WIZARD_STEPS.map((label) => (
+          <Step key={label}>
+            <StepLabel>{label}</StepLabel>
+          </Step>
+        ))}
+      </Stepper>
+
+      {step === 0 && (
+        <StepConnector
+          selected={formData.source_type}
+          onSelect={(source_type) => {
+            setFormData((d) => ({ ...d, source_type }));
+            // Auto-advance on pick (cartograph behavior).
+            setStep(1);
+          }}
+        />
+      )}
+      {step === 1 && (
+        <StepConfigure
+          data={formData}
+          onChange={setFormData}
+          urlError={urlError}
+          spaceKeysError={spaceKeysError}
+          jqlError={jqlError}
+          disabled={submitting}
+        />
+      )}
+      {step === 2 && (
+        <StepScan
+          buildScanRequest={buildScanRequest}
+          cachedResult={scanResult}
+          cachedScopeHash={scanResultHash}
+          onScanComplete={(result) => {
+            // C2 — defense-in-depth guard. The *primary* protection
+            // against late scan results corrupting state is the
+            // ``mountedRef`` in StepScan (C4): unmount fires synchronously
+            // during the commit that removes ``<StepScan>``, so the
+            // ``if (!mountedRef.current) return`` inside ``runScan``
+            // intercepts the late resolve before this callback is ever
+            // invoked. This step check is a belt to that braces, in
+            // case React's commit ordering ever changes underfoot.
+            if (step !== 2) return;
+            setScanResult(result);
+            setScanResultHash(result ? currentScopeHash : null);
+            setScanSkipped(false);
+          }}
+        />
+      )}
+      {step === 3 && (
+        <StepConfirm
+          data={formData}
+          onChange={setFormData}
+          scanResult={scanResult}
+          scanSkipped={scanSkipped}
+          submitError={submitError}
+          disabled={submitting}
+        />
+      )}
+    </>
+  );
+
+  const actionButtons = (
+    <>
+      <Stack direction="row" spacing={1} sx={{ flex: 1 }}>
+        {step > 0 && (
+          <Button onClick={goBack} disabled={submitting} data-testid="wizard-back">
+            Back
+          </Button>
+        )}
+        {step === 2 && (
+          <Button onClick={skipScan} disabled={submitting} data-testid="wizard-skip-scan">
+            Skip preview
+          </Button>
+        )}
+      </Stack>
+      {!inline && (
+        <Button onClick={requestClose} disabled={submitting}>
+          Cancel
+        </Button>
+      )}
+      {step < 3 && step > 0 && (
+        <Button
+          variant="contained"
+          onClick={goNext}
+          disabled={!canAdvance || submitting}
+          data-testid="wizard-next"
+        >
+          Next
+        </Button>
+      )}
+      {step === 3 && (
+        <Button
+          variant="contained"
+          onClick={() => void handleSubmit()}
+          disabled={submitting}
+          data-testid="wizard-submit"
+        >
+          {submitting ? 'Starting…' : 'Add source'}
+        </Button>
+      )}
+    </>
+  );
+
+  // Confirm-discard dialog — used by both inline and dialog variants.
+  const discardDialog = (
+    <Dialog
+      open={confirmDiscardOpen}
+      onClose={() => setConfirmDiscardOpen(false)}
+      maxWidth="xs"
+      data-testid="wizard-discard-confirm"
+    >
+      <DialogTitle>Discard changes?</DialogTitle>
+      <DialogContent>
+        <DialogContentText>
+          You'll lose the source configuration entered so far.
+        </DialogContentText>
+      </DialogContent>
+      <DialogActions>
+        <Button
+          onClick={() => setConfirmDiscardOpen(false)}
+          data-testid="wizard-discard-cancel"
+        >
+          Keep editing
+        </Button>
+        <Button
+          color="error"
+          variant="contained"
+          onClick={confirmDiscard}
+          data-testid="wizard-discard-confirm-button"
+        >
+          Discard
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+
+  // ------------------------------------------------------------------
+  // Inline variant — renders as a plain Box, no modal overlay.
+  // ------------------------------------------------------------------
+  if (inline) {
+    if (!open) return null;
+    return (
+      <Box data-testid="add-source-wizard">
+        <Typography variant="h6" sx={{ mb: 2 }}>
+          Add a source
+        </Typography>
+        <Box sx={{ mb: 2 }}>{stepContent}</Box>
+        <Stack direction="row" spacing={1} sx={{ mt: 2 }}>
+          {actionButtons}
+        </Stack>
+        {discardDialog}
+      </Box>
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Dialog variant (default) — original MUI Dialog wrapper.
+  // ------------------------------------------------------------------
   return (
     <Dialog
       open={open}
@@ -388,138 +568,16 @@ export function AddSourceWizard({
       data-testid="add-source-wizard"
     >
       <DialogTitle>Add a source</DialogTitle>
-      <DialogContent>
-        <Stepper activeStep={step} sx={{ mb: 2 }}>
-          {WIZARD_STEPS.map((label) => (
-            <Step key={label}>
-              <StepLabel>{label}</StepLabel>
-            </Step>
-          ))}
-        </Stepper>
-
-        {step === 0 && (
-          <StepConnector
-            selected={formData.source_type}
-            onSelect={(source_type) => {
-              setFormData((d) => ({ ...d, source_type }));
-              // Auto-advance on pick (cartograph behavior).
-              setStep(1);
-            }}
-          />
-        )}
-        {step === 1 && (
-          <StepConfigure
-            data={formData}
-            onChange={setFormData}
-            urlError={urlError}
-            spaceKeysError={spaceKeysError}
-            jqlError={jqlError}
-            disabled={submitting}
-          />
-        )}
-        {step === 2 && (
-          <StepScan
-            buildScanRequest={buildScanRequest}
-            cachedResult={scanResult}
-            cachedScopeHash={scanResultHash}
-            onScanComplete={(result) => {
-              // C2 — defense-in-depth guard. The *primary* protection
-              // against late scan results corrupting state is the
-              // ``mountedRef`` in StepScan (C4): unmount fires synchronously
-              // during the commit that removes ``<StepScan>``, so the
-              // ``if (!mountedRef.current) return`` inside ``runScan``
-              // intercepts the late resolve before this callback is ever
-              // invoked. This step check is a belt to that braces, in
-              // case React's commit ordering ever changes underfoot.
-              if (step !== 2) return;
-              setScanResult(result);
-              setScanResultHash(result ? currentScopeHash : null);
-              setScanSkipped(false);
-            }}
-          />
-        )}
-        {step === 3 && (
-          <StepConfirm
-            data={formData}
-            onChange={setFormData}
-            scanResult={scanResult}
-            scanSkipped={scanSkipped}
-            submitError={submitError}
-            disabled={submitting}
-          />
-        )}
-      </DialogContent>
+      <DialogContent>{stepContent}</DialogContent>
       <DialogActions sx={{ px: 3, pb: 2 }}>
-        <Stack direction="row" spacing={1} sx={{ flex: 1 }}>
-          {step > 0 && (
-            <Button onClick={goBack} disabled={submitting} data-testid="wizard-back">
-              Back
-            </Button>
-          )}
-          {step === 2 && (
-            <Button onClick={skipScan} disabled={submitting} data-testid="wizard-skip-scan">
-              Skip preview
-            </Button>
-          )}
-        </Stack>
-        <Button onClick={requestClose} disabled={submitting}>
-          Cancel
-        </Button>
-        {step < 3 && step > 0 && (
-          <Button
-            variant="contained"
-            onClick={goNext}
-            disabled={!canAdvance || submitting}
-            data-testid="wizard-next"
-          >
-            Next
-          </Button>
-        )}
-        {step === 3 && (
-          <Button
-            variant="contained"
-            onClick={() => void handleSubmit()}
-            disabled={submitting}
-            data-testid="wizard-submit"
-          >
-            {submitting ? 'Starting…' : 'Add source'}
-          </Button>
-        )}
+        {actionButtons}
       </DialogActions>
 
       {/*
         Confirm-discard dialog (Rio C5). Rendered inside the main Dialog so
         focus management stays sane — MUI nests Dialogs by default.
       */}
-      <Dialog
-        open={confirmDiscardOpen}
-        onClose={() => setConfirmDiscardOpen(false)}
-        maxWidth="xs"
-        data-testid="wizard-discard-confirm"
-      >
-        <DialogTitle>Discard changes?</DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            You'll lose the source configuration entered so far.
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions>
-          <Button
-            onClick={() => setConfirmDiscardOpen(false)}
-            data-testid="wizard-discard-cancel"
-          >
-            Keep editing
-          </Button>
-          <Button
-            color="error"
-            variant="contained"
-            onClick={confirmDiscard}
-            data-testid="wizard-discard-confirm-button"
-          >
-            Discard
-          </Button>
-        </DialogActions>
-      </Dialog>
+      {discardDialog}
     </Dialog>
   );
 }
