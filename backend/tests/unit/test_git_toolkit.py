@@ -19,9 +19,8 @@ from app.core.sources.exceptions import SourceAuthError, SourceNotFoundError
 
 def _has_network() -> bool:
     try:
-        socket.setdefaulttimeout(2)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("github.com", 443))
-        return True
+        with socket.create_connection(("github.com", 443), timeout=2):
+            return True
     except OSError:
         return False
 
@@ -347,3 +346,100 @@ async def test_integration_clone_public_repo():
         fc = await tk.fetch_content(first.origin)
         assert isinstance(fc.content, str)
         assert fc.info.path == first.path
+
+
+# ---------------------------------------------------------------------------
+# 14. Auth URL — provider-specific credential prefix
+# ---------------------------------------------------------------------------
+
+_AUTH_URL_CASES = [
+    (
+        "github",
+        "https://github.com/foo/bar.git",
+        "ghp_token",
+        "https://ghp_token@github.com/foo/bar.git",
+    ),
+    (
+        "gitlab",
+        "https://gitlab.com/group/project.git",
+        "glpat-token",
+        "https://oauth2:glpat-token@gitlab.com/group/project.git",
+    ),
+    (
+        "bitbucket",
+        "https://bitbucket.org/workspace/repo.git",
+        "bb_token",
+        "https://x-token-auth:bb_token@bitbucket.org/workspace/repo.git",
+    ),
+    (
+        "azure_devops",
+        "https://dev.azure.com/myorg/myproject/_git/myrepo",
+        "pat_token",
+        "https://pat_token@dev.azure.com/myorg/myproject/_git/myrepo",
+    ),
+]
+
+
+@pytest.mark.parametrize("name,repo_url,token,expected", _AUTH_URL_CASES)
+def test_auth_url_provider_prefix(name, repo_url, token, expected):
+    """_auth_url uses provider-correct credential prefix."""
+    toolkit = GitToolkit(repo_url=repo_url, token=token)
+    assert toolkit._auth_url() == expected, f"[{name}] wrong auth URL"
+
+
+# ---------------------------------------------------------------------------
+# 15. list_files — symlinks are skipped
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_files_skips_symlinks(tmp_path: Path):
+    """Symlinks must not appear in list_files output."""
+    real_file = tmp_path / "real.py"
+    real_file.write_text("print('real')")
+    link_file = tmp_path / "link.py"
+    link_file.symlink_to(real_file)
+
+    tk = GitToolkit(repo_url=str(tmp_path))
+    files = [fi async for fi in tk.list_files()]
+    paths = {fi.path for fi in files}
+    assert "real.py" in paths
+    assert "link.py" not in paths
+
+
+# ---------------------------------------------------------------------------
+# 16. fetch_content — path-traversal is rejected
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_content_path_traversal_raises(tmp_path: Path):
+    """pointer.ref that escapes workdir must raise SourceNotFoundError."""
+    # Create the toolkit pointed at a subdir so ../escape.txt exits it.
+    subdir = tmp_path / "repo"
+    subdir.mkdir()
+    escape_target = tmp_path / "escape.txt"
+    escape_target.write_text("secret")
+
+    tk = GitToolkit(repo_url=str(subdir))
+    ptr = OriginPointer(
+        source_type="git",
+        ref="../escape.txt",
+        url="file:///escape.txt",
+        ingested_at=__import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc),
+    )
+    with pytest.raises(SourceNotFoundError, match="escapes repository"):
+        await tk.fetch_content(ptr)
+
+
+# ---------------------------------------------------------------------------
+# 17. _safe_url — strips credentials even when no token is set on instance
+# ---------------------------------------------------------------------------
+
+
+def test_safe_url_strips_embedded_credentials():
+    """_safe_url must remove credentials baked into repo_url."""
+    toolkit = GitToolkit(repo_url="https://ghp_xxx@github.com/foo/bar.git", token=None)
+    safe = toolkit._safe_url()
+    assert "ghp_xxx" not in safe
+    assert "github.com" in safe

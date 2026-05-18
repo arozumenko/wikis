@@ -105,6 +105,16 @@ def _match_patterns(rel_path: str, patterns: list[str]) -> bool:
     return False
 
 
+def _strip_url_credentials(url: str) -> str:
+    """Return *url* with any embedded userinfo (user:pass) removed."""
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url)
+    if parsed.username or parsed.password:
+        return urlunparse(parsed._replace(netloc=parsed.hostname or ""))
+    return url
+
+
 def _build_blob_url(
     repo_url: str,
     path: str,
@@ -122,13 +132,11 @@ def _build_blob_url(
         url = url[:-4]
 
     # Remove embedded credentials (https://<token>@host/...)
-    from urllib.parse import urlparse, urlunparse
+    url = _strip_url_credentials(url)
+
+    from urllib.parse import urlparse
 
     parsed = urlparse(url)
-    if parsed.username or parsed.password:
-        cleaned = parsed._replace(netloc=parsed.hostname or "")
-        url = urlunparse(cleaned)
-
     host = parsed.hostname or ""
 
     if "github" in host:
@@ -225,6 +233,13 @@ class GitToolkit(SourceToolkit):
         Args:
             config: Keys: ``repo_url`` (required), ``branch``, ``token``,
                 ``whitelist`` (str or list), ``blacklist`` (str or list).
+
+        Security precondition:
+            The caller is responsible for validating ``repo_url`` against any
+            local-path allowlist (``ALLOWED_LOCAL_PATHS``) before constructing
+            the toolkit.  ``from_config`` does NOT call ``validate_local_path``.
+            When wired into ``WikiService`` in #189, validation must happen at
+            the API boundary, not here.
         """
         repo_url: str = config["repo_url"]
         branch: str = config.get("branch", "main")
@@ -259,24 +274,41 @@ class GitToolkit(SourceToolkit):
         return text
 
     def _auth_url(self) -> str:
-        """Return the clone URL with credentials embedded if a token is set."""
+        """Return the clone URL with credentials embedded if a token is set.
+
+        The credential prefix varies by provider:
+        - GitHub / Azure DevOps: ``{token}@host``
+        - GitLab: ``oauth2:{token}@host``
+        - Bitbucket: ``x-token-auth:{token}@host``
+        - Default (unknown self-hosted): ``{token}@host``
+        """
         if not self._token:
             return self._repo_url
 
         from urllib.parse import urlparse, urlunparse
 
         parsed = urlparse(self._repo_url)
-        authed = parsed._replace(netloc=f"{self._token}@{parsed.hostname}{(':' + str(parsed.port)) if parsed.port else ''}")
+        host = parsed.hostname or ""
+        port_suffix = f":{parsed.port}" if parsed.port else ""
+
+        if host == "gitlab.com" or host.startswith("gitlab."):
+            userinfo = f"oauth2:{self._token}"
+        elif host == "bitbucket.org" or host.startswith("bitbucket."):
+            userinfo = f"x-token-auth:{self._token}"
+        else:
+            # GitHub, Azure DevOps (dev.azure.com), and unknown self-hosted
+            userinfo = self._token
+
+        authed = parsed._replace(netloc=f"{userinfo}@{host}{port_suffix}")
         return urlunparse(authed)
 
     def _safe_url(self) -> str:
-        """Clone URL without credentials — safe for logging."""
-        if not self._token:
-            return self._repo_url
-        from urllib.parse import urlparse, urlunparse
+        """Clone URL without credentials — safe for logging.
 
-        parsed = urlparse(self._repo_url)
-        return urlunparse(parsed._replace(netloc=parsed.hostname or ""))
+        Strips both the instance token (if set) and any credentials that may
+        have been embedded directly in ``repo_url`` by the caller.
+        """
+        return _strip_url_credentials(self._repo_url)
 
     def _ensure_workdir(self) -> None:
         """Resolve or clone the repository exactly once.
@@ -289,6 +321,7 @@ class GitToolkit(SourceToolkit):
 
         from app.core.local_repo_provider import extract_git_metadata, is_local_path
 
+        # TODO(#189): caller (WikiService) must call validate_local_path before reaching this branch
         if is_local_path(self._repo_url):
             self._is_local = True
             raw = self._repo_url.removeprefix("file://")
@@ -360,6 +393,14 @@ class GitToolkit(SourceToolkit):
         Args:
             include: Additional include patterns (merged with instance whitelist).
             exclude: Additional exclude patterns (merged with instance blacklist).
+
+        Note:
+            ``list_files`` does NOT apply the project-wide
+            ``FilesystemRepositoryIndexer`` exclusion defaults (heavy dirs like
+            ``node_modules``, extension allowlists, file-size caps).  Callers
+            that want indexer-equivalent behavior must pass the same
+            ``include``/``exclude`` patterns explicitly.  This keeps the toolkit
+            composable — the filter policy lives with the caller.
         """
         self._ensure_workdir()
         workdir = self._workdir
@@ -371,6 +412,11 @@ class GitToolkit(SourceToolkit):
         now = datetime.now(tz=timezone.utc)
 
         for abs_path in workdir.rglob("*"):
+            # Skip symlinks before is_file() which follows them.
+            if abs_path.is_symlink():
+                rel_sym = abs_path.relative_to(workdir)
+                logger.debug("Skipping symlink: %s", rel_sym)
+                continue
             if not abs_path.is_file():
                 continue
 
@@ -426,7 +472,13 @@ class GitToolkit(SourceToolkit):
         workdir = self._workdir
         assert workdir is not None  # noqa: S101
 
-        target = workdir / pointer.ref
+        resolved = (workdir / pointer.ref).resolve()
+        if not resolved.is_relative_to(workdir.resolve()):
+            raise SourceNotFoundError(f"Path escapes repository: {pointer.ref!r}")
+        if resolved.is_symlink():
+            raise SourceNotFoundError(f"Refusing to read symlink: {pointer.ref!r}")
+
+        target = resolved
         if not target.exists():
             raise SourceNotFoundError(f"File not found in working tree: {pointer.ref}")
         try:
