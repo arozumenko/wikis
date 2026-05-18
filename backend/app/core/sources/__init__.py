@@ -16,14 +16,20 @@ from app.core.sources.exceptions import (
     SourceNotFoundError,
     SourceUnavailableError,
 )
+from app.core.sources.confluence_toolkit import ConfluenceToolkit
 from app.core.sources.git_toolkit import GitToolkit
+from app.core.sources.jira_toolkit import JiraToolkit
 from app.core.sources.registry import ToolkitRegistry, registry
 
 registry.register(GitToolkit)
+registry.register(ConfluenceToolkit)
+registry.register(JiraToolkit)
 
 __all__ = [
     "SourceToolkit",
     "GitToolkit",
+    "ConfluenceToolkit",
+    "JiraToolkit",
     "FileInfo",
     "FileContent",
     "OriginPointer",
