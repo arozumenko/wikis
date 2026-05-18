@@ -155,6 +155,9 @@ class MultiGraphQueryService:
                     layer=layer,
                     path_prefix=path_prefix,
                 )
+                for result in results:
+                    setattr(result, "wiki_id", wiki_id)
+                    setattr(result, "source_wiki_id", wiki_id)
                 all_results.extend(results)
             except Exception as exc:
                 logger.warning("search failed for wiki %s: %s", wiki_id, exc)
@@ -173,15 +176,32 @@ class MultiGraphQueryService:
         max_depth: int = 2,
         max_results: int = 50,
     ) -> list[RelationshipResult]:
-        """Traverse relationships for a node_id, trying each wiki graph in order."""
+        """Traverse relationships for a node_id, trying each wiki service in order."""
         for _wiki_id, svc in self._services.items():
-            if node_id in svc.graph:
-                return svc.get_relationships(
-                    node_id,
-                    direction=direction,
-                    max_depth=max_depth,
-                    max_results=max_results,
-                )
+            graph = getattr(svc, "graph", None)
+            if graph is not None:
+                if node_id in graph:
+                    return svc.get_relationships(
+                        node_id,
+                        direction=direction,
+                        max_depth=max_depth,
+                        max_results=max_results,
+                    )
+                continue
+            getter = getattr(svc, "get_node", None)
+            if getter is None:
+                continue
+            try:
+                if getter(node_id) is None:
+                    continue
+            except Exception:  # pragma: no cover — defensive
+                continue
+            return svc.get_relationships(
+                node_id,
+                direction=direction,
+                max_depth=max_depth,
+                max_results=max_results,
+            )
         return []
 
     # ------------------------------------------------------------------
@@ -231,6 +251,8 @@ class MultiGraphQueryService:
             try:
                 results = svc.query(expression)
                 for r in results:
+                    setattr(r, "wiki_id", wiki_id)
+                    setattr(r, "source_wiki_id", wiki_id)
                     if r.node_id not in seen_node_ids:
                         seen_node_ids.add(r.node_id)
                         all_results.append(r)

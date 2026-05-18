@@ -103,6 +103,15 @@ If `read_source_file` and `list_repo_files` appear in your tool list, use them t
 
 **These tools may not always be available.** If they are not in your tool list,
 rely on `search_codebase` for all code discovery.
+
+## Project Cross-Repo Links (when available)
+
+If `find_cross_repo_links` appears in your tool list, you are in project mode.
+Use it for questions about how repositories integrate or depend on each other.
+Its results are direct evidence links from API-surface matching: REST endpoints,
+DTO/object shapes, FFI/ABI, protobuf/gRPC, GraphQL, BDD steps, CLI commands,
+and similar repo-to-repo contracts. Treat these links as high-confidence starting
+points, then use `get_relationships` and `get_code` to inspect the exact symbols.
 """
 
 # =============================================================================
@@ -132,6 +141,13 @@ Use AFTER finding symbols via search to understand connections:
 - What calls this function?
 - What does this class inherit from?
 - What depends on this module?
+
+## `find_cross_repo_links` - Direct Project Integration Evidence (if available)
+
+Use this in project mode to find explicit links between repos by API contract,
+shared DTO/object shape, FFI/ABI binding, protobuf/gRPC service, GraphQL field,
+BDD step, CLI command, or similar surface. Call it with either a broad query or
+an exact symbol/node id found by `search_symbols`.
 
 ## `read_source_file` - Direct File Access (if available)
 

@@ -78,9 +78,11 @@ export function ChatDrawer({ wikiId }: ChatDrawerProps) {
       if (mode === 'fast') {
         const response = await askQuestion({
           wiki_id: wikiId,
+          project_id: null,
           question,
           chat_history: chatHistory,
           k: 15,
+          min_confidence: null,
         });
         assistantMsg = {
           role: 'assistant',
@@ -92,9 +94,10 @@ export function ChatDrawer({ wikiId }: ChatDrawerProps) {
         // 'deep' uses general research; 'codemap' uses the ask-first code map pipeline
         const response = await deepResearch({
           wiki_id: wikiId,
+          project_id: null,
           question,
           research_type: mode === 'codemap' ? 'codemap' : 'general',
-          enable_subagents: true,
+          chat_history: chatHistory,
         });
         assistantMsg = {
           role: 'assistant',

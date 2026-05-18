@@ -19,6 +19,7 @@ import pytest
 from pydantic import SecretStr
 
 from app.config import Settings
+from app.core.code_graph.graph_query_service import RelationshipResult
 from app.models.api import ResearchRequest, ResearchResponse, SourceReference
 from app.services.research_service import (
     ResearchService,
@@ -843,6 +844,58 @@ class TestBuildCallTreeRelationships:
         sources = [SourceReference(file_path="svc.py", symbol="func_a")]
         result = _build_call_tree_from_sources(sources, gqs)
         assert result is not None
+
+    def test_cross_repo_api_surface_edge_uses_exact_project_node_ids(self):
+        """A direct project edge traverses by node id, not ambiguous symbol names."""
+        from app.services.research_service import _build_call_tree_from_sources
+
+        nodes = {
+            "api-wiki::producer": {
+                "symbol_name": "ModelsAPI",
+                "symbol_type": "method",
+                "rel_path": "api/models.py",
+                "line_start": 12,
+            },
+            "sdk-wiki::consumer": {
+                "symbol_name": "EliteAClient.models",
+                "symbol_type": "method",
+                "rel_path": "elitea_sdk/client.py",
+                "line_start": 55,
+            },
+        }
+        rel = RelationshipResult(
+            source_name="ModelsAPI",
+            target_name="EliteAClient.models",
+            relationship_type="cross_repo_api_surface",
+            source_type="method",
+            target_type="method",
+            source_node_id="api-wiki::producer",
+            target_node_id="sdk-wiki::consumer",
+        )
+        gqs = self._make_gqs_with_rels(nodes, [rel])
+        gqs.resolve_symbol = MagicMock(return_value=None)
+        sources = [
+            SourceReference(
+                file_path="api/models.py",
+                symbol="ModelsAPI",
+                node_id="api-wiki::producer",
+                wiki_id="api-wiki",
+            )
+        ]
+
+        result = _build_call_tree_from_sources(sources, gqs)
+
+        assert result is not None
+        section_paths = {section.file_path for section in result.sections}
+        assert "api/models.py" in section_paths
+        assert "elitea_sdk/client.py" in section_paths
+        producer = next(
+            symbol
+            for section in result.sections
+            for symbol in section.symbols
+            if symbol.name == "ModelsAPI"
+        )
+        assert "cross_repo_api_surface: EliteAClient.models" in producer.relationships
 
     def test_excluded_relationship_type_skipped(self):
         """A 'uses' relationship is filtered out (only call-flow edges kept)."""

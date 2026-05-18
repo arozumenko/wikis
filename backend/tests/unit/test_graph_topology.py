@@ -156,7 +156,31 @@ class TestOrphanDetection:
 
 
 class TestFTS5Resolution:
-    """Step 3 — FTS5 lexical orphan resolution."""
+    """Step 3 — FTS5 lexical orphan resolution.
+
+    These tests cover the **legacy** flat-FTS cascade. The v2 cascade
+    (explicit-ref → hybrid → tiered lexical → directory) is exercised
+    in tests/unit/test_graph_topology_v2.py and the cascade module's
+    own unit suites. We pin v2 off here to keep coverage on the
+    legacy path, which is still selectable via WIKI_ORPHAN_CASCADE_V2=0.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _legacy_cascade(self, monkeypatch):
+        from app.core import feature_flags as _ff
+
+        original = _ff.get_feature_flags()
+        from dataclasses import replace
+
+        forced = replace(
+            original,
+            orphan_cascade_v2=False,
+            orphan_lexical_tiered=False,
+            orphan_hybrid_search=False,
+        )
+        monkeypatch.setattr(_ff, "get_feature_flags", lambda: forced)
+        # graph_topology imports get_feature_flags lazily inside
+        # resolve_orphans so the monkeypatch above is enough.
 
     def test_fts5_resolves_orphan(self):
         G = nx.MultiDiGraph()
@@ -215,7 +239,22 @@ class TestFTS5Resolution:
 
 
 class TestSemanticResolution:
-    """Step 4 — semantic vector orphan resolution."""
+    """Step 4 — semantic vector orphan resolution (legacy cascade)."""
+
+    @pytest.fixture(autouse=True)
+    def _legacy_cascade(self, monkeypatch):
+        from app.core import feature_flags as _ff
+
+        original = _ff.get_feature_flags()
+        from dataclasses import replace
+
+        forced = replace(
+            original,
+            orphan_cascade_v2=False,
+            orphan_lexical_tiered=False,
+            orphan_hybrid_search=False,
+        )
+        monkeypatch.setattr(_ff, "get_feature_flags", lambda: forced)
 
     def test_semantic_resolves_orphan(self):
         G = nx.MultiDiGraph()
@@ -579,6 +618,36 @@ class TestEdgeWeighting:
         expected = 1.0 / math.log(1 + 2)
         assert abs(edge_data["weight"] - expected) < 1e-6
 
+    def test_cross_language_confidence_weight_preserved(self):
+        G = nx.MultiDiGraph()
+        G.add_node("py.handler")
+        G.add_node("ts.client")
+        G.add_edge(
+            "py.handler",
+            "ts.client",
+            edge_class="cross_language",
+            weight=0.42,
+        )
+
+        apply_edge_weights(G)
+        edge_data = list(G.get_edge_data("py.handler", "ts.client").values())[0]
+        assert edge_data["weight"] == pytest.approx(0.42)
+
+    def test_test_link_confidence_weight_preserved(self):
+        G = nx.MultiDiGraph()
+        G.add_node("test.file")
+        G.add_node("src.file")
+        G.add_edge(
+            "test.file",
+            "src.file",
+            edge_class="test_link",
+            weight=0.5,
+        )
+
+        apply_edge_weights(G)
+        edge_data = list(G.get_edge_data("test.file", "src.file").values())[0]
+        assert edge_data["weight"] == pytest.approx(0.5)
+
 
 # ====================================================================
 # TestHubDetection
@@ -673,6 +742,75 @@ class TestEdgePersistence:
         assert count == 99
         # Should have called upsert_edges_batch multiple times
         assert db.upsert_edges_batch.call_count >= 3
+
+    def test_persist_preserves_provenance_and_confidence(self):
+        """Phase 1 (graph-quality roadmap): persist_weights_to_db must
+        round-trip provenance and confidence from NetworkX edge attrs
+        into the DB. Earlier revisions silently dropped them, leaving
+        every persisted row with NULL provenance and the default
+        EXTRACTED confidence regardless of upstream linker decisions.
+        """
+        G = nx.MultiDiGraph()
+        G.add_node("src")
+        G.add_node("tgt")
+        G.add_node("ast_src")
+        G.add_node("ast_tgt")
+        G.add_edge(
+            "src",
+            "tgt",
+            relationship_type="cross_language_L1",
+            edge_class="cross_language",
+            weight=0.6,
+            confidence="INFERRED",
+            provenance={
+                "source": "cross_language_linker",
+                "level": "L1",
+                "matcher": "api_surface:rest",
+                "surface": "GET /users/{id}",
+            },
+            created_by="cross_language_linker",
+        )
+        # AST-style edge with no explicit provenance — must get a
+        # backfilled non-null provenance dict so phase2_stats_v2 never
+        # falls back to the generic "unknown" bucket.
+        G.add_edge(
+            "ast_src",
+            "ast_tgt",
+            relationship_type="calls",
+            weight=1.0,
+        )
+
+        db = _mock_db()
+        db.edge_count.return_value = 2
+
+        persist_weights_to_db(db, G)
+
+        # Collect every batched edge dict the helper handed to the DB.
+        batched: list[dict] = []
+        for call in db.upsert_edges_batch.call_args_list:
+            batched.extend(call.args[0])
+
+        by_type = {row["rel_type"]: row for row in batched}
+        assert "cross_language_L1" in by_type
+        l1_row = by_type["cross_language_L1"]
+        assert l1_row["confidence"] == "INFERRED"
+        assert l1_row["edge_class"] == "cross_language"
+        assert l1_row["provenance"] == {
+            "source": "cross_language_linker",
+            "level": "L1",
+            "matcher": "api_surface:rest",
+            "surface": "GET /users/{id}",
+        }
+
+        ast_row = by_type["calls"]
+        # Confidence default still applies, but provenance must be a
+        # dict tagging the edge as AST-derived.
+        assert ast_row["confidence"] == "EXTRACTED"
+        assert isinstance(ast_row["provenance"], dict)
+        assert ast_row["provenance"].get("source") in {"ast", "calls"}
+        assert ast_row["provenance"].get("source") == "ast"
+        assert ast_row["provenance"].get("matcher") == "calls"
+
 
 
 # ====================================================================

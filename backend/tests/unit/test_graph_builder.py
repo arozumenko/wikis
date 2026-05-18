@@ -20,6 +20,7 @@ from app.core.code_graph.graph_builder import (
     _BASIC_AST_TYPE_MAP,
     _IMPORT_TYPES,
 )
+from app.core.feature_flags import FeatureFlags
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,25 @@ def _make_builder():
 
         builder = EnhancedUnifiedGraphBuilder(max_workers=1)
     return builder
+
+
+def _flags(**overrides):
+    return FeatureFlags(**overrides)
+
+
+@pytest.fixture(autouse=True)
+def _pin_legacy_node_id_style():
+    """Most tests in this module were written against the legacy
+    ``node_id_style="stem"`` behavior (``python::auth::Foo``). Production
+    flipped the default to ``rel_path`` (``python::auth_py::Foo``); pin the
+    flag here so the legacy assertions remain meaningful. Tests that need
+    the new style must patch ``get_feature_flags`` themselves.
+    """
+    with patch(
+        "app.core.code_graph.graph_builder.get_feature_flags",
+        return_value=_flags(node_id_style="stem"),
+    ):
+        yield
 
 
 def _make_basic_symbol(
@@ -1206,9 +1226,53 @@ def test_detect_cross_language_relationships_returns_empty():
 
 def test_detect_cross_language_relationships_with_data():
     builder = _make_builder()
-    files = {"python": ["/repo/auth.py"], "java": ["/repo/Auth.java"]}
-    result = builder._detect_cross_language_relationships(files, {})
-    assert result == []
+    builder.repo_path = "/repo"
+    files = {"python": ["/repo/auth.py"], "typescript": ["/repo/web/auth.ts"]}
+    py_symbol = _make_basic_symbol(
+        name="create_user",
+        file_path="/repo/auth.py",
+        rel_path="auth.py",
+        language="python",
+    )
+    ts_symbol = _make_basic_symbol(
+        name="createUser",
+        file_path="/repo/web/auth.ts",
+        rel_path="web/auth.ts",
+        language="typescript",
+    )
+    py_result = _make_basic_parse_result(
+        "/repo/auth.py",
+        "python",
+        [py_symbol],
+        relationships=[
+            BasicRelationship(
+                source_symbol="create_user",
+                target_symbol="createUser",
+                relationship_type="calls",
+                source_file="/repo/auth.py",
+                target_file="/repo/web/auth.ts",
+            )
+        ],
+    )
+    ts_result = _make_basic_parse_result("/repo/web/auth.ts", "typescript", [ts_symbol])
+
+    with patch("app.core.code_graph.graph_builder.get_feature_flags", return_value=_flags(node_id_style="rel_path")):
+        result = builder._detect_cross_language_relationships(
+            files,
+            {"/repo/auth.py": py_result, "/repo/web/auth.ts": ts_result},
+        )
+
+    assert result == [
+        {
+            "source": "python::auth_py::create_user",
+            "target": "typescript::web__auth_ts::createUser",
+            "confidence": 0.95,
+            "relationship_type": "cross_language_L0",
+            "parser_relationship_type": "calls",
+            "source_language": "python",
+            "target_language": "typescript",
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1727,7 +1791,7 @@ def test_build_node_target_direct_match():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {"AuthService": [node_id]}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "AuthService", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "AuthService", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1738,7 +1802,7 @@ def test_build_node_target_not_found():
     node_cache = {}
     symbol_registry = {"by_name": {}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "UnknownSymbol", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "UnknownSymbol", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result is None
 
@@ -1751,7 +1815,7 @@ def test_build_node_target_self_reference():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "self.some_method", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "self.some_method", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1764,7 +1828,7 @@ def test_build_node_target_dotted_name():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {"UserModel": [node_id]}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "models.UserModel", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "models.UserModel", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1777,7 +1841,7 @@ def test_build_node_target_with_target_file_hint():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "UserModel", "python", "auth", symbol_registry, graph, {}, node_cache, "models"
+        "UserModel", "python", "auth", "", symbol_registry, graph, {}, node_cache, "models"
     )
     assert result == node_id
 
@@ -1791,7 +1855,7 @@ def test_resolve_target_strategy4_registry_by_name():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {"UserModel": [node_id]}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "UserModel", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "UserModel", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1808,7 +1872,7 @@ def test_resolve_target_strategy3_unqualified_match():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "models.UserModel", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "models.UserModel", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1828,13 +1892,13 @@ def test_resolve_target_strategy5_qualified_name():
         "by_qualified_name": {"payments.TxProcessor": node_id},
     }
     result = builder._resolve_target_node_sync(
-        "payments.TxProcessor", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "payments.TxProcessor", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     # Strategy 3 len==2: qualified_target="python::payments::TxProcessor" IS in cache → returns there
     # Actually this still gets caught in strategy 3. Let's use a 3-part name for strategy 5.
     # 3-part name: "a.payments.TxProcessor"
     result = builder._resolve_target_node_sync(
-        "a.payments.TxProcessor", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "a.payments.TxProcessor", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     # Strategy 3 for 3 parts: tries "payments.TxProcessor", "TxProcessor" (not in cache via partial)
     # Actually let's force it: ensure neither partial matches in node_cache
@@ -1852,7 +1916,7 @@ def test_resolve_target_strategy5_qualified_name():
     # "x.SpecialModel": strategy 3 len==2 tries "python::x::SpecialModel" (not in cache) then
     # "python::auth::SpecialModel" (not in cache) → falls to strategy 5
     result2 = builder._resolve_target_node_sync(
-        "x.SpecialModel", "python", "auth", symbol_registry2, graph, {}, node_cache2, None
+        "x.SpecialModel", "python", "auth", "", symbol_registry2, graph, {}, node_cache2, None
     )
     assert result2 == node_id2
 
@@ -1870,7 +1934,7 @@ def test_resolve_target_strategy7_direct_file_match():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "SomeClass.something.do_stuff", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "SomeClass.something.do_stuff", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1887,7 +1951,7 @@ def test_resolve_target_strategy7_dotted_method():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {"validate": [node_id]}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "SomeClass.Handler.validate", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "SomeClass.Handler.validate", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1900,7 +1964,7 @@ def test_resolve_target_debug_mode_prints(capsys):
     node_cache = {}
     symbol_registry = {"by_name": {}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "ExternalLib.method", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "ExternalLib.method", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result is None
     captured = capsys.readouterr()
@@ -1917,7 +1981,7 @@ def test_resolve_target_dotted_three_parts_qualified_match():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "a.b.c", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "a.b.c", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1933,7 +1997,7 @@ def test_resolve_target_dotted_three_parts_single_part_fallback():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "a.b.c", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "a.b.c", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1947,7 +2011,7 @@ def test_resolve_target_strategy4_second_pass_non_definition():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {"somevar": [node_id]}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "somevar", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "somevar", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1965,7 +2029,7 @@ def test_resolve_target_strategy4_with_value_type():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {"UserModel": [node_id]}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "UserModel", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "UserModel", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1980,7 +2044,7 @@ def test_resolve_target_strategy7_dotted_method_via_registry():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {"do_work": [node_id]}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "a.b.do_work", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "a.b.do_work", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -1998,7 +2062,7 @@ def test_resolve_target_strategy7_registry_with_enum_type():
     node_cache = {node_id: True}
     symbol_registry = {"by_name": {"process": [node_id]}, "by_qualified_name": {}}
     result = builder._resolve_target_node_sync(
-        "a.b.c.process", "python", "auth", symbol_registry, graph, {}, node_cache, None
+        "a.b.c.process", "python", "auth", "", symbol_registry, graph, {}, node_cache, None
     )
     assert result == node_id
 
@@ -2333,3 +2397,128 @@ def test_iter_symbol_chunks_exception_handled_gracefully():
     docs = list(builder._iter_symbol_chunks({"/repo/bad.py": mock_result}))
     # Should not raise; returns empty list
     assert isinstance(docs, list)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1c (graph-quality roadmap) — decorator preamble enrichment
+# ---------------------------------------------------------------------------
+
+
+class TestDecoratorPreamble:
+    """``_get_decorator_preamble`` must re-attach decorators that
+    tree-sitter rich parsers leave outside a symbol's ``source_text``
+    slice. Without this enrichment, the api_surface_extractor REST
+    matchers never see ``@router.get("/x")`` and the cross-language
+    linker silently emits zero edges.
+    """
+
+    def _write_file(self, tmp_path, name: str, content: str) -> str:
+        p = tmp_path / name
+        p.write_text(content, encoding="utf-8")
+        return str(p)
+
+    def test_preamble_returns_empty_when_no_decorator(self, tmp_path):
+        builder = _make_builder()
+        path = self._write_file(
+            tmp_path,
+            "plain.py",
+            "def login():\n    return 'ok'\n",
+        )
+        # ``def login`` is at line 1 (1-indexed); nothing precedes it.
+        assert builder._get_decorator_preamble(path, 1) == ""
+
+    def test_preamble_captures_single_fastapi_decorator(self, tmp_path):
+        builder = _make_builder()
+        src = (
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "\n"
+            "@router.get(\"/login\")\n"
+            "def login():\n"
+            "    return {\"ok\": True}\n"
+        )
+        path = self._write_file(tmp_path, "routes.py", src)
+        # ``def login`` is at line 5 (1-indexed). The decorator on line 4
+        # must be captured.
+        preamble = builder._get_decorator_preamble(path, 5)
+        assert "@router.get(\"/login\")" in preamble
+
+    def test_preamble_captures_multiple_decorators(self, tmp_path):
+        builder = _make_builder()
+        src = (
+            "@router.get(\"/users/{id}\")\n"
+            "@require_auth\n"
+            "def get_user(id: int):\n"
+            "    return {}\n"
+        )
+        path = self._write_file(tmp_path, "users.py", src)
+        # ``def get_user`` is at line 3; both decorators on lines 1 and 2
+        # must be captured.
+        preamble = builder._get_decorator_preamble(path, 3)
+        assert "@router.get(\"/users/{id}\")" in preamble
+        assert "@require_auth" in preamble
+
+    def test_preamble_caches_file_contents(self, tmp_path):
+        builder = _make_builder()
+        path = self._write_file(
+            tmp_path,
+            "cached.py",
+            "@router.post(\"/x\")\ndef handler():\n    pass\n",
+        )
+        builder._get_decorator_preamble(path, 2)
+        assert path in builder._file_lines_cache
+        # Mutating the underlying file must NOT change the cached
+        # result, proving the cache is consulted on subsequent calls.
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# wiped\n")
+        cached = builder._get_decorator_preamble(path, 2)
+        assert "@router.post(\"/x\")" in cached
+
+    def test_preamble_handles_missing_file_gracefully(self, tmp_path):
+        builder = _make_builder()
+        # File does not exist — must return empty string, not raise.
+        assert builder._get_decorator_preamble(str(tmp_path / "missing.py"), 5) == ""
+
+
+def test_decorator_preamble_unblocks_rest_api_surface_detection(tmp_path):
+    """Integration of the decorator preamble with the api_surface
+    extractor: a Python source slice that omits its decorator (the
+    typical tree-sitter output) is invisible to the REST matcher;
+    prepending the decorator makes ``GET /login`` discoverable, which
+    is the precondition for the cross-language linker to emit any
+    cross_language_L1 edges on a FastAPI repo.
+    """
+    from app.core.code_graph.api_surface_extractor import extract_api_surfaces
+
+    builder = _make_builder()
+    src = (
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "\n"
+        "@router.get(\"/login\")\n"
+        "def login():\n"
+        "    return {\"ok\": True}\n"
+    )
+    path = str(tmp_path / "routes.py")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(src)
+
+    # Simulate the parser slice (def line through end-of-body only).
+    naked_body = "def login():\n    return {\"ok\": True}\n"
+    naked_node = {
+        "language": "python",
+        "source_text": naked_body,
+        "symbol_name": "login",
+    }
+    assert extract_api_surfaces(naked_node) == []
+
+    # With the decorator preamble re-attached the REST matcher fires.
+    preamble = builder._get_decorator_preamble(path, 5)
+    assert preamble  # sanity
+    enriched_node = {
+        "language": "python",
+        "source_text": preamble + naked_body,
+        "symbol_name": "login",
+    }
+    surfaces = extract_api_surfaces(enriched_node)
+    assert any(s["kind"] == "rest" and s["surface"] == "GET /login" for s in surfaces)

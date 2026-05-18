@@ -182,6 +182,7 @@ class SourceReference(BaseModel):
     """A reference to a source code location."""
 
     file_path: str
+    node_id: str | None = None
     line_start: int | None = None
     line_end: int | None = None
     snippet: str | None = None

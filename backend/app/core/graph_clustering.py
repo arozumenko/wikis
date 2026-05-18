@@ -320,6 +320,12 @@ def architectural_projection(
         return child_to_parent.get(nid)
 
     for u, v, data in G.edges(data=True):
+        # Phase 6: cross-language and test-link edges are synthetic
+        # connectivity hints, not architectural relationships. Letting
+        # them into the projection distorts Leiden communities.
+        ec = (data.get("edge_class") or "").lower()
+        if ec in {"cross_language", "test_link"}:
+            continue
         mu = _remap(u)
         mv = _remap(v)
         if mu is None or mv is None:

@@ -45,6 +45,7 @@ from sqlalchemy import (
     select,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
@@ -149,6 +150,10 @@ def _define_tables(
         Column("micro_cluster", Integer),
         Column("is_hub", Integer, server_default="0"),
         Column("hub_assignment", Text),
+        # Phase 6 (graph-quality roadmap) — list of API-surface objects
+        # (REST/gRPC/GraphQL/FFI/BDD/CLI) extracted from the symbol's
+        # source_text. NULL when nothing detected.
+        Column("api_surface", JSONB),
         # tsvector column for FTS
         Column("fts_vector", Text),  # Will be cast to tsvector in DDL
         schema=schema,
@@ -171,6 +176,9 @@ def _define_tables(
         Column("language", Text, server_default=""),
         Column("annotations", Text, server_default=""),
         Column("created_by", Text, server_default="ast"),
+        # Phase 1 (graph-quality roadmap) — JSON blob describing the
+        # synthetic edge's source. NULL for parser-derived AST edges.
+        Column("provenance", Text),
         schema=schema,
     )
 
@@ -240,6 +248,14 @@ def _define_tables(
 # ═══════════════════════════════════════════════════════════════════════════
 # PostgresWikiStorage
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def get_feature_flags_pg_norm() -> bool:
+    """Convenience reader for ``WIKI_PG_TS_RANK_NORM`` (Phase 0)."""
+    from ..feature_flags import get_feature_flags
+
+    return get_feature_flags().pg_ts_rank_normalize
+
 
 class PostgresWikiStorage:
     """PostgreSQL storage backend conforming to ``WikiStorageProtocol``.
@@ -390,6 +406,24 @@ class PostgresWikiStorage:
                         ALTER TABLE {schema}.repo_edges
                             ADD CONSTRAINT repo_edges_confidence_chk
                             CHECK (confidence IN ('EXTRACTED','INFERRED','AMBIGUOUS'));
+                    END IF;
+                    -- Phase 1 (graph-quality roadmap): provenance column.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_edges'
+                          AND column_name = 'provenance'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_edges
+                            ADD COLUMN provenance JSONB DEFAULT NULL;
+                    END IF;
+                    -- Phase 6 (graph-quality roadmap): api_surface column.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_nodes'
+                          AND column_name = 'api_surface'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_nodes
+                            ADD COLUMN api_surface JSONB DEFAULT NULL;
                     END IF;
                 END $$;
             """))
@@ -633,6 +667,23 @@ class PostgresWikiStorage:
         """Convert a SQLAlchemy Row to a plain dict."""
         return dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
 
+    def _attach_score_norm(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Add ``score_norm`` ∈ (0, 1] derived from a Postgres ``ts_rank`` value.
+
+        PostgreSQL's ``ts_rank_cd`` returns small positive floats. Phase 0
+        of the graph-quality roadmap normalizes them via a configurable
+        cap so callers can compare scores across backends.
+        """
+        from ..feature_flags import get_feature_flags
+
+        rank = row.get("fts_rank")
+        if rank is None:
+            row["score_norm"] = 0.0
+            return row
+        cap = max(get_feature_flags().pg_ts_rank_cap, 1e-9)
+        row["score_norm"] = max(0.0, min(float(rank) / cap, 1.0))
+        return row
+
     def _normalize_node(self, n: dict[str, Any]) -> dict[str, Any]:
         """Normalize a node dict for insertion."""
         symbol_type = n.get("symbol_type", "")
@@ -653,6 +704,13 @@ class PostgresWikiStorage:
         params = n.get("parameters", "")
         if isinstance(params, (list, tuple)):
             params = json.dumps(params)
+
+        # Phase 6 — api_surface persisted as JSONB. Empty list → NULL.
+        api_surface = n.get("api_surface")
+        if isinstance(api_surface, (list, tuple)):
+            api_surface = json.dumps(list(api_surface)) if api_surface else None
+        elif isinstance(api_surface, dict):
+            api_surface = json.dumps(api_surface)
 
         _s = self._strip_nul
         source_text = _s(n.get("source_text", ""))
@@ -684,6 +742,7 @@ class PostgresWikiStorage:
             "micro_cluster": n.get("micro_cluster"),
             "is_hub": n.get("is_hub", 0),
             "hub_assignment": _s(n.get("hub_assignment")),
+            "api_surface": api_surface,
         }
 
     # ==================================================================
@@ -703,7 +762,12 @@ class PostgresWikiStorage:
         # Use PostgreSQL UPSERT (INSERT ... ON CONFLICT ... DO UPDATE)
         cols = list(rows[0].keys())
         col_list = ", ".join(cols)
-        val_placeholders = ", ".join(f":{c}" for c in cols)
+        # api_surface is JSONB; explicit cast keeps SQLAlchemy able to
+        # bind a Python str/None like the provenance column does.
+        val_placeholders = ", ".join(
+            f"CAST(:{c} AS JSONB)" if c == "api_surface" else f":{c}"
+            for c in cols
+        )
         update_set = ", ".join(
             f"{c} = EXCLUDED.{c}" for c in cols if c != "node_id"
         )
@@ -873,6 +937,11 @@ class PostgresWikiStorage:
             annotations = e.get("annotations", "")
             if isinstance(annotations, dict):
                 annotations = json.dumps(annotations)
+            provenance = e.get("provenance")
+            if isinstance(provenance, dict):
+                provenance = json.dumps(provenance)
+            elif provenance is not None and not isinstance(provenance, str):
+                provenance = json.dumps(provenance)
             rows.append({
                 "source_id": _s(e["source_id"]),
                 "target_id": _s(e["target_id"]),
@@ -887,11 +956,16 @@ class PostgresWikiStorage:
                 "language": _s(e.get("language", "")),
                 "annotations": _s(annotations),
                 "created_by": _s(e.get("created_by", "ast")),
+                "provenance": provenance,
             })
 
         cols = [c for c in rows[0].keys() if c != "id"]
         col_list = ", ".join(cols)
-        val_placeholders = ", ".join(f":{c}" for c in cols)
+        # provenance is JSONB; explicit cast lets SQLAlchemy bind a Python str/None.
+        val_placeholders = ", ".join(
+            f"CAST(:{c} AS JSONB)" if c == "provenance" else f":{c}"
+            for c in cols
+        )
 
         sql = text(f"INSERT INTO {schema}.repo_edges ({col_list}) VALUES ({val_placeholders})")
 
@@ -982,9 +1056,17 @@ class PostgresWikiStorage:
         symbol_types: list[str] | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """BM25-like ranked text search using PostgreSQL tsvector."""
+        """BM25-like ranked text search using PostgreSQL tsvector.
+
+        Returns dicts with ``fts_rank`` (raw ``ts_rank_cd``) and
+        ``score_norm`` ∈ [0, 1] (Phase 0 — graph-quality roadmap).
+        """
         if not query or not query.strip():
             return []
+
+        from ..feature_flags import get_feature_flags
+
+        rank_norm = get_feature_flags().pg_ts_rank_normalize
 
         # Convert query to tsquery (websearch format handles natural language)
         conditions = ["fts_doc @@ websearch_to_tsquery('english', :query)"]
@@ -1004,8 +1086,16 @@ class PostgresWikiStorage:
 
         where = " AND ".join(conditions)
 
+        # Length-normalization bit flag 32 keeps long docs from dominating;
+        # gate it on WIKI_PG_TS_RANK_NORM so legacy ranking stays available.
+        rank_expr = (
+            "ts_rank_cd(fts_doc, websearch_to_tsquery('english', :query), 32)"
+            if rank_norm
+            else "ts_rank_cd(fts_doc, websearch_to_tsquery('english', :query))"
+        )
+
         sql = text(
-            f"SELECT *, ts_rank_cd(fts_doc, websearch_to_tsquery('english', :query)) AS fts_rank "
+            f"SELECT *, {rank_expr} AS fts_rank "
             f"FROM {self._schema}.repo_nodes "
             f"WHERE {where} "
             f"ORDER BY fts_rank DESC LIMIT :lim"
@@ -1014,7 +1104,7 @@ class PostgresWikiStorage:
         try:
             with self._engine.connect() as conn:
                 rows = conn.execute(sql, params).fetchall()
-                return [self._row_to_dict(r) for r in rows]
+                return [self._attach_score_norm(self._row_to_dict(r)) for r in rows]
         except Exception as exc:
             logger.warning("PostgreSQL FTS search failed: %s", exc)
             return []
@@ -1561,6 +1651,7 @@ class PostgresWikiStorage:
             "signature": signature,
             "parameters": parameters,
             "return_type": return_type,
+            "api_surface": data.get("api_surface"),
         }
 
     def _nx_edge_to_dict(self, u: str, v: str, key: int, data: dict) -> dict[str, Any]:
@@ -1569,6 +1660,20 @@ class PostgresWikiStorage:
         if isinstance(annotations, dict):
             annotations = json.dumps(annotations)
 
+        # Phase 1 (graph-quality roadmap): persist provenance + confidence
+        # so initial ``from_networkx`` import retains linker/parser
+        # attribution. Backfill a minimal AST provenance when nothing is
+        # set so downstream attribution never falls back to "unknown".
+        provenance = data.get("provenance")
+        if provenance is None:
+            created_by = data.get("created_by") or "ast"
+            provenance = {"source": str(created_by)}
+            rel_type_val = data.get("relationship_type")
+            if rel_type_val:
+                provenance["matcher"] = str(rel_type_val)
+        if isinstance(provenance, dict):
+            provenance = json.dumps(provenance)
+
         _s = self._strip_nul
         return {
             "source_id": _s(str(u)),
@@ -1576,6 +1681,7 @@ class PostgresWikiStorage:
             "rel_type": _s(data.get("relationship_type", "")),
             "edge_class": _s(data.get("edge_class", "structural")),
             "analysis_level": _s(data.get("analysis_level", "comprehensive")),
+            "confidence": _s(data.get("confidence", "EXTRACTED")),
             "weight": data.get("weight", 1.0),
             "raw_similarity": data.get("raw_similarity"),
             "source_file": _s(data.get("source_file", "")),
@@ -1583,6 +1689,7 @@ class PostgresWikiStorage:
             "language": _s(data.get("language", "")),
             "annotations": _s(annotations),
             "created_by": _s(data.get("created_by", "ast")),
+            "provenance": _s(provenance) if isinstance(provenance, str) else provenance,
         }
 
     def to_networkx(self) -> nx.MultiDiGraph:
@@ -1606,6 +1713,17 @@ class PostgresWikiStorage:
                         d["parameters"] = json.loads(params)
                     except (json.JSONDecodeError, TypeError):
                         pass
+                # api_surface is JSONB and normally arrives as list/dict.
+                # Defensive: if any driver returns it as a raw JSON string,
+                # decode it so downstream consumers (cross-language linker,
+                # project recompute) see the structured payload rather than
+                # treating the string as truthy and dropping every surface.
+                api_surface = d.get("api_surface")
+                if api_surface and isinstance(api_surface, str):
+                    try:
+                        d["api_surface"] = json.loads(api_surface)
+                    except (json.JSONDecodeError, TypeError):
+                        d["api_surface"] = None
                 G.add_node(nid, **d)
 
             # Edges
@@ -1825,17 +1943,221 @@ class PostgresWikiStorage:
             with self._engine.connect() as conn:
                 rows = conn.execute(
                     text(
-                        f"SELECT *, ts_rank_cd(fts_doc, to_tsquery('english', :name)) AS rank "
+                        f"SELECT *, ts_rank_cd(fts_doc, to_tsquery('english', :name)) AS fts_rank "
                         f"FROM {self._schema}.repo_nodes "
                         f"WHERE fts_doc @@ to_tsquery('english', :name) {where_extra} "
-                        "ORDER BY rank DESC LIMIT :lim"
+                        "ORDER BY fts_rank DESC LIMIT :lim"
                     ),
                     params,
                 ).fetchall()
-                return [self._row_to_dict(r) for r in rows]
+                return [self._attach_score_norm(self._row_to_dict(r)) for r in rows]
         except Exception as exc:
             logger.debug("search_fts_by_symbol_name failed for '%s': %s", name, exc)
             return []
+
+    # ------------------------------------------------------------------
+    # Phase 0 — graph-quality roadmap additions
+    # ------------------------------------------------------------------
+
+    def count_fts_matches(self, query: str, *, exact_match: bool = False) -> int:
+        """Total tsvector hits for *query* (Phase 0)."""
+        if not query or not query.strip():
+            return 0
+        ts_func = "phraseto_tsquery" if exact_match else "websearch_to_tsquery"
+        sql = text(
+            f"SELECT count(*) AS c FROM {self._schema}.repo_nodes "
+            f"WHERE fts_doc @@ {ts_func}('english', :q)"
+        )
+        try:
+            with self._engine.connect() as conn:
+                row = conn.execute(sql, {"q": query}).fetchone()
+                return int(row[0]) if row else 0
+        except Exception as exc:
+            logger.debug("count_fts_matches failed for '%s': %s", query, exc)
+            return 0
+
+    def search_fts_by_column(
+        self,
+        query: str,
+        column: str,
+        *,
+        limit: int = 20,
+        path_prefix: str | None = None,
+        symbol_types: list[str] | None = None,
+        exact_match: bool = False,
+    ) -> list[dict[str, Any]]:
+        """FTS restricted to a single text column (Phase 0)."""
+        allowed = {"symbol_name", "signature", "docstring", "source_text"}
+        if column not in allowed:
+            raise ValueError(
+                f"search_fts_by_column: column must be one of {sorted(allowed)}",
+            )
+        if not query or not query.strip():
+            return []
+
+        ts_func = "phraseto_tsquery" if exact_match else "websearch_to_tsquery"
+        rank_norm = get_feature_flags_pg_norm()
+        rank_modifier = ", 32" if rank_norm else ""
+
+        conditions = [
+            f"to_tsvector('english', coalesce({column}, '')) @@ {ts_func}('english', :q)",
+        ]
+        params: dict[str, Any] = {"q": query, "lim": limit}
+        if path_prefix:
+            conditions.append("rel_path LIKE :pp")
+            params["pp"] = path_prefix.rstrip("/") + "/%"
+        if symbol_types:
+            conditions.append("symbol_type = ANY(:st)")
+            params["st"] = symbol_types
+
+        where = " AND ".join(conditions)
+        sql = text(
+            f"SELECT *, ts_rank_cd("
+            f"to_tsvector('english', coalesce({column}, '')), "
+            f"{ts_func}('english', :q){rank_modifier}) AS fts_rank "
+            f"FROM {self._schema}.repo_nodes "
+            f"WHERE {where} "
+            f"ORDER BY fts_rank DESC LIMIT :lim"
+        )
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                return [self._attach_score_norm(self._row_to_dict(r)) for r in rows]
+        except Exception as exc:
+            logger.debug("search_fts_by_column(%s) failed for '%s': %s", column, query, exc)
+            return []
+
+    def search_fts_with_path(
+        self,
+        query: str,
+        path_prefix: str,
+        *,
+        symbol_types: list[str] | None = None,
+        exact_match: bool = False,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """FTS that requires a non-empty ``path_prefix`` (Phase 0)."""
+        if not path_prefix or not path_prefix.strip():
+            raise ValueError("search_fts_with_path requires a non-empty path_prefix")
+        if not query or not query.strip():
+            return []
+
+        ts_func = "phraseto_tsquery" if exact_match else "websearch_to_tsquery"
+        rank_norm = get_feature_flags_pg_norm()
+        rank_modifier = ", 32" if rank_norm else ""
+
+        conditions = [
+            f"fts_doc @@ {ts_func}('english', :q)",
+            "rel_path LIKE :pp",
+        ]
+        params: dict[str, Any] = {
+            "q": query,
+            "lim": limit,
+            "pp": path_prefix.rstrip("/") + "/%",
+        }
+        if symbol_types:
+            conditions.append("symbol_type = ANY(:st)")
+            params["st"] = symbol_types
+
+        where = " AND ".join(conditions)
+        sql = text(
+            f"SELECT *, ts_rank_cd(fts_doc, {ts_func}('english', :q){rank_modifier}) AS fts_rank "
+            f"FROM {self._schema}.repo_nodes "
+            f"WHERE {where} "
+            f"ORDER BY fts_rank DESC LIMIT :lim"
+        )
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                return [self._attach_score_norm(self._row_to_dict(r)) for r in rows]
+        except Exception as exc:
+            logger.debug("search_fts_with_path failed for '%s': %s", query, exc)
+            return []
+
+    def get_embedding_by_id(self, node_id: str) -> list[float] | None:
+        """Return the stored embedding for ``node_id`` or ``None`` (Phase 0)."""
+        if not node_id:
+            return None
+        sql = text(
+            f"SELECT embedding FROM {self._schema}.repo_vec WHERE node_id = :nid"
+        )
+        try:
+            with self._engine.connect() as conn:
+                row = conn.execute(sql, {"nid": node_id}).fetchone()
+        except Exception as exc:
+            logger.debug("get_embedding_by_id failed for '%s': %s", node_id, exc)
+            return None
+        if not row or row[0] is None:
+            return None
+        emb = row[0]
+        # pgvector returns a list-like; normalize to plain list[float]
+        try:
+            return [float(x) for x in emb]
+        except TypeError:
+            # Some drivers return the vector as a string "[1,2,3]"
+            s = str(emb).strip().lstrip("[").rstrip("]")
+            return [float(x) for x in s.split(",") if x]
+
+    def batch_similarity_search(
+        self,
+        embeddings: list[tuple[str, list[float]]],
+        *,
+        k: int = 5,
+        path_prefix: str | None = None,
+        distance_threshold: float = 0.15,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Single-SQL batched KNN over pgvector using LATERAL join (Phase 0)."""
+        if not embeddings:
+            return {}
+
+        # Build a VALUES list  (qid, embedding_text)
+        values_rows: list[str] = []
+        params: dict[str, Any] = {"k": k, "thr": distance_threshold}
+        for i, (qid, emb) in enumerate(embeddings):
+            params[f"qid_{i}"] = qid
+            params[f"emb_{i}"] = "[" + ",".join(str(float(x)) for x in emb) + "]"
+            values_rows.append(f"(:qid_{i}, CAST(:emb_{i} AS vector))")
+
+        path_filter = ""
+        if path_prefix:
+            params["pp"] = path_prefix.rstrip("/") + "/%"
+            path_filter = " AND n.rel_path LIKE :pp"
+
+        sql = text(
+            f"WITH q(qid, qvec) AS (VALUES {', '.join(values_rows)}) "
+            f"SELECT q.qid, n.*, (v.embedding <=> q.qvec) AS vec_distance "
+            f"FROM q "
+            f"CROSS JOIN LATERAL ("
+            f"  SELECT v2.node_id, v2.embedding "
+            f"  FROM {self._schema}.repo_vec v2 "
+            f"  ORDER BY v2.embedding <=> q.qvec "
+            f"  LIMIT :k"
+            f") v "
+            f"JOIN {self._schema}.repo_nodes n ON n.node_id = v.node_id "
+            f"WHERE (v.embedding <=> q.qvec) < :thr{path_filter} "
+            f"ORDER BY q.qid, vec_distance"
+        )
+
+        out: dict[str, list[dict[str, Any]]] = {qid: [] for qid, _ in embeddings}
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                for r in rows:
+                    d = self._row_to_dict(r)
+                    qid = d.pop("qid", None)
+                    if qid is None:
+                        continue
+                    out.setdefault(qid, []).append(d)
+        except Exception as exc:
+            logger.debug("batch_similarity_search failed: %s", exc)
+            # Fall back to per-query loop so callers always get usable data.
+            for qid, emb in embeddings:
+                hits = self.search_vec(emb, k=k, path_prefix=path_prefix)
+                out[qid] = [
+                    h for h in hits
+                    if float(h.get("vec_distance", 1.0)) < distance_threshold
+                ]
+        return out
 
     def get_edge_targets(self, source_id: str) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:

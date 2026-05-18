@@ -1170,6 +1170,138 @@
         }
       }
     },
+    "/api/v1/wikis/{wiki_id}/diff": {
+      "post": {
+        "summary": "Diff Wiki",
+        "description": "Diff a fresh-parse payload against the indexed snapshot.\n\nThe caller supplies the freshly parsed nodes (id + content_hash + path);\nthe server compares them against the wiki's stored ``repo_nodes`` and\nreturns the resulting change set plus the wiki pages those changes\ntouch (via the ``page_symbols`` reverse index from #116 PR 1).\n\nRead-only: no parsing, no LLM, no writes. PR 3 will wire the actual\nre-parse loop on top of this primitive.",
+        "operationId": "diff_wiki_api_v1_wikis__wiki_id__diff_post",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiffWikiRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiffWikiResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wikis/{wiki_id}/incremental-refresh": {
+      "post": {
+        "summary": "Incremental Refresh Wiki",
+        "description": "Trigger an incremental refresh on a previously-generated wiki.\n\nThe caller supplies pre-parsed nodes (same shape as ``/diff``).\nThe server diffs them against the indexed snapshot, dispatches each\naffected page through the trivial / edit / structural regimes, and\nstreams progress over SSE.\n\nOwner-only \u2014 same access model as ``/refresh`` since this surfaces\ninternal content_hash + node_id state through the per-page events.",
+        "operationId": "incremental_refresh_wiki_api_v1_wikis__wiki_id__incremental_refresh_post",
+        "parameters": [
+          {
+            "name": "wiki_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wiki Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IncrementalRefreshRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IncrementalRefreshResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/wikis/{wiki_id}/visibility": {
       "patch": {
         "summary": "Update Wiki Visibility",
@@ -1937,6 +2069,60 @@
         }
       }
     },
+    "/api/v1/projects/{project_id}/recompute": {
+      "post": {
+        "summary": "Recompute Project Route",
+        "description": "Stream a project-level recompute (relatedness \u2192 cross-repo \u2192 leiden).\n\nGated server-side by ``flags.project_graph``. Emits SSE progress events\nmatching the wiki-generation widget contract.",
+        "operationId": "recompute_project_route_api_v1_projects__project_id__recompute_post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/projects/{project_id}/search": {
       "get": {
         "summary": "Search Project",
@@ -2122,6 +2308,49 @@
   },
   "components": {
     "schemas": {
+      "AffectedPageResponse": {
+        "properties": {
+          "page_id": {
+            "type": "string",
+            "title": "Page Id"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "anchor_slug": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anchor Slug"
+          },
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/NodeChangeResponse"
+            },
+            "type": "array",
+            "title": "Changes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "page_id"
+        ],
+        "title": "AffectedPageResponse",
+        "description": "One wiki page touched by the change set."
+      },
       "AskRequest": {
         "description": "Request to ask a question about a wiki.",
         "properties": {
@@ -2164,6 +2393,18 @@
             "default": 15,
             "title": "K",
             "type": "integer"
+          },
+          "min_confidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Min Confidence"
           }
         },
         "required": [
@@ -2226,7 +2467,7 @@
           },
           "steps": {
             "items": {
-              "$ref": "#/$defs/CallStackStep"
+              "$ref": "#/components/schemas/CallStackStep"
             },
             "title": "Steps",
             "type": "array"
@@ -2262,6 +2503,48 @@
         "title": "CallStackStep",
         "type": "object"
       },
+      "ChangeSetResponse": {
+        "properties": {
+          "added": {
+            "items": {
+              "$ref": "#/components/schemas/NodeChangeResponse"
+            },
+            "type": "array",
+            "title": "Added"
+          },
+          "modified": {
+            "items": {
+              "$ref": "#/components/schemas/NodeChangeResponse"
+            },
+            "type": "array",
+            "title": "Modified"
+          },
+          "moved": {
+            "items": {
+              "$ref": "#/components/schemas/NodeChangeResponse"
+            },
+            "type": "array",
+            "title": "Moved"
+          },
+          "deleted": {
+            "items": {
+              "$ref": "#/components/schemas/NodeChangeResponse"
+            },
+            "type": "array",
+            "title": "Deleted"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total"
+        ],
+        "title": "ChangeSetResponse",
+        "description": "Aggregate change set \u2014 one entry per kind."
+      },
       "ChatMessage": {
         "description": "A single chat message.",
         "properties": {
@@ -2291,14 +2574,14 @@
           },
           "call_stacks": {
             "items": {
-              "$ref": "#/$defs/CallStack"
+              "$ref": "#/components/schemas/CallStack"
             },
             "title": "Call Stacks",
             "type": "array"
           },
           "sections": {
             "items": {
-              "$ref": "#/$defs/CodeMapSection"
+              "$ref": "#/components/schemas/CodeMapSection"
             },
             "title": "Sections",
             "type": "array"
@@ -2330,7 +2613,7 @@
           },
           "symbols": {
             "items": {
-              "$ref": "#/$defs/CodeMapSymbol"
+              "$ref": "#/components/schemas/CodeMapSymbol"
             },
             "title": "Symbols",
             "type": "array"
@@ -2427,6 +2710,46 @@
         "title": "DeleteWikiResponse",
         "type": "object"
       },
+      "DiffWikiRequest": {
+        "properties": {
+          "parsed_nodes": {
+            "items": {
+              "$ref": "#/components/schemas/ParsedNodeInput"
+            },
+            "type": "array",
+            "maxItems": 50000,
+            "title": "Parsed Nodes"
+          }
+        },
+        "type": "object",
+        "title": "DiffWikiRequest",
+        "description": "Body for ``POST /wikis/{wiki_id}/diff`` \u2014 supply the freshly parsed\nnodes; the server diffs them against the indexed snapshot.\n\nCapped at 50 000 nodes per request to bound the cost of the per-node\nreverse-index lookup. The largest repos in our corpus parse to ~30k\narchitectural nodes; 50k gives ~1.5x headroom before PR 3 swaps in the\nbatched ``get_pages_citing_nodes`` query."
+      },
+      "DiffWikiResponse": {
+        "properties": {
+          "wiki_id": {
+            "type": "string",
+            "title": "Wiki Id"
+          },
+          "change_set": {
+            "$ref": "#/components/schemas/ChangeSetResponse"
+          },
+          "affected_pages": {
+            "items": {
+              "$ref": "#/components/schemas/AffectedPageResponse"
+            },
+            "type": "array",
+            "title": "Affected Pages"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wiki_id",
+          "change_set"
+        ],
+        "title": "DiffWikiResponse",
+        "description": "Result of the diff endpoint \u2014 no writes occur."
+      },
       "ErrorResponse": {
         "description": "Standard error response.",
         "properties": {
@@ -2459,16 +2782,51 @@
         "type": "object"
       },
       "GenerateWikiRequest": {
-        "description": "Request to generate a wiki from a repository.",
+        "description": "Request to generate a wiki from a repository or Atlassian source.\n\nPreferred (new) shape\n---------------------\nsource_type + scope + auth \u2014 see module docstring for field shapes.\n\nBackwards-compatible (legacy) shape\n------------------------------------\nrepo_url + branch + access_token \u2014 auto-normalized into the new shape\nby the ``_normalize_legacy`` validator so old callers keep working.",
         "properties": {
-          "repo_url": {
-            "title": "Repo Url",
+          "source_type": {
+            "default": "git",
+            "enum": [
+              "git",
+              "confluence",
+              "jira"
+            ],
+            "title": "Source Type",
             "type": "string"
           },
+          "scope": {
+            "additionalProperties": true,
+            "title": "Scope",
+            "type": "object"
+          },
+          "auth": {
+            "additionalProperties": true,
+            "title": "Auth",
+            "type": "object"
+          },
+          "repo_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Repo Url"
+          },
           "branch": {
-            "default": "main",
-            "title": "Branch",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Branch"
           },
           "provider": {
             "default": "github",
@@ -2543,6 +2901,22 @@
             "default": null,
             "title": "Embedding Model"
           },
+          "structure_planner": {
+            "anyOf": [
+              {
+                "enum": [
+                  "agentic",
+                  "graph_clustering"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Structure Planner"
+          },
           "planner_type": {
             "anyOf": [
               {
@@ -2572,9 +2946,6 @@
             "title": "Exclude Tests"
           }
         },
-        "required": [
-          "repo_url"
-        ],
         "title": "GenerateWikiRequest",
         "type": "object"
       },
@@ -2645,6 +3016,61 @@
         ],
         "title": "HealthResponse",
         "type": "object"
+      },
+      "IncrementalRefreshRequest": {
+        "properties": {
+          "parsed_nodes": {
+            "items": {
+              "$ref": "#/components/schemas/ParsedNodeInput"
+            },
+            "type": "array",
+            "maxItems": 50000,
+            "title": "Parsed Nodes"
+          }
+        },
+        "type": "object",
+        "title": "IncrementalRefreshRequest",
+        "description": "POST ``/wikis/{id}/incremental-refresh`` body.\n\nCaller supplies pre-parsed nodes (same shape as ``/diff``). Capped at\n50_000 nodes per request to bound the orchestrator's snapshot work."
+      },
+      "IncrementalRefreshResponse": {
+        "properties": {
+          "wiki_id": {
+            "type": "string",
+            "title": "Wiki Id"
+          },
+          "invocation_id": {
+            "type": "string",
+            "title": "Invocation Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "page_count": {
+            "type": "integer",
+            "title": "Page Count"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wiki_id",
+          "invocation_id",
+          "status",
+          "page_count"
+        ],
+        "title": "IncrementalRefreshResponse",
+        "description": "Initial response \u2014 actual progress flows over SSE.\n\nThe orchestrator runs asynchronously after this returns; subscribe\nto ``/invocations/{invocation_id}/stream`` for ``page_unchanged``,\n``page_patched``, ``page_edited``, ``page_regenerated``, and the\nfinal ``incremental_summary`` event with the run stats."
       },
       "Invocation": {
         "properties": {
@@ -2766,6 +3192,75 @@
         "title": "Invocation",
         "description": "Tracks the state of a background wiki generation job."
       },
+      "NodeChangeResponse": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "added",
+              "modified",
+              "deleted",
+              "moved"
+            ],
+            "title": "Kind"
+          },
+          "node_id": {
+            "type": "string",
+            "title": "Node Id"
+          },
+          "old_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Old Hash"
+          },
+          "new_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "New Hash"
+          },
+          "old_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Old Path"
+          },
+          "new_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "New Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "node_id"
+        ],
+        "title": "NodeChangeResponse",
+        "description": "One change in the response. Field population depends on ``kind``."
+      },
       "PageListItem": {
         "properties": {
           "page_title": {
@@ -2853,6 +3348,36 @@
         ],
         "title": "PageNeighborsResponse",
         "description": "Response containing the neighbor graph for a single wiki page."
+      },
+      "ParsedNodeInput": {
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "title": "Node Id"
+          },
+          "content_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Hash"
+          },
+          "rel_path": {
+            "type": "string",
+            "title": "Rel Path",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
+        "title": "ParsedNodeInput",
+        "description": "One node from a fresh parse, supplied to the diff endpoint.\n\nOnly the three fields needed for change classification are required;\ncallers can pass the same dicts they would otherwise hand to\n``upsert_nodes_batch`` (extra keys are ignored)."
       },
       "ProjectAddWikiRequest": {
         "properties": {
@@ -3373,6 +3898,18 @@
             "title": "File Path",
             "type": "string"
           },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Node Id"
+          },
           "line_start": {
             "anyOf": [
               {
@@ -3468,6 +4005,18 @@
             ],
             "default": null,
             "title": "Wiki Title"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Confidence"
           }
         },
         "required": [

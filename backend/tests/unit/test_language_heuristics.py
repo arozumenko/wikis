@@ -166,5 +166,3 @@ class TestComputeAugmentationBudgetFraction:
         """Even with very high priority, result is clamped to 0.6."""
         hints = LanguageHints(language="test", impl_augmentation_priority=10.0)
         assert compute_augmentation_budget_fraction(hints) <= 0.6
-
-

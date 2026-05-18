@@ -12,6 +12,7 @@ const SSE_PATHS = [
   /^\/api\/v1\/invocations\/[^/]+\/stream$/,
   /^\/api\/v1\/ask$/,
   /^\/api\/v1\/research$/,
+  /^\/api\/v1\/projects\/[^/]+\/recompute$/,
 ];
 
 function isSSEPath(pathname: string): boolean {

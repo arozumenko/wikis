@@ -34,6 +34,7 @@ from ..parsers.javascript_visitor_parser import JavaScriptVisitorParser
 from ..parsers.python_parser import PythonParser
 from ..parsers.typescript_enhanced_parser import TypeScriptEnhancedParser
 from ..utils.resource_monitor import resource_monitor
+from ..feature_flags import get_feature_flags  # re-exported so tests can patch
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,19 @@ def attach_graph_indexes(graph: "nx.MultiDiGraph") -> None:  # noqa: F821
     graph._suffix_index = defaultdict(list)
     graph._decl_impl_index = defaultdict(list)
     graph._constant_def_index = defaultdict(list)
+
+    # Phase 5 / Action 3B — qualified-name + FQN indexes.
+    # ``_qualified_name_index``: ``"Parent.symbol"`` → list of node_ids
+    #   (multiple, since the same qualified path can exist in many files).
+    # ``_fqn_index``: ``"rel_path::Parent.symbol"`` → single node_id.
+    # Built only when ``WIKI_QUALIFIED_NAME_INDEX`` is enabled (default on);
+    # consumers fall back to the legacy simple-name index otherwise.
+    try:
+        _qni_enabled = bool(get_feature_flags().qualified_name_index)
+    except Exception:  # pragma: no cover - feature flags must always import
+        _qni_enabled = True
+    graph._qualified_name_index = defaultdict(list) if _qni_enabled else {}
+    graph._fqn_index = {} if _qni_enabled else {}
 
     def _symbol_type_of(node_id: str) -> str:
         node_data = graph.nodes.get(node_id, {})
@@ -127,6 +141,31 @@ def attach_graph_indexes(graph: "nx.MultiDiGraph") -> None:  # noqa: F821
                 _maybe_set(graph._full_name_index, full_name, node_id)
 
             graph._name_index[symbol_name].append(node_id)
+
+            # Phase 5 — qualified + FQN indexes (Parent.symbol / rel_path::...).
+            # ``symbol_name`` may already be the qualified form (e.g.,
+            # ``AppConfig.__init__``) when the parser emits dotted names; for
+            # bare leaf names we still want a qualified entry, so use the
+            # symbol's stored ``full_name`` minus the module prefix when
+            # available.
+            if _qni_enabled:
+                qualified = symbol_name
+                full_name = node_data.get('full_name')
+                if not full_name:
+                    symbol_obj = node_data.get('symbol')
+                    full_name = getattr(symbol_obj, 'full_name', None) if symbol_obj else None
+                if full_name:
+                    parts = full_name.split('.')
+                    file_stem = node_data.get('file_name') or ''
+                    if len(parts) >= 2 and file_stem and parts[0] == file_stem:
+                        qualified = '.'.join(parts[1:]) or qualified
+                    else:
+                        qualified = full_name
+                if qualified:
+                    graph._qualified_name_index[qualified].append(node_id)
+                rel_path_attr = node_data.get('rel_path') or file_path
+                if rel_path_attr and qualified:
+                    graph._fqn_index[f"{rel_path_attr}::{qualified}"] = node_id
 
             parts = node_id.split('::', 2)
             suffix = parts[2] if len(parts) == 3 else node_id
@@ -481,6 +520,15 @@ class EnhancedUnifiedGraphBuilder:
         
         # File-level imports storage (for basic parsers, like code splitter)
         self.file_imports = {}  # file_path -> set of file-level imports
+
+        # Phase 1c (graph-quality roadmap): cache of (file_path -> list[str])
+        # holding the file's lines, so we can prepend decorator preambles
+        # (e.g. ``@router.get("/users")``) to a symbol's ``source_text``
+        # without re-reading the file once per symbol. Tree-sitter parsers
+        # typically emit the def/class slice only; the decorator lives on
+        # an earlier sibling node and is dropped, which makes the REST
+        # api-surface matchers fail and the cross-language linker silent.
+        self._file_lines_cache: dict[str, list[str]] = {}
         
         # Store last analysis result for statistics
         self.last_analysis: Optional[UnifiedAnalysis] = None
@@ -776,7 +824,15 @@ class EnhancedUnifiedGraphBuilder:
         with resource_monitor("graph_builder.build_node_index", logger):
             self._build_node_index(unified_graph)
         
-        # Phase 4: Generate symbol-level chunk documents (NO character splitting)
+        # Phase 4: detect cross-language relationships and generate stats
+        # before parse_results can be cleared by document generation.
+        with resource_monitor("graph_builder.cross_language_rels", logger):
+            cross_lang_rels = self._detect_cross_language_relationships(files_by_language, parse_results)
+
+        with resource_monitor("graph_builder.language_stats", logger):
+            language_stats = self._generate_language_stats(parse_results)
+
+        # Phase 5: Generate symbol-level chunk documents (NO character splitting)
         # By default, clear parse results after generating documents to save RAM
         documents_iter = None
         with resource_monitor("graph_builder.generate_documents", logger):
@@ -795,14 +851,6 @@ class EnhancedUnifiedGraphBuilder:
                         parse_results.clear()
                     except Exception:
                         pass
-        
-        # Phase 5: Detect cross-language relationships (from original UnifiedGraphBuilder)
-        with resource_monitor("graph_builder.cross_language_rels", logger):
-            cross_lang_rels = self._detect_cross_language_relationships(files_by_language, parse_results)
-        
-        # Phase 6: Generate statistics
-        with resource_monitor("graph_builder.language_stats", logger):
-            language_stats = self._generate_language_stats(parse_results)
         
         analysis = UnifiedAnalysis(
             documents=chunk_documents,
@@ -1263,7 +1311,14 @@ class EnhancedUnifiedGraphBuilder:
                 file_name = Path(file_path).stem
                 doc_lang = result.language  # e.g. 'markdown', 'yaml', 'text'
                 for symbol in result.symbols:
-                    node_id = f"{doc_lang}::{file_name}::{symbol.name}"
+                    rel_path = getattr(symbol, 'rel_path', '') or file_path
+                    node_id = self._make_node_id(
+                        doc_lang,
+                        file_name=file_name,
+                        file_path=file_path,
+                        rel_path=rel_path,
+                        symbol_name=symbol.name,
+                    )
                     # Handle duplicates
                     base_node_id = node_id
                     counter = 1
@@ -1275,8 +1330,6 @@ class EnhancedUnifiedGraphBuilder:
                     if hasattr(symbol_type_str, 'value'):
                         symbol_type_str = symbol_type_str.value
                     symbol_type_str = str(symbol_type_str).lower()
-
-                    rel_path = getattr(symbol, 'rel_path', '') or file_path
 
                     node_attrs = {
                         'name': symbol.name,
@@ -1332,6 +1385,66 @@ class EnhancedUnifiedGraphBuilder:
         if not name:
             return ""
         return name.split('.')[-1].split('::')[-1]
+
+    @staticmethod
+    def _safe_node_path(path: str) -> str:
+        return (path or "").replace("/", "__").replace(".", "_")
+
+    def _node_file_component(
+        self,
+        *,
+        file_path: str = "",
+        file_name: str = "",
+        rel_path: str | None = None,
+    ) -> str:
+        if get_feature_flags().node_id_style == "rel_path":
+            candidate = rel_path or ""
+            if not candidate and file_path:
+                try:
+                    repo_root = getattr(self, "repo_path", "") or ""
+                    candidate = self._calculate_relative_path(file_path, repo_root) if repo_root else file_path
+                except Exception:
+                    candidate = file_path
+            return self._safe_node_path(candidate or file_name)
+        return file_name
+
+    def _make_node_id(
+        self,
+        language: str,
+        *,
+        file_name: str,
+        symbol_name: str,
+        file_path: str = "",
+        rel_path: str | None = None,
+    ) -> str:
+        file_component = self._node_file_component(
+            file_path=file_path,
+            file_name=file_name,
+            rel_path=rel_path,
+        )
+        return f"{language}::{file_component}::{symbol_name}"
+
+    def _find_cached_node_by_file_suffix(
+        self,
+        *,
+        language: str,
+        file_path: str,
+        file_name: str,
+        symbol_name: str,
+        node_cache: Dict[str, bool],
+    ) -> str | None:
+        if get_feature_flags().node_id_style != "rel_path" or not symbol_name:
+            return None
+        safe_basename = self._safe_node_path(Path(file_path).name or file_name)
+        prefix = f"{language}::"
+        suffix = f"::{symbol_name}"
+        for candidate in node_cache:
+            if not candidate.startswith(prefix) or not candidate.endswith(suffix):
+                continue
+            file_component = candidate[len(prefix): -len(suffix)]
+            if file_component == safe_basename or file_component.endswith(f"__{safe_basename}"):
+                return candidate
+        return None
 
     @staticmethod
     def _get_type_priority() -> Dict[str, int]:
@@ -1433,7 +1546,15 @@ class EnhancedUnifiedGraphBuilder:
                     continue
                 
                 # Create the same node_id as in _process_file_symbols
-                node_id = f"{language}::{file_name}::{symbol.name}"
+                rel_path = getattr(symbol, 'rel_path', '') or file_path
+                local_qualified_name = self._get_local_qualified_name(symbol, file_name)
+                node_id = self._make_node_id(
+                    language,
+                    file_name=file_name,
+                    file_path=file_path,
+                    rel_path=rel_path,
+                    symbol_name=local_qualified_name,
+                )
                 
                 # Only count each unique node_id once
                 if node_id not in processed_symbols:
@@ -1442,7 +1563,7 @@ class EnhancedUnifiedGraphBuilder:
                     
                     # Track symbol definitions for legitimate duplicate detection
                     # Use full node_id to properly distinguish symbols from different files
-                    symbol_key = f"{file_name}::{symbol.name}"  # Include file context
+                    symbol_key = f"{rel_path}::{symbol.name}"  # Include file context
                     if symbol_key not in symbol_definitions:
                         symbol_definitions[symbol_key] = []
                     symbol_definitions[symbol_key].append((file_path, symbol.symbol_type.value if hasattr(symbol.symbol_type, 'value') else str(symbol.symbol_type)))
@@ -1577,7 +1698,6 @@ class EnhancedUnifiedGraphBuilder:
         """Process symbols from a single file with relative path support"""
         file_name = Path(file_path).stem
         rel_path = self._calculate_relative_path(file_path, repo_root) if repo_root else file_path
-        
         for symbol in result.symbols:
             # Skip symbols with empty names
             if not symbol.name or symbol.name.strip() == "":
@@ -1593,8 +1713,20 @@ class EnhancedUnifiedGraphBuilder:
             # For nested symbols, include parent context: Parent.symbol
             # This disambiguates e.g., AppConfig.__init__ vs DatabaseConfig.__init__
             local_qualified_name = self._get_local_qualified_name(symbol, file_name)
-            node_id = f"{language}::{file_name}::{local_qualified_name}"
-            
+
+            # Phase 5 / Action 3A — rel_path-based node IDs.
+            # Default ``"stem"`` keeps the legacy file-stem scheme (and its
+            # hash-suffix collision branch). ``"rel_path"`` replaces the stem
+            # with a path-safe slug, removing the collision class entirely.
+            _id_style = get_feature_flags().node_id_style
+            node_id = self._make_node_id(
+                language,
+                file_name=file_name,
+                file_path=file_path,
+                rel_path=rel_path,
+                symbol_name=local_qualified_name,
+            )
+
             # Only skip if this EXACT node already exists (same file + same symbol)
             # Do NOT skip symbols with same name from different files - those are legitimate!
             if graph.has_node(node_id):
@@ -1602,16 +1734,32 @@ class EnhancedUnifiedGraphBuilder:
                 if existing_file == file_path:
                     # True duplicate from same file, skip
                     continue
-                else:
+                elif _id_style != "rel_path":
                     # Different file (e.g., declaration vs implementation)
                     # Create unique node_id by appending file hash
                     file_hash = hash(file_path) & 0xFFFF
                     node_id = f"{node_id}_{file_hash:04x}"
+                else:
+                    # rel_path style is collision-free by construction; a
+                    # repeat indicates a legitimate redeclaration in the
+                    # same file (handled above) or a parser bug — skip.
+                    continue
             
             # Extract line numbers from Range object for flat access
             _range = getattr(symbol, 'range', None)
             _start_line = _range.start.line if _range else 0
             _end_line = _range.end.line if _range else 0
+
+            # Phase 1c (graph-quality roadmap): prepend decorator preamble
+            # so REST api-surface matchers can detect FastAPI/Flask/NestJS
+            # routes (``@router.get("/x")`` etc.) that tree-sitter parsers
+            # leave outside the function/method ``source_text`` slice.
+            base_source_text = getattr(symbol, 'source_text', '') or ''
+            decorator_preamble = self._get_decorator_preamble(file_path, _start_line)
+            if decorator_preamble and not base_source_text.lstrip().startswith('@'):
+                enriched_source_text = decorator_preamble + base_source_text
+            else:
+                enriched_source_text = base_source_text
 
             # Add symbol to graph
             graph.add_node(node_id,
@@ -1622,6 +1770,12 @@ class EnhancedUnifiedGraphBuilder:
                          language=language,
                          symbol_type=symbol.symbol_type.value if hasattr(symbol.symbol_type, 'value') else str(symbol.symbol_type),
                          symbol_name=symbol.name,
+                         name=symbol.name,
+                         type=symbol.symbol_type.value if hasattr(symbol.symbol_type, 'value') else str(symbol.symbol_type),
+                         source_text=enriched_source_text,
+                         docstring=getattr(symbol, 'docstring', '') or '',
+                         parameters=getattr(symbol, 'parameters', []) or [],
+                         return_type=getattr(symbol, 'return_type', '') or '',
                          start_line=_start_line,
                          end_line=_end_line,
                          parent_symbol=getattr(symbol, 'parent_symbol', None),
@@ -1652,6 +1806,71 @@ class EnhancedUnifiedGraphBuilder:
         Returns a set-like dict for O(1) membership testing.
         """
         return {node: True for node in graph.nodes()}
+
+    def _get_decorator_preamble(self, file_path: str, start_line: int) -> str:
+        """Return the contiguous block of ``@``-prefixed decorator lines
+        immediately preceding ``start_line`` in *file_path*.
+
+        Phase 1c (graph-quality roadmap): tree-sitter rich parsers slice
+        ``source_text`` from the ``def`` / ``class`` line, dropping any
+        decorators on earlier sibling AST nodes. The api_surface_extractor
+        REST matchers (``@router.get("/x")`` etc.) need the decorator
+        text to fire, so we re-attach it here. File contents are cached
+        per ``CodeGraphBuilder`` instance to avoid re-reading on every
+        symbol.
+
+        ``start_line`` is the parsers' ``Range.start.line`` (1-indexed
+        for ast-based Python; tree-sitter wrappers normalise to the same
+        convention here). Returns an empty string when the file cannot
+        be read or no decorators precede the symbol.
+        """
+        if not file_path or start_line is None or start_line <= 1:
+            return ""
+        lines = self._file_lines_cache.get(file_path)
+        if lines is None:
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                lines = text.splitlines(keepends=True)
+            except (OSError, UnicodeError):
+                lines = []
+            self._file_lines_cache[file_path] = lines
+        if not lines:
+            return ""
+        preamble: list[str] = []
+        # ``start_line`` is 1-indexed (Python ast.lineno semantics); the
+        # def/class line is at lines[start_line - 1]. Look upward from
+        # the line *above* that.
+        idx = int(start_line) - 2
+        if idx < 0:
+            return ""
+        lookback_limit = max(0, idx - 32)
+        in_decorator = False
+        while idx >= lookback_limit and idx < len(lines):
+            line = lines[idx]
+            stripped = line.lstrip()
+            if stripped.startswith("@"):
+                preamble.append(line)
+                in_decorator = True
+                idx -= 1
+                continue
+            if in_decorator and stripped == "":
+                idx -= 1
+                continue
+            if in_decorator and (
+                stripped.startswith(")")
+                or stripped.startswith(",")
+                or stripped.startswith("'")
+                or stripped.startswith('"')
+            ):
+                preamble.append(line)
+                idx -= 1
+                continue
+            break
+        if not preamble:
+            return ""
+        preamble.reverse()
+        return "".join(preamble)
     
     def _add_relationships_bulk(self, graph: nx.MultiDiGraph, parse_results: Dict[str, ParseResult],
                                language: str, symbol_registry: Dict[str, Any]):
@@ -1706,10 +1925,10 @@ class EnhancedUnifiedGraphBuilder:
                 # For cross-file relationships (like DEFINES_BODY), use target_file if available
                 target_file_hint = None
                 if hasattr(relationship, 'target_file') and relationship.target_file:
-                    target_file_hint = Path(relationship.target_file).stem
+                    target_file_hint = str(relationship.target_file)
                 
                 target_node = self._resolve_target_node_sync(
-                    target_symbol, language, file_name, symbol_registry, graph, parse_results, node_cache, target_file_hint
+                    target_symbol, language, file_name, file_path, symbol_registry, graph, parse_results, node_cache, target_file_hint
                 )
                 
                 # Validate nodes
@@ -1880,9 +2099,23 @@ class EnhancedUnifiedGraphBuilder:
         """Synchronous version of source node resolution with O(1) cache lookup"""
         
         # Strategy 1: Direct match in current file (check this FIRST before file-level)
-        direct_source = f"{language}::{file_name}::{source_symbol}"
+        direct_source = self._make_node_id(
+            language,
+            file_name=file_name,
+            file_path=file_path,
+            symbol_name=source_symbol,
+        )
         if direct_source in node_cache:
             return direct_source
+        suffix_source = self._find_cached_node_by_file_suffix(
+            language=language,
+            file_path=file_path,
+            file_name=file_name,
+            symbol_name=source_symbol,
+            node_cache=node_cache,
+        )
+        if suffix_source:
+            return suffix_source
         
         # NOTE: C++ qualified name workaround REMOVED after parser standardization
         # C++ parser now uses '.' separator like all other parsers (see PARSER_GRAPH_STANDARDIZATION.md)
@@ -1890,7 +2123,12 @@ class EnhancedUnifiedGraphBuilder:
         # Strategy 2: File-level imports (source = module name)
         # Only use this if NOT found as actual symbol (to handle Java where class name == file name)
         if source_symbol == file_name:
-            source_node = f"{language}::{file_name}::__file__"
+            source_node = self._make_node_id(
+                language,
+                file_name=file_name,
+                file_path=file_path,
+                symbol_name="__file__",
+            )
             if source_node not in node_cache:
                 graph.add_node(source_node,
                              symbol_name="__file__",
@@ -1914,7 +2152,12 @@ class EnhancedUnifiedGraphBuilder:
             # 2. 'app.AppConfig.database' (full name)
             for i in range(len(parts) - 1, -1, -1):  # Reverse order: from end to start
                 partial_name = '.'.join(parts[i:])
-                candidate = f"{language}::{file_name}::{partial_name}"
+                candidate = self._make_node_id(
+                    language,
+                    file_name=file_name,
+                    file_path=file_path,
+                    symbol_name=partial_name,
+                )
                 if candidate in node_cache:
                     return candidate
             
@@ -1922,7 +2165,12 @@ class EnhancedUnifiedGraphBuilder:
             # Only if no qualified match found
             for i in range(len(parts) - 1, -1, -1):
                 single_part = parts[i]
-                candidate = f"{language}::{file_name}::{single_part}"
+                candidate = self._make_node_id(
+                    language,
+                    file_name=file_name,
+                    file_path=file_path,
+                    symbol_name=single_part,
+                )
                 if candidate in node_cache:
                     return candidate
         
@@ -1951,10 +2199,15 @@ class EnhancedUnifiedGraphBuilder:
         # Strategy 7: Create fallback node
         # NOTE: C++ qualified name workaround REMOVED after parser standardization
         # C++ parser now uses '.' separator like all other parsers (see PARSER_GRAPH_STANDARDIZATION.md)
-        fallback_node = f"{language}::{file_name}::{source_symbol}"
+        fallback_node = self._make_node_id(
+            language,
+            file_name=file_name,
+            file_path=file_path,
+            symbol_name=source_symbol,
+        )
         return fallback_node
     
-    def _resolve_target_node_sync(self, target_symbol: str, language: str, file_name: str,
+    def _resolve_target_node_sync(self, target_symbol: str, language: str, file_name: str, file_path: str,
                                   symbol_registry: Dict[str, Any], graph: nx.MultiDiGraph,
                                   parse_results: Dict[str, ParseResult], node_cache: Dict[str, bool],
                                   target_file_hint: Optional[str] = None) -> Optional[str]:
@@ -1966,19 +2219,43 @@ class EnhancedUnifiedGraphBuilder:
         
         # Strategy 0: If target_file_hint provided, try that file first (for cross-file relationships)
         if target_file_hint and target_file_hint != file_name:
-            hinted_target = f"{language}::{target_file_hint}::{target_symbol}"
+            hinted_target = self._make_node_id(
+                language,
+                file_name=Path(target_file_hint).stem,
+                file_path=target_file_hint,
+                symbol_name=target_symbol,
+            )
             if hinted_target in node_cache:
                 return hinted_target
         
         # Strategy 1: Direct match in same file
-        direct_target = f"{language}::{file_name}::{target_symbol}"
+        direct_target = self._make_node_id(
+            language,
+            file_name=file_name,
+            file_path=file_path,
+            symbol_name=target_symbol,
+        )
         if direct_target in node_cache:
             return direct_target
+        suffix_target = self._find_cached_node_by_file_suffix(
+            language=language,
+            file_path=file_path,
+            file_name=file_name,
+            symbol_name=target_symbol,
+            node_cache=node_cache,
+        )
+        if suffix_target:
+            return suffix_target
         
         # Strategy 2: Handle self references
         if target_symbol.startswith('self.'):
             attribute_name = target_symbol[5:]
-            self_target = f"{language}::{file_name}::{attribute_name}"
+            self_target = self._make_node_id(
+                language,
+                file_name=file_name,
+                file_path=file_path,
+                symbol_name=attribute_name,
+            )
             if self_target in node_cache:
                 return self_target
         
@@ -1990,11 +2267,21 @@ class EnhancedUnifiedGraphBuilder:
             # First handle simple 2-part module.class case
             if len(parts) == 2:
                 module_name, class_name = parts
-                qualified_target = f"{language}::{module_name}::{class_name}"
+                qualified_target = self._make_node_id(
+                    language,
+                    file_name=module_name,
+                    file_path=module_name,
+                    symbol_name=class_name,
+                )
                 if qualified_target in node_cache:
                     return qualified_target
                 
-                unqualified_target = f"{language}::{file_name}::{class_name}"
+                unqualified_target = self._make_node_id(
+                    language,
+                    file_name=file_name,
+                    file_path=file_path,
+                    symbol_name=class_name,
+                )
                 if unqualified_target in node_cache:
                     return unqualified_target
             
@@ -2007,14 +2294,24 @@ class EnhancedUnifiedGraphBuilder:
             for i in range(len(parts) - 1, -1, -1):  # Reverse order: from end to start
                 # First try the qualified name from this part onwards (more specific)
                 partial_name = '.'.join(parts[i:])
-                candidate = f"{language}::{file_name}::{partial_name}"
+                candidate = self._make_node_id(
+                    language,
+                    file_name=file_name,
+                    file_path=file_path,
+                    symbol_name=partial_name,
+                )
                 if candidate in node_cache:
                     return candidate
             
             # Fallback: try single parts (less specific - only if no qualified match found)
             for i in range(len(parts) - 1, -1, -1):
                 single_part = parts[i]
-                candidate = f"{language}::{file_name}::{single_part}"
+                candidate = self._make_node_id(
+                    language,
+                    file_name=file_name,
+                    file_path=file_path,
+                    symbol_name=single_part,
+                )
                 if candidate in node_cache:
                     return candidate
         
@@ -2053,7 +2350,12 @@ class EnhancedUnifiedGraphBuilder:
         if '.' in target_symbol:
             method_name = target_symbol.split('.')[-1]
             
-            method_candidate = f"{language}::{file_name}::{method_name}"
+            method_candidate = self._make_node_id(
+                language,
+                file_name=file_name,
+                file_path=file_path,
+                symbol_name=method_name,
+            )
             if method_candidate in node_cache:
                 return method_candidate
             
@@ -2131,7 +2433,14 @@ class EnhancedUnifiedGraphBuilder:
             
             # Add symbols as nodes
             for symbol in result.symbols:
-                node_id = f"{language}::{file_name}::{symbol.name}"
+                symbol_rel_path = getattr(symbol, 'rel_path', '') or file_path
+                node_id = self._make_node_id(
+                    language,
+                    file_name=file_name,
+                    file_path=file_path,
+                    rel_path=symbol_rel_path,
+                    symbol_name=symbol.name,
+                )
                 
                 # Handle duplicates
                 base_node_id = node_id
@@ -2172,8 +2481,22 @@ class EnhancedUnifiedGraphBuilder:
             # Add relationships as edges
             for relationship in result.relationships:
                 # Simple resolution for basic relationships
-                source_id = f"{language}::{file_name}::{relationship.source_symbol}"
-                target_id = f"{language}::{file_name}::{relationship.target_symbol}"
+                first_symbol = result.symbols[0] if result.symbols else None
+                result_rel_path = getattr(first_symbol, 'rel_path', '') or file_path
+                source_id = self._make_node_id(
+                    language,
+                    file_name=file_name,
+                    file_path=file_path,
+                    rel_path=result_rel_path,
+                    symbol_name=relationship.source_symbol,
+                )
+                target_id = self._make_node_id(
+                    language,
+                    file_name=file_name,
+                    file_path=file_path,
+                    rel_path=result_rel_path,
+                    symbol_name=relationship.target_symbol,
+                )
                 
                 if source_id in graph.nodes and target_id in graph.nodes:
                     edge_attrs = {
@@ -2678,12 +3001,112 @@ class EnhancedUnifiedGraphBuilder:
     
     def _detect_cross_language_relationships(self, files_by_language: Dict[str, List[str]], 
                                            parse_results: Dict[str, Union[ParseResult, BasicParseResult]]) -> List[Any]:
-        """Detect cross-language relationships (simplified for now)"""
-        cross_lang_rels = []
-        
-        # For now, return empty list - this would require more sophisticated analysis
-        # to detect things like Java calling Python scripts, etc.
-        
+        """Detect parser-supplied relationships that cross language files.
+
+        Rich/basic parsers may annotate relationships with ``target_file``
+        when they can resolve an import/call/definition into another file.
+        When the target file belongs to a different language, promote that
+        relationship as Phase 6 L0 evidence for ``cross_language_linker``.
+        """
+        if not files_by_language or not parse_results:
+            return []
+
+        def _norm(path: str) -> str:
+            try:
+                return str(Path(path).resolve())
+            except Exception:
+                return str(path)
+
+        file_to_language: Dict[str, str] = {}
+        basename_to_files: Dict[str, List[str]] = defaultdict(list)
+        for lang, paths in files_by_language.items():
+            for path in paths:
+                path_str = str(path)
+                file_to_language[_norm(path_str)] = lang
+                file_to_language[path_str] = lang
+                basename_to_files[Path(path_str).name].append(path_str)
+
+        def _resolve_target_file(target_file: str, source_file: str) -> str:
+            if not target_file:
+                return ""
+            candidates = [target_file]
+            repo_root = getattr(self, "repo_path", "") or ""
+            if repo_root:
+                candidates.append(str(Path(repo_root) / target_file))
+            candidates.append(str(Path(source_file).parent / target_file))
+            for candidate in candidates:
+                if _norm(candidate) in file_to_language or candidate in file_to_language:
+                    return candidate
+            matches = basename_to_files.get(Path(target_file).name) or []
+            return matches[0] if len(matches) == 1 else ""
+
+        def _rel_path(result: Any, file_path: str) -> str:
+            for symbol in getattr(result, "symbols", []) or []:
+                rel_path = getattr(symbol, "rel_path", "") or ""
+                if rel_path:
+                    return rel_path
+            repo_root = getattr(self, "repo_path", "") or ""
+            if repo_root:
+                try:
+                    return self._calculate_relative_path(file_path, repo_root)
+                except Exception:
+                    return file_path
+            return file_path
+
+        cross_lang_rels: List[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for source_file, result in parse_results.items():
+            source_language = getattr(result, "language", "") or file_to_language.get(_norm(source_file), "")
+            source_rel_path = _rel_path(result, source_file)
+            for relationship in getattr(result, "relationships", []) or []:
+                target_file_raw = getattr(relationship, "target_file", None)
+                if not target_file_raw:
+                    continue
+                target_file = _resolve_target_file(str(target_file_raw), source_file)
+                if not target_file:
+                    continue
+                target_language = file_to_language.get(_norm(target_file)) or file_to_language.get(target_file, "")
+                if not target_language or target_language == source_language:
+                    continue
+                target_result = parse_results.get(target_file) or parse_results.get(_norm(target_file))
+                target_rel_path = _rel_path(target_result, target_file) if target_result is not None else target_file
+
+                source_symbol = getattr(relationship, "source_symbol", "") or ""
+                target_symbol = getattr(relationship, "target_symbol", "") or ""
+                if not source_symbol or not target_symbol:
+                    continue
+
+                source_id = self._make_node_id(
+                    source_language,
+                    file_name=Path(source_file).stem,
+                    file_path=source_file,
+                    rel_path=source_rel_path,
+                    symbol_name=source_symbol,
+                )
+                target_id = self._make_node_id(
+                    target_language,
+                    file_name=Path(target_file).stem,
+                    file_path=target_file,
+                    rel_path=target_rel_path,
+                    symbol_name=target_symbol,
+                )
+                rel_type = getattr(relationship, "relationship_type", "cross_language")
+                if hasattr(rel_type, "value"):
+                    rel_type = rel_type.value
+                key = (source_id, target_id, str(rel_type))
+                if key in seen:
+                    continue
+                seen.add(key)
+                cross_lang_rels.append({
+                    "source": source_id,
+                    "target": target_id,
+                    "confidence": 0.95,
+                    "relationship_type": "cross_language_L0",
+                    "parser_relationship_type": str(rel_type),
+                    "source_language": source_language,
+                    "target_language": target_language,
+                })
+
         return cross_lang_rels
     
     def _generate_language_stats(self, parse_results: Dict[str, Union[ParseResult, BasicParseResult]]) -> Dict[str, Any]:

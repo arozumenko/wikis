@@ -124,6 +124,127 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/wikis/{wiki_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Wiki
+         * @description Get wiki detail with pages and their content.
+         */
+        get: operations["get_wiki_api_v1_wikis__wiki_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete Wiki */
+        delete: operations["delete_wiki_api_v1_wikis__wiki_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search Wiki
+         * @description Full-text search over wiki pages with graph-expansion re-ranking.
+         */
+        get: operations["search_wiki_api_v1_wikis__wiki_id__search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/pages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Wiki Pages
+         * @description List all pages in a wiki with their titles and descriptions.
+         */
+        get: operations["list_wiki_pages_api_v1_wikis__wiki_id__pages_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/pages/{page_title}/neighbors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Page Neighbors
+         * @description Return the wikilink graph neighborhood for a single wiki page.
+         */
+        get: operations["get_page_neighbors_api_v1_wikis__wiki_id__pages__page_title__neighbors_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/pages/{page_title}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Wiki Page By Title
+         * @description Return the full content of a single wiki page identified by its title.
+         */
+        get: operations["get_wiki_page_by_title_api_v1_wikis__wiki_id__pages__page_title__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/pages/{page_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Wiki Page
+         * @description Get a single wiki page content. page_id can be section/page format.
+         */
+        get: operations["get_wiki_page_api_v1_wikis__wiki_id__pages__page_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/wikis/{wiki_id}/resume": {
         parameters: {
             query?: never;
@@ -135,6 +256,46 @@ export interface paths {
         put?: never;
         /** Resume Wiki */
         post: operations["resume_wiki_api_v1_wikis__wiki_id__resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/qa": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Qa
+         * @description Paginated Q&A history for a wiki.
+         */
+        get: operations["list_qa_api_v1_wikis__wiki_id__qa_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/qa/stats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Qa Stats
+         * @description QA statistics for a wiki.
+         */
+        get: operations["qa_stats_api_v1_wikis__wiki_id__qa_stats_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -158,7 +319,63 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/wikis/{wiki_id}": {
+    "/api/v1/wikis/{wiki_id}/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Diff Wiki
+         * @description Diff a fresh-parse payload against the indexed snapshot.
+         *
+         *     The caller supplies the freshly parsed nodes (id + content_hash + path);
+         *     the server compares them against the wiki's stored ``repo_nodes`` and
+         *     returns the resulting change set plus the wiki pages those changes
+         *     touch (via the ``page_symbols`` reverse index from #116 PR 1).
+         *
+         *     Read-only: no parsing, no LLM, no writes. PR 3 will wire the actual
+         *     re-parse loop on top of this primitive.
+         */
+        post: operations["diff_wiki_api_v1_wikis__wiki_id__diff_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/incremental-refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Incremental Refresh Wiki
+         * @description Trigger an incremental refresh on a previously-generated wiki.
+         *
+         *     The caller supplies pre-parsed nodes (same shape as ``/diff``).
+         *     The server diffs them against the indexed snapshot, dispatches each
+         *     affected page through the trivial / edit / structural regimes, and
+         *     streams progress over SSE.
+         *
+         *     Owner-only — same access model as ``/refresh`` since this surfaces
+         *     internal content_hash + node_id state through the per-page events.
+         */
+        post: operations["incremental_refresh_wiki_api_v1_wikis__wiki_id__incremental_refresh_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/visibility": {
         parameters: {
             query?: never;
             header?: never;
@@ -168,8 +385,213 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Delete Wiki */
-        delete: operations["delete_wiki_api_v1_wikis__wiki_id__delete"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Update Wiki Visibility
+         * @description Change a wiki's visibility between 'personal' and 'shared'.
+         */
+        patch: operations["update_wiki_visibility_api_v1_wikis__wiki_id__visibility_patch"];
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/description": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Update Wiki Description
+         * @description Update the user-provided description for a wiki.
+         */
+        patch: operations["update_wiki_description_api_v1_wikis__wiki_id__description_patch"];
+        trace?: never;
+    };
+    "/api/v1/wikis/{wiki_id}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export Wiki
+         * @description Export a wiki as a downloadable ZIP archive.
+         *
+         *     Supports two formats:
+         *     - ``obsidian`` — Obsidian vault layout with YAML frontmatter
+         *     - ``wikis`` — Wikis-to-Wikis bundle for re-importing into another instance
+         */
+        get: operations["export_wiki_api_v1_wikis__wiki_id__export_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/wikis/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import Wiki
+         * @description Import a wiki from a ``.wikiexport`` bundle produced by the wikis export.
+         */
+        post: operations["import_wiki_api_v1_wikis_import_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Projects */
+        get: operations["list_projects_api_v1_projects_get"];
+        put?: never;
+        /** Create Project */
+        post: operations["create_project_api_v1_projects_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Project */
+        get: operations["get_project_api_v1_projects__project_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete Project */
+        delete: operations["delete_project_api_v1_projects__project_id__delete"];
+        options?: never;
+        head?: never;
+        /** Update Project */
+        patch: operations["update_project_api_v1_projects__project_id__patch"];
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/wikis": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Project Wikis */
+        get: operations["list_project_wikis_api_v1_projects__project_id__wikis_get"];
+        put?: never;
+        /** Add Wiki To Project */
+        post: operations["add_wiki_to_project_api_v1_projects__project_id__wikis_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/wikis/{wiki_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove Wiki From Project */
+        delete: operations["remove_wiki_from_project_api_v1_projects__project_id__wikis__wiki_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/recompute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Recompute Project Route
+         * @description Stream a project-level recompute (relatedness → cross-repo → leiden).
+         *
+         *     Gated server-side by ``flags.project_graph``. Emits SSE progress events
+         *     matching the wiki-generation widget contract.
+         */
+        post: operations["recompute_project_route_api_v1_projects__project_id__recompute_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search Project
+         * @description Full-text search over all wiki pages in a project with graph-expansion re-ranking.
+         */
+        get: operations["search_project_api_v1_projects__project_id__search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/map": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Project Codemap
+         * @description Build a code-map for all wikis in a project.
+         *
+         *     Proxies to the codemap pipeline with ``project_id`` set and
+         *     ``research_type=codemap``.
+         */
+        post: operations["project_codemap_api_v1_projects__project_id__map_post"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -197,12 +619,34 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * AffectedPageResponse
+         * @description One wiki page touched by the change set.
+         */
+        AffectedPageResponse: {
+            /** Page Id */
+            page_id: string;
+            /** Title */
+            title?: string | null;
+            /** Anchor Slug */
+            anchor_slug?: string | null;
+            /** Changes */
+            changes?: components["schemas"]["NodeChangeResponse"][];
+        };
+        /**
          * AskRequest
          * @description Request to ask a question about a wiki.
          */
         AskRequest: {
-            /** Wiki Id */
-            wiki_id: string;
+            /**
+             * Wiki Id
+             * @default null
+             */
+            wiki_id: string | null;
+            /**
+             * Project Id
+             * @default null
+             */
+            project_id: string | null;
             /** Question */
             question: string;
             /** Chat History */
@@ -214,14 +658,9 @@ export interface components {
             k: number;
             /**
              * Min Confidence
-             * Minimum edge-confidence label accepted during graph
-             * expansion (#120 Phase 2). One of `EXTRACTED`,
-             * `INFERRED`, `AMBIGUOUS`, or `null` (no filter).
-             * Manually added — keep in sync with
-             * backend/app/models/api.py::AskRequest until
-             * `npm run generate:types` runs.
+             * @default null
              */
-            min_confidence?: string | null;
+            min_confidence: string | null;
         };
         /**
          * AskResponse
@@ -232,6 +671,65 @@ export interface components {
             answer: string;
             /** Sources */
             sources?: components["schemas"]["SourceReference"][];
+            /**
+             * Tool Steps
+             * @default 0
+             */
+            tool_steps: number;
+            /**
+             * Qa Id
+             * @default
+             */
+            qa_id: string;
+        };
+        /** Body_import_wiki_api_v1_wikis_import_post */
+        Body_import_wiki_api_v1_wikis_import_post: {
+            /** Bundle */
+            bundle: string;
+        };
+        /**
+         * CallStack
+         * @description A named call-flow chain, e.g. 'Frontend Auth' or 'MCP Auth'.
+         */
+        CallStack: {
+            /** Title */
+            title: string;
+            /** Steps */
+            steps?: components["schemas"]["CallStackStep"][];
+        };
+        /**
+         * CallStackStep
+         * @description One step in a call stack chain.
+         */
+        CallStackStep: {
+            /** Symbol */
+            symbol: string;
+            /**
+             * File Path
+             * @default
+             */
+            file_path: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+        };
+        /**
+         * ChangeSetResponse
+         * @description Aggregate change set — one entry per kind.
+         */
+        ChangeSetResponse: {
+            /** Added */
+            added?: components["schemas"]["NodeChangeResponse"][];
+            /** Modified */
+            modified?: components["schemas"]["NodeChangeResponse"][];
+            /** Moved */
+            moved?: components["schemas"]["NodeChangeResponse"][];
+            /** Deleted */
+            deleted?: components["schemas"]["NodeChangeResponse"][];
+            /** Total */
+            total: number;
         };
         /**
          * ChatMessage
@@ -244,6 +742,75 @@ export interface components {
             content: string;
         };
         /**
+         * CodeMapData
+         * @description Hierarchical call-tree for the code-map right panel.
+         */
+        CodeMapData: {
+            /**
+             * Summary
+             * @default
+             */
+            summary: string;
+            /** Call Stacks */
+            call_stacks?: components["schemas"]["CallStack"][];
+            /** Sections */
+            sections?: components["schemas"]["CodeMapSection"][];
+        };
+        /**
+         * CodeMapSection
+         * @description A top-level section in the call-tree (usually one source file).
+         */
+        CodeMapSection: {
+            /** Id */
+            id: string;
+            /** Title */
+            title: string;
+            /**
+             * File Path
+             * @default
+             */
+            file_path: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /** Symbols */
+            symbols?: components["schemas"]["CodeMapSymbol"][];
+        };
+        /**
+         * CodeMapSymbol
+         * @description A single symbol (function / class / variable) shown as a leaf in the tree.
+         */
+        CodeMapSymbol: {
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /**
+             * Symbol Type
+             * @default
+             */
+            symbol_type: string;
+            /**
+             * File Path
+             * @default
+             */
+            file_path: string;
+            /**
+             * Line Start
+             * @default null
+             */
+            line_start: number | null;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /** Relationships */
+            relationships?: string[];
+        };
+        /**
          * DeleteWikiResponse
          * @description Response after deleting a wiki.
          */
@@ -252,6 +819,36 @@ export interface components {
             deleted: boolean;
             /** Wiki Id */
             wiki_id: string;
+            /**
+             * Message
+             * @default null
+             */
+            message: string | null;
+        };
+        /**
+         * DiffWikiRequest
+         * @description Body for ``POST /wikis/{wiki_id}/diff`` — supply the freshly parsed
+         *     nodes; the server diffs them against the indexed snapshot.
+         *
+         *     Capped at 50 000 nodes per request to bound the cost of the per-node
+         *     reverse-index lookup. The largest repos in our corpus parse to ~30k
+         *     architectural nodes; 50k gives ~1.5x headroom before PR 3 swaps in the
+         *     batched ``get_pages_citing_nodes`` query.
+         */
+        DiffWikiRequest: {
+            /** Parsed Nodes */
+            parsed_nodes?: components["schemas"]["ParsedNodeInput"][];
+        };
+        /**
+         * DiffWikiResponse
+         * @description Result of the diff endpoint — no writes occur.
+         */
+        DiffWikiResponse: {
+            /** Wiki Id */
+            wiki_id: string;
+            change_set: components["schemas"]["ChangeSetResponse"];
+            /** Affected Pages */
+            affected_pages?: components["schemas"]["AffectedPageResponse"][];
         };
         /**
          * ErrorResponse
@@ -270,16 +867,42 @@ export interface components {
         };
         /**
          * GenerateWikiRequest
-         * @description Request to generate a wiki from a repository.
+         * @description Request to generate a wiki from a repository or Atlassian source.
+         *
+         *     Preferred (new) shape
+         *     ---------------------
+         *     source_type + scope + auth — see module docstring for field shapes.
+         *
+         *     Backwards-compatible (legacy) shape
+         *     ------------------------------------
+         *     repo_url + branch + access_token — auto-normalized into the new shape
+         *     by the ``_normalize_legacy`` validator so old callers keep working.
          */
         GenerateWikiRequest: {
-            /** Repo Url */
-            repo_url: string;
+            /**
+             * Source Type
+             * @default git
+             * @enum {string}
+             */
+            source_type: "git" | "confluence" | "jira";
+            /** Scope */
+            scope?: {
+                [key: string]: unknown;
+            };
+            /** Auth */
+            auth?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Repo Url
+             * @default null
+             */
+            repo_url: string | null;
             /**
              * Branch
-             * @default main
+             * @default null
              */
-            branch: string;
+            branch: string | null;
             /**
              * Provider
              * @default github
@@ -311,6 +934,11 @@ export interface components {
              */
             force_rebuild_index: boolean;
             /**
+             * Visibility
+             * @default personal
+             */
+            visibility: string;
+            /**
              * Llm Model
              * @default null
              */
@@ -321,23 +949,20 @@ export interface components {
              */
             embedding_model: string | null;
             /**
-             * Planner Type
-             * @description Structure planner override (optional, falls back to server config).
+             * Structure Planner
              * @default null
-             * @enum {string|null}
              */
-            planner_type: "agent" | "cluster" | null;
+            structure_planner: ("agentic" | "graph_clustering") | null;
+            /**
+             * Planner Type
+             * @default null
+             */
+            planner_type: ("agent" | "cluster") | null;
             /**
              * Exclude Tests
-             * @description Soft-skip test nodes during clustering (cluster planner only).
              * @default null
              */
             exclude_tests: boolean | null;
-            /**
-             * Visibility
-             * @default personal
-             */
-            visibility: string;
         };
         /**
          * GenerateWikiResponse
@@ -373,6 +998,38 @@ export interface components {
             };
         };
         /**
+         * IncrementalRefreshRequest
+         * @description POST ``/wikis/{id}/incremental-refresh`` body.
+         *
+         *     Caller supplies pre-parsed nodes (same shape as ``/diff``). Capped at
+         *     50_000 nodes per request to bound the orchestrator's snapshot work.
+         */
+        IncrementalRefreshRequest: {
+            /** Parsed Nodes */
+            parsed_nodes?: components["schemas"]["ParsedNodeInput"][];
+        };
+        /**
+         * IncrementalRefreshResponse
+         * @description Initial response — actual progress flows over SSE.
+         *
+         *     The orchestrator runs asynchronously after this returns; subscribe
+         *     to ``/invocations/{invocation_id}/stream`` for ``page_unchanged``,
+         *     ``page_patched``, ``page_edited``, ``page_regenerated``, and the
+         *     final ``incremental_summary`` event with the run stats.
+         */
+        IncrementalRefreshResponse: {
+            /** Wiki Id */
+            wiki_id: string;
+            /** Invocation Id */
+            invocation_id: string;
+            /** Status */
+            status: string;
+            /** Page Count */
+            page_count: number;
+            /** Message */
+            message?: string | null;
+        };
+        /**
          * Invocation
          * @description Tracks the state of a background wiki generation job.
          */
@@ -381,6 +1038,21 @@ export interface components {
             id: string;
             /** Wiki Id */
             wiki_id: string;
+            /**
+             * Repo Url
+             * @default
+             */
+            repo_url: string;
+            /**
+             * Branch
+             * @default
+             */
+            branch: string;
+            /**
+             * Owner Id
+             * @default
+             */
+            owner_id: string;
             /**
              * Status
              * @default generating
@@ -423,12 +1095,269 @@ export interface components {
             model_context_limit?: number | null;
         };
         /**
+         * NodeChangeResponse
+         * @description One change in the response. Field population depends on ``kind``.
+         */
+        NodeChangeResponse: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "added" | "modified" | "deleted" | "moved";
+            /** Node Id */
+            node_id: string;
+            /** Old Hash */
+            old_hash?: string | null;
+            /** New Hash */
+            new_hash?: string | null;
+            /** Old Path */
+            old_path?: string | null;
+            /** New Path */
+            new_path?: string | null;
+        };
+        /**
+         * PageListItem
+         * @description A brief description of a single wiki page, used in list responses.
+         */
+        PageListItem: {
+            /** Page Title */
+            page_title: string;
+            /** Description */
+            description: string;
+            /** Section */
+            section?: string | null;
+        };
+        /**
+         * PageNeighbor
+         * @description A neighboring wiki page with its relationship direction.
+         */
+        PageNeighbor: {
+            /** Title */
+            title: string;
+            /**
+             * Rel
+             * @enum {string}
+             */
+            rel: "links_to" | "linked_from";
+        };
+        /**
+         * PageNeighborsResponse
+         * @description Response containing the neighbor graph for a single wiki page.
+         */
+        PageNeighborsResponse: {
+            /** Wiki Id */
+            wiki_id: string;
+            /** Page Title */
+            page_title: string;
+            /** Links To */
+            links_to: string[];
+            /** Linked From */
+            linked_from: string[];
+        };
+        /**
+         * ParsedNodeInput
+         * @description One node from a fresh parse, supplied to the diff endpoint.
+         *
+         *     Only the three fields needed for change classification are required;
+         *     callers can pass the same dicts they would otherwise hand to
+         *     ``upsert_nodes_batch`` (extra keys are ignored).
+         */
+        ParsedNodeInput: {
+            /** Node Id */
+            node_id: string;
+            /** Content Hash */
+            content_hash?: string | null;
+            /**
+             * Rel Path
+             * @default
+             */
+            rel_path: string;
+        };
+        /**
+         * ProjectAddWikiRequest
+         * @description Request to add a wiki to a project.
+         */
+        ProjectAddWikiRequest: {
+            /** Wiki Id */
+            wiki_id: string;
+        };
+        /**
+         * ProjectCreateRequest
+         * @description Request to create a new project.
+         */
+        ProjectCreateRequest: {
+            /** Name */
+            name: string;
+            /** Description */
+            description?: string | null;
+            /**
+             * Visibility
+             * @default personal
+             * @enum {string}
+             */
+            visibility: "personal" | "shared";
+        };
+        /**
+         * ProjectListResponse
+         * @description Response listing all projects.
+         */
+        ProjectListResponse: {
+            /** Projects */
+            projects: components["schemas"]["ProjectResponse"][];
+        };
+        /**
+         * ProjectResponse
+         * @description Response for a single project.
+         */
+        ProjectResponse: {
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /** Description */
+            description: string | null;
+            /** Visibility */
+            visibility: string;
+            /** Owner Id */
+            owner_id: string;
+            /**
+             * Is Owner
+             * @default false
+             */
+            is_owner: boolean;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Wiki Count
+             * @default 0
+             */
+            wiki_count: number;
+        };
+        /**
+         * ProjectSearchResponse
+         * @description Response for a search scoped to all wikis in a project.
+         */
+        ProjectSearchResponse: {
+            /** Query */
+            query: string;
+            /** Results */
+            results: components["schemas"]["SearchResultItem"][];
+            /** Wiki Summary */
+            wiki_summary: components["schemas"]["WikiSummaryItem"][];
+        };
+        /**
+         * ProjectUpdateRequest
+         * @description Request to update an existing project.
+         */
+        ProjectUpdateRequest: {
+            /** Name */
+            name?: string | null;
+            /** Description */
+            description?: string | null;
+            /** Visibility */
+            visibility?: ("personal" | "shared") | null;
+        };
+        /**
+         * QAListResponse
+         * @description Paginated QA list response.
+         */
+        QAListResponse: {
+            /** Items */
+            items: components["schemas"]["QARecordResponse"][];
+            /** Total */
+            total: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+        };
+        /**
+         * QARecordResponse
+         * @description Single QA record in API responses.
+         */
+        QARecordResponse: {
+            /** Id */
+            id: string;
+            /** Wiki Id */
+            wiki_id: string;
+            /** Question */
+            question: string;
+            /** Answer */
+            answer: string;
+            /** Sources Json */
+            sources_json?: string | null;
+            /**
+             * Tool Steps
+             * @default 0
+             */
+            tool_steps: number;
+            /**
+             * Mode
+             * @default fast
+             * @enum {string}
+             */
+            mode: "fast" | "deep";
+            /**
+             * Status
+             * @default pending
+             * @enum {string}
+             */
+            status: "pending" | "validated" | "rejected" | "enriched" | "stale";
+            /**
+             * Is Cache Hit
+             * @default false
+             */
+            is_cache_hit: boolean;
+            /**
+             * Has Context
+             * @default false
+             */
+            has_context: boolean;
+            /** Created At */
+            created_at?: string | null;
+        };
+        /**
+         * QAStatsResponse
+         * @description QA statistics response.
+         */
+        QAStatsResponse: {
+            /** Total Count */
+            total_count: number;
+            /** Cache Hit Count */
+            cache_hit_count: number;
+            /** Validated Count */
+            validated_count: number;
+            /** Rejected Count */
+            rejected_count: number;
+            /** Hit Rate */
+            hit_rate: number;
+        };
+        /**
+         * RefreshWikiRequest
+         * @description Request body for wiki refresh — allows passing an access token for private repos.
+         */
+        RefreshWikiRequest: {
+            /** Access Token */
+            access_token?: string | null;
+        };
+        /**
          * ResearchRequest
          * @description Request to perform deep research on a wiki.
          */
         ResearchRequest: {
-            /** Wiki Id */
-            wiki_id: string;
+            /**
+             * Wiki Id
+             * @default null
+             */
+            wiki_id: string | null;
+            /**
+             * Project Id
+             * @default null
+             */
+            project_id: string | null;
             /** Question */
             question: string;
             /**
@@ -436,11 +1365,8 @@ export interface components {
              * @default general
              */
             research_type: string;
-            /**
-             * Enable Subagents
-             * @default true
-             */
-            enable_subagents: boolean;
+            /** Chat History */
+            chat_history?: components["schemas"]["ChatMessage"][];
         };
         /**
          * ResearchResponse
@@ -453,8 +1379,26 @@ export interface components {
             sources?: components["schemas"]["SourceReference"][];
             /** Research Steps */
             research_steps?: string[];
-            /** Code Map */
-            code_map?: components["schemas"]["CodeMapData"] | null;
+            /** @default null */
+            code_map: components["schemas"]["CodeMapData"] | null;
+        };
+        /**
+         * SearchResultItem
+         * @description A single search result item from a wiki page.
+         */
+        SearchResultItem: {
+            /** Wiki Id */
+            wiki_id: string;
+            /** Wiki Name */
+            wiki_name: string;
+            /** Page Title */
+            page_title: string;
+            /** Snippet */
+            snippet: string;
+            /** Score */
+            score: number;
+            /** Neighbors */
+            neighbors: components["schemas"]["PageNeighbor"][];
         };
         /**
          * SourceReference
@@ -463,6 +1407,11 @@ export interface components {
         SourceReference: {
             /** File Path */
             file_path: string;
+            /**
+             * Node Id
+             * @default null
+             */
+            node_id: string | null;
             /**
              * Line Start
              * @default null
@@ -479,6 +1428,21 @@ export interface components {
              */
             snippet: string | null;
             /**
+             * Symbol
+             * @default null
+             */
+            symbol: string | null;
+            /**
+             * Symbol Type
+             * @default null
+             */
+            symbol_type: string | null;
+            /**
+             * Relevance Score
+             * @default null
+             */
+            relevance_score: number | null;
+            /**
              * Wiki Id
              * @default null
              */
@@ -490,16 +1454,25 @@ export interface components {
             wiki_title: string | null;
             /**
              * Confidence
-             * Edge-confidence label (#120). EXTRACTED = direct parser
-             * observation, INFERRED = name-only resolution,
-             * AMBIGUOUS = reserved multi-target. `null` when the
-             * citation comes from a path with no edge metadata
-             * (e.g. a pure FTS hit). Manually added — keep in sync
-             * with `backend/app/models/api.py::SourceReference`
-             * until `npm run generate:types` runs.
              * @default null
              */
             confidence: string | null;
+        };
+        /**
+         * UpdateWikiDescriptionRequest
+         * @description Request to update the description of a wiki.
+         */
+        UpdateWikiDescriptionRequest: {
+            /** Description */
+            description?: string | null;
+        };
+        /**
+         * UpdateWikiVisibilityRequest
+         * @description Request to update the visibility of a wiki.
+         */
+        UpdateWikiVisibilityRequest: {
+            /** Visibility */
+            visibility: string;
         };
         /** ValidationError */
         ValidationError: {
@@ -521,6 +1494,42 @@ export interface components {
         WikiListResponse: {
             /** Wikis */
             wikis?: components["schemas"]["WikiSummary"][];
+        };
+        /**
+         * WikiPageListResponse
+         * @description Response listing all pages in a wiki.
+         */
+        WikiPageListResponse: {
+            /** Wiki Id */
+            wiki_id: string;
+            /** Pages */
+            pages: components["schemas"]["PageListItem"][];
+        };
+        /**
+         * WikiPageResponse
+         * @description Response containing full content of a single wiki page.
+         */
+        WikiPageResponse: {
+            /** Wiki Id */
+            wiki_id: string;
+            /** Page Title */
+            page_title: string;
+            /** Content */
+            content: string;
+            /** Sections */
+            sections: string[];
+        };
+        /**
+         * WikiSearchResponse
+         * @description Response for a search scoped to a single wiki.
+         */
+        WikiSearchResponse: {
+            /** Query */
+            query: string;
+            /** Results */
+            results: components["schemas"]["SearchResultItem"][];
+            /** Wiki Summary */
+            wiki_summary: components["schemas"]["WikiSummaryItem"][];
         };
         /**
          * WikiSummary
@@ -592,6 +1601,33 @@ export interface components {
              * @default false
              */
             requires_token: boolean;
+            /**
+             * Description
+             * @default null
+             */
+            description: string | null;
+        };
+        /**
+         * WikiSummaryItem
+         * @description Per-wiki aggregate summary within a search response.
+         */
+        WikiSummaryItem: {
+            /** Wiki Id */
+            wiki_id: string;
+            /** Wiki Name */
+            wiki_name: string;
+            /** Match Count */
+            match_count: number;
+            /** Relevance */
+            relevance: number;
+        };
+        /**
+         * _ProjectCodeMapRequest
+         * @description Request body for the project code-map endpoint.
+         */
+        _ProjectCodeMapRequest: {
+            /** Question */
+            question: string;
         };
         /**
          * SSEEvent
@@ -676,100 +1712,21 @@ export interface components {
              * @default false
              */
             recoverable: boolean;
-        };
-        /** CodeMapSymbol */
-        CodeMapSymbol: {
-            /** Id */
-            id: string;
-            /** Name */
-            name: string;
             /**
-             * Symbol Type
-             * @default
+             * Error Type
+             * @default null
              */
-            symbol_type: string;
+            error_type: string | null;
             /**
-             * File Path
-             * @default
+             * Model Limit
+             * @default null
              */
-            file_path: string;
-            /** Line Start */
-            line_start?: number | null;
+            model_limit: number | null;
             /**
-             * Description
-             * @default
+             * Suggested Actions
+             * @default null
              */
-            description: string;
-            /**
-             * Relationships
-             * @default []
-             */
-            relationships: string[];
-        };
-        /** CodeMapSection */
-        CodeMapSection: {
-            /** Id */
-            id: string;
-            /** Title */
-            title: string;
-            /**
-             * File Path
-             * @default
-             */
-            file_path: string;
-            /**
-             * Description
-             * @default
-             */
-            description: string;
-            /**
-             * Symbols
-             * @default []
-             */
-            symbols: components["schemas"]["CodeMapSymbol"][];
-        };
-        /** CodeMapData */
-        CodeMapData: {
-            /**
-             * Summary
-             * @default
-             */
-            summary: string;
-            /**
-             * Call Stacks
-             * @default []
-             */
-            call_stacks: components["schemas"]["CallStack"][];
-            /**
-             * Sections
-             * @default []
-             */
-            sections: components["schemas"]["CodeMapSection"][];
-        };
-        /** CallStackStep */
-        CallStackStep: {
-            /** Symbol */
-            symbol: string;
-            /**
-             * File Path
-             * @default
-             */
-            file_path: string;
-            /**
-             * Description
-             * @default
-             */
-            description: string;
-        };
-        /** CallStack */
-        CallStack: {
-            /** Title */
-            title: string;
-            /**
-             * Steps
-             * @default []
-             */
-            steps: components["schemas"]["CallStackStep"][];
+            suggested_actions: string[] | null;
         };
     };
     responses: never;
@@ -796,7 +1753,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        [key: string]: string;
+                        [key: string]: unknown;
                     };
                 };
             };
@@ -826,7 +1783,16 @@ export interface operations {
                     "application/json": components["schemas"]["GenerateWikiResponse"];
                 };
             };
-            /** @description Unprocessable Content */
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -1041,7 +2007,7 @@ export interface operations {
             };
         };
     };
-    resume_wiki_api_v1_wikis__wiki_id__resume_post: {
+    get_wiki_api_v1_wikis__wiki_id__get: {
         parameters: {
             query?: never;
             header?: {
@@ -1055,45 +2021,14 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Successful Response */
-            202: {
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["GenerateWikiResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    refresh_wiki_api_v1_wikis__wiki_id__refresh_post: {
-        parameters: {
-            query?: never;
-            header?: {
-                authorization?: string | null;
-            };
-            path: {
-                wiki_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GenerateWikiResponse"];
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description Validation Error */
@@ -1127,6 +2062,980 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DeleteWikiResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_wiki_api_v1_wikis__wiki_id__search_get: {
+        parameters: {
+            query: {
+                q: string;
+                hop_depth?: number;
+                top_k?: number;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiSearchResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_wiki_pages_api_v1_wikis__wiki_id__pages_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiPageListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_page_neighbors_api_v1_wikis__wiki_id__pages__page_title__neighbors_get: {
+        parameters: {
+            query?: {
+                hop_depth?: number;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+                page_title: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PageNeighborsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_wiki_page_by_title_api_v1_wikis__wiki_id__pages__page_title__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+                page_title: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiPageResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_wiki_page_api_v1_wikis__wiki_id__pages__page_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+                page_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_wiki_api_v1_wikis__wiki_id__resume_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GenerateWikiResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_qa_api_v1_wikis__wiki_id__qa_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+                status?: ("pending" | "validated" | "rejected" | "enriched" | "stale") | null;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QAListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    qa_stats_api_v1_wikis__wiki_id__qa_stats_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QAStatsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    refresh_wiki_api_v1_wikis__wiki_id__refresh_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RefreshWikiRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GenerateWikiResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    diff_wiki_api_v1_wikis__wiki_id__diff_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DiffWikiRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiffWikiResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    incremental_refresh_wiki_api_v1_wikis__wiki_id__incremental_refresh_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IncrementalRefreshRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IncrementalRefreshResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_wiki_visibility_api_v1_wikis__wiki_id__visibility_patch: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateWikiVisibilityRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiSummary"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_wiki_description_api_v1_wikis__wiki_id__description_patch: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateWikiDescriptionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    export_wiki_api_v1_wikis__wiki_id__export_get: {
+        parameters: {
+            query?: {
+                /** @description Export format: 'obsidian' or 'wikis' */
+                format?: string;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                    "application/zip": unknown;
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    import_wiki_api_v1_wikis_import_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_import_wiki_api_v1_wikis_import_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiSummary"];
+                };
+            };
+            /** @description Request Entity Too Large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    list_projects_api_v1_projects_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_project_api_v1_projects_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_project_api_v1_projects__project_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_project_api_v1_projects__project_id__delete: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_project_api_v1_projects__project_id__patch: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_project_wikis_api_v1_projects__project_id__wikis_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    add_wiki_to_project_api_v1_projects__project_id__wikis_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectAddWikiRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_wiki_from_project_api_v1_projects__project_id__wikis__wiki_id__delete: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                project_id: string;
+                wiki_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    recompute_project_route_api_v1_projects__project_id__recompute_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_project_api_v1_projects__project_id__search_get: {
+        parameters: {
+            query: {
+                q: string;
+                hop_depth?: number;
+                top_k?: number;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectSearchResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    project_codemap_api_v1_projects__project_id__map_post: {
+        parameters: {
+            query?: {
+                accept?: string;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["_ProjectCodeMapRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchResponse"];
                 };
             };
             /** @description Validation Error */

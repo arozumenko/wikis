@@ -572,3 +572,111 @@ export function subscribeAskSSE(
 
   return () => controller.abort();
 }
+
+// ---------------------------------------------------------------------
+// PR-16 — Project recompute SSE (cross-repo pipeline progress)
+// ---------------------------------------------------------------------
+
+export interface RecomputeProgressEvent {
+  type:
+    | 'project_relatedness_progress'
+    | 'cross_repo_linker_progress'
+    | 'project_clustering_progress'
+    | 'recompute_complete'
+    | 'recompute_error'
+    | string;
+  progressToken?: string;
+  progress?: number;
+  total?: number;
+  message?: string;
+  _phase?: string;
+  _projectId?: string;
+  _pair?: [string, string];
+  _communityCount?: number;
+  // recompute_complete payload
+  status?: string;
+  wiki_count?: number;
+  pair_count?: number;
+  edge_count?: number;
+  community_count?: number;
+  recomputed_at?: string;
+  // recompute_error payload
+  error?: string;
+}
+
+/**
+ * Subscribe to a project recompute SSE stream
+ * (POST /api/v1/projects/{projectId}/recompute).
+ *
+ * Returns a cancel function that aborts the request.
+ */
+export function subscribeRecomputeSSE(
+  projectId: string,
+  onEvent: (event: RecomputeProgressEvent) => void,
+  onDone: () => void,
+  onError: (e: unknown) => void,
+): () => void {
+  const controller = new AbortController();
+
+  (async () => {
+    try {
+      const token = await getAuthToken();
+      const headers: Record<string, string> = {
+        Accept: 'text/event-stream',
+      };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      const resp = await fetch(
+        `${API_BASE}/api/v1/projects/${encodeURIComponent(projectId)}/recompute`,
+        { method: 'POST', headers, signal: controller.signal },
+      );
+
+      if (!resp.ok || !resp.body) {
+        onError(new Error(`HTTP ${resp.status}`));
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let eventType = '';
+      let dataStr = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+
+        for (const rawLine of lines) {
+          const line = rawLine.replace(/\r$/, '');
+          if (line.startsWith('event: ')) {
+            eventType = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            dataStr += (dataStr ? '\n' : '') + line.slice(6);
+          } else if (line === '') {
+            if (eventType && dataStr) {
+              try {
+                const raw = JSON.parse(dataStr) as Record<string, unknown>;
+                const { type, payload } = parseSSEData(eventType, raw);
+                onEvent({ type, ...payload } as RecomputeProgressEvent);
+              } catch {
+                /* skip malformed */
+              }
+            }
+            eventType = '';
+            dataStr = '';
+          }
+        }
+      }
+
+      onDone();
+    } catch (e) {
+      if ((e as Error).name !== 'AbortError') onError(e);
+    }
+  })();
+
+  return () => controller.abort();
+}

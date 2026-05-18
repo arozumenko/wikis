@@ -301,4 +301,3 @@ class ChangeDetector:
             AffectedPage(page_id=page_id, changes=changes)
             for page_id, changes in sorted(page_to_changes.items())
         ]
-

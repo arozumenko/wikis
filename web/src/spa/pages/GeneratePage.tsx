@@ -40,6 +40,9 @@ export function GeneratePage() {
             type: 'error', event: 'error',
             error: 'A wiki already exists for this repository. Use the dashboard to find and refresh it.',
             recoverable: true,
+            error_type: null,
+            model_limit: null,
+            suggested_actions: null,
           }]);
           return;
         }
@@ -49,6 +52,9 @@ export function GeneratePage() {
             event: 'error',
             error: 'Failed to start wiki generation',
             recoverable: true,
+            error_type: null,
+            model_limit: null,
+            suggested_actions: null,
           },
         ]);
       }

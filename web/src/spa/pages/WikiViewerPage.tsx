@@ -449,7 +449,15 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           setGenEvents((prev) => [
             ...prev,
             // Keep legacy shape so GenerationProgress recognises it as an error event
-            { type: 'error', event: 'error', error: msg, recoverable: false },
+            {
+              type: 'error',
+              event: 'error',
+              error: msg,
+              recoverable: false,
+              error_type: null,
+              model_limit: null,
+              suggested_actions: null,
+            },
           ]);
         }
       },

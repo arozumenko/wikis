@@ -102,10 +102,41 @@ async def build_multi_wiki_components(
             f"No wikis in project '{project_id}' have a usable retriever stack"
         )
 
-    # Merge into a single EngineComponents using MultiWikiRetrieverStack
-    from app.core.multi_retriever import MultiWikiRetrieverStack
+    # Resolve project-aware feature flags + storage once.
+    from app.core.feature_flags import get_feature_flags
 
-    multi_stack = MultiWikiRetrieverStack(wiki_stacks)
+    flags = get_feature_flags()
+    project_storage: Any = None
+    if flags.project_graph and (flags.federated_query or flags.federated_retriever):
+        try:
+            from app.core.storage.project_storage import open_project_storage
+
+            project_storage = open_project_storage(
+                project_id,
+                cache_dir=getattr(settings, "cache_dir", None),
+                settings=settings,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to open project storage for %s; "
+                "falling back to non-federated path",
+                project_id,
+                exc_info=True,
+            )
+            project_storage = None
+
+    # Choose retriever stack: federated when flag on AND project storage available.
+    if flags.federated_retriever and project_storage is not None:
+        from app.core.federated_retriever import FederatedRetrieverStack
+
+        multi_stack = FederatedRetrieverStack(
+            wiki_stacks,
+            dampening=float(getattr(flags, "cross_repo_dampening", 0.7) or 0.7),
+        )
+    else:
+        from app.core.multi_retriever import MultiWikiRetrieverStack
+
+        multi_stack = MultiWikiRetrieverStack(wiki_stacks)
 
     # Use the first wiki's llm / repo_analysis as the "primary" for generation
     primary = next(iter(loaded.values()))
@@ -129,9 +160,37 @@ async def build_multi_wiki_components(
             fts = comp.graph_manager.fts_index if comp.graph_manager else None
             individual_services[wid] = GraphQueryService(comp.code_graph, fts_index=fts)
 
-    multi_gqs: MultiGraphQueryService | None = None
+    multi_gqs: Any = None
     if individual_services:
-        multi_gqs = MultiGraphQueryService(individual_services)
+        if flags.federated_query and project_storage is not None:
+            from app.core.code_graph.federated_query_service import (
+                FederatedQueryService,
+            )
+
+            multi_gqs = FederatedQueryService(
+                individual_services,
+                project_id=project_id,
+                project_storage=project_storage,
+            )
+        else:
+            multi_gqs = MultiGraphQueryService(individual_services)
+
+    # Late-bind the federated query service into the retriever so cross-repo
+    # expansion can resolve neighbours. Skipped silently if either side opted
+    # out via flags.
+    if (
+        flags.federated_retriever
+        and multi_gqs is not None
+        and project_storage is not None
+        and hasattr(multi_stack, "_fqs")
+    ):
+        multi_stack._fqs = multi_gqs
+
+    repo_paths = {
+        wid: comp.repo_path
+        for wid, comp in loaded.items()
+        if isinstance(comp.repo_path, str) and comp.repo_path
+    }
 
     # Build a combined code_graph (use primary's; multi-graph ops use query_service)
     merged = EngineComponents(
@@ -140,7 +199,7 @@ async def build_multi_wiki_components(
         code_graph=primary.code_graph,
         repo_analysis=primary.repo_analysis,
         llm=primary.llm,
-        repo_path=primary.repo_path,
+        repo_path=repo_paths or primary.repo_path,
         query_service=multi_gqs,
     )
 

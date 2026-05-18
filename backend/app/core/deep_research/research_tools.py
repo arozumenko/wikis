@@ -24,7 +24,7 @@ from langchain_core.documents import Document
 from langchain_core.tools import tool
 
 from ..code_graph.graph_query_service import GraphQueryService
-from ..constants import ARCHITECTURAL_SYMBOLS, DOC_SYMBOL_TYPES
+from ..constants import ARCHITECTURAL_SYMBOLS, CODE_SYMBOL_TYPES, DOC_SYMBOL_TYPES
 from .hybrid_fusion import (
     HYBRID_FUSION_ENABLED,
     fuse_search_results,
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # Container types that can own child methods/functions via 'defines' edges.
 # Used by orphan FTS fallback to discover string-based references.
 CONTAINER_SYMBOL_TYPES = frozenset({"class", "interface", "struct", "enum", "trait"})
+PROGRESSIVE_SYMBOL_TYPES = frozenset(CODE_SYMBOL_TYPES | {"method"})
 
 # Try to import EmbeddingsFilter for semantic reranking
 try:
@@ -232,7 +233,7 @@ def create_codebase_tools(
     event_callback: Callable | None = None,
     similarity_threshold: float = 0.75,
     graph_text_index: Any = None,  # GraphTextIndex (FTS5)
-    repo_path: str | None = None,  # Path to cloned repo for direct file access
+    repo_path: str | dict[str, str] | None = None,  # Path(s) to cloned repo(s) for direct file access
     query_service: Any = None,  # Pre-built GraphQueryService or MultiGraphQueryService (projects)
     min_confidence: str | None = None,  # #120/#157: edge-confidence floor
 ) -> list:
@@ -271,6 +272,192 @@ def create_codebase_tools(
     # so we cap its contribution to avoid drowning out code results from FTS5.
     _MAX_DOC_RESULTS = int(os.environ.get("WIKIS_MAX_DOC_RESULTS", "3"))
 
+    def _node_content(data: dict[str, Any]) -> str:
+        symbol_obj = data.get("symbol") if data else None
+        if symbol_obj is not None and getattr(symbol_obj, "source_text", None):
+            return symbol_obj.source_text
+        return (
+            data.get("content")
+            or data.get("source_text")
+            or data.get("docstring")
+            or ""
+        )
+
+    def _doc_from_symbol_result(result: Any, search_source: str) -> Document | None:
+        """Materialize a query-service symbol hit into a tool result document."""
+        data: dict[str, Any] = {}
+        if query_service is not None and hasattr(query_service, "get_node"):
+            try:
+                data = query_service.get_node(result.node_id) or {}
+            except Exception:
+                data = {}
+        if not data and code_graph is not None:
+            try:
+                data = code_graph.nodes.get(result.node_id, {}) or {}
+            except Exception:
+                data = {}
+
+        content = _node_content(data)
+        if not content.strip():
+            content = result.docstring or ""
+        if not content.strip():
+            return None
+
+        wiki_id = (
+            getattr(result, "wiki_id", "")
+            or getattr(result, "source_wiki_id", "")
+            or data.get("wiki_id", "")
+        )
+        rel_path = result.rel_path or data.get("rel_path", "") or result.file_path or data.get("file_path", "")
+        return Document(
+            page_content=content,
+            metadata={
+                "source": rel_path or "unknown",
+                "rel_path": rel_path,
+                "file_path": result.file_path or data.get("file_path", ""),
+                "symbol_name": result.symbol_name or data.get("symbol_name", "") or data.get("name", ""),
+                "symbol_type": result.symbol_type or data.get("symbol_type", "unknown"),
+                "start_line": data.get("start_line", "") or data.get("line_start", ""),
+                "end_line": data.get("end_line", "") or data.get("line_end", ""),
+                "node_id": result.node_id,
+                "raw_node_id": getattr(result, "raw_node_id", "") or data.get("raw_node_id", ""),
+                "source_wiki_id": wiki_id,
+                "wiki_id": wiki_id,
+                "search_score": result.score,
+                "score": result.score,
+                "search_source": search_source,
+                "project_dedup_key": f"{wiki_id}::{result.node_id or rel_path}",
+            },
+        )
+
+    def _format_doc_source(doc: Document) -> str:
+        source = doc.metadata.get("source", doc.metadata.get("rel_path", "unknown"))
+        wiki_id = doc.metadata.get("source_wiki_id") or doc.metadata.get("wiki_id")
+        return f"{wiki_id}:{source}" if wiki_id else source
+
+    def _is_document_hit(doc: Document) -> bool:
+        metadata = doc.metadata or {}
+        symbol_type = (metadata.get("symbol_type") or metadata.get("type") or "").lower()
+        return bool(
+            metadata.get("is_documentation")
+            or metadata.get("semantic_retrieved")
+            or metadata.get("is_doc")
+            or symbol_type in DOC_SYMBOL_TYPES
+            or symbol_type.endswith("_document")
+        )
+
+    def _diversify_project_results(results: list[Any], limit: int) -> list[Any]:
+        """Keep project discovery from being dominated by one wiki."""
+        if limit <= 0 or len(results) <= limit:
+            return results[:limit]
+        buckets: dict[str, list[Any]] = {}
+        for result in results:
+            wiki_id = getattr(result, "wiki_id", "") or getattr(result, "source_wiki_id", "") or ""
+            buckets.setdefault(wiki_id, []).append(result)
+        if len(buckets) <= 1:
+            return results[:limit]
+
+        selected: list[Any] = []
+        seen_ids: set[str] = set()
+        active_keys = [key for key, bucket in buckets.items() if bucket]
+        while active_keys and len(selected) < limit:
+            next_active: list[str] = []
+            for key in active_keys:
+                bucket = buckets[key]
+                if not bucket:
+                    continue
+                item = bucket.pop(0)
+                item_key = getattr(item, "node_id", "") or f"{key}:{getattr(item, 'symbol_name', '')}"
+                if item_key not in seen_ids:
+                    selected.append(item)
+                    seen_ids.add(item_key)
+                    if len(selected) >= limit:
+                        break
+                if bucket:
+                    next_active.append(key)
+            active_keys = next_active
+
+        if len(selected) < limit:
+            for item in results:
+                item_key = getattr(item, "node_id", "") or getattr(item, "symbol_name", "")
+                if item_key and item_key in seen_ids:
+                    continue
+                selected.append(item)
+                if item_key:
+                    seen_ids.add(item_key)
+                if len(selected) >= limit:
+                    break
+        return selected[:limit]
+
+    def _call_cross_repo_edges(node_id: str, direction: str = "both") -> list[dict[str, Any]]:
+        if query_service is None or not hasattr(query_service, "cross_repo_edges"):
+            return []
+        try:
+            return query_service.cross_repo_edges(node_id, direction=direction) or []
+        except TypeError:
+            try:
+                return query_service.cross_repo_edges(node_id) or []
+            except Exception:
+                return []
+        except Exception:
+            return []
+
+    def _relationship_extra(r: Any, other_node_id: str = "") -> str:
+        extras: list[str] = []
+        other_wiki_id = ""
+        if other_node_id and "::" in other_node_id:
+            other_wiki_id = other_node_id.split("::", 1)[0]
+        other_wiki_id = other_wiki_id or getattr(r, "target_wiki_id", "") or getattr(r, "source_wiki_id", "")
+        if other_wiki_id:
+            extras.append(f"wiki: {other_wiki_id}")
+        if other_node_id:
+            extras.append(f"id: `{other_node_id}`")
+        provenance = getattr(r, "provenance", None) or {}
+        surface = provenance.get("surface") if isinstance(provenance, dict) else ""
+        matcher = provenance.get("matcher") if isinstance(provenance, dict) else ""
+        weight = getattr(r, "weight", None)
+        if surface:
+            extras.append(f"surface: `{surface}`")
+        if matcher:
+            extras.append(f"matcher: {matcher}")
+        if isinstance(weight, (int, float)) and weight != 1.0:
+            extras.append(f"weight: {weight:.3f}")
+        return " " + " ".join(f"[{extra}]" for extra in extras) if extras else ""
+
+    def _format_cross_repo_edge(row: dict[str, Any]) -> str:
+        source_node_id = row.get("source_node_id", "") or ""
+        target_node_id = row.get("target_node_id", "") or ""
+        provenance = dict(row.get("provenance") or {})
+        source_data = query_service.get_node(source_node_id) if hasattr(query_service, "get_node") else {}
+        target_data = query_service.get_node(target_node_id) if hasattr(query_service, "get_node") else {}
+        source_data = source_data or {}
+        target_data = target_data or {}
+        source_name = source_data.get("symbol_name") or source_data.get("name") or source_node_id
+        target_name = target_data.get("symbol_name") or target_data.get("name") or target_node_id
+        source_type = source_data.get("symbol_type", "") or "symbol"
+        target_type = target_data.get("symbol_type", "") or "symbol"
+        source_file = source_data.get("rel_path") or source_data.get("file_path") or "unknown"
+        target_file = target_data.get("rel_path") or target_data.get("file_path") or "unknown"
+        rel_type = provenance.get("source_relationship_type") or row.get("edge_class") or "cross_repo"
+        source_wiki = provenance.get("source_wiki_id") or (source_node_id.split("::", 1)[0] if "::" in source_node_id else "")
+        target_wiki = provenance.get("target_wiki_id") or (target_node_id.split("::", 1)[0] if "::" in target_node_id else "")
+        surface = provenance.get("surface", "")
+        matcher = provenance.get("matcher", "")
+        detail = [f"{rel_type}"]
+        if surface:
+            detail.append(f"surface `{surface}`")
+        if matcher:
+            detail.append(f"matcher {matcher}")
+        try:
+            detail.append(f"weight {float(row.get('weight', 1.0) or 1.0):.3f}")
+        except (TypeError, ValueError):
+            pass
+        return (
+            f"`{source_name}` ({source_type}) [wiki: {source_wiki}] [id: `{source_node_id}`] in {source_file} "
+            f"→ `{target_name}` ({target_type}) [wiki: {target_wiki}] [id: `{target_node_id}`] in {target_file} "
+            f"[{'; '.join(detail)}]"
+        )
+
     @tool(parse_docstring=True)
     def search_codebase(query: str, k: int = 10) -> str:
         """Search the repository codebase for relevant code, classes, functions, and documentation.
@@ -303,6 +490,13 @@ def create_codebase_tools(
 
                     for doc in vs_docs:
                         doc.metadata["search_source"] = "vectorstore"
+                        wiki_id = doc.metadata.get("source_wiki_id") or doc.metadata.get("wiki_id") or ""
+                        node_id = doc.metadata.get("node_id") or doc.metadata.get("source") or doc.metadata.get("rel_path") or ""
+                        symbol_name = doc.metadata.get("symbol_name") or ""
+                        doc.metadata.setdefault(
+                            "project_dedup_key",
+                            f"{wiki_id}::{node_id or symbol_name}",
+                        )
                     all_docs.extend(vs_docs)
                     logger.info(f"[SEARCH_CODEBASE] VS returned {len(vs_docs)} docs (cap={k_doc}, query={query!r:.60})")
                 except Exception as e:
@@ -314,7 +508,25 @@ def create_codebase_tools(
             k_code = max(k, 10)  # At least 10 code results from FTS5
             graph_docs = []
             try:
-                if graph_text_index is not None and graph_text_index.is_open:
+                if query_service is not None:
+                    svc_results = query_service.search(
+                        query,
+                        k=k_code,
+                        exclude_types=DOC_SYMBOL_TYPES,
+                    )
+                    for result in svc_results:
+                        doc = _doc_from_symbol_result(result, "graph_query")
+                        if doc is not None:
+                            graph_docs.append(doc)
+                    if graph_docs:
+                        top_names = [d.metadata.get("symbol_name", "?") for d in graph_docs[:5]]
+                        logger.info(
+                            f"[SEARCH_CODEBASE][QUERY_SERVICE] {len(graph_docs)} results "
+                            f"(k={k_code}, query={query!r:.60}, top={top_names})"
+                        )
+                    else:
+                        logger.info(f"[SEARCH_CODEBASE][QUERY_SERVICE] 0 results (query={query!r:.60})")
+                elif graph_text_index is not None and graph_text_index.is_open:
                     # FTS5-backed search: use search_smart for better query
                     # construction (keyword extraction + intent-aware FTS5).
                     graph_docs = graph_text_index.search_smart(
@@ -356,22 +568,27 @@ def create_codebase_tools(
                 all_docs = fuse_search_results(
                     ranked_lists,
                     cap=k * 2,
-                    dedup_key="symbol_name",
+                    dedup_key="project_dedup_key",
                 )
                 logger.info(f"[SEARCH_CODEBASE][RRF] Fused {len(all_docs)} results from {list(ranked_lists.keys())}")
             else:
                 # Legacy path: simple concatenation (VS first, graph deduped)
                 if graph_docs:
                     vs_symbols = {
-                        doc.metadata.get("symbol_name", "").lower()
+                        (
+                            doc.metadata.get("source_wiki_id") or doc.metadata.get("wiki_id") or "",
+                            doc.metadata.get("symbol_name", "").lower(),
+                        )
                         for doc in all_docs
                         if doc.metadata.get("symbol_name")
                     }
                     for doc in graph_docs:
                         sym = doc.metadata.get("symbol_name", "").lower()
-                        if sym and sym not in vs_symbols:
+                        wiki_id = doc.metadata.get("source_wiki_id") or doc.metadata.get("wiki_id") or ""
+                        key = (wiki_id, sym)
+                        if sym and key not in vs_symbols:
                             all_docs.append(doc)
-                            vs_symbols.add(sym)
+                            vs_symbols.add(key)
 
                 # Sort: prefer vector store results (semantic), then graph
                 all_docs.sort(key=lambda d: 0 if d.metadata.get("search_source") == "vectorstore" else 1)
@@ -381,7 +598,7 @@ def create_codebase_tools(
 
             results = []
             for i, doc in enumerate(all_docs):
-                source = doc.metadata.get("source", doc.metadata.get("rel_path", "unknown"))
+                source = _format_doc_source(doc)
                 symbol = doc.metadata.get("symbol_name", "")
                 symbol_type = doc.metadata.get("symbol_type", "")
                 start_line = doc.metadata.get("start_line", "")
@@ -449,7 +666,7 @@ def create_codebase_tools(
             }
         )
 
-        if code_graph is None:
+        if query_service is None and code_graph is None:
             return "Code graph not available for relationship analysis"
 
         try:
@@ -457,12 +674,18 @@ def create_codebase_tools(
             target_node = None
             matching_nodes = []
             if query_service:
-                target_node = query_service.resolve_symbol(symbol_name)
+                if hasattr(query_service, "get_node"):
+                    try:
+                        if query_service.get_node(symbol_name) is not None:
+                            target_node = symbol_name
+                    except Exception:
+                        target_node = None
+                target_node = target_node or query_service.resolve_symbol(symbol_name)
                 if target_node:
                     matching_nodes = [target_node]
 
             # Fallback: brute-force scan if service didn't find it
-            if not target_node:
+            if not target_node and code_graph is not None:
                 for node_id in code_graph.nodes():
                     if symbol_name.lower() in node_id.lower():
                         matching_nodes.append(node_id)
@@ -620,13 +843,24 @@ def create_codebase_tools(
         """
         emit({"type": "tool_start", "tool": "search_graph", "input": query, "timestamp": datetime.now().isoformat()})
 
-        if code_graph is None:
+        if query_service is None and code_graph is None:
             return "Code graph not available for graph search."
 
         try:
             # Step 1: Find matching symbols via FTS5 or brute-force
             matched_docs: list[Document] = []
-            if graph_text_index is not None and graph_text_index.is_open:
+            if query_service is not None:
+                svc_results = query_service.search(
+                    query,
+                    k=k,
+                    exclude_types=DOC_SYMBOL_TYPES,
+                )
+                matched_docs = [
+                    doc
+                    for result in svc_results
+                    if (doc := _doc_from_symbol_result(result, "graph_query")) is not None
+                ]
+            elif graph_text_index is not None and graph_text_index.is_open:
                 matched_docs = graph_text_index.search_smart(
                     query,
                     k=k,
@@ -661,13 +895,26 @@ def create_codebase_tools(
 
                 if include_neighbors:
                     # Use GraphQueryService for O(1) resolution (SPEC-1)
-                    node_id = None
+                    node_id = doc.metadata.get("node_id") or None
                     if query_service:
-                        node_id = query_service.resolve_symbol(sym_name, file_path=rel_path)
-                    if not node_id:
+                        node_id = node_id or query_service.resolve_symbol(sym_name, file_path=rel_path)
+                    if not node_id and code_graph is not None:
                         node_id = _find_graph_node(code_graph, sym_name, rel_path)
                     if node_id:
-                        neighbor_lines = _format_neighbors(code_graph, node_id)
+                        neighbor_lines = []
+                        if query_service is not None:
+                            rels = query_service.get_relationships(
+                                node_id,
+                                direction="both",
+                                max_depth=1,
+                                max_results=8,
+                            )
+                            for rel in rels:
+                                neighbor_lines.append(
+                                    f"  - `{rel.source_name}` → `{rel.target_name}` [{rel.relationship_type}]"
+                                )
+                        elif code_graph is not None:
+                            neighbor_lines = _format_neighbors(code_graph, node_id)
                         if neighbor_lines:
                             section_lines.append("\n**Relationships:**")
                             section_lines.extend(neighbor_lines)
@@ -735,17 +982,30 @@ def create_codebase_tools(
 
         try:
             results = []
-            sym_types = frozenset({symbol_type.lower()}) if symbol_type else None
+            if symbol_type:
+                requested_types = frozenset({symbol_type.lower()})
+                sym_types = requested_types & PROGRESSIVE_SYMBOL_TYPES
+                if not sym_types:
+                    return f"No architectural symbols found for unsupported symbol_type: {symbol_type}"
+            else:
+                sym_types = PROGRESSIVE_SYMBOL_TYPES
             path_prefix = file_prefix if file_prefix else None
 
             if query_service:
+                wiki_count = 1
+                if hasattr(query_service, "wiki_ids"):
+                    try:
+                        wiki_count = max(len(query_service.wiki_ids()), 1)
+                    except Exception:
+                        wiki_count = 1
                 svc_results = query_service.search(
                     query,
-                    k=k,
+                    k=max(k * wiki_count, k),
                     symbol_types=sym_types,
                     exclude_types=DOC_SYMBOL_TYPES,
                     path_prefix=path_prefix,
                 )
+                svc_results = _diversify_project_results(svc_results, k)
                 for r in svc_results:
                     # Extract one-line doc (first sentence of docstring).
                     # Use ``query_service.get_node`` so the lookup works for
@@ -772,10 +1032,18 @@ def create_codebase_tools(
                             "file": r.rel_path or r.file_path,
                             "refs": r.connections,
                             "doc": one_line,
+                            "node_id": r.node_id,
+                            "wiki_id": getattr(r, "wiki_id", "") or getattr(r, "source_wiki_id", ""),
                         }
                     )
             elif graph_text_index and graph_text_index.is_open:
-                docs = graph_text_index.search_smart(query, k=k, intent="symbol", exclude_types=DOC_SYMBOL_TYPES)
+                docs = graph_text_index.search_smart(
+                    query,
+                    k=k,
+                    intent="symbol",
+                    symbol_types=sym_types,
+                    exclude_types=DOC_SYMBOL_TYPES,
+                )
                 for doc in docs:
                     m = doc.metadata
                     results.append(
@@ -786,6 +1054,8 @@ def create_codebase_tools(
                             "file": m.get("rel_path", m.get("source", "")),
                             "refs": 0,
                             "doc": "",
+                            "node_id": m.get("node_id", ""),
+                            "wiki_id": m.get("wiki_id", "") or m.get("source_wiki_id", ""),
                         }
                     )
             else:
@@ -807,8 +1077,11 @@ def create_codebase_tools(
             for i, r in enumerate(results):
                 doc_str = f" — {r['doc']}" if r["doc"] else ""
                 layer_str = f" [{r['layer']}]" if r["layer"] else ""
+                wiki_str = f" [wiki: {r['wiki_id']}]" if r.get("wiki_id") else ""
+                id_str = f" [id: `{r['node_id']}`]" if r.get("node_id") else ""
                 lines.append(
-                    f"{i + 1}. `{r['name']}` ({r['kind']}{layer_str}) in {r['file']} [{r['refs']} refs]{doc_str}"
+                    f"{i + 1}. `{r['name']}` ({r['kind']}{layer_str}) in {r['file']} "
+                    f"[{r['refs']} refs]{wiki_str}{id_str}{doc_str}"
                 )
             return "\n".join(lines)
 
@@ -991,7 +1264,7 @@ def create_codebase_tools(
         lines.append("\nTip: use get_code on these referencing symbols to see the full context.")
         return "\n".join(lines)
 
-    @tool(parse_docstring=True)
+    @tool("get_relationships", parse_docstring=True)
     def get_relationships_tool(symbol_name: str, direction: str = "both", max_depth: int = 2) -> str:
         """Get relationships for a code symbol. Returns compact edge list (no source code).
 
@@ -1015,19 +1288,64 @@ def create_codebase_tools(
             return "Code graph not available for relationship analysis"
 
         try:
-            # #120/#157: closure-captured min_confidence flows into
-            # the live agent path here via resolve_and_traverse →
-            # GraphQueryService.get_relationships.
-            node_id, rels = query_service.resolve_and_traverse(
-                symbol_name,
-                direction=direction,
-                max_depth=max_depth,
-                max_results=50,
-                min_confidence=min_confidence,
-            )
+            # Prefer exact node IDs when project-mode tools pass a namespaced
+            # project node ID; otherwise resolve by symbol name. Main's
+            # confidence floor is forwarded when the backing query service
+            # supports it.
+            node_id = None
+            if hasattr(query_service, "get_node"):
+                try:
+                    if query_service.get_node(symbol_name) is not None:
+                        node_id = symbol_name
+                except Exception:
+                    node_id = None
+            if node_id:
+                try:
+                    rels = query_service.get_relationships(
+                        node_id,
+                        direction=direction,
+                        max_depth=max_depth,
+                        max_results=50,
+                        min_confidence=min_confidence,
+                    )
+                except TypeError:
+                    rels = query_service.get_relationships(
+                        node_id,
+                        direction=direction,
+                        max_depth=max_depth,
+                        max_results=50,
+                    )
+            else:
+                try:
+                    node_id, rels = query_service.resolve_and_traverse(
+                        symbol_name,
+                        direction=direction,
+                        max_depth=max_depth,
+                        max_results=50,
+                        min_confidence=min_confidence,
+                    )
+                except TypeError:
+                    node_id, rels = query_service.resolve_and_traverse(
+                        symbol_name,
+                        direction=direction,
+                        max_depth=max_depth,
+                        max_results=50,
+                    )
 
             if not node_id:
                 return f"Symbol '{symbol_name}' not found. Try search_symbols first."
+
+            root_display_name = symbol_name
+            root_names = {symbol_name.lower(), node_id.lower()}
+            if hasattr(query_service, "get_node"):
+                try:
+                    root_data = query_service.get_node(node_id) or {}
+                except Exception:
+                    root_data = {}
+                root_symbol_name = root_data.get("symbol_name", "") or root_data.get("name", "")
+                if root_symbol_name:
+                    root_display_name = root_symbol_name
+                    root_names.add(root_symbol_name.lower())
 
             emit(
                 {
@@ -1055,21 +1373,22 @@ def create_codebase_tools(
                     return orphan_hits
                 return f"`{symbol_name}` has no relationships within {max_depth} hops."
 
-            lines = [f"Relationships for `{symbol_name}` (node: `{node_id}`):\n"]
+            lines = [f"Relationships for `{root_display_name}` (node: `{node_id}`):\n"]
             for r in rels:
                 # Determine arrow direction relative to the root symbol:
                 # If node_id is the source (or source_name matches), it's outgoing
+                source_node_id = getattr(r, "source_node_id", "") or ""
+                target_node_id = getattr(r, "target_node_id", "") or ""
                 src_low = (r.source_name or "").lower()
-                is_outgoing = (
-                    r.source_name == node_id or src_low == symbol_name.lower() or symbol_name.lower() in src_low
-                )
+                is_outgoing = source_node_id == node_id or r.source_name == node_id or src_low in root_names
                 if is_outgoing:
-                    arrow, other, other_type = "→", r.target_name, r.target_type
+                    arrow, other, other_type, other_node_id = "→", r.target_name, r.target_type, target_node_id
                 else:
-                    arrow, other, other_type = "←", r.source_name, r.source_type
+                    arrow, other, other_type, other_node_id = "←", r.source_name, r.source_type, source_node_id
                 hop_str = f" (hop {r.hop_distance})" if r.hop_distance > 1 else ""
                 type_str = f" ({other_type})" if other_type else ""
-                lines.append(f"  {arrow} `{other}`{type_str} [{r.relationship_type}]{hop_str}")
+                extra_str = _relationship_extra(r, other_node_id)
+                lines.append(f"  {arrow} `{other}`{type_str} [{r.relationship_type}]{hop_str}{extra_str}")
 
             # If ALL rels are structural 'defines' edges, the container
             # only has child-containment links — also run orphan FTS to
@@ -1091,6 +1410,100 @@ def create_codebase_tools(
         except Exception as e:
             logger.error(f"get_relationships failed: {e}", exc_info=True)
             return f"Relationship analysis failed: {str(e)}"
+
+    @tool(parse_docstring=True)
+    def find_cross_repo_links(query: str = "", symbol_name: str = "", k: int = 10) -> str:
+        """Find direct cross-repo evidence links in project mode.
+
+        Use this for project-level questions about how repositories integrate.
+        These links come from explicit API-surface matches such as REST endpoints,
+        DTO/object shapes, FFI/ABI calls, protobuf/gRPC services, GraphQL fields,
+        BDD steps, CLI commands, and related direct contracts.
+
+        Args:
+            query: Search text used to find starting symbols when symbol_name is not provided
+            symbol_name: Exact symbol or project node id from search_symbols results
+            k: Maximum number of direct links to return (default 10)
+        """
+        emit({"type": "tool_start", "tool": "find_cross_repo_links", "input": symbol_name or query, "timestamp": datetime.now().isoformat()})
+
+        if query_service is None or not hasattr(query_service, "cross_repo_edges"):
+            return "Direct cross-repo links are available only in project mode."
+
+        try:
+            limit = max(1, min(int(k or 10), 25))
+        except (TypeError, ValueError):
+            limit = 10
+
+        try:
+            candidate_ids: list[str] = []
+            if symbol_name:
+                if hasattr(query_service, "get_node"):
+                    try:
+                        if query_service.get_node(symbol_name) is not None:
+                            candidate_ids.append(symbol_name)
+                    except Exception:
+                        pass
+                if not candidate_ids and hasattr(query_service, "resolve_symbol"):
+                    resolved = query_service.resolve_symbol(symbol_name)
+                    if resolved:
+                        candidate_ids.append(resolved)
+            elif query:
+                results = query_service.search(
+                    query,
+                    k=max(limit, 10),
+                    symbol_types=PROGRESSIVE_SYMBOL_TYPES,
+                    exclude_types=DOC_SYMBOL_TYPES,
+                )
+                for result in _diversify_project_results(results, max(limit, 10)):
+                    node_id = getattr(result, "node_id", "")
+                    if node_id:
+                        candidate_ids.append(node_id)
+            else:
+                return "Provide either query or symbol_name to find direct cross-repo links."
+
+            seen_candidates: set[str] = set()
+            candidate_ids = [node_id for node_id in candidate_ids if not (node_id in seen_candidates or seen_candidates.add(node_id))]
+            if not candidate_ids:
+                return f"No project symbols found for: {symbol_name or query}"
+
+            rows: list[dict[str, Any]] = []
+            seen_edges: set[tuple[str, str, str]] = set()
+            for node_id in candidate_ids:
+                for row in _call_cross_repo_edges(node_id, direction="both"):
+                    key = (
+                        row.get("source_node_id", ""),
+                        row.get("target_node_id", ""),
+                        row.get("edge_class", ""),
+                    )
+                    if key in seen_edges:
+                        continue
+                    seen_edges.add(key)
+                    rows.append(row)
+                    if len(rows) >= limit:
+                        break
+                if len(rows) >= limit:
+                    break
+
+            emit(
+                {
+                    "type": "tool_end",
+                    "tool": "find_cross_repo_links",
+                    "result_count": len(rows),
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+
+            if not rows:
+                return f"No direct cross-repo links found for: {symbol_name or query}"
+
+            lines = [f"Found {len(rows)} direct cross-repo links for: {symbol_name or query}\n"]
+            for index, row in enumerate(rows, 1):
+                lines.append(f"{index}. {_format_cross_repo_edge(row)}")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"find_cross_repo_links failed: {e}", exc_info=True)
+            return f"Cross-repo link search failed: {str(e)}"
 
     @tool(parse_docstring=True)
     def get_code(symbol_name: str, max_lines: int = 200) -> str:
@@ -1117,7 +1530,13 @@ def create_codebase_tools(
         try:
             node_id = None
             if query_service:
-                node_id = query_service.resolve_symbol(symbol_name)
+                if hasattr(query_service, "get_node"):
+                    try:
+                        if query_service.get_node(symbol_name) is not None:
+                            node_id = symbol_name
+                    except Exception:
+                        node_id = None
+                node_id = node_id or query_service.resolve_symbol(symbol_name)
             if not node_id and code_graph is not None:
                 node_id = _find_graph_node(code_graph, symbol_name)
             if not node_id:
@@ -1202,11 +1621,23 @@ def create_codebase_tools(
             docs = []
             if retriever_stack:
                 try:
-                    # Doc search uses FAISS similarity directly — skip EmbeddingsFilter
-                    # reranking because the filter may use a different embedding model
-                    # than the index, causing valid results to be rejected.
-                    vs_docs = retriever_stack.search_repository(query=query, k=k, apply_expansion=False)
-                    docs.extend(vs_docs)
+                    doc_search = getattr(retriever_stack, "search_docs_semantic", None)
+                    if doc_search is not None:
+                        vs_docs = doc_search(
+                            query=query,
+                            k=k,
+                            similarity_threshold=0.0,
+                        )
+                    else:
+                        # Fallback for older retrievers: use repository search,
+                        # but keep only documentation nodes/chunks.
+                        vs_docs = retriever_stack.search_repository(
+                            query=query,
+                            k=max(k * 3, 10),
+                            apply_expansion=False,
+                        )
+                        vs_docs = [doc for doc in vs_docs if _is_document_hit(doc)]
+                    docs.extend(vs_docs[:k])
                 except Exception as e:
                     logger.warning(f"search_docs VS failed: {e}")
 
@@ -1224,7 +1655,7 @@ def create_codebase_tools(
 
             sections = []
             for i, doc in enumerate(docs):
-                source = doc.metadata.get("source", doc.metadata.get("rel_path", "unknown"))
+                source = _format_doc_source(doc)
                 sections.append(f"### [{i + 1}] {source}\n\n{doc.page_content}")
 
             return f"## Documentation: {query}\n\n" + "\n\n---\n\n".join(sections)
@@ -1299,7 +1730,13 @@ def create_codebase_tools(
                 location = r.rel_path or r.file_path or "?"
                 layer_tag = f" [{r.layer}]" if r.layer else ""
                 conn_tag = f" ({r.connections} connections)" if r.connections else ""
-                lines.append(f"- **{r.symbol_name}** ({r.symbol_type}){layer_tag} — `{location}`{conn_tag}")
+                wiki_id = getattr(r, "wiki_id", "") or getattr(r, "source_wiki_id", "")
+                wiki_tag = f" [wiki: {wiki_id}]" if wiki_id else ""
+                id_tag = f" [id: `{r.node_id}`]" if r.node_id else ""
+                lines.append(
+                    f"- **{r.symbol_name}** ({r.symbol_type}){layer_tag} — "
+                    f"`{location}`{conn_tag}{wiki_tag}{id_tag}"
+                )
 
             return "\n".join(lines)
 
@@ -1311,7 +1748,78 @@ def create_codebase_tools(
     # read_source_file — direct file access to the cloned repository
     # ================================================================
 
-    _repo_available = repo_path is not None and os.path.isdir(repo_path)
+    def _build_repo_roots(value: str | dict[str, str] | None) -> dict[str, str]:
+        if isinstance(value, dict):
+            roots = {}
+            for wiki_id, path in value.items():
+                if path and os.path.isdir(path):
+                    roots[str(wiki_id)] = os.path.realpath(path)
+            return roots
+        if isinstance(value, str) and os.path.isdir(value):
+            return {"": os.path.realpath(value)}
+        return {}
+
+    _repo_roots = _build_repo_roots(repo_path)
+    _multi_repo_files = len(_repo_roots) > 1
+    _repo_available = bool(_repo_roots)
+
+    def _repo_aliases() -> dict[str, str]:
+        aliases: dict[str, str] = {}
+        for wiki_id, root in _repo_roots.items():
+            raw_aliases = {wiki_id, os.path.basename(root)}
+            basename = os.path.basename(root)
+            parts = basename.split("_")
+            if len(parts) >= 2:
+                raw_aliases.add(parts[-1])
+                raw_aliases.add("_".join(parts[:2]))
+            for alias in raw_aliases:
+                alias = (alias or "").strip().strip("/")
+                if alias:
+                    aliases.setdefault(alias, wiki_id)
+                    aliases.setdefault(alias.replace("-", "_"), wiki_id)
+                    aliases.setdefault(alias.lower(), wiki_id)
+        return aliases
+
+    _repo_alias_map = _repo_aliases()
+
+    def _split_repo_qualified_path(path_value: str) -> tuple[str | None, str]:
+        clean = (path_value or ".").strip().lstrip("/")
+        if not clean or clean == ".":
+            return None, "."
+        first, sep, rest = clean.partition("/")
+        wiki_id = _repo_alias_map.get(first) or _repo_alias_map.get(first.lower())
+        if wiki_id is not None:
+            return wiki_id, rest if sep else "."
+        return None, clean
+
+    def _safe_join(root: str, rel_path: str) -> str | None:
+        try:
+            full = os.path.realpath(os.path.join(root, rel_path))
+            root_real = os.path.realpath(root)
+            if not full.startswith(root_real + os.sep) and full != root_real:
+                return None
+            return full
+        except (ValueError, OSError):
+            return None
+
+    def _matching_repo_paths(path_value: str, *, expect_dir: bool = False, expect_file: bool = False) -> list[tuple[str, str, str]]:
+        explicit_wiki_id, rel_path = _split_repo_qualified_path(path_value)
+        candidates = (
+            [(explicit_wiki_id, _repo_roots[explicit_wiki_id])]
+            if explicit_wiki_id in _repo_roots
+            else list(_repo_roots.items())
+        )
+        matches = []
+        for wiki_id, root in candidates:
+            full = _safe_join(root, rel_path)
+            if not full:
+                continue
+            if expect_dir and not os.path.isdir(full):
+                continue
+            if expect_file and not os.path.isfile(full):
+                continue
+            matches.append((wiki_id, rel_path, full))
+        return matches
 
     @tool(parse_docstring=True)
     def read_source_file(file_path: str, offset: int = 0, limit: int = 200) -> str:
@@ -1329,17 +1837,15 @@ def create_codebase_tools(
         if not _repo_available:
             return "Error: Repository clone is not available on disk. Use search_codebase instead."
 
-        # Resolve and validate the path stays within the repo
-        try:
-            full = os.path.realpath(os.path.join(repo_path, file_path))
-            repo_real = os.path.realpath(repo_path)
-            if not full.startswith(repo_real + os.sep) and full != repo_real:
-                return f"Error: Path '{file_path}' is outside the repository."
-        except (ValueError, OSError):
-            return f"Error: Invalid path '{file_path}'."
+        matches = _matching_repo_paths(file_path, expect_file=True)
+        if not matches:
+            searched = ", ".join(_repo_roots.keys()) if _multi_repo_files else "repository"
+            return f"Error: File not found: {file_path} (searched: {searched})"
+        if len(matches) > 1:
+            options = [f"{wiki_id}/{rel_path}" for wiki_id, rel_path, _full in matches]
+            return "Error: File path is ambiguous across repositories. Use one of: " + ", ".join(options)
 
-        if not os.path.isfile(full):
-            return f"Error: File not found: {file_path}"
+        wiki_id, rel_path, full = matches[0]
 
         try:
             with open(full, errors="replace") as f:
@@ -1347,7 +1853,8 @@ def create_codebase_tools(
             total = len(lines)
             selected = lines[offset : offset + limit]
             numbered = [f"{offset + i + 1:>5} | {line.rstrip()}" for i, line in enumerate(selected)]
-            header = f"# {file_path} ({total} lines total, showing {offset + 1}-{offset + len(selected)})"
+            display_path = f"{wiki_id}:{rel_path}" if _multi_repo_files else rel_path
+            header = f"# {display_path} ({total} lines total, showing {offset + 1}-{offset + len(selected)})"
             return header + "\n" + "\n".join(numbered)
         except Exception as e:
             return f"Error reading {file_path}: {e}"
@@ -1366,35 +1873,33 @@ def create_codebase_tools(
         if not _repo_available:
             return "Error: Repository clone is not available on disk. Use search_codebase instead."
 
-        try:
-            full = os.path.realpath(os.path.join(repo_path, directory))
-            repo_real = os.path.realpath(repo_path)
-            if not full.startswith(repo_real + os.sep) and full != repo_real:
-                return f"Error: Path '{directory}' is outside the repository."
-        except (ValueError, OSError):
-            return f"Error: Invalid path '{directory}'."
-
-        if not os.path.isdir(full):
-            return f"Error: Directory not found: {directory}"
+        matches = _matching_repo_paths(directory, expect_dir=True)
+        if not matches:
+            searched = ", ".join(_repo_roots.keys()) if _multi_repo_files else "repository"
+            return f"Error: Directory not found: {directory} (searched: {searched})"
 
         try:
             import fnmatch
 
-            entries = sorted(os.listdir(full))
-            if pattern:
-                entries = [e for e in entries if fnmatch.fnmatch(e, pattern)]
+            sections = []
+            for wiki_id, rel_path, full in matches:
+                entries = sorted(os.listdir(full))
+                if pattern:
+                    entries = [e for e in entries if fnmatch.fnmatch(e, pattern)]
 
-            lines = []
-            for entry in entries[:200]:
-                entry_path = os.path.join(full, entry)
-                suffix = "/" if os.path.isdir(entry_path) else ""
-                lines.append(f"  {entry}{suffix}")
+                lines = []
+                for entry in entries[:200]:
+                    entry_path = os.path.join(full, entry)
+                    suffix = "/" if os.path.isdir(entry_path) else ""
+                    lines.append(f"  {entry}{suffix}")
 
-            header = f"# {directory}/ ({len(entries)} entries"
-            if len(entries) > 200:
-                header += ", showing first 200"
-            header += ")"
-            return header + "\n" + "\n".join(lines)
+                display_path = f"{wiki_id}:{rel_path}" if _multi_repo_files else rel_path
+                header = f"# {display_path}/ ({len(entries)} entries"
+                if len(entries) > 200:
+                    header += ", showing first 200"
+                header += ")"
+                sections.append(header + "\n" + "\n".join(lines))
+            return "\n\n".join(sections)
         except Exception as e:
             return f"Error listing {directory}: {e}"
 
@@ -1406,13 +1911,15 @@ def create_codebase_tools(
 
     # File access tools — included only when the cloned repo is on disk
     _file_tools = [read_source_file, list_repo_files] if _repo_available else []
+    _project_link_tools = [find_cross_repo_links] if query_service is not None and hasattr(query_service, "cross_repo_edges") else []
     if _repo_available:
-        logger.info("[RESEARCH_TOOLS] read_source_file + list_repo_files enabled (repo_path=%s)", repo_path)
+        logger.info("[RESEARCH_TOOLS] read_source_file + list_repo_files enabled (repo_roots=%s)", list(_repo_roots.keys()))
 
     if _use_progressive:
         logger.info("[RESEARCH_TOOLS] Using progressive disclosure tools (SPEC-5)")
         return [
             search_symbols,
+            *_project_link_tools,
             get_relationships_tool,
             get_code,
             search_docs,

@@ -84,7 +84,7 @@ class DeepResearchEngine:
         backend: object | None = None,
         llm_settings: dict | None = None,
         config: ResearchConfig | None = None,
-        repo_path: str | None = None,
+        repo_path: str | dict[str, str] | None = None,
         query_service: Any = None,  # Pre-built GraphQueryService or MultiGraphQueryService
     ):
         """

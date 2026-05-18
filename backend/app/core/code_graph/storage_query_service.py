@@ -343,6 +343,8 @@ class StorageQueryService:
                         source_type=(src_row.get("symbol_type") or "").lower(),
                         target_type=(tgt_row.get("symbol_type") or "").lower(),
                         hop_distance=depth + 1,
+                        source_node_id=src,
+                        target_node_id=tgt,
                     )
                 )
 

@@ -517,6 +517,17 @@ class WikiService:
                     source_scope=request.scope or None,
                 )
 
+            # Mark every project containing this wiki as stale so PR-15 can
+            # decide to enqueue a project recompute. Best-effort, never raises.
+            try:
+                await self._mark_owning_projects_stale(invocation.wiki_id)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "mark_owning_projects_stale failed for %s",
+                    invocation.wiki_id,
+                    exc_info=True,
+                )
+
             invocation.status = "complete"
             invocation.progress = 1.0
             invocation.current_phase = "done"
@@ -611,6 +622,36 @@ class WikiService:
                         )
                 except Exception as _db_err:
                     logger.warning(f"Failed to reconcile wiki status in DB: {_db_err}")
+
+    async def _mark_owning_projects_stale(self, wiki_id: str) -> None:
+        """Find projects containing *wiki_id* and stamp them stale (PR-14).
+
+        Best-effort: requires ``flags.project_graph``. PR-15 reads
+        ``project_meta['stale']`` to decide whether to enqueue a recompute.
+        """
+        from sqlalchemy import select
+
+        from app.core.feature_flags import get_feature_flags
+        from app.db import get_session_factory
+        from app.models.db_models import ProjectWikiRecord
+        from app.services.project_recompute import mark_projects_for_wiki_stale
+
+        if not get_feature_flags().project_graph:
+            return
+
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            result = await session.execute(
+                select(ProjectWikiRecord.project_id).where(
+                    ProjectWikiRecord.wiki_id == wiki_id
+                )
+            )
+            project_ids = [row[0] for row in result.all() if row[0]]
+        if not project_ids:
+            return
+        mark_projects_for_wiki_stale(
+            wiki_id=wiki_id, project_ids=project_ids, settings=self.settings
+        )
 
     async def get_invocation(self, invocation_id: str) -> Invocation | None:
         self._cleanup_old_invocations()

@@ -93,9 +93,20 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
         return {"edges_weighted": 0, "min": 0, "max": 0, "mean": 0}
 
     # Compute in-degree using ONLY structural edges (AST-derived).
-    # Synthetic edges (orphan resolution, doc injection) are excluded
-    # so they don't inflate anchor degrees and crush real edges.
-    _SYNTHETIC_CLASSES = frozenset({"directory", "lexical", "semantic", "doc", "bridge"})
+    # Synthetic edges (orphan resolution, doc injection, cross-language
+    # linker, test linker) are excluded so they don't inflate anchor
+    # degrees and crush real edges.
+    _SYNTHETIC_CLASSES = frozenset({
+        "directory", "lexical", "semantic", "doc", "bridge",
+        "cross_language",   # Phase 6 — cross-language linker
+        "test_link",        # Phase 6 — test linker
+        "cross_repo",       # Phase 8 — cross-repo linker
+    })
+    _CALIBRATED_SYNTHETIC_CLASSES = frozenset({
+        "cross_language",
+        "test_link",
+        "cross_repo",
+    })
     structural_in: Dict[str, int] = {}
     for _u, v, data in G.edges(data=True):
         if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:
@@ -108,10 +119,19 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
         in_deg = structural_in.get(v, 0)
         w = 1.0 / math.log(in_deg + 2)
 
+        edge_class = data.get("edge_class", "structural")
         # Synthetic recovery edges get a weight floor so Leiden
-        # actually groups orphan nodes with their anchors.
-        if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:
-            w = max(w, SYNTHETIC_WEIGHT_FLOOR)
+        # actually groups orphan nodes with their anchors. Linker-added
+        # synthetic classes already carry calibrated confidence weights,
+        # so keep those explicit values instead of rewriting them.
+        if edge_class in _SYNTHETIC_CLASSES:
+            if edge_class in _CALIBRATED_SYNTHETIC_CLASSES and data.get("weight") is not None:
+                try:
+                    w = float(data["weight"])
+                except (TypeError, ValueError):
+                    w = SYNTHETIC_WEIGHT_FLOOR
+            else:
+                w = max(w, SYNTHETIC_WEIGHT_FLOOR)
             synthetic_count += 1
 
         data["weight"] = w
@@ -348,6 +368,206 @@ def _resolve_orphans_by_directory(
     return edges_added
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 3b. Orphan resolution v2 — cascade reorder (roadmap Phases 3 + 4)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _resolve_orphans_v2(
+    db,
+    G: nx.MultiDiGraph,
+    orphans: List[str],
+    resolved: Set[str],
+    stats: Dict[str, Any],
+    flags,
+    t_start: float,
+    *,
+    embedding_fn: Optional[Callable] = None,
+    embed_batch_fn: Optional[Callable] = None,
+    fts_limit: int = 3,
+    vec_k: int = 3,
+    vec_distance_threshold: float = 0.15,
+    max_lexical_edges: int = 2,
+    embed_batch_size: int = 64,
+    vec_prefix_depth: Optional[int] = None,
+    embed_max_workers: Optional[int] = None,
+) -> Dict[str, Any]:
+    """4-pass cascade: explicit-ref → hybrid → tiered lexical → directory.
+
+    Owns edge writes for every pass; the building-block modules
+    (``graph_orphan_cascade_v2``, ``graph_orphan_hybrid``,
+    ``graph_lexical_v2``) are pure and only return hit lists.
+    """
+    import time as _time
+
+    stats.setdefault("explicit_ref", 0)
+
+    # ── Pass 1 — explicit references (markdown links, backticks, imports)
+    pass1_t = _time.monotonic()
+    try:
+        from .graph_orphan_cascade_v2 import (
+            collect_orphan_embeddings,
+            resolve_orphans_explicit_refs,
+        )
+        explicit_hits = resolve_orphans_explicit_refs(
+            db, G, orphans, flags=flags,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("explicit-ref pass failed: %s", exc)
+        explicit_hits = {}
+
+    for nid, hits in explicit_hits.items():
+        if not hits:
+            continue
+        for hit in hits:
+            tgt = hit.get("node_id")
+            if not tgt or tgt == nid:
+                continue
+            matcher = hit.get("_matcher", "explicit_ref")
+            edge_class = "doc" if matcher == "md_link" else "lexical"
+            _add_edge(
+                db, G,
+                source=nid, target=tgt,
+                rel_type="explicit_ref",
+                edge_class=edge_class,
+                created_by="explicit_ref_v2",
+                skip_db=True,
+                provenance={
+                    "source": "explicit_ref",
+                    "matcher": matcher,
+                    "raw_score": hit.get("_raw_score", 0.95),
+                },
+            )
+            stats["explicit_ref"] += 1
+        resolved.add(nid)
+
+    logger.info(
+        "[ORPHAN] Pass 1 (explicit refs): %d edges, %d resolved in %.1fs",
+        stats["explicit_ref"], len(resolved), _time.monotonic() - pass1_t,
+    )
+
+    # ── Pass 2 — hybrid FTS+Vec via RRF
+    stats.setdefault("hybrid", 0)
+    pass2_t = _time.monotonic()
+    pending = [nid for nid in orphans if nid not in resolved]
+    orphan_embs = None
+    if flags.orphan_reuse_embeddings and pending:
+        try:
+            orphan_embs = collect_orphan_embeddings(db, pending)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("collect_orphan_embeddings failed: %s", exc)
+
+    if pending:
+        try:
+            from .graph_orphan_hybrid import resolve_orphans_hybrid
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("hybrid module unavailable: %s", exc)
+            resolve_orphans_hybrid = None  # type: ignore[assignment]
+        if resolve_orphans_hybrid is not None:
+            for nid in pending:
+                try:
+                    hits = resolve_orphans_hybrid(
+                        db, G, nid,
+                        orphan_embeddings=orphan_embs,
+                        embed_fn=embedding_fn,
+                        flags=flags,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("hybrid pass failed for %s: %s", nid, exc)
+                    continue
+                if not hits:
+                    continue
+                for hit in hits:
+                    tgt = hit.get("node_id")
+                    if not tgt or tgt == nid:
+                        continue
+                    _add_edge(
+                        db, G,
+                        source=nid, target=tgt,
+                        rel_type="hybrid_link",
+                        edge_class="semantic",
+                        created_by="hybrid_rrf",
+                        skip_db=True,
+                        provenance={
+                            "source": "hybrid_rrf",
+                            "rrf_score": hit.get("rrf_score"),
+                            "fts_rank": hit.get("fts_rank"),
+                            "vec_rank": hit.get("vec_rank"),
+                        },
+                    )
+                    stats["hybrid"] += 1
+                resolved.add(nid)
+
+    logger.info(
+        "[ORPHAN] Pass 2 (hybrid RRF): %d edges, %d resolved in %.1fs",
+        stats["hybrid"], len(resolved), _time.monotonic() - pass2_t,
+    )
+
+    # ── Pass 3 — tiered lexical T1–T4 (only if still unresolved)
+    pass3_t = _time.monotonic()
+    pending = [nid for nid in orphans if nid not in resolved]
+    if pending:
+        from .graph_lexical_v2 import resolve_orphans_lexical_tiered as _tiered
+        for nid in pending:
+            try:
+                hits = _tiered(
+                    db, G, nid,
+                    fts_limit=max(fts_limit, 8),
+                    max_lexical_edges=max_lexical_edges,
+                    flags=flags,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("tiered lexical failed for %s: %s", nid, exc)
+                continue
+            if not hits:
+                continue
+            for hit in hits:
+                tgt = hit.get("node_id")
+                if not tgt or tgt == nid:
+                    continue
+                _add_edge(
+                    db, G,
+                    source=nid, target=tgt,
+                    rel_type="lexical_link",
+                    edge_class="lexical",
+                    created_by="fts5_lexical_v2",
+                    skip_db=True,
+                    provenance={
+                        "source": "fts_lexical_tiered",
+                        "tier": hit.get("_tier"),
+                        "query": hit.get("_query"),
+                        "score_norm": hit.get("score_norm"),
+                    },
+                )
+                stats["lexical"] += 1
+            resolved.add(nid)
+
+    logger.info(
+        "[ORPHAN] Pass 3 (tiered lexical): %d edges, %d resolved in %.1fs",
+        stats["lexical"], len(resolved), _time.monotonic() - pass3_t,
+    )
+
+    # ── Pass 4 — directory proximity fallback
+    pass4_t = _time.monotonic()
+    remaining = find_orphans(G)
+    if remaining:
+        stats["directory"] = _resolve_orphans_by_directory(db, G, remaining)
+
+    stats["orphans_remaining"] = len(find_orphans(G))
+    stats["resolved"] = stats["orphans_found"] - stats["orphans_remaining"]
+
+    logger.info(
+        "[ORPHAN] v2 total: %d/%d resolved in %.1fs "
+        "(explicit=%d, hybrid=%d, lexical=%d, directory=%d), %d remaining",
+        stats["resolved"], stats["orphans_found"],
+        _time.monotonic() - t_start,
+        stats["explicit_ref"], stats["hybrid"], stats["lexical"],
+        stats["directory"], stats["orphans_remaining"],
+    )
+
+    return stats
+
+
 def resolve_orphans(
     db,
     G: nx.MultiDiGraph,
@@ -428,8 +648,71 @@ def resolve_orphans(
 
     resolved: Set[str] = set()
 
+    from .feature_flags import get_feature_flags as _flags
+    _f = _flags()
+
+    # ── Phase 3+4 cascade reorder (roadmap §3.1) ─────────────
+    # When ``orphan_cascade_v2`` is on (default) the dispatcher runs
+    # the high-precision passes first:
+    #   Pass 1 — explicit references (md links, backticks, imports)
+    #   Pass 2 — hybrid FTS+Vec via RRF
+    #   Pass 3 — tiered lexical T1–T4 (Phase 2)
+    #   Pass 4 — directory proximity (legacy)
+    # Each pass only acts on still-unresolved orphans. Building blocks
+    # are pure; this dispatcher owns all edge writes + provenance.
+    if _f.orphan_cascade_v2:
+        return _resolve_orphans_v2(
+            db, G, orphans, resolved, stats, _f, t0,
+            embedding_fn=embedding_fn,
+            embed_batch_fn=embed_batch_fn,
+            fts_limit=fts_limit,
+            vec_k=vec_k,
+            vec_distance_threshold=vec_distance_threshold,
+            max_lexical_edges=max_lexical_edges,
+            embed_batch_size=embed_batch_size,
+            vec_prefix_depth=vec_prefix_depth,
+            embed_max_workers=embed_max_workers,
+        )
+
     # ── Pass 1: FTS5 lexical match ───────────────────────────
-    for node_id in orphans:
+    # Phase 2 (graph-quality roadmap): when ``orphan_lexical_tiered`` is
+    # on, delegate to the tiered T1–T4 cascade with IDF gating + REST
+    # disambiguation. The legacy flat-FTS path remains the default.
+    if _f.orphan_lexical_tiered:
+        from .graph_lexical_v2 import resolve_orphans_lexical_tiered as _tiered
+        for node_id in orphans:
+            try:
+                hits = _tiered(
+                    db, G, node_id,
+                    fts_limit=max(fts_limit, 8),
+                    max_lexical_edges=max_lexical_edges,
+                    flags=_f,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("tiered lexical resolve failed for %s: %s", node_id, exc)
+                continue
+            if not hits:
+                continue
+            for hit in hits:
+                _add_edge(
+                    db, G,
+                    source=node_id,
+                    target=hit["node_id"],
+                    rel_type="lexical_link",
+                    edge_class="lexical",
+                    created_by="fts5_lexical_v2",
+                    skip_db=True,
+                    provenance={
+                        "source": "fts_lexical_tiered",
+                        "tier": hit.get("_tier"),
+                        "query": hit.get("_query"),
+                        "score_norm": hit.get("score_norm"),
+                    },
+                )
+                stats["lexical"] += 1
+            resolved.add(node_id)
+    else:
+     for node_id in orphans:
         node = db.get_node(node_id) if db is not None else None
 
         # Get symbol_name from DB first, fall back to graph attributes
@@ -448,8 +731,23 @@ def resolve_orphans(
         if not symbol_name or len(symbol_name) < 2:
             continue
 
+        # Phase 1 (graph-quality roadmap): skip generic / short queries
+        # so utility tokens like "init" / "config" do not spray edges.
+        if _is_low_value_lexical_query(symbol_name):
+            continue
+
         fts_hits = db.search_fts5(query=symbol_name, limit=fts_limit)
         fts_hits = [h for h in fts_hits if h.get("node_id", "") != node_id]
+
+        # Phase 1: drop hits below the configured score-norm threshold so
+        # weak BM25 matches do not become edges.
+        min_norm = _f.fts_min_score_norm
+        if min_norm > 0:
+            fts_hits = [
+                h for h in fts_hits
+                if h.get("score_norm") is None
+                or float(h.get("score_norm", 0.0)) >= min_norm
+            ]
 
         if fts_hits:
             for hit in fts_hits[:max_lexical_edges]:
@@ -461,6 +759,11 @@ def resolve_orphans(
                     edge_class="lexical",
                     created_by="fts5_lexical",
                     skip_db=True,
+                    provenance={
+                        "source": "fts_lexical",
+                        "query": symbol_name,
+                        "score_norm": hit.get("score_norm"),
+                    },
                 )
                 stats["lexical"] += 1
             resolved.add(node_id)
@@ -633,14 +936,30 @@ def _add_edge(
     raw_similarity: Optional[float] = None,
     *,
     skip_db: bool = False,
-) -> None:
+    provenance: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Add a synthetic edge to both the in-memory graph AND the DB.
 
     When *skip_db* is True the edge is added only to the in-memory graph.
     Use this inside ``resolve_orphans`` / ``inject_doc_edges`` /
     ``bridge_disconnected_components`` because ``persist_weights_to_db``
     rewrites **all** edges to the DB at the end of Phase 2 anyway.
+
+    When ``WIKI_EDGE_DEDUP`` is on (default), duplicate
+    ``(source, target, rel_type)`` triples are skipped and the function
+    returns ``False``. Returns ``True`` when an edge was actually added.
+
+    ``provenance`` is an optional dict (e.g. ``{"source": "fts_lexical",
+    "query": "AuthService", "score": 0.42}``) that is stored both as the
+    in-memory edge attribute and (when persisted) in the
+    ``repo_edges.provenance`` column.
     """
+    from .feature_flags import get_feature_flags
+
+    flags = get_feature_flags()
+    if flags.edge_dedup and _has_typed_edge(G, source, target, rel_type):
+        return False
+
     attrs: Dict[str, Any] = {
         "relationship_type": rel_type,
         "edge_class": edge_class,
@@ -648,11 +967,69 @@ def _add_edge(
     }
     if raw_similarity is not None:
         attrs["raw_similarity"] = raw_similarity
+    if provenance is not None:
+        attrs["provenance"] = provenance
 
     G.add_edge(source, target, **attrs)
 
     if not skip_db and db is not None:
         db.upsert_edge(source, target, rel_type, **attrs)
+    return True
+
+
+def _has_typed_edge(
+    G: nx.MultiDiGraph, source: str, target: str, rel_type: str
+) -> bool:
+    """Return True iff an edge with the given ``relationship_type`` exists.
+
+    Used by :func:`_add_edge` (when ``WIKI_EDGE_DEDUP`` is on) and by
+    Phase 2 helpers that need to skip duplicate work without consulting
+    a local ``seen`` set.
+    """
+    if not G.has_edge(source, target):
+        return False
+    return any(
+        d.get("relationship_type") == rel_type
+        for d in G[source][target].values()
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 1 (graph-quality roadmap) — lexical query gating
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: Tokens that are too generic to drive lexical orphan resolution. Mirrors the
+#: set added in the deepwiki_plugin Phase 1 backport.
+_LEXICAL_STOPWORDS: frozenset[str] = frozenset({
+    "init", "main", "test", "tests", "setup", "config", "utils", "helper",
+    "helpers", "common", "base", "abstract", "interface", "impl", "data",
+    "model", "service", "factory", "manager", "handler", "controller",
+    "view", "router", "routes", "api", "lib", "src", "app", "core",
+})
+
+#: Minimum query length (after stripping) for an FTS lookup to be issued.
+_MIN_FTS_QUERY_LEN: int = 4
+
+
+def _is_low_value_lexical_query(query: str) -> bool:
+    """Return True when *query* should be skipped by Phase 2 lexical lookups.
+
+    A query is low-value when, after stripping, it is shorter than
+    :data:`_MIN_FTS_QUERY_LEN` *or* its lowercase form is a member of
+    :data:`_LEXICAL_STOPWORDS`. The check is gated by
+    :attr:`FeatureFlags.fts_stopword_gate` so callers can disable it for
+    debugging.
+    """
+    from .feature_flags import get_feature_flags
+
+    if not get_feature_flags().fts_stopword_gate:
+        return False
+    if not query:
+        return True
+    cleaned = query.strip()
+    if len(cleaned) < _MIN_FTS_QUERY_LEN:
+        return True
+    return cleaned.lower() in _LEXICAL_STOPWORDS
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -967,12 +1344,30 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
             import json
             annotations = json.dumps(annotations)
 
+        # Phase 1 (graph-quality roadmap): provenance + confidence must
+        # round-trip from NetworkX edge attrs into the DB. Earlier
+        # revisions silently dropped them here, leaving every persisted
+        # row with NULL provenance and the default 'EXTRACTED'
+        # confidence regardless of upstream linker decisions, which
+        # broke phase2_stats_v2 attribution.
+        provenance = data.get("provenance")
+        if provenance is None:
+            # Backfill a minimal provenance so downstream stats can
+            # always attribute an edge to its producer instead of the
+            # generic "unknown" bucket.
+            created_by = data.get("created_by") or "ast"
+            provenance = {"source": str(created_by)}
+            rel_type_val = data.get("relationship_type")
+            if rel_type_val:
+                provenance["matcher"] = str(rel_type_val)
+
         edge_batch.append({
             "source_id": str(u),
             "target_id": str(v),
             "rel_type": data.get("relationship_type", ""),
             "edge_class": data.get("edge_class", "structural"),
             "analysis_level": data.get("analysis_level", "comprehensive"),
+            "confidence": data.get("confidence", "EXTRACTED"),
             "weight": data.get("weight", 1.0),
             "raw_similarity": data.get("raw_similarity"),
             "source_file": data.get("source_file", ""),
@@ -980,6 +1375,7 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
             "language": data.get("language", ""),
             "annotations": annotations,
             "created_by": data.get("created_by", "ast"),
+            "provenance": provenance,
         })
 
         if len(edge_batch) >= PERSIST_BATCH_SIZE:
@@ -1146,6 +1542,17 @@ def run_phase2(
     """
     results: Dict[str, Any] = {}
 
+    # Phase 1 (graph-quality roadmap) — observability snapshots.
+    from .feature_flags import get_feature_flags as _flags
+    from .graph_topology_diagnostics import Phase2Stats, explain_connectivity
+
+    flags = _flags()
+    observe = flags.phase2_observability
+    stats_v2: Optional[Phase2Stats] = Phase2Stats() if observe else None
+
+    if observe:
+        stats_v2.components_before_orphan = nx.number_weakly_connected_components(G)
+
     # Step 1: Orphan resolution — inject semantic/lexical edges FIRST
     # so that weighting and hub detection see the COMPLETE edge set.
     results["orphan_resolution"] = resolve_orphans(
@@ -1154,16 +1561,27 @@ def run_phase2(
         embed_batch_fn=embed_batch_fn,
         vec_distance_threshold=vec_distance_threshold,
     )
+    if observe:
+        stats_v2.components_after_orphan = nx.number_weakly_connected_components(G)
+        stats_v2.orphan_resolution = results["orphan_resolution"]
 
     # Step 2: Doc edge injection (hyperlink + proximity)
     results["doc_edges"] = inject_doc_edges(db, G)
+    if observe:
+        stats_v2.components_after_doc = nx.number_weakly_connected_components(G)
+        stats_v2.doc_edges = results["doc_edges"]
 
     # Step 3: Bridge disconnected components — BEFORE weighting so
     # bridge edges receive proper weights in step 4.
     results["bridging"] = bridge_disconnected_components(db, G)
+    if observe:
+        stats_v2.components_after_bridge = nx.number_weakly_connected_components(G)
+        stats_v2.bridging = results["bridging"]
 
     # Step 4: Edge weighting — on ALL edges (structural + semantic + lexical + doc + bridge)
     results["weighting"] = apply_edge_weights(G)
+    if observe:
+        stats_v2.weighting = results["weighting"]
 
     # Step 5: Hub detection — on complete degree distribution
     hubs = detect_hubs(G, z_threshold=z_threshold)
@@ -1172,6 +1590,8 @@ def run_phase2(
         "count": len(hubs),
         "node_ids": sorted(hubs)[:20],  # Cap at 20 for readability
     }
+    if observe:
+        stats_v2.hubs = results["hubs"]
 
     # Step 6: Persist weights
     results["persisted_edges"] = persist_weights_to_db(db, G)
@@ -1180,6 +1600,12 @@ def run_phase2(
     if db is not None:
         db.set_meta("phase2_completed", True)
         db.set_meta("phase2_stats", results)
+        if observe and stats_v2 is not None:
+            # Populate edge breakdowns now that all edges exist.
+            edge_view = explain_connectivity(db, G)
+            stats_v2.edges_by_class = edge_view.edges_by_class
+            stats_v2.edges_by_provenance = edge_view.edges_by_provenance
+            db.set_meta("phase2_stats_v2", stats_v2.as_dict())
 
     logger.info(
         "Phase 2 complete: %d orphans resolved, %d doc edges injected, "

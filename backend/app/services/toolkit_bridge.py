@@ -33,7 +33,7 @@ class EngineComponents:
     storage: Any = None  # WikiStorageProtocol (UnifiedWikiDB / PostgresWikiStorage)
     repo_analysis: dict | None = None
     llm: Any = None  # BaseChatModel
-    repo_path: str | None = None  # Path to cloned repo (if still on disk)
+    repo_path: str | dict[str, str] | None = None  # Path(s) to cloned repo(s), if still on disk
     unified_db_path: str | None = None  # Path to .wiki.db
     query_service: Any = None  # GraphQueryService / StorageQueryService / MultiGraphQueryService
 

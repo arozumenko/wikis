@@ -306,6 +306,32 @@ class TestTSTypeAliases:
         names = [s.name for s in result.symbols]
         assert "Entity" in names
 
+    def test_type_alias_preserves_source_text(self):
+        """Regression: TS type_alias symbols must carry their full
+        declaration text in ``source_text``. Without it, downstream
+        consumers (API surface extractor, cross-language linker) can't
+        hash the alias body and obj: surfaces fail to pair with their
+        Pydantic counterparts on the Python side.
+        """
+        src = (
+            "export type UserPublic = {\n"
+            "  id: string;\n"
+            "  email: string;\n"
+            "  is_active: boolean;\n"
+            "};\n"
+        )
+        result = parse(src)
+        aliases = [s for s in result.symbols if s.name == "UserPublic"]
+        assert aliases, "UserPublic type alias should be extracted"
+        sym = aliases[0]
+        assert sym.source_text, (
+            "type_alias must populate source_text (was None — broke obj: pairing)"
+        )
+        # Full declaration body (the export modifier lives on the parent
+        # export_statement node, so the alias node itself starts at "type").
+        assert sym.source_text.lstrip().startswith("type UserPublic")
+        assert "is_active" in sym.source_text
+
 
 # ---------------------------------------------------------------------------
 # Enums

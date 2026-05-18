@@ -91,6 +91,29 @@ def _serialize_float32_vec(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
+def _deserialize_float32_vec(blob: bytes) -> list[float]:
+    """Deserialize a sqlite-vec blob into a list of floats."""
+    if not blob:
+        return []
+    count = len(blob) // 4
+    return list(struct.unpack(f"{count}f", blob))
+
+
+def _attach_score_norm_sqlite(row: dict[str, Any]) -> dict[str, Any]:
+    """Add ``score_norm`` ∈ (0, 1] derived from a SQLite BM25 ``fts_rank``.
+
+    SQLite FTS5 ``bm25()`` returns negative scores (more negative = better
+    match). Phase 0 of the graph-quality roadmap normalizes this to a
+    bounded positive value so callers can compare scores across backends.
+    """
+    rank = row.get("fts_rank")
+    if rank is None:
+        row["score_norm"] = 0.0
+    else:
+        row["score_norm"] = 1.0 / (1.0 + abs(float(rank)))
+    return row
+
+
 def _can_load_extensions() -> bool:
     """Check if the active sqlite3 driver supports loading extensions."""
     try:
@@ -155,6 +178,12 @@ CREATE TABLE IF NOT EXISTS repo_nodes (
     is_hub          INTEGER DEFAULT 0,
     hub_assignment  TEXT DEFAULT NULL,
 
+    -- Phase 6 (graph-quality roadmap) — JSON list of API surface
+    -- objects (REST/gRPC/GraphQL/FFI/BDD/CLI) extracted from this
+    -- symbol's source_text. NULL when no surface detected. Used by
+    -- the cross-language linker (L1) and federated query expansion.
+    api_surface     TEXT DEFAULT NULL,
+
     -- Timestamps
     indexed_at      TEXT DEFAULT (datetime('now'))
 );
@@ -204,6 +233,11 @@ CREATE TABLE IF NOT EXISTS repo_edges (
 
     -- Provenance
     created_by      TEXT DEFAULT 'ast',
+
+    -- Phase 1 (graph-quality roadmap) — JSON blob describing the synthetic
+    -- edge's source (e.g. {"source": "fts_lexical", "query": "AuthService"}).
+    -- NULL for parser-derived AST edges.
+    provenance      TEXT DEFAULT NULL,
 
     FOREIGN KEY (source_id) REFERENCES repo_nodes(node_id),
     FOREIGN KEY (target_id) REFERENCES repo_nodes(node_id)
@@ -497,6 +531,16 @@ class UnifiedWikiDB:
             self.conn.commit()
             self._backfill_is_test()
 
+        # Phase 6 (graph-quality roadmap): API surface JSON column.
+        if "api_surface" not in cols:
+            logger.info(
+                "Migrating schema: adding api_surface column to repo_nodes (Phase 6)"
+            )
+            cur.execute(
+                "ALTER TABLE repo_nodes ADD COLUMN api_surface TEXT DEFAULT NULL"
+            )
+            self.conn.commit()
+
         # #116 incremental regen: content_hash for change detection.
         # Existing rows stay NULL; backfilled lazily on next reindex of that file.
         if "content_hash" not in cols:
@@ -571,6 +615,15 @@ class UnifiedWikiDB:
                 )
                 self.conn.commit()
 
+            if "provenance" not in edge_cols:
+                logger.info(
+                    "Migrating schema: adding provenance column to repo_edges (Phase 1)"
+                )
+                cur.execute(
+                    "ALTER TABLE repo_edges ADD COLUMN provenance TEXT DEFAULT NULL"
+                )
+                self.conn.commit()
+
     def _backfill_is_test(self) -> None:
         """Set is_test=1 for existing rows whose rel_path matches test patterns."""
         rows = self.conn.execute(
@@ -629,7 +682,8 @@ class UnifiedWikiDB:
             source_text, docstring, signature, parameters, return_type,
             content_hash,
             is_architectural, is_doc, is_test, chunk_type,
-            macro_cluster, micro_cluster, is_hub, hub_assignment
+            macro_cluster, micro_cluster, is_hub, hub_assignment,
+            api_surface
         ) VALUES (
             :node_id, :rel_path, :file_name, :language,
             :start_line, :end_line,
@@ -637,7 +691,8 @@ class UnifiedWikiDB:
             :source_text, :docstring, :signature, :parameters, :return_type,
             :content_hash,
             :is_architectural, :is_doc, :is_test, :chunk_type,
-            :macro_cluster, :micro_cluster, :is_hub, :hub_assignment
+            :macro_cluster, :micro_cluster, :is_hub, :hub_assignment,
+            :api_surface
         )
         """
 
@@ -674,6 +729,16 @@ class UnifiedWikiDB:
             if content_hash is None and source_text:
                 content_hash = compute_content_hash(source_text)
 
+            # Phase 6: api_surface may arrive as list[dict] from
+            # extract_api_surfaces_for_graph; serialize to JSON for
+            # storage. Empty lists collapse to NULL so the column stays
+            # cheap.
+            api_surface = n.get("api_surface")
+            if isinstance(api_surface, (list, tuple)):
+                api_surface = json.dumps(list(api_surface)) if api_surface else None
+            elif isinstance(api_surface, dict):
+                api_surface = json.dumps(api_surface)
+
             rows.append(
                 {
                     "node_id": n["node_id"],
@@ -700,6 +765,7 @@ class UnifiedWikiDB:
                     "micro_cluster": n.get("micro_cluster"),
                     "is_hub": n.get("is_hub", 0),
                     "hub_assignment": n.get("hub_assignment"),
+                    "api_surface": api_surface,
                 }
             )
 
@@ -822,12 +888,14 @@ class UnifiedWikiDB:
             source_id, target_id, rel_type, edge_class, analysis_level,
             confidence,
             weight, raw_similarity,
-            source_file, target_file, language, annotations, created_by
+            source_file, target_file, language, annotations, created_by,
+            provenance
         ) VALUES (
             :source_id, :target_id, :rel_type, :edge_class, :analysis_level,
             :confidence,
             :weight, :raw_similarity,
-            :source_file, :target_file, :language, :annotations, :created_by
+            :source_file, :target_file, :language, :annotations, :created_by,
+            :provenance
         )
         """
 
@@ -836,6 +904,12 @@ class UnifiedWikiDB:
             annotations = e.get("annotations", "")
             if isinstance(annotations, dict):
                 annotations = json.dumps(annotations)
+
+            provenance = e.get("provenance")
+            if isinstance(provenance, dict):
+                provenance = json.dumps(provenance)
+            elif provenance is not None and not isinstance(provenance, str):
+                provenance = json.dumps(provenance)
 
             rows.append(
                 {
@@ -852,6 +926,7 @@ class UnifiedWikiDB:
                     "language": e.get("language", ""),
                     "annotations": annotations,
                     "created_by": e.get("created_by", "ast"),
+                    "provenance": provenance,
                 }
             )
 
@@ -960,7 +1035,10 @@ class UnifiedWikiDB:
     ) -> list[dict[str, Any]]:
         """BM25-ranked text search with optional path/cluster/type filtering.
 
-        Returns list of dicts with node metadata + ``fts_rank`` score.
+        Returns list of dicts with node metadata, ``fts_rank`` (raw BM25,
+        more-negative = better) and ``score_norm`` ∈ (0, 1] computed as
+        ``1 / (1 + abs(fts_rank))`` so callers can compare scores across
+        backends (Phase 0 of the graph-quality roadmap).
         """
         if not query or not query.strip():
             return []
@@ -1000,7 +1078,7 @@ class UnifiedWikiDB:
 
         try:
             rows = self.conn.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
+            return [_attach_score_norm_sqlite(dict(r)) for r in rows]
         except sqlite3.OperationalError as exc:
             # FTS5 query syntax errors — fall back to prefix search
             logger.debug("FTS5 query failed (%s), trying prefix match", exc)
@@ -1008,7 +1086,7 @@ class UnifiedWikiDB:
             params[0] = safe_query
             try:
                 rows = self.conn.execute(sql, params).fetchall()
-                return [dict(r) for r in rows]
+                return [_attach_score_norm_sqlite(dict(r)) for r in rows]
             except sqlite3.OperationalError:
                 return []
 
@@ -1517,6 +1595,7 @@ class UnifiedWikiDB:
             "signature": signature,
             "parameters": parameters,
             "return_type": return_type,
+            "api_surface": data.get("api_surface"),
         }
 
     def _nx_edge_to_dict(self, u: str, v: str, key: int, data: dict) -> dict[str, Any]:
@@ -1525,12 +1604,26 @@ class UnifiedWikiDB:
         if isinstance(annotations, dict):
             annotations = json.dumps(annotations)
 
+        # Phase 1 (graph-quality roadmap): persist provenance + confidence
+        # so initial ``from_networkx`` import retains the linker/parser
+        # attribution that the in-memory graph already carries. Backfill
+        # a minimal AST provenance when nothing is set so phase2_stats_v2
+        # never falls back to the generic "unknown" bucket.
+        provenance = data.get("provenance")
+        if provenance is None:
+            created_by = data.get("created_by") or "ast"
+            provenance = {"source": str(created_by)}
+            rel_type_val = data.get("relationship_type")
+            if rel_type_val:
+                provenance["matcher"] = str(rel_type_val)
+
         return {
             "source_id": str(u),
             "target_id": str(v),
             "rel_type": data.get("relationship_type", ""),
             "edge_class": data.get("edge_class", "structural"),
             "analysis_level": data.get("analysis_level", "comprehensive"),
+            "confidence": data.get("confidence", "EXTRACTED"),
             "weight": data.get("weight", 1.0),
             "raw_similarity": data.get("raw_similarity"),
             "source_file": data.get("source_file", ""),
@@ -1538,6 +1631,7 @@ class UnifiedWikiDB:
             "language": data.get("language", ""),
             "annotations": annotations,
             "created_by": data.get("created_by", "ast"),
+            "provenance": provenance,
         }
 
     def to_networkx(self) -> nx.MultiDiGraph:
@@ -1562,6 +1656,16 @@ class UnifiedWikiDB:
                     d["parameters"] = json.loads(params)
                 except (json.JSONDecodeError, TypeError):
                     pass
+            # Deserialize api_surface back to list[dict]. The TEXT column
+            # holds the JSON-encoded ``[APISurface, ...]`` list; without
+            # this, downstream consumers (cross-language linker, project
+            # recompute) see a raw string and silently drop every surface.
+            api_surface = d.get("api_surface")
+            if api_surface and isinstance(api_surface, str):
+                try:
+                    d["api_surface"] = json.loads(api_surface)
+                except (json.JSONDecodeError, TypeError):
+                    d["api_surface"] = None
             G.add_node(nid, **d)
 
         # --- Load edges ---
@@ -1803,16 +1907,151 @@ class UnifiedWikiDB:
 
         try:
             rows = self.conn.execute(
-                "SELECT n.* FROM repo_fts f "  # noqa: S608
+                "SELECT n.*, bm25(repo_fts, 10.0, 4.0, 2.0, 1.0) AS fts_rank "  # noqa: S608
+                "FROM repo_fts f "
                 "JOIN repo_nodes n ON f.node_id = n.node_id "
                 f"WHERE repo_fts MATCH ?{where_extra} "
-                "ORDER BY rank LIMIT ?",
+                "ORDER BY fts_rank LIMIT ?",
                 params,
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [_attach_score_norm_sqlite(dict(r)) for r in rows]
         except sqlite3.OperationalError as exc:
             logger.debug("search_fts_by_symbol_name failed for '%s': %s", name, exc)
             return []
+
+    # ------------------------------------------------------------------
+    # Phase 0 — graph-quality roadmap additions
+    # ------------------------------------------------------------------
+
+    def count_fts_matches(self, query: str, *, exact_match: bool = False) -> int:
+        """Return the total number of FTS matches for *query*.
+
+        ``exact_match=True`` quotes the query as a phrase so multi-word
+        names (``"refresh wiki"``) match the literal sequence only.
+        """
+        if not query or not query.strip():
+            return 0
+        safe = query.replace('"', '""')
+        if exact_match:
+            safe = f'"{safe}"'
+        try:
+            row = self.conn.execute(
+                "SELECT count(*) AS c FROM repo_fts WHERE repo_fts MATCH ?",
+                (safe,),
+            ).fetchone()
+            return int(row["c"]) if row else 0
+        except sqlite3.OperationalError as exc:
+            logger.debug("count_fts_matches failed for '%s': %s", query, exc)
+            return 0
+
+    def search_fts_by_column(
+        self,
+        query: str,
+        column: str,
+        *,
+        limit: int = 20,
+        path_prefix: str | None = None,
+        symbol_types: list[str] | None = None,
+        exact_match: bool = False,
+    ) -> list[dict[str, Any]]:
+        """FTS search restricted to one of the four indexed text columns."""
+        allowed = {"symbol_name", "signature", "docstring", "source_text"}
+        if column not in allowed:
+            raise ValueError(
+                f"search_fts_by_column: column must be one of {sorted(allowed)}",
+            )
+        if not query or not query.strip():
+            return []
+        safe_query = query.replace('"', '""')
+        if exact_match:
+            safe_query = f'"{safe_query}"'
+        scoped_query = f"{column}:{safe_query}"
+        return self.search_fts5(
+            scoped_query,
+            path_prefix=path_prefix,
+            symbol_types=symbol_types,
+            limit=limit,
+        )
+
+    def search_fts_with_path(
+        self,
+        query: str,
+        path_prefix: str,
+        *,
+        symbol_types: list[str] | None = None,
+        exact_match: bool = False,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """FTS search that requires a non-empty ``path_prefix``."""
+        if not path_prefix or not path_prefix.strip():
+            raise ValueError("search_fts_with_path requires a non-empty path_prefix")
+        if not query or not query.strip():
+            return []
+        safe_query = query.replace('"', '""')
+        if exact_match:
+            safe_query = f'"{safe_query}"'
+        return self.search_fts5(
+            safe_query,
+            path_prefix=path_prefix,
+            symbol_types=symbol_types,
+            limit=limit,
+        )
+
+    def get_embedding_by_id(self, node_id: str) -> list[float] | None:
+        """Fetch a stored embedding by node ID, or ``None`` when absent."""
+        if not self._vec_available or not node_id:
+            return None
+        try:
+            row = self.conn.execute(
+                "SELECT embedding FROM repo_vec WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            logger.debug("get_embedding_by_id failed for '%s': %s", node_id, exc)
+            return None
+        if not row or row["embedding"] is None:
+            return None
+        return _deserialize_float32_vec(row["embedding"])
+
+    def batch_similarity_search(
+        self,
+        embeddings: list[tuple[str, list[float]]],
+        *,
+        k: int = 5,
+        path_prefix: str | None = None,
+        distance_threshold: float = 0.15,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Per-query KNN; sqlite-vec has no native batch KNN so this loops.
+
+        Concurrency is controlled by
+        :attr:`FeatureFlags.vec_batch_concurrency`.
+        """
+        if not embeddings or not self._vec_available:
+            return {}
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        from ..feature_flags import get_feature_flags
+
+        max_workers = max(1, get_feature_flags().vec_batch_concurrency)
+        out: dict[str, list[dict[str, Any]]] = {}
+
+        def _one(item: tuple[str, list[float]]) -> tuple[str, list[dict[str, Any]]]:
+            qid, emb = item
+            hits = self.search_vec(emb, k=k, path_prefix=path_prefix)
+            kept = [h for h in hits if float(h.get("vec_distance", 1.0)) < distance_threshold]
+            return qid, kept
+
+        if max_workers == 1 or len(embeddings) == 1:
+            for item in embeddings:
+                qid, hits = _one(item)
+                out[qid] = hits
+            return out
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for qid, hits in pool.map(_one, embeddings):
+                out[qid] = hits
+        return out
 
     def get_edge_targets(self, source_id: str) -> list[dict[str, Any]]:
         """Lightweight outgoing edges: [{target_id, rel_type, weight}]."""
