@@ -296,6 +296,32 @@ class WikiManagementService:
             result = await session.execute(select(WikiRecord).where(WikiRecord.id == wiki_id))
             return result.scalar_one_or_none()
 
+    async def mark_status(
+        self,
+        wiki_id: str,
+        status: str,
+        error: str | None = None,
+    ) -> bool:
+        """Update only ``status`` (and optional ``error``) on an existing wiki record.
+
+        Used by reconciliation paths — orphan recovery on startup and the
+        invocation finalize hook in ``WikiService`` — to keep the persistent
+        ``WikiRecord.status`` consistent with the in-memory ``Invocation``
+        regardless of which terminal state was reached. Returns ``False`` if
+        no record exists for ``wiki_id``.
+        """
+        async with self.session_factory() as session:
+            async with session.begin():
+                result = await session.execute(select(WikiRecord).where(WikiRecord.id == wiki_id))
+                record = result.scalar_one_or_none()
+                if record is None:
+                    return False
+                record.status = status
+                record.updated_at = datetime.now()
+                if error is not None:
+                    record.error = error
+        return True
+
     async def get_wiki(self, wiki_id: str, user_id: str | None = None) -> WikiRecord | None:
         """Return the wiki record if the caller may view it, else None."""
         async with self.session_factory() as session:

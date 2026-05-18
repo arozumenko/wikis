@@ -20,6 +20,7 @@ import { WikiSidebar } from '../components/WikiSidebar';
 import { WikiPageView } from '../components/WikiPageView';
 import { OnThisPage } from '../components/OnThisPage';
 import { useRepoContext } from '../context/RepoContext';
+import { useResume } from '../hooks/useResume';
 import { AskBar } from '../components/AskBar';
 import type { AskMode, MinConfidence } from '../components/AskBar';
 import { AnswerView } from '../components/AnswerView';
@@ -228,72 +229,165 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
     }
   }, [searchParams, pages]);
 
+  // #191: read activePageId via a ref inside loadAndReconcile so the resume
+  // callback doesn't close over the stale (initial null) value and reset
+  // the user's selected page on every focus/online event (Copilot C2).
+  const activePageIdRef = useRef<string | null>(activePageId);
+  activePageIdRef.current = activePageId;
+
+  // #201: loadAndReconcile's useCallback dep array is gated on wikiId only
+  // (so resume invocations don't recreate the callback on every URL-param
+  // tweak). URL-derived values are read via refs to avoid the stale-closure
+  // trap when the same wiki page is revisited with different query params.
+  const searchParamsRef = useRef(searchParams);
+  searchParamsRef.current = searchParams;
+  const urlGeneratingRef = useRef(urlGenerating);
+  urlGeneratingRef.current = urlGenerating;
+  const urlInvocationIdRef = useRef(urlInvocationId);
+  urlInvocationIdRef.current = urlInvocationId;
+
+  // #191 (Rio M1): in-flight async fetches from loadAndReconcile must not
+  // call setRepo etc. after the component unmounts — would re-populate the
+  // RepoContext for a wiki that's no longer mounted.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  /**
+   * Refetch the wiki detail and reconcile local state with backend truth.
+   *
+   * #191: the SPA must not trust its cached generating/failed state. This
+   * function is called on mount, when ``wikiId`` changes, and on resume
+   * (visibility/focus/online) — backend wins every time.
+   *
+   * Reconciliation rules:
+   *  - ``complete``                       → exit generating, load pages
+   *  - ``failed | partial | cancelled``   → surface error event, stop SSE
+   *  - ``generating`` + new invocation_id → switch SSE to that invocation,
+   *                                         drop stale events from the
+   *                                         previous (orphaned) run
+   *
+   * On 404 with URL params claiming generation in-flight, stay in
+   * generating mode so the SSE subscriber gets a chance — covers the race
+   * where POST /wikis returns before the WikiRecord row is committed.
+   */
+  const loadAndReconcile = useCallback(
+    ({ isInitial }: { isInitial: boolean }) => {
+      if (!wikiId) return;
+      if (isInitial) {
+        setLoading(true);
+        setError(null);
+      }
+
+      getWiki(wikiId)
+        .then((data) => {
+          if (!mountedRef.current) return;
+          setWiki(data);
+          setPages(data.pages);
+          setRepo({
+            wikiId: data.wiki_id,
+            repoUrl: data.repo_url,
+            branch: data.branch,
+            indexedAt: data.indexed_at ?? data.created_at,
+            commitHash: data.commit_hash,
+            requiresToken: data.requires_token,
+          });
+
+          if (data.status === 'generating' && data.invocation_id) {
+            // #191 (Copilot C4): drop the `prev &&` guard so a null→id
+            // transition (user was viewing a terminal failure, backend
+            // reports a fresh generating invocation after retry) also
+            // clears the stale events buffer. Same-id case still skipped.
+            setActiveInvocationId((prev) => {
+              if (prev !== data.invocation_id) setGenEvents([]);
+              return data.invocation_id!;
+            });
+            setIsGenerating(true);
+          } else if (
+            data.status === 'failed' ||
+            data.status === 'partial' ||
+            data.status === 'cancelled'
+          ) {
+            const errorMsg =
+              (data as WikiDetail & { error?: string }).error ?? `Generation ${data.status}`;
+            setIsGenerating(true);
+            setActiveInvocationId(null);
+            setGenEvents([
+              {
+                type: 'task_failed' as const,
+                taskId: data.invocation_id,
+                status: 'failed',
+                error: errorMsg,
+              },
+            ]);
+          } else {
+            // status === 'complete' (or any other terminal-success state):
+            // we own the pages now, stop the generating overlay regardless
+            // of what the SSE buffer believes.
+            setIsGenerating(false);
+            setActiveInvocationId(null);
+            setGenEvents([]);
+          }
+
+          if (data.pages.length > 0 && isInitial) {
+            const urlPage = searchParamsRef.current.get('page');
+            const urlPageTitle = searchParamsRef.current.get('page_title');
+            const matched = urlPage
+              ? data.pages.find((p) => p.id === urlPage)
+              : urlPageTitle
+                ? data.pages.find((p) => p.title === urlPageTitle)
+                : null;
+            setActivePageId(matched ? matched.id : data.pages[0].id);
+          } else if (data.pages.length > 0 && !activePageIdRef.current) {
+            // Land on a page when gen→complete arrived via REST on resume
+            // (the SSE wiki_complete handler does the same, but only fires
+            // if the SSE stream delivered the terminal event). Read via
+            // ref to avoid the stale-closure bug — see Copilot C2.
+            setActivePageId(data.pages[0].id);
+          }
+        })
+        .catch(() => {
+          if (!mountedRef.current) return;
+          // 404 + URL params claim generation in-flight → keep the
+          // generating UI; the SSE subscriber will pick up events. For any
+          // other failure on the initial load, surface the error.
+          if (isInitial) {
+            if (urlGeneratingRef.current && urlInvocationIdRef.current) {
+              setIsGenerating(true);
+              setActiveInvocationId(urlInvocationIdRef.current);
+            } else {
+              setError('Failed to load wiki');
+            }
+            setPages([]);
+          }
+        })
+        .finally(() => {
+          if (!mountedRef.current) return;
+          if (isInitial) setLoading(false);
+        });
+    },
+    // wikiId-only dep gating keeps the callback stable across URL-param
+    // tweaks. searchParams / urlGenerating / urlInvocationId / activePageId
+    // are all read via refs above so the closure sees the latest render's
+    // values on every resume — see #201 and Copilot C2.
+    [wikiId, setRepo],
+  );
+
   // Fetch wiki data from API
   useEffect(() => {
     if (!wikiId) return;
-    setLoading(true);
-    setError(null);
-
-    getWiki(wikiId)
-      .then((data) => {
-        setWiki(data);
-        setPages(data.pages);
-        setRepo({
-          wikiId: data.wiki_id,
-          repoUrl: data.repo_url,
-          branch: data.branch,
-          indexedAt: data.indexed_at ?? data.created_at,
-          commitHash: data.commit_hash,
-          requiresToken: data.requires_token,
-        });
-        if (data.pages.length > 0) {
-          const urlPage = searchParams.get('page');
-          const urlPageTitle = searchParams.get('page_title');
-          const matched = urlPage
-            ? data.pages.find((p) => p.id === urlPage)
-            : urlPageTitle
-              ? data.pages.find((p) => p.title === urlPageTitle)
-              : null;
-          setActivePageId(matched ? matched.id : data.pages[0].id);
-        }
-
-        // Auto-detect generating/failed state from API response
-        if (data.status === 'generating' && data.invocation_id) {
-          setIsGenerating(true);
-          setActiveInvocationId(data.invocation_id);
-        } else if (
-          data.status === 'failed' ||
-          data.status === 'partial' ||
-          data.status === 'cancelled'
-        ) {
-          // Show error state with repo info and retry button
-          setIsGenerating(true);
-          setActiveInvocationId(null);
-          const errorMsg =
-            (data as WikiDetail & { error?: string }).error ?? `Generation ${data.status}`;
-          setGenEvents([
-            {
-              type: 'task_failed' as const,
-              taskId: data.invocation_id,
-              status: 'failed',
-              error: errorMsg,
-            },
-          ]);
-        }
-      })
-      .catch(() => {
-        // If 404 and we have URL params indicating generation, stay in generating mode
-        if (urlGenerating && urlInvocationId) {
-          setIsGenerating(true);
-          setActiveInvocationId(urlInvocationId);
-        } else {
-          setError('Failed to load wiki');
-        }
-        setPages([]);
-      })
-      .finally(() => setLoading(false));
+    loadAndReconcile({ isInitial: true });
     return () => clearRepo();
   }, [wikiId]);
+
+  // #191: refetch + reconcile on resume so cached state can never override
+  // backend truth after sleep/network drops. Cheap call — same endpoint
+  // the dashboard polls, no SSE involved.
+  useResume(() => loadAndReconcile({ isInitial: false }), !!wikiId);
 
   // Subscribe to SSE when generating (#306 fix: reconnects on mount)
   useEffect(() => {
@@ -344,20 +438,28 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           // Keep isGenerating=true so GenerationProgress stays visible with retry button
         }
       },
-      () => {
-        setGenEvents((prev) => [
-          ...prev,
-          // Keep legacy shape so GenerationProgress recognises it as an error event
-          {
-            type: 'error',
-            event: 'error',
-            error: 'Connection lost',
-            recoverable: true,
-            error_type: null,
-            model_limit: null,
-            suggested_actions: null,
-          },
-        ]);
+      (err) => {
+        // #191: terminal connection errors only. Transient drops are
+        // recovered silently by subscribeSSE's reconnect loop; surfacing
+        // them in the activity log creates false "failed" UI for what is
+        // really just a sleep/wake cycle. HTTP 4xx (auth/missing) is
+        // surfaced from sse.ts as a terminal Error — show that.
+        const msg = (err as Error)?.message ?? '';
+        if (/HTTP (401|403|404)/.test(msg)) {
+          setGenEvents((prev) => [
+            ...prev,
+            // Keep legacy shape so GenerationProgress recognises it as an error event
+            {
+              type: 'error',
+              event: 'error',
+              error: msg,
+              recoverable: false,
+              error_type: null,
+              model_limit: null,
+              suggested_actions: null,
+            },
+          ]);
+        }
       },
     );
 
