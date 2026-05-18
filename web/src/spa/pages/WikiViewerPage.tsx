@@ -235,6 +235,17 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
   const activePageIdRef = useRef<string | null>(activePageId);
   activePageIdRef.current = activePageId;
 
+  // #201: loadAndReconcile's useCallback dep array is gated on wikiId only
+  // (so resume invocations don't recreate the callback on every URL-param
+  // tweak). URL-derived values are read via refs to avoid the stale-closure
+  // trap when the same wiki page is revisited with different query params.
+  const searchParamsRef = useRef(searchParams);
+  searchParamsRef.current = searchParams;
+  const urlGeneratingRef = useRef(urlGenerating);
+  urlGeneratingRef.current = urlGenerating;
+  const urlInvocationIdRef = useRef(urlInvocationId);
+  urlInvocationIdRef.current = urlInvocationId;
+
   // #191 (Rio M1): in-flight async fetches from loadAndReconcile must not
   // call setRepo etc. after the component unmounts — would re-populate the
   // RepoContext for a wiki that's no longer mounted.
@@ -323,8 +334,8 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           }
 
           if (data.pages.length > 0 && isInitial) {
-            const urlPage = searchParams.get('page');
-            const urlPageTitle = searchParams.get('page_title');
+            const urlPage = searchParamsRef.current.get('page');
+            const urlPageTitle = searchParamsRef.current.get('page_title');
             const matched = urlPage
               ? data.pages.find((p) => p.id === urlPage)
               : urlPageTitle
@@ -345,9 +356,9 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           // generating UI; the SSE subscriber will pick up events. For any
           // other failure on the initial load, surface the error.
           if (isInitial) {
-            if (urlGenerating && urlInvocationId) {
+            if (urlGeneratingRef.current && urlInvocationIdRef.current) {
               setIsGenerating(true);
-              setActiveInvocationId(urlInvocationId);
+              setActiveInvocationId(urlInvocationIdRef.current);
             } else {
               setError('Failed to load wiki');
             }
@@ -359,9 +370,10 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           if (isInitial) setLoading(false);
         });
     },
-    // searchParams / urlGenerating / urlInvocationId are intentionally
-    // read fresh each call. activePageId is read via activePageIdRef to
-    // avoid stale-closure resets on resume.
+    // wikiId-only dep gating keeps the callback stable across URL-param
+    // tweaks. searchParams / urlGenerating / urlInvocationId / activePageId
+    // are all read via refs above so the closure sees the latest render's
+    // values on every resume — see #201 and Copilot C2.
     [wikiId, setRepo],
   );
 
