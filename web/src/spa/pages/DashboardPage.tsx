@@ -469,7 +469,7 @@ export function DashboardPage() {
               >
                 <AddIcon sx={{ fontSize: 32, color: 'text.secondary', mb: 1 }} />
                 <Typography variant="body2" color="text.secondary">
-                  Add a repository
+                  Add a source
                 </Typography>
               </CardActionArea>
             </Card>
