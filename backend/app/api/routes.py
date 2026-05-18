@@ -88,6 +88,18 @@ NOT_IMPLEMENTED = "Not implemented — Phase 2"
 # ---------------------------------------------------------------------------
 
 
+# #203: ``POST /wikis`` is the documented contract (see the module
+# docstring on ``app/models/api.py``) and the path the SPA's
+# ``generateWikiMultiSource`` calls. The route alias was missed in #195 —
+# only the frontend half and the docstring landed. ``POST /generate``
+# stays as a legacy alias so any pre-existing callers (tests, MCP, ad-hoc
+# scripts) keep working unchanged.
+@router.post(
+    "/wikis",
+    response_model=GenerateWikiResponse,
+    status_code=202,
+    responses={409: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+)
 @router.post(
     "/generate",
     response_model=GenerateWikiResponse,
