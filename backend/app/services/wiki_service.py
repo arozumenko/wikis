@@ -202,13 +202,19 @@ class WikiService:
                             f"Server restarted during {prior_status}"
                         )
                         inv.completed_at = datetime.now()
-                        # #191 (Copilot C5): only propagate to WikiRecord for
-                        # full-generation orphans. ``running`` is the
-                        # incremental-refresh in-flight status — the wiki was
-                        # ``complete`` before the refresh started, so marking
-                        # it failed would invalidate previously-good content
-                        # (``get_wiki`` would short-circuit to no pages).
-                        if inv.wiki_id and prior_status == "generating":
+                        # #177 (inverts #191 C5): now that incremental_refresh
+                        # writes status="running" to the DB at start, an
+                        # orphaned ``running`` row means the refresh crashed
+                        # mid-flight — it MUST be transitioned to ``failed``
+                        # so the user sees "refresh crashed, please retry"
+                        # rather than the stale ``complete`` content silently
+                        # standing. Previously we skipped the WikiRecord
+                        # update for ``running`` to avoid invalidating
+                        # previously-good content; with the DB write in place
+                        # that reasoning inverts: the record already shows
+                        # ``running``, so leaving it there is worse than
+                        # flipping it to ``failed``.
+                        if inv.wiki_id:
                             orphaned_wiki_ids.append((inv.wiki_id, inv.error))
                     self._invocations[inv_id] = inv
                 except Exception:  # noqa: S110
@@ -1184,6 +1190,45 @@ class WikiService:
             finally:
                 # Re-persist so the terminal status survives a restart.
                 await self._persist_invocations()
+                # #177: transition the DB WikiRecord to the terminal status.
+                # Mirrors _run_generation's reconciliation finally block.
+                # ``mark_status`` is update-only — if the pre-register call
+                # above silently failed, the record may not exist, but for a
+                # refresh (as opposed to a full generate) the wiki had a
+                # valid record before we started, so that case is unlikely.
+                if self.wiki_management and wiki_id:
+                    try:
+                        await self.wiki_management.mark_status(
+                            wiki_id=wiki_id,
+                            status=invocation.status,
+                            error=invocation.error,
+                        )
+                    except Exception as _db_err:
+                        logger.warning(
+                            "[incremental_refresh] Failed to reconcile "
+                            "WikiRecord status for %s: %s",
+                            wiki_id,
+                            _db_err,
+                        )
+
+        # #177: write status="running" to the DB now — AFTER the early-return
+        # guards — so we only record a start when we're actually committed to
+        # launching the background task. Using mark_status (update-only) rather
+        # than register_wiki preserves commit_hash, title, page_count, etc.
+        # that the original generate() wrote. A crashed process leaves this
+        # row at "running"; load_persisted_invocations flips it to "failed"
+        # on restart.
+        if self.wiki_management:
+            try:
+                await self.wiki_management.mark_status(
+                    wiki_id=wiki_id,
+                    status="running",
+                    error=None,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[incremental_refresh] Failed to pre-register refresh: %s", e
+                )
 
         task = asyncio.create_task(_run())
         self._tasks[invocation.id] = task
