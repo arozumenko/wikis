@@ -811,15 +811,22 @@ async def test_jira_invalid_jql_raises_scan_error() -> None:
 
 @pytest.mark.asyncio
 async def test_atlassian_401_refresh_retry_success() -> None:
-    """A 401 on the first call followed by a transparent refresh should produce a valid scan.
+    """A 401 raised by the AtlassianClient bubbles up to the scan service as ScanError.
 
-    AtlassianClient handles the one-retry cycle internally (refresh token →
-    new access token → retry). This test models that contract by having the
-    *first* call to the spaces endpoint raise ``SourceAuthError`` (the 401
-    surface) and the *second* call return the success payload. The scan
-    service must complete successfully and the underlying get method must
-    have been called exactly twice — once for the failed attempt and once
-    for the post-refresh retry.
+    AtlassianClient's transparent refresh-and-retry happens *inside* the
+    client. When the client surfaces a ``SourceAuthError`` to the scan
+    service, that means the retry has already been exhausted — refresh
+    failed or the token is permanently invalid. The scan service must
+    translate that into ``ScanError(reachable=False)``.
+
+    This test verifies that translation by feeding the mock a single
+    ``SourceAuthError`` and asserting (a) the scan raises ``ScanError``
+    with ``reachable=False`` and (b) the mock was called exactly once
+    — proving the service did NOT swallow the auth error or retry.
+
+    The companion test ``test_atlassian_transparent_refresh_succeeds``
+    covers the inverse case where the client retried internally and the
+    scan service only ever sees successes.
     """
     service = SourceScanService()
 
