@@ -937,28 +937,6 @@ class WikiService:
         )
         self._invocations[invocation.id] = invocation
 
-        # #177: pre-register the refresh so hard-crash failure windows are
-        # visible in the DB. Mirrors generate()'s register_wiki(status=
-        # "generating") call. A crashed process leaves status="running" in
-        # the DB; load_persisted_invocations picks that up and flips it to
-        # "failed" on restart.
-        if self.wiki_management:
-            try:
-                await self.wiki_management.register_wiki(
-                    wiki_id=wiki_id,
-                    repo_url=wiki_record.repo_url,
-                    branch=wiki_record.branch,
-                    title=wiki_record.title,
-                    page_count=wiki_record.page_count,
-                    owner_id=owner_id,
-                    status="running",
-                    error=None,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[incremental_refresh] Failed to pre-register refresh: %s", e
-                )
-
         from pathlib import Path as _Path
 
         from app.core.agents.page_patcher import PagePatcher
@@ -1232,6 +1210,25 @@ class WikiService:
                             wiki_id,
                             _db_err,
                         )
+
+        # #177: write status="running" to the DB now — AFTER the early-return
+        # guards — so we only record a start when we're actually committed to
+        # launching the background task. Using mark_status (update-only) rather
+        # than register_wiki preserves commit_hash, title, page_count, etc.
+        # that the original generate() wrote. A crashed process leaves this
+        # row at "running"; load_persisted_invocations flips it to "failed"
+        # on restart.
+        if self.wiki_management:
+            try:
+                await self.wiki_management.mark_status(
+                    wiki_id=wiki_id,
+                    status="running",
+                    error=None,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[incremental_refresh] Failed to pre-register refresh: %s", e
+                )
 
         task = asyncio.create_task(_run())
         self._tasks[invocation.id] = task
