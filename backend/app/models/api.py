@@ -199,12 +199,44 @@ class GitScanPreview(BaseModel):
     size_bytes: int
 
 
+class ConfluenceSpaceInfo(BaseModel):
+    """Per-space summary inside a :class:`ConfluenceScanPreview`."""
+
+    key: str
+    name: str
+    page_count: int | None = None  # None when the API doesn't return a total
+
+
+class ConfluenceScanPreview(BaseModel):
+    """Preview returned for ``source_type == "confluence"``.
+
+    ``page_count`` on each space is the total returned by the Confluence API
+    for that space.  When the API paginates without a total-results field,
+    ``page_count`` is left as ``None`` and the caller should render it as
+    ``"?"``.
+    """
+
+    spaces: list[ConfluenceSpaceInfo]
+    # None when ANY per-space ``page_count`` is unknown (permission-filtered or
+    # the API didn't return ``totalSize``). An honest "I don't know" rather than
+    # an undercounted sum that would mislead the wizard's capacity estimate.
+    total_pages: int | None = None
+
+
+class JiraScanPreview(BaseModel):
+    """Preview returned for ``source_type == "jira"``."""
+
+    matching_issues: int
+    sample_issue_keys: list[str]
+    jql_validated: bool
+
+
 class ScanResponse(BaseModel):
     """Result of a source scan. ``preview`` shape varies by ``source_type``."""
 
     source_type: str
     reachable: bool
-    preview: GitScanPreview | None = None
+    preview: GitScanPreview | ConfluenceScanPreview | JiraScanPreview | None = None
     warnings: list[str] = Field(default_factory=list)
 
 

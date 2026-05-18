@@ -163,15 +163,17 @@ async def scan_source(
     no ``WikiRecord``, no invocation registration, no token write. The
     response carries reachability + a connector-specific preview shape.
 
-    Errors (no ``responses=`` declaration intentionally — the 400 and 501
-    bodies don't match :class:`ErrorResponse`'s top-level shape and the
-    SPA codegen would otherwise produce wrong client types. A proper
-    error envelope lands with #211 once Atlassian scan settles the
-    response model across all source types.):
+    All three source types are supported: ``git``, ``confluence``, ``jira``.
+
+    Errors (no ``responses=`` declaration intentionally — the 400 body
+    doesn't match :class:`ErrorResponse`'s top-level shape and the SPA
+    codegen would otherwise produce wrong client types.):
 
     * ``400`` — ``{"detail": {"error": <message>, "reachable": <bool>}}``
-      for unreachable / auth-fail / invalid-scope.
-    * ``501`` — ``{"detail": <message>}`` for confluence/jira until #211.
+      for unreachable / auth-fail / invalid-scope / invalid-JQL.
+    * ``422`` — Pydantic validation error when ``source_type`` is not one of
+      ``"git"``, ``"confluence"``, or ``"jira"`` (``Literal`` constraint on
+      :class:`ScanRequest` — the handler is never reached for unknown values).
 
     TODO(follow-up): rate-limit / tmpdir-exhaustion guard. A malicious
     authenticated user can fan out concurrent scans; each shallow clone
@@ -192,8 +194,7 @@ async def scan_source(
             detail={"error": str(exc), "reachable": exc.reachable},
         )
     except NotImplementedError as exc:
-        # Confluence / Jira scan lands in #211; the wizard surfaces this
-        # as a "preview not yet supported for this source" affordance.
+        # Unknown source_type with no scanner implementation.
         raise HTTPException(status_code=501, detail=str(exc))  # noqa: B904
 
 
