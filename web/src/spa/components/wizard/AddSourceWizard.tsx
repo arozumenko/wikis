@@ -423,10 +423,14 @@ export function AddSourceWizard({
             cachedResult={scanResult}
             cachedScopeHash={scanResultHash}
             onScanComplete={(result) => {
-              // C2 — ignore late callbacks once the user has moved on
-              // (Skip clicked or Back hit). The current step is the
-              // canonical source of truth for whether scan output is
-              // relevant.
+              // C2 — defense-in-depth guard. The *primary* protection
+              // against late scan results corrupting state is the
+              // ``mountedRef`` in StepScan (C4): unmount fires synchronously
+              // during the commit that removes ``<StepScan>``, so the
+              // ``if (!mountedRef.current) return`` inside ``runScan``
+              // intercepts the late resolve before this callback is ever
+              // invoked. This step check is a belt to that braces, in
+              // case React's commit ordering ever changes underfoot.
               if (step !== 2) return;
               setScanResult(result);
               setScanResultHash(result ? currentScopeHash : null);
