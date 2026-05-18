@@ -171,8 +171,9 @@ async def scan_source(
 
     * ``400`` — ``{"detail": {"error": <message>, "reachable": <bool>}}``
       for unreachable / auth-fail / invalid-scope / invalid-JQL.
-    * ``501`` — ``{"detail": <message>}`` for any unknown ``source_type``
-      that has no scanner implementation.
+    * ``422`` — Pydantic validation error when ``source_type`` is not one of
+      ``"git"``, ``"confluence"``, or ``"jira"`` (``Literal`` constraint on
+      :class:`ScanRequest` — the handler is never reached for unknown values).
 
     TODO(follow-up): rate-limit / tmpdir-exhaustion guard. A malicious
     authenticated user can fan out concurrent scans; each shallow clone

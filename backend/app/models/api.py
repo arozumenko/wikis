@@ -217,7 +217,10 @@ class ConfluenceScanPreview(BaseModel):
     """
 
     spaces: list[ConfluenceSpaceInfo]
-    total_pages: int
+    # None when ANY per-space ``page_count`` is unknown (permission-filtered or
+    # the API didn't return ``totalSize``). An honest "I don't know" rather than
+    # an undercounted sum that would mislead the wizard's capacity estimate.
+    total_pages: int | None = None
 
 
 class JiraScanPreview(BaseModel):

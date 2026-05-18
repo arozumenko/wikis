@@ -207,6 +207,12 @@ class SourceScanService:
             requested_keys = []
         else:
             requested_keys = list(space_keys_raw)
+            # C1 — every element must be a non-empty string; reject dict/int/None
+            # payloads that would silently pass through set() or reach the API.
+            if not all(isinstance(k, str) and k for k in requested_keys):
+                raise ScanError(
+                    "scope.space_keys must be a list of non-empty strings"
+                )
 
         auth = request.auth or {}
         access_token = auth.get("access_token")
@@ -250,9 +256,13 @@ class SourceScanService:
         except (SourceNotFoundError, SourceUnavailableError, SourceConnectionError) as exc:
             raise ScanError(str(exc), reachable=False) from exc
 
-        total_pages = sum(
-            s.page_count for s in space_infos if s.page_count is not None
-        )
+        # C2+C5 — if ALL spaces have a known page count, sum them. If ANY are
+        # None (permission-filtered or API didn't return totalSize), report None
+        # so the wizard renders "?" rather than a silently undercounted total.
+        if all(s.page_count is not None for s in space_infos):
+            total_pages: int | None = sum(s.page_count for s in space_infos)  # type: ignore[misc]
+        else:
+            total_pages = None
         preview = ConfluenceScanPreview(spaces=space_infos, total_pages=total_pages)
         return ScanResponse(
             source_type="confluence",
@@ -278,7 +288,11 @@ class SourceScanService:
             raise ScanError(
                 "scope.base_url must be a non-empty string for jira scans"
             )
-        jql: str = scope.get("jql") or "ORDER BY created DESC"
+        jql = scope.get("jql")
+        # C3 — mirror the repo_url / base_url guards: reject non-string and
+        # empty values explicitly rather than silently coercing them.
+        if not isinstance(jql, str) or not jql:
+            raise ScanError("scope.jql must be a non-empty string")
 
         auth = request.auth or {}
         access_token = auth.get("access_token")
