@@ -293,11 +293,14 @@ describe('AddSourceWizard', () => {
 
   it('Skip-preview during an in-flight scan does not overwrite scanSkipped (C2)', async () => {
     const user = userEvent.setup();
-    let resolveScan: ((value: import('../../../api/wiki').ScanResponse) => void) | null = null;
+    type Resolver = (value: import('../../../api/wiki').ScanResponse) => void;
+    // Cast around TS's CFA — it narrows the captured-in-Promise variable
+    // back to ``null`` even though the executor assigns it synchronously.
+    let resolveScan: Resolver | null = null;
     mockScanSource.mockImplementation(
       () =>
-        new Promise((resolve) => {
-          resolveScan = resolve;
+        new Promise<import('../../../api/wiki').ScanResponse>((resolve) => {
+          resolveScan = resolve as Resolver;
         }),
     );
     renderWizard();
@@ -309,7 +312,7 @@ describe('AddSourceWizard', () => {
     expect(await screen.findByTestId('confirm-scan-skipped')).toBeInTheDocument();
     // Now resolve the late scan — Confirm must STILL show the skipped notice,
     // not the success stats.
-    resolveScan?.({
+    (resolveScan as Resolver | null)?.({
       source_type: 'git',
       reachable: true,
       preview: {
