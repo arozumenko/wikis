@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 import respx
 
 from app.core.sources import registry
-from app.core.sources.confluence_toolkit import ConfluenceToolkit
+from app.core.sources.confluence_toolkit import ConfluenceToolkit, _sanitize_path_component
 
 _BASE = "https://example.atlassian.net"
 
@@ -234,7 +233,8 @@ def test_build_origin_pointer_numeric_id():
 def test_build_origin_pointer_path_form():
     tk = ConfluenceToolkit.from_config(_MIN_CONFIG)
     ptr = tk.build_origin_pointer("ENG/My Page", revision=None)
-    assert "/wiki/spaces/ENG/pages/My Page" in ptr.url
+    # Title must be URL-encoded (spaces → %20) in the backlink URL.
+    assert "/wiki/spaces/ENG/pages/My%20Page" in ptr.url
     assert ptr.ref == "ENG/My Page"
 
 
@@ -246,3 +246,136 @@ def test_build_origin_pointer_path_form():
 def test_registry_create_returns_confluence_toolkit():
     tk = registry.create("confluence", _FULL_CONFIG)
     assert isinstance(tk, ConfluenceToolkit)
+
+
+# ---------------------------------------------------------------------------
+# 11. _sanitize_path_component — path traversal and special chars
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_removes_slashes():
+    result = _sanitize_path_component("Page / with .. and \\ chars")
+    assert "/" not in result
+    assert "\\" not in result
+    assert ".." not in result.split("-")
+
+
+def test_sanitize_dotdot_not_a_segment():
+    """'..' as a standalone traversal segment must be eliminated."""
+    result = _sanitize_path_component("../../../etc/passwd")
+    for segment in result.split("-"):
+        assert segment != ".."
+
+
+def test_sanitize_empty_becomes_untitled():
+    assert _sanitize_path_component("...") == "untitled"
+
+
+# ---------------------------------------------------------------------------
+# 12. list_files — path sanitization end-to-end for title and space_key
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_files_sanitizes_title_and_space_key():
+    """Title with path traversal chars must produce a safe synthetic path."""
+    respx.get(f"{_BASE}/wiki/rest/api/content/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": "77",
+                        "title": "Page / with .. and \\ chars",
+                        "space": {"key": "ENG"},
+                        "version": {"number": 1},
+                    }
+                ],
+                "_links": {},
+            },
+        )
+    )
+    tk = ConfluenceToolkit.from_config(_MIN_CONFIG)
+    files = [fi async for fi in tk.list_files()]
+    assert len(files) == 1
+    path = files[0].path
+    # The path is {space}/{title} — only one literal "/" separating them.
+    parts = path.split("/", 1)
+    assert len(parts) == 2, f"Expected exactly one '/' separator in path: {path!r}"
+    title_part = parts[1]
+    assert "/" not in title_part, f"Unexpected '/' in title component: {title_part!r}"
+    assert "\\" not in title_part
+    for seg in title_part.split("-"):
+        assert seg != ".."
+
+
+# ---------------------------------------------------------------------------
+# 13. build_origin_pointer — URL-encoding of path components
+# ---------------------------------------------------------------------------
+
+
+def test_build_origin_pointer_url_encodes_space_in_title():
+    """Spaces in the title must be percent-encoded in the backlink URL."""
+    tk = ConfluenceToolkit.from_config(_MIN_CONFIG)
+    ptr = tk.build_origin_pointer("ENG/My Page Title", revision=None)
+    assert "My%20Page%20Title" in ptr.url
+
+
+def test_build_origin_pointer_url_encodes_special_chars():
+    """Special characters in title should be percent-encoded."""
+    tk = ConfluenceToolkit.from_config(_MIN_CONFIG)
+    ptr = tk.build_origin_pointer("ENG/Hello World & More", revision=None)
+    assert " " not in ptr.url
+    assert "&" not in ptr.url
+
+
+# ---------------------------------------------------------------------------
+# 14. list_files — include/exclude glob filtering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_files_include_filter_by_space():
+    """include=['ENG/*'] keeps only ENG pages."""
+
+    def _page(pid: str, title: str, space: str) -> dict:
+        return {"id": pid, "title": title, "space": {"key": space}, "version": {"number": 1}}
+
+    respx.get(f"{_BASE}/wiki/rest/api/content/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [_page("1", "Intro", "ENG"), _page("2", "Ops Guide", "OPS")],
+                "_links": {},
+            },
+        )
+    )
+    tk = ConfluenceToolkit.from_config(_MIN_CONFIG)
+    files = [fi async for fi in tk.list_files(include=["ENG/*"])]
+    assert len(files) == 1
+    assert files[0].path.startswith("ENG/")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_files_exclude_filter_by_space():
+    """exclude=['OPS/*'] drops OPS pages."""
+
+    def _page(pid: str, title: str, space: str) -> dict:
+        return {"id": pid, "title": title, "space": {"key": space}, "version": {"number": 1}}
+
+    respx.get(f"{_BASE}/wiki/rest/api/content/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [_page("1", "Intro", "ENG"), _page("2", "Ops Guide", "OPS")],
+                "_links": {},
+            },
+        )
+    )
+    tk = ConfluenceToolkit.from_config(_MIN_CONFIG)
+    files = [fi async for fi in tk.list_files(exclude=["OPS/*"])]
+    assert len(files) == 1
+    assert files[0].path.startswith("ENG/")

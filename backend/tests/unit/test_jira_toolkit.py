@@ -9,7 +9,7 @@ import pytest
 import respx
 
 from app.core.sources import registry
-from app.core.sources.jira_toolkit import JiraToolkit, _DEFAULT_JQL
+from app.core.sources.jira_toolkit import JiraToolkit, _DEFAULT_JQL, _sanitize_path_component
 
 _BASE = "https://example.atlassian.net"
 
@@ -229,3 +229,130 @@ def test_build_origin_pointer_with_revision():
 def test_registry_create_returns_jira_toolkit():
     tk = registry.create("jira", _FULL_CONFIG)
     assert isinstance(tk, JiraToolkit)
+
+
+# ---------------------------------------------------------------------------
+# 10. _sanitize_path_component — path traversal sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_path_component_traversal_chars():
+    """Summaries with ../..  path traversal chars produce a safe component."""
+    result = _sanitize_path_component("../../../etc/passwd")
+    assert "/" not in result
+    assert ".." not in result.split("-")  # no ".." segment remains
+
+
+def test_sanitize_path_component_backslash():
+    result = _sanitize_path_component("C:\\Windows\\System32")
+    assert "\\" not in result
+
+
+def test_sanitize_path_component_control_chars():
+    result = _sanitize_path_component("bad\x00name\x1f")
+    assert "\x00" not in result
+    assert "\x1f" not in result
+
+
+def test_sanitize_path_component_empty_result_becomes_untitled():
+    result = _sanitize_path_component("...")
+    assert result == "untitled"
+
+
+def test_sanitize_path_component_truncates_to_80():
+    long_s = "a" * 200
+    assert len(_sanitize_path_component(long_s)) <= 80
+
+
+# ---------------------------------------------------------------------------
+# 11. list_files — path sanitization end-to-end
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_files_sanitizes_traversal_summary():
+    """Issue with summary containing path traversal chars gets a safe path."""
+    respx.get(f"{_BASE}/rest/api/3/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "issues": [
+                    {
+                        "key": "ENG-99",
+                        "fields": {
+                            "summary": "../../../etc/passwd",
+                            "status": {"name": "Open"},
+                            "issuetype": {"name": "Bug"},
+                        },
+                    }
+                ],
+                "total": 1,
+            },
+        )
+    )
+    tk = JiraToolkit.from_config(_MIN_CONFIG)
+    files = [fi async for fi in tk.list_files()]
+    assert len(files) == 1
+    path = files[0].path
+    assert "/" not in path.split(": ", 1)[1], f"slash found in path component: {path!r}"
+    # No '..' segment should survive sanitization
+    for segment in path.split("-"):
+        assert segment != ".."
+
+
+# ---------------------------------------------------------------------------
+# 12. list_files — include/exclude glob filtering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_files_include_filter_by_project():
+    """include=['ENG-*'] keeps only ENG issues."""
+
+    def _issue(key: str, summary: str) -> dict:
+        return {
+            "key": key,
+            "fields": {"summary": summary, "status": {"name": "Open"}, "issuetype": {"name": "Bug"}},
+        }
+
+    respx.get(f"{_BASE}/rest/api/3/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "issues": [_issue("ENG-1", "Bug one"), _issue("OPS-2", "Ops issue")],
+                "total": 2,
+            },
+        )
+    )
+    tk = JiraToolkit.from_config(_MIN_CONFIG)
+    files = [fi async for fi in tk.list_files(include=["ENG-*"])]
+    assert len(files) == 1
+    assert files[0].path.startswith("ENG-1")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_files_exclude_filter():
+    """exclude=['OPS-*'] drops OPS issues."""
+
+    def _issue(key: str, summary: str) -> dict:
+        return {
+            "key": key,
+            "fields": {"summary": summary, "status": {"name": "Open"}, "issuetype": {"name": "Bug"}},
+        }
+
+    respx.get(f"{_BASE}/rest/api/3/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "issues": [_issue("ENG-1", "Bug one"), _issue("OPS-2", "Ops issue")],
+                "total": 2,
+            },
+        )
+    )
+    tk = JiraToolkit.from_config(_MIN_CONFIG)
+    files = [fi async for fi in tk.list_files(exclude=["OPS-*"])]
+    assert len(files) == 1
+    assert files[0].path.startswith("ENG-1")

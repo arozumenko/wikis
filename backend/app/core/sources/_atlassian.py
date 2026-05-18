@@ -7,6 +7,7 @@ toolkit modules stay focused on API shape, not transport concerns.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -24,6 +25,32 @@ logger = logging.getLogger(__name__)
 _REFRESH_URL = "https://auth.atlassian.com/oauth/token"
 _MAX_RATE_LIMIT_RETRIES = 3
 _DEFAULT_RETRY_AFTER = 5  # seconds
+
+
+def _parse_retry_after(value: str | None, default: int) -> int:
+    """Parse a Retry-After header value into an integer number of seconds.
+
+    Handles both integer seconds and HTTP-date forms.  Clamps to [0, 60] so a
+    malicious header cannot force an arbitrarily long sleep.
+    """
+    if not value:
+        return default
+    try:
+        return max(0, min(60, int(value.strip())))
+    except ValueError:
+        # HTTP-date form, e.g. "Mon, 18 May 2026 12:34:56 GMT"
+        try:
+            from datetime import datetime, timezone
+
+            from email.utils import parsedate_to_datetime
+
+            target = parsedate_to_datetime(value)
+            if target is None:
+                return default
+            delta = (target - datetime.now(timezone.utc)).total_seconds()
+            return max(0, min(60, int(delta)))
+        except (TypeError, ValueError):
+            return default
 
 
 class AtlassianClient:
@@ -97,16 +124,26 @@ class AtlassianClient:
                     "refresh_token": self._refresh_token,
                 },
             )
-        except httpx.ConnectError as exc:
-            raise SourceAuthError(f"Atlassian token refresh failed: {exc}") from exc
+        except httpx.TimeoutException as exc:
+            raise SourceAuthError("Atlassian token refresh failed: request timed out") from exc
+        except httpx.RequestError as exc:
+            raise SourceAuthError("Atlassian token refresh failed: network error") from exc
 
         if resp.status_code != 200:
             raise SourceAuthError(
                 f"Atlassian token refresh failed: HTTP {resp.status_code}"
             )
 
-        body = resp.json()
-        self._access_token = body["access_token"]
+        try:
+            body = resp.json()
+        except json.JSONDecodeError as exc:
+            raise SourceAuthError("Atlassian token refresh returned invalid JSON") from exc
+
+        try:
+            self._access_token = body["access_token"]
+        except KeyError as exc:
+            raise SourceAuthError("Atlassian token refresh response missing access_token") from exc
+
         # Atlassian rotates refresh tokens — keep the new one
         if "refresh_token" in body:
             self._refresh_token = body["refresh_token"]
@@ -121,17 +158,25 @@ class AtlassianClient:
 
     @staticmethod
     def _map_error(resp: httpx.Response, path: str) -> None:
-        """Raise the appropriate SourceError for non-2xx status codes."""
-        code = resp.status_code
-        if code == 400:
-            raise SourceConnectionError(
-                f"Bad request (400) for {path} — check CQL/JQL or configuration"
-            )
-        if code == 404:
-            raise SourceNotFoundError(path)
-        if code >= 500:
+        """Raise the appropriate SourceError for any non-2xx status code.
+
+        This method always raises for non-2xx responses so callers never
+        see an error response in the success path.
+        """
+        status = resp.status_code
+        if status < 300:
+            return  # 2xx — success, nothing to do
+        if status >= 500:
             raise SourceUnavailableError(
-                f"Atlassian server error {code} for {path}"
+                f"Atlassian server error {status} for {path}"
+            )
+        if status == 404:
+            raise SourceNotFoundError(path)
+        if status in (401, 403):
+            raise SourceAuthError(f"Atlassian permission denied for {path}")
+        if 400 <= status < 500:
+            raise SourceConnectionError(
+                f"Atlassian {status} for {path}"
             )
 
     # ------------------------------------------------------------------
@@ -171,7 +216,7 @@ class AtlassianClient:
                     raise SourceUnavailableError(
                         f"Atlassian rate limit exceeded after {_MAX_RATE_LIMIT_RETRIES} attempts for {path}"
                     )
-                retry_after = int(resp.headers.get("Retry-After", _DEFAULT_RETRY_AFTER))
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"), _DEFAULT_RETRY_AFTER)
                 logger.warning("Rate limited by Atlassian; waiting %ds (attempt %d)", retry_after, attempt + 1)
                 await asyncio.sleep(retry_after)
                 continue

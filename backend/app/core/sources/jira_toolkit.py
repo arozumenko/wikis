@@ -5,28 +5,53 @@ Uses OAuth 2.0 Bearer auth via AtlassianClient (shared transport layer).
 
 from __future__ import annotations
 
+import fnmatch
 import logging
+import re
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import AsyncIterator
+
+from markdownify import markdownify as _md  # type: ignore[import-untyped]
 
 from app.core.sources._atlassian import AtlassianClient
 from app.core.sources.base import FileContent, FileInfo, OriginPointer, SourceToolkit
 
 logger = logging.getLogger(__name__)
 
-try:
-    from markdownify import markdownify as _md  # type: ignore[import-untyped]
-except ImportError:  # pragma: no cover — markdownify is a core dep; this is a safety net
-
-    def _md(html: str, **kwargs: Any) -> str:  # type: ignore[misc]
-        return html
-
-
 _DEFAULT_JQL = "ORDER BY created DESC"
+
+# Characters not allowed in synthetic path components.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+# Collapse runs of dashes.
+_MULTI_DASH_RE = re.compile(r"-{2,}")
+
+
+def _sanitize_path_component(s: str) -> str:
+    """Sanitize a user-supplied string for use in a synthetic file path.
+
+    - Replaces path separators (``/``, ``\\``), control characters, and the
+      literal two-dot sequence ``..`` with ``-``.
+    - Strips leading/trailing whitespace and dots.
+    - Collapses runs of ``-`` into a single ``-``.
+    - Truncates to 80 characters.
+    - Returns ``"untitled"`` when the result would otherwise be empty.
+    """
+    result = s.replace("/", "-").replace("\\", "-")
+    # Replace ".." as a whole token wherever it appears
+    result = result.replace("..", "-")
+    result = _CONTROL_CHARS_RE.sub("-", result)
+    result = result.strip(". \t\r\n")
+    result = _MULTI_DASH_RE.sub("-", result)
+    result = result[:80].strip("-")
+    return result or "untitled"
 
 
 class JiraToolkit(SourceToolkit):
     """Source adapter for Atlassian Jira Cloud (REST API v3).
+
+    The synthetic path for each issue is ``"{key}: {sanitized_summary}"``.
+    ``include``/``exclude`` glob patterns in :meth:`list_files` are matched
+    against this synthetic path, not against real-world Jira hierarchy.
 
     Args:
         base_url: Tenant root URL, e.g. ``"https://example.atlassian.net"``.
@@ -104,11 +129,16 @@ class JiraToolkit(SourceToolkit):
                 issues = data.get("issues", [])
                 for issue in issues:
                     key = issue["key"]
-                    summary = issue.get("fields", {}).get("summary", key)
-                    # Truncate long summaries so path stays readable
-                    if len(summary) > 80:
-                        summary = summary[:80]
-                    path = f"{key}: {summary}"
+                    raw_summary = issue.get("fields", {}).get("summary", key)
+                    sanitized = _sanitize_path_component(raw_summary)
+                    path = f"{key}: {sanitized}"
+
+                    # Apply include/exclude glob filters on the synthetic path.
+                    if include and not any(fnmatch.fnmatch(path, pat) for pat in include):
+                        continue
+                    if exclude and any(fnmatch.fnmatch(path, pat) for pat in exclude):
+                        continue
+
                     pointer = self.build_origin_pointer(key)
                     yield FileInfo(
                         path=path,

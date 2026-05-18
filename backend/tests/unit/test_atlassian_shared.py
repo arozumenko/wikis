@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 import respx
 
-from app.core.sources._atlassian import AtlassianClient, _REFRESH_URL
+from app.core.sources._atlassian import (
+    AtlassianClient,
+    _DEFAULT_RETRY_AFTER,
+    _REFRESH_URL,
+    _parse_retry_after,
+)
 from app.core.sources.exceptions import (
     SourceAuthError,
     SourceConnectionError,
@@ -247,3 +253,145 @@ def test_token_redaction_filter_masks_access_token(caplog):
     combined = "\n".join(r.getMessage() for r in caplog.records)
     assert "supersecret" not in combined
     assert "***" in combined
+
+
+# ---------------------------------------------------------------------------
+# 9. _map_error — extended status code coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_403_raises_source_auth_error():
+    """403 Forbidden → SourceAuthError (permission denied)."""
+    respx.get(f"{_BASE}/restricted").mock(return_value=httpx.Response(403, json={}))
+    with pytest.raises(SourceAuthError, match="permission denied"):
+        async with _client() as c:
+            await c.get("/restricted")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_422_raises_connection_error():
+    """422 Unprocessable Entity → SourceConnectionError."""
+    respx.get(f"{_BASE}/validate").mock(return_value=httpx.Response(422, json={}))
+    with pytest.raises(SourceConnectionError):
+        async with _client() as c:
+            await c.get("/validate")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_409_raises_connection_error():
+    """409 Conflict → SourceConnectionError."""
+    respx.get(f"{_BASE}/conflict").mock(return_value=httpx.Response(409, json={}))
+    with pytest.raises(SourceConnectionError):
+        async with _client() as c:
+            await c.get("/conflict")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_418_raises_connection_error():
+    """418 I'm a teapot (random 4xx) → SourceConnectionError (catch-all)."""
+    respx.get(f"{_BASE}/teapot").mock(return_value=httpx.Response(418, json={}))
+    with pytest.raises(SourceConnectionError):
+        async with _client() as c:
+            await c.get("/teapot")
+
+
+# ---------------------------------------------------------------------------
+# 10. _parse_retry_after — Retry-After header variants
+# ---------------------------------------------------------------------------
+
+
+def test_parse_retry_after_integer():
+    assert _parse_retry_after("10", _DEFAULT_RETRY_AFTER) == 10
+
+
+def test_parse_retry_after_none_returns_default():
+    assert _parse_retry_after(None, _DEFAULT_RETRY_AFTER) == _DEFAULT_RETRY_AFTER
+
+
+def test_parse_retry_after_empty_string_returns_default():
+    assert _parse_retry_after("", _DEFAULT_RETRY_AFTER) == _DEFAULT_RETRY_AFTER
+
+
+def test_parse_retry_after_invalid_string_returns_default():
+    assert _parse_retry_after("invalid-value", _DEFAULT_RETRY_AFTER) == _DEFAULT_RETRY_AFTER
+
+
+def test_parse_retry_after_http_date_in_past_returns_zero():
+    """An HTTP-date in the past should produce 0 (clamped), not negative."""
+    past_date = "Thu, 01 Jan 2000 00:00:00 GMT"
+    result = _parse_retry_after(past_date, _DEFAULT_RETRY_AFTER)
+    assert result == 0
+
+
+def test_parse_retry_after_http_date_no_crash():
+    """Any valid HTTP-date must not raise — even if it can't be parsed exactly."""
+    result = _parse_retry_after("Mon, 18 May 2026 12:34:56 GMT", _DEFAULT_RETRY_AFTER)
+    # Result is in [0, 60] — exact value depends on when the test runs.
+    assert 0 <= result <= 60
+
+
+def test_parse_retry_after_clamps_large_integer():
+    """Values > 60 are clamped to 60."""
+    assert _parse_retry_after("3600", _DEFAULT_RETRY_AFTER) == 60
+
+
+# ---------------------------------------------------------------------------
+# 11. _refresh — broadened exception handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_refresh_timeout_raises_source_auth_error():
+    """`httpx.TimeoutException` during refresh → `SourceAuthError`."""
+    respx.post(_REFRESH_URL).mock(side_effect=httpx.TimeoutException("timeout"))
+    with pytest.raises(SourceAuthError, match="timed out"):
+        async with _client(
+            access_token="tok", refresh_token="ref", client_id="cid"
+        ) as c:
+            await c._refresh()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_refresh_request_error_raises_source_auth_error():
+    """`httpx.RequestError` during refresh → `SourceAuthError`."""
+    respx.post(_REFRESH_URL).mock(side_effect=httpx.ConnectError("refused"))
+    with pytest.raises(SourceAuthError, match="network error"):
+        async with _client(
+            access_token="tok", refresh_token="ref", client_id="cid"
+        ) as c:
+            await c._refresh()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_refresh_invalid_json_raises_source_auth_error():
+    """Malformed JSON from refresh endpoint → `SourceAuthError`."""
+    respx.post(_REFRESH_URL).mock(
+        return_value=httpx.Response(200, content=b"not-json", headers={"content-type": "application/json"})
+    )
+    with pytest.raises(SourceAuthError, match="invalid JSON"):
+        async with _client(
+            access_token="tok", refresh_token="ref", client_id="cid"
+        ) as c:
+            await c._refresh()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_refresh_missing_access_token_raises_source_auth_error():
+    """Response JSON without `access_token` key → `SourceAuthError`."""
+    respx.post(_REFRESH_URL).mock(
+        return_value=httpx.Response(200, json={"error": "insufficient_scope"})
+    )
+    with pytest.raises(SourceAuthError, match="missing access_token"):
+        async with _client(
+            access_token="tok", refresh_token="ref", client_id="cid"
+        ) as c:
+            await c._refresh()
