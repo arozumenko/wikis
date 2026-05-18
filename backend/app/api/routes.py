@@ -165,15 +165,20 @@ async def scan_source(
 
     All three source types are supported: ``git``, ``confluence``, ``jira``.
 
+    Request shape: ``source_type`` is **required** — it discriminates the
+    typed scope/auth variants (#215). Callers must include it explicitly;
+    omitting it returns 422 (Pydantic ``union_tag_not_found``). Pre-#215
+    callers that relied on the implicit ``"git"`` default need to update.
+
     Errors (no ``responses=`` declaration intentionally — the 400 body
     doesn't match :class:`ErrorResponse`'s top-level shape and the SPA
     codegen would otherwise produce wrong client types.):
 
     * ``400`` — ``{"detail": {"error": <message>, "reachable": <bool>}}``
       for unreachable / auth-fail / invalid-scope / invalid-JQL.
-    * ``422`` — Pydantic validation error when ``source_type`` is not one of
-      ``"git"``, ``"confluence"``, or ``"jira"`` (``Literal`` constraint on
-      :class:`ScanRequest` — the handler is never reached for unknown values).
+    * ``422`` — Pydantic validation error: ``source_type`` missing or not
+      ``"git"`` / ``"confluence"`` / ``"jira"``, or per-variant field
+      validation failed.
 
     TODO(follow-up): rate-limit / tmpdir-exhaustion guard. A malicious
     authenticated user can fan out concurrent scans; each shallow clone

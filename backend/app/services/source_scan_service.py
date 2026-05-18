@@ -88,8 +88,9 @@ class SourceScanService:
             ) from exc
 
     async def _scan_git(self, request: GitScanRequest) -> ScanResponse:
-        # scope and auth are now typed models — Pydantic enforces non-empty
-        # strings and correct field names before we reach this point.
+        # Pydantic enforces `repo_url: str` is present and the right type, but
+        # an *empty* string is still a valid `str` — the guard below is the
+        # actual enforcement layer for non-emptiness (Rio #224 review).
         repo_url = request.scope.repo_url
         if not repo_url:
             raise ScanError("scope.repo_url must be a non-empty string for git scans")
@@ -195,11 +196,12 @@ class SourceScanService:
         render ``"?"``.
 
         scope.space_keys is validated as list[str] by ConfluenceScope; empty
-        list means "all spaces".  The C1 element-type check is still applied
-        here for robustness but Pydantic should already enforce it.
+        list means "all spaces". Per-element non-emptiness is not enforced
+        by Pydantic — the C1 guard below is the actual element-level check.
         """
-        # Typed accessors — Pydantic enforces non-empty base_url + list[str]
-        # space_keys before we reach this point.
+        # Pydantic enforces the field shape (str / list[str]) but accepts
+        # empty strings — the guards below are the actual non-empty checks
+        # (Rio #224 review).
         base_url = request.scope.base_url
         if not base_url:
             raise ScanError(
@@ -275,10 +277,11 @@ class SourceScanService:
         reporting ``reachable=True`` when the preview cannot be computed would
         mislead the wizard into advancing to the next step.
 
-        scope.base_url and scope.jql are validated as non-empty strings by
-        JiraScope before we reach this point.
+        scope.base_url and scope.jql are typed as `str` by JiraScope —
+        Pydantic enforces the type but accepts empty strings. The guards
+        below are the actual non-empty checks (Rio #224 review).
         """
-        # Typed accessors — Pydantic enforces non-empty strings before we get here.
+        # See class docstring on the empty-string semantics.
         base_url = request.scope.base_url
         if not base_url:
             raise ScanError(
