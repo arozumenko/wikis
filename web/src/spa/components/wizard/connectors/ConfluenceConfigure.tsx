@@ -8,8 +8,8 @@
  */
 
 import { Alert, Autocomplete, Box, Chip, TextField, Typography } from '@mui/material';
-import { Link } from 'react-router-dom';
 import { useConnections } from '../../../hooks/useConnections';
+import { AtlassianConnect } from './AtlassianConnect';
 import type { ConfluenceFormState } from '../types';
 
 interface ConfluenceConfigureProps {
@@ -25,18 +25,30 @@ export function ConfluenceConfigure({
   spaceKeysError,
   disabled,
 }: ConfluenceConfigureProps) {
-  const { atlassian } = useConnections();
+  const { atlassian, saveAtlassian } = useConnections();
 
   if (!atlassian) {
     return (
-      <Box sx={{ py: 2 }}>
-        <Alert severity="warning" data-testid="atlassian-connect-warning">
-          No Atlassian connection found.{' '}
-          <Link to="/settings?tab=connections" style={{ color: 'inherit' }}>
-            Connect to Atlassian in Settings
-          </Link>
-          .
+      <Box sx={{ py: 2 }} data-testid="atlassian-connect-warning">
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          No Atlassian connection found. Connect below to continue.
         </Alert>
+        <AtlassianConnect onConnected={() => {
+          // useConnections reads from localStorage reactively — the state
+          // update that populated localStorage happened in the OAuth callback
+          // page; we only need to trigger a re-render here. Calling saveAtlassian
+          // with the current value (if present) or a no-op reload is sufficient.
+          // In practice the storage event fired by the callback page already
+          // updates this hook; this is a belt-and-suspenders trigger.
+          const stored = localStorage.getItem('wikis.connections.atlassian');
+          if (stored) {
+            try {
+              saveAtlassian(JSON.parse(stored));
+            } catch {
+              // ignore malformed entry
+            }
+          }
+        }} />
       </Box>
     );
   }

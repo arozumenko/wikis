@@ -6,8 +6,8 @@
  */
 
 import { Alert, Box, TextField, Typography } from '@mui/material';
-import { Link } from 'react-router-dom';
 import { useConnections } from '../../../hooks/useConnections';
+import { AtlassianConnect } from './AtlassianConnect';
 import type { JiraFormState } from '../types';
 
 interface JiraConfigureProps {
@@ -18,18 +18,24 @@ interface JiraConfigureProps {
 }
 
 export function JiraConfigure({ data, onChange, jqlError, disabled }: JiraConfigureProps) {
-  const { atlassian } = useConnections();
+  const { atlassian, saveAtlassian } = useConnections();
 
   if (!atlassian) {
     return (
-      <Box sx={{ py: 2 }}>
-        <Alert severity="warning" data-testid="atlassian-connect-warning">
-          No Atlassian connection found.{' '}
-          <Link to="/settings?tab=connections" style={{ color: 'inherit' }}>
-            Connect to Atlassian in Settings
-          </Link>
-          .
+      <Box sx={{ py: 2 }} data-testid="atlassian-connect-warning">
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          No Atlassian connection found. Connect below to continue.
         </Alert>
+        <AtlassianConnect onConnected={() => {
+          const stored = localStorage.getItem('wikis.connections.atlassian');
+          if (stored) {
+            try {
+              saveAtlassian(JSON.parse(stored));
+            } catch {
+              // ignore malformed entry
+            }
+          }
+        }} />
       </Box>
     );
   }

@@ -311,7 +311,7 @@ export function AddSourceWizard({
       } else {
         const fresh = await refreshAtlassianIfNeeded();
         if (!fresh) {
-          setSubmitError('Atlassian connection lost. Please reconnect in Settings.');
+          setSubmitError('Atlassian connection lost. Please go back and reconnect.');
           setSubmitting(false);
           return;
         }
