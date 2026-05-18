@@ -2,7 +2,7 @@ import { apiRequest, clearTokenCache, getAuthToken } from './client';
 import type { components } from './types.generated';
 
 type GenerateWikiRequest = components['schemas']['GenerateWikiRequest'];
-type GenerateWikiResponse = components['schemas']['GenerateWikiResponse'];
+export type GenerateWikiResponse = components['schemas']['GenerateWikiResponse'];
 
 // ---------------------------------------------------------------------------
 // Multi-source wiki generation (POST /api/v1/wikis — new API shape, #117/#189)
@@ -45,6 +45,43 @@ export interface GenerateWikiMultiSourceRequest {
 
 export const generateWikiMultiSource = (req: GenerateWikiMultiSourceRequest) =>
   apiRequest<GenerateWikiResponse>('/api/v1/wikis', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  });
+
+// ---------------------------------------------------------------------------
+// Source scan (#207)
+// ---------------------------------------------------------------------------
+//
+// Validates a source configuration and returns a preview without persisting
+// anything server-side. Drives Step 3 of the source-ingestion wizard (#208).
+// Local types declared here until the next openapi-typescript regen pulls
+// them out of the backend schema.
+
+export interface ScanRequest {
+  source_type: WikiSourceType;
+  scope: GitScope | ConfluenceScope | JiraScope;
+  auth: GitAuth | AtlassianAuth;
+}
+
+export interface GitScanPreview {
+  default_branch: string | null;
+  resolved_branch: string;
+  commit_hash: string | null;
+  file_count: number;
+  top_paths: string[];
+  size_bytes: number;
+}
+
+export interface ScanResponse {
+  source_type: string;
+  reachable: boolean;
+  preview: GitScanPreview | null;
+  warnings: string[];
+}
+
+export const scanSource = (req: ScanRequest) =>
+  apiRequest<ScanResponse>('/api/v1/sources/scan', {
     method: 'POST',
     body: JSON.stringify(req),
   });
