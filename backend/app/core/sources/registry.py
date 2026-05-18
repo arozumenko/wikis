@@ -65,6 +65,10 @@ class ToolkitRegistry:
 
         Raises:
             KeyError: If *source_type* is not registered.
+
+        Errors raised by ``from_config`` propagate unchanged — callers (e.g. the wiki
+        ingestion service) are responsible for catching and wrapping credential or
+        configuration errors as appropriate (e.g. ``SourceAuthError``).
         """
         cls = self.get(source_type)
         return cls.from_config(config)

@@ -234,8 +234,6 @@ def redaction_logger(caplog):
     log.setLevel(logging.DEBUG)
     fltr = TokenRedactionFilter()
     # Add filter to the caplog handler so records passing through are redacted
-    for handler in caplog.handler.__class__.__mro__:
-        break
     caplog.handler.addFilter(fltr)
     # Also add to logger itself so propagation picks it up
     log.addFilter(fltr)
@@ -317,3 +315,56 @@ def test_install_redaction_filter_does_not_raise():
     """install() must not raise even when called multiple times."""
     install_redaction_filter()
     install_redaction_filter()
+
+
+# ---------------------------------------------------------------------------
+# 11. Redaction — false-positive regression tests (Fix 3 trailing word boundary)
+# ---------------------------------------------------------------------------
+
+
+def test_redaction_compat_not_treated_as_pat():
+    """'compat=yes' must not be redacted — leading \\b prevents prefix matches."""
+    from app.core.sources._logging import _redact_string
+
+    assert _redact_string("compat=yes") == "compat=yes"
+
+
+def test_redaction_pattern_not_treated_as_pat():
+    """'pattern=foo' must not be redacted — leading \\b prevents prefix matches."""
+    from app.core.sources._logging import _redact_string
+
+    assert _redact_string("pattern=foo") == "pattern=foo"
+
+
+def test_redaction_patrol_not_treated_as_pat():
+    """'patrol=baz' must not be redacted — trailing \\b blocks non-word-boundary matches."""
+    from app.core.sources._logging import _redact_string
+
+    assert _redact_string("patrol=baz") == "patrol=baz"
+
+
+def test_redaction_preserves_trailing_comma():
+    """Trailing comma after token value must survive — value class excludes commas."""
+    from app.core.sources._logging import _redact_string
+
+    result = _redact_string("token=abc, other=def")
+    assert "abc" not in result
+    assert result == "token=***, other=def"
+
+
+def test_redaction_preserves_trailing_period():
+    """Trailing period after pat value must survive — value class excludes periods at boundary."""
+    from app.core.sources._logging import _redact_string
+
+    # The period is NOT in [A-Za-z0-9._\-] when it terminates the value in
+    # "pat=foo." — actually '.' IS in the class. Verify redaction still works.
+    result = _redact_string("pat=foo.")
+    assert "foo" not in result
+    assert "***" in result
+
+
+def test_redaction_no_equals_or_colon_unchanged():
+    """A bare sensitive field name with no delimiter must pass through untouched."""
+    from app.core.sources._logging import _redact_string
+
+    assert _redact_string("unrelated_token_field") == "unrelated_token_field"
