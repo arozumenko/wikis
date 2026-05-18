@@ -18,7 +18,6 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material';
-import { Link } from 'react-router-dom';
 import { useConnections } from '../hooks/useConnections';
 import type { AtlassianAuth, GenerateWikiMultiSourceRequest, WikiSourceType } from '../api/wiki';
 import type { components } from '../api/types.generated';
@@ -376,12 +375,9 @@ function GitTab({
       </FormControl>
 
       {patSource === 'stored' && gitConnections.length === 0 && (
-        <Alert severity="info" sx={{ mt: 1 }}>
-          No stored Git PATs found.{' '}
-          <Link to="/settings?tab=connections" style={{ color: 'inherit' }}>
-            Add a Git PAT in Settings
-          </Link>
-          .
+        <Alert severity="info" sx={{ mt: 1 }} data-testid="git-no-pat-alert">
+          No stored Git PATs found. Switch to &ldquo;Paste token once&rdquo; above to
+          provide a token without storing it.
         </Alert>
       )}
 
@@ -439,11 +435,8 @@ function ConfluenceTab({ spaceKeys, setSpaceKeys, spaceKeysError, disabled }: Co
     return (
       <Box sx={{ py: 2 }}>
         <Alert severity="warning" data-testid="atlassian-connect-warning">
-          No Atlassian connection found.{' '}
-          <Link to="/settings?tab=connections" style={{ color: 'inherit' }}>
-            Connect to Atlassian in Settings
-          </Link>
-          .
+          No Atlassian connection found. Use the &ldquo;Add a source&rdquo; wizard to
+          connect to Atlassian.
         </Alert>
       </Box>
     );
@@ -525,11 +518,8 @@ function JiraTab({ jql, setJql, jqlError, disabled }: JiraTabProps) {
     return (
       <Box sx={{ py: 2 }}>
         <Alert severity="warning" data-testid="atlassian-connect-warning">
-          No Atlassian connection found.{' '}
-          <Link to="/settings?tab=connections" style={{ color: 'inherit' }}>
-            Connect to Atlassian in Settings
-          </Link>
-          .
+          No Atlassian connection found. Use the &ldquo;Add a source&rdquo; wizard to
+          connect to Atlassian.
         </Alert>
       </Box>
     );
@@ -799,11 +789,7 @@ function MultiSourceGenerateForm({
 
       {atlassianMissing && (
         <FormHelperText error sx={{ textAlign: 'center', mt: 0.5 }}>
-          Connect to Atlassian in{' '}
-          <Link to="/settings?tab=connections" style={{ color: 'inherit' }}>
-            Settings
-          </Link>{' '}
-          to continue.
+          Connect to Atlassian via the &ldquo;Add a source&rdquo; wizard to continue.
         </FormHelperText>
       )}
     </Box>

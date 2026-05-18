@@ -8,7 +8,6 @@
  */
 
 import { Alert, Box, FormControl, InputLabel, MenuItem, Select, TextField } from '@mui/material';
-import { Link } from 'react-router-dom';
 import { useConnections } from '../../../hooks/useConnections';
 import type { GitFormState } from '../types';
 
@@ -68,12 +67,9 @@ export function GitConfigure({ data, onChange, urlError, disabled }: GitConfigur
       </FormControl>
 
       {data.patSource === 'stored' && gitConnections.length === 0 && (
-        <Alert severity="info" sx={{ mt: 1 }}>
-          No stored Git PATs found.{' '}
-          <Link to="/settings?tab=connections" style={{ color: 'inherit' }}>
-            Add a Git PAT in Settings
-          </Link>
-          .
+        <Alert severity="info" sx={{ mt: 1 }} data-testid="git-no-pat-alert">
+          No stored Git PATs found. Switch to &ldquo;Paste token once&rdquo; above to
+          provide a token without storing it.
         </Alert>
       )}
 
