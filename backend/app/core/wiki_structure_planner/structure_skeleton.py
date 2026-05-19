@@ -38,9 +38,8 @@ logger = logging.getLogger(__name__)
 ArtifactKind = Literal["symbol", "doc_section", "confluence_page", "jira_issue"]
 ClusterKind = Literal["code", "doc", "confluence", "jira"]
 
-_VALID_ARTIFACT_KINDS: frozenset[str] = frozenset(
-    {"symbol", "doc_section", "confluence_page", "jira_issue"}
-)
+_VALID_ARTIFACT_KINDS: frozenset[str] = frozenset({"symbol", "doc_section", "confluence_page", "jira_issue"})
+_VALID_CLUSTER_KINDS: frozenset[str] = frozenset({"code", "doc", "confluence", "jira"})
 
 # ── Symbol type filter ────────────────────────────────────────────────
 # Architectural types only – no methods, no doc symbols.
@@ -175,12 +174,19 @@ class ArtifactInfo:
     layer: str = ""  # architectural layer (code symbols only; blank otherwise)
     connections: int = 0  # graph degree (code symbols only; 0 otherwise)
     summary: str = ""  # one-line description / first heading paragraph
+    # Source-specific metadata (empty string when irrelevant for the kind).
+    # Adding these now to spare #232–#235 evidence packs from re-parsing
+    # source_path or doing extra fetches; data is already on FileInfo at
+    # scan time (confluence_toolkit.py / jira_toolkit.py).
+    space_key: str = ""  # confluence_page only
+    parent_path: str = ""  # confluence_page only (breadcrumb)
+    issue_type: str = ""  # jira_issue only ("epic", "story", "subtask", …)
+    epic_key: str = ""  # jira_issue only (parent epic for stories/subtasks)
 
     def __post_init__(self) -> None:
         if self.kind not in _VALID_ARTIFACT_KINDS:
             raise ValueError(
-                f"Invalid ArtifactInfo.kind {self.kind!r}. "
-                f"Must be one of: {sorted(_VALID_ARTIFACT_KINDS)}"
+                f"Invalid ArtifactInfo.kind {self.kind!r}. Must be one of: {sorted(_VALID_ARTIFACT_KINDS)}"
             )
 
 
@@ -201,6 +207,10 @@ class Cluster:
     primary_languages: list[str]
     depth_range: tuple[int, int]  # (min_depth, max_depth)
 
+    def __post_init__(self) -> None:
+        if self.kind not in _VALID_CLUSTER_KINDS:
+            raise ValueError(f"Invalid Cluster.kind {self.kind!r}. Must be one of: {sorted(_VALID_CLUSTER_KINDS)}")
+
 
 @dataclass
 class DirCluster(Cluster):
@@ -210,6 +220,14 @@ class DirCluster(Cluster):
     that have not yet been migrated to ``Cluster``.  Internally the symbols
     are stored in ``artifacts`` as ``ArtifactInfo(kind="symbol", …)``; the
     ``symbols`` property reconstructs ``SymbolInfo`` objects on demand.
+
+    Invariant: ``_symbols`` and ``artifacts`` hold parallel views of the
+    same data — ``total_symbols == total_artifacts == len(_symbols) ==
+    len(artifacts)``. The class assumes no post-construction mutation; if
+    the caller appends to either list, the views diverge. Both views are
+    retained so legacy ``.symbols`` callers keep typed access to
+    ``SymbolInfo`` (with ``type`` and full ``docstring``) without round-
+    tripping through the lossier ``ArtifactInfo``.
     """
 
     # Stored separately so existing code that reads .symbols still works.

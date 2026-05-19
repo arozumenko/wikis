@@ -22,6 +22,7 @@ from app.core.wiki_structure_planner.structure_skeleton import (
 
 # ── ArtifactInfo construction ─────────────────────────────────────────────────
 
+
 class TestArtifactInfoConstruction:
     def test_symbol_kind(self):
         a = ArtifactInfo(
@@ -92,8 +93,43 @@ class TestArtifactInfoConstruction:
         assert a.connections == 0
         assert a.summary == ""
 
+    def test_confluence_metadata_fields(self):
+        a = ArtifactInfo(
+            kind="confluence_page",
+            name="Auth Guide",
+            source_path="exported/auth.md",
+            space_key="ENG",
+            parent_path="Engineering / Security",
+        )
+        assert a.space_key == "ENG"
+        assert a.parent_path == "Engineering / Security"
+        # Jira-only fields stay empty for confluence
+        assert a.issue_type == ""
+        assert a.epic_key == ""
+
+    def test_jira_metadata_fields(self):
+        a = ArtifactInfo(
+            kind="jira_issue",
+            name="PROJ-123",
+            source_path="exported/PROJ-123.md",
+            issue_type="story",
+            epic_key="PROJ-42",
+        )
+        assert a.issue_type == "story"
+        assert a.epic_key == "PROJ-42"
+        assert a.space_key == ""
+        assert a.parent_path == ""
+
+    def test_metadata_fields_default_to_empty_for_code(self):
+        a = ArtifactInfo(kind="symbol", name="Foo", source_path="src/foo.py")
+        assert a.space_key == ""
+        assert a.parent_path == ""
+        assert a.issue_type == ""
+        assert a.epic_key == ""
+
 
 # ── Cluster construction ──────────────────────────────────────────────────────
+
 
 class TestClusterConstruction:
     def _make_symbol_artifact(self, name: str = "Foo", path: str = "src/foo.py") -> ArtifactInfo:
@@ -158,10 +194,16 @@ class TestClusterConstruction:
         assert c.kind == "confluence"
 
     def test_jira_cluster_kind(self):
-        arts = [ArtifactInfo(
-            kind="jira_issue", name="PROJ-1", source_path="jira/PROJ-1.md",
-            layer="", connections=0, summary="",
-        )]
+        arts = [
+            ArtifactInfo(
+                kind="jira_issue",
+                name="PROJ-1",
+                source_path="jira/PROJ-1.md",
+                layer="",
+                connections=0,
+                summary="",
+            )
+        ]
         c = Cluster(
             cluster_id=4,
             kind="jira",
@@ -176,18 +218,26 @@ class TestClusterConstruction:
     def test_cluster_dirs_preserved(self):
         arts = [self._make_symbol_artifact()]
         c = Cluster(
-            cluster_id=1, kind="code", dirs=["a", "b"],
-            artifacts=arts, total_artifacts=1,
-            primary_languages=["py"], depth_range=(0, 1),
+            cluster_id=1,
+            kind="code",
+            dirs=["a", "b"],
+            artifacts=arts,
+            total_artifacts=1,
+            primary_languages=["py"],
+            depth_range=(0, 1),
         )
         assert c.dirs == ["a", "b"]
 
     def test_cluster_depth_range(self):
         arts = [self._make_symbol_artifact()]
         c = Cluster(
-            cluster_id=1, kind="code", dirs=["a/b/c"],
-            artifacts=arts, total_artifacts=1,
-            primary_languages=["py"], depth_range=(2, 2),
+            cluster_id=1,
+            kind="code",
+            dirs=["a/b/c"],
+            artifacts=arts,
+            total_artifacts=1,
+            primary_languages=["py"],
+            depth_range=(2, 2),
         )
         assert c.depth_range == (2, 2)
 
@@ -198,16 +248,34 @@ class TestClusterConstruction:
             self._make_doc_artifact(),
         ]
         c = Cluster(
-            cluster_id=5, kind="code", dirs=["src"],
-            artifacts=arts, total_artifacts=2,
-            primary_languages=["py"], depth_range=(0, 0),
+            cluster_id=5,
+            kind="code",
+            dirs=["src"],
+            artifacts=arts,
+            total_artifacts=2,
+            primary_languages=["py"],
+            depth_range=(0, 0),
         )
         kinds = {a.kind for a in c.artifacts}
         assert "symbol" in kinds
         assert "doc_section" in kinds
 
+    def test_invalid_cluster_kind_raises(self):
+        arts = [self._make_symbol_artifact()]
+        with pytest.raises(ValueError, match="Invalid Cluster.kind"):
+            Cluster(
+                cluster_id=99,
+                kind="typo",  # type: ignore[arg-type]
+                dirs=["src"],
+                artifacts=arts,
+                total_artifacts=1,
+                primary_languages=["py"],
+                depth_range=(0, 0),
+            )
+
 
 # ── DirCluster backwards-compat alias ────────────────────────────────────────
+
 
 class TestDirClusterBackwardsCompat:
     """DirCluster must still be importable and constructible for callers
@@ -215,8 +283,12 @@ class TestDirClusterBackwardsCompat:
 
     def _make_sym(self) -> SymbolInfo:
         return SymbolInfo(
-            name="Foo", type="class", rel_path="src/foo.py",
-            layer="core_type", connections=2, docstring="",
+            name="Foo",
+            type="class",
+            rel_path="src/foo.py",
+            layer="core_type",
+            connections=2,
+            docstring="",
         )
 
     def test_dircluster_is_importable(self):
@@ -283,27 +355,44 @@ class TestDirClusterBackwardsCompat:
 
 # ── StructureSkeleton.clusters ────────────────────────────────────────────────
 
+
 class TestStructureSkeletonClusters:
     def _make_code_cluster(self, cid: int = 1) -> Cluster:
         art = ArtifactInfo(
-            kind="symbol", name=f"Cls{cid}", source_path=f"src/mod{cid}.py",
-            layer="core_type", connections=1, summary="",
+            kind="symbol",
+            name=f"Cls{cid}",
+            source_path=f"src/mod{cid}.py",
+            layer="core_type",
+            connections=1,
+            summary="",
         )
         return Cluster(
-            cluster_id=cid, kind="code", dirs=[f"src/mod{cid}"],
-            artifacts=[art], total_artifacts=1,
-            primary_languages=["py"], depth_range=(1, 1),
+            cluster_id=cid,
+            kind="code",
+            dirs=[f"src/mod{cid}"],
+            artifacts=[art],
+            total_artifacts=1,
+            primary_languages=["py"],
+            depth_range=(1, 1),
         )
 
     def _make_doc_cluster(self, cid: int = 10) -> Cluster:
         art = ArtifactInfo(
-            kind="doc_section", name="Intro", source_path=f"docs/intro{cid}.md",
-            layer="", connections=0, summary="",
+            kind="doc_section",
+            name="Intro",
+            source_path=f"docs/intro{cid}.md",
+            layer="",
+            connections=0,
+            summary="",
         )
         return Cluster(
-            cluster_id=cid, kind="doc", dirs=["docs"],
-            artifacts=[art], total_artifacts=1,
-            primary_languages=[], depth_range=(0, 0),
+            cluster_id=cid,
+            kind="doc",
+            dirs=["docs"],
+            artifacts=[art],
+            total_artifacts=1,
+            primary_languages=[],
+            depth_range=(0, 0),
         )
 
     def test_skeleton_accepts_clusters_list(self):
@@ -353,12 +442,20 @@ class TestStructureSkeletonClusters:
     def test_skeleton_code_clusters_still_works(self):
         """Existing code that passes code_clusters= still works."""
         sym = SymbolInfo(
-            name="X", type="class", rel_path="src/x.py",
-            layer="core_type", connections=1, docstring="",
+            name="X",
+            type="class",
+            rel_path="src/x.py",
+            layer="core_type",
+            connections=1,
+            docstring="",
         )
         dc = DirCluster(
-            cluster_id=1, dirs=["src"], symbols=[sym],
-            total_symbols=1, primary_languages=["py"], depth_range=(0, 0),
+            cluster_id=1,
+            dirs=["src"],
+            symbols=[sym],
+            total_symbols=1,
+            primary_languages=["py"],
+            depth_range=(0, 0),
         )
         skel = StructureSkeleton(
             code_clusters=[dc],
