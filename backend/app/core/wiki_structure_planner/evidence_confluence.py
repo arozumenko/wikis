@@ -44,12 +44,12 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..parsers.markdown_chunker import Chunk, chunk_markdown
+from ..parsers.markdown_chunker import chunk_markdown
 from ._evidence_utils import (
-    TOC_FENCE_RE as _TOC_FENCE_RE,
     collect_attachments,
     extract_first_paragraph,
     extract_toc_from_text,
+    mask_code_fences,
     safe_join,
 )
 from .structure_skeleton import Cluster
@@ -303,7 +303,7 @@ def _process_page(
     if frontmatter:
         title = str(frontmatter.get("title", "")).strip()
     if not title:
-        masked_body = _TOC_FENCE_RE.sub(lambda m: " " * (m.end() - m.start()), body)
+        masked_body = mask_code_fences(body)
         h1_m = re.search(r"^# (.+)$", masked_body, re.MULTILINE)
         if h1_m:
             title = h1_m.group(1).strip()

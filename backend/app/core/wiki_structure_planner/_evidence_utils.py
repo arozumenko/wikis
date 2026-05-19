@@ -7,6 +7,7 @@ into a single authoritative location.
 Public API
 ----------
 safe_join(root, rel_path)                      -> str | None
+mask_code_fences(text)                         -> str
 extract_toc_from_text(md_text, max_entries=20) -> list[str]
 extract_first_paragraph(chunks, cap=200)        -> str
 collect_attachments(chunks)                     -> list[str]
@@ -80,6 +81,28 @@ def safe_join(root: str, rel_path: str) -> str | None:
         return None
 
 
+# ── Code-fence masking ────────────────────────────────────────────────────────
+
+
+def mask_code_fences(text: str) -> str:
+    """Replace fenced-code-block contents with spaces, preserving offsets.
+
+    Returned string has the same length as the input; the leading ``` / ~~~,
+    the body, and the trailing fence are all replaced with spaces. Lets
+    callers run heading or link regexes on the masked text without picking up
+    matches that live inside code blocks, while leaving offsets valid for
+    splicing back into the original.
+
+    Handles unclosed fences via the ``\\Z`` alternative — important for
+    LLM-truncated input.
+    """
+
+    def _blank(m: re.Match[str]) -> str:
+        return " " * (m.end() - m.start())
+
+    return TOC_FENCE_RE.sub(_blank, text)
+
+
 # ── TOC extraction ────────────────────────────────────────────────────────────
 
 
@@ -112,10 +135,7 @@ def extract_toc_from_text(md_text: str, max_entries: int = 20) -> list[str]:
         Heading names in document order, H1 and H2 only, at most *max_entries*.
     """
 
-    def _blank(m: re.Match[str]) -> str:
-        return " " * (m.end() - m.start())
-
-    masked = TOC_FENCE_RE.sub(_blank, md_text)
+    masked = mask_code_fences(md_text)
     toc: list[str] = []
     for m in TOC_HEADING_RE.finditer(masked):
         heading = m.group(2).strip()

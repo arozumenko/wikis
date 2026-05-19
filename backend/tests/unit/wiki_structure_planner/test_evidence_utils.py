@@ -11,19 +11,16 @@ which write a tiny temp tree.
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
 import pytest
 
+from app.core.parsers.markdown_chunker import Chunk
 from app.core.wiki_structure_planner._evidence_utils import (
     collect_attachments,
     extract_first_paragraph,
     extract_toc_from_text,
+    mask_code_fences,
     safe_join,
 )
-from app.core.parsers.markdown_chunker import Chunk
-
 
 # ── safe_join ─────────────────────────────────────────────────────────────────
 
@@ -72,6 +69,51 @@ class TestSafeJoin:
         # An absolute rel_path should always be rejected regardless of root
         result = safe_join(str(tmp_path), "/absolute/path")
         assert result is None
+
+
+# ── mask_code_fences ──────────────────────────────────────────────────────────
+
+
+class TestMaskCodeFences:
+    def test_preserves_length(self):
+        md = "Hello\n```\ncode here\n```\nWorld"
+        masked = mask_code_fences(md)
+        assert len(masked) == len(md)
+
+    def test_fenced_content_replaced_with_spaces(self):
+        md = "Outside\n```bash\n# install\necho hi\n```\nAfter"
+        masked = mask_code_fences(md)
+        # Non-fence text preserved
+        assert "Outside" in masked
+        assert "After" in masked
+        # Fence body must be blanked — `# install` should not survive as a
+        # potential heading match.
+        assert "# install" not in masked
+        # Offsets are preserved so positions inside the fence are still valid
+        # to splice against the original text.
+        opening = md.index("```")
+        closing = md.rindex("```") + 3
+        assert masked[opening:closing].strip() == ""
+
+    def test_unclosed_fence_masks_to_eof(self):
+        # LLM-truncated input: fence with no closing.
+        md = "Real heading\n```\n# fake heading inside fence\nno close..."
+        masked = mask_code_fences(md)
+        assert "Real heading" in masked
+        # Everything after the opening fence is masked.
+        opening = md.index("```")
+        assert masked[opening:].strip() == ""
+
+    def test_tilde_fences_handled(self):
+        md = "Before\n~~~\n# inside\n~~~\nAfter"
+        masked = mask_code_fences(md)
+        assert "Before" in masked
+        assert "After" in masked
+        assert "# inside" not in masked
+
+    def test_no_fences_is_identity(self):
+        md = "# Real Heading\n\nProse with no code blocks at all."
+        assert mask_code_fences(md) == md
 
 
 # ── extract_toc_from_text ──────────────────────────────────────────────────────
