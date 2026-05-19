@@ -320,16 +320,59 @@ def _inject_from_skeleton(spec: PageSpec, cluster: Cluster) -> None:
 def _fallback_spec(cluster: Cluster, note: str) -> tuple[PageSpec, str]:
     """Synthesise a minimal PageSpec when the LLM fails for a cluster.
 
+    Pulls fallback wording from the cluster's directory list, artifact names,
+    and source paths so the downstream writer never receives an empty
+    ``description`` or empty ``retrieval_query``.  An empty retrieval query
+    would yield no retrieval context and the writer would either hallucinate
+    or produce thin content.
+
     Returns:
         (spec, human-readable note explaining the fallback)
     """
-    dir_leaf = cluster.dirs[0].rsplit("/", 1)[-1] if cluster.dirs else "misc"
+    dirs = list(cluster.dirs)
+    dir_leaf = dirs[0].rsplit("/", 1)[-1] if dirs else "misc"
     title = f"{dir_leaf.replace('_', ' ').replace('-', ' ').title()} Components"
+
+    # Build description with graceful degradation:
+    # 1. dirs → "Components in foo/bar, baz"
+    # 2. else artifact names → "Components: Foo, Bar, Baz"
+    # 3. else minimal → "Cluster <id> components ({kind})"
+    if dirs:
+        description = f"Components in {', '.join(dirs[:3])}"
+    elif cluster.artifacts:
+        names = [a.name for a in cluster.artifacts[:3] if a.name]
+        if names:
+            description = f"Components: {', '.join(names)}"
+        else:
+            description = f"Cluster {cluster.cluster_id} components ({cluster.kind})"
+    else:
+        description = f"Cluster {cluster.cluster_id} components ({cluster.kind})"
+
+    # Build retrieval_query with graceful degradation:
+    # 1. dirs (first 4)
+    # 2. else artifact names (first 4)
+    # 3. else artifact source_path leaves (first 4)
+    # 4. else cluster kind keyword (never empty)
+    query_terms: list[str] = []
+    if dirs:
+        query_terms = dirs[:4]
+    elif cluster.artifacts:
+        query_terms = [a.name for a in cluster.artifacts[:4] if a.name]
+        if not query_terms:
+            query_terms = [
+                a.source_path.rsplit("/", 1)[-1]
+                for a in cluster.artifacts[:4]
+                if a.source_path
+            ]
+    if not query_terms:
+        query_terms = [cluster.kind, "components"]
+    retrieval_query = " ".join(t for t in query_terms if t)
+
     spec = PageSpec(
         cluster_id=cluster.cluster_id,
         title=title,
-        description=f"Components in {', '.join(cluster.dirs[:3])}",
-        retrieval_query=" ".join(cluster.dirs[:4]),
+        description=description,
+        retrieval_query=retrieval_query,
     )
     _inject_from_skeleton(spec, cluster)
     return spec, note
@@ -342,7 +385,6 @@ def _plan_cluster(
     cluster: Cluster,
     pack: EvidencePack | None,
     *,
-    llm: BaseChatModel,
     llm_with_tools: Any,
     repo_root: str,
     budget_tracker: list[int],  # [used, total] — mutated in-place
@@ -353,8 +395,8 @@ def _plan_cluster(
     Args:
         cluster: Cluster to plan.
         pack: Pre-fetched evidence pack or ``None``.
-        llm: Base chat model (used only as fallback if tools not needed).
-        llm_with_tools: LLM bound with tool schemas.
+        llm_with_tools: LLM bound with tool schemas (or the bare LLM when
+            the provider does not support ``bind_tools``).
         repo_root: Repo root for tool IO.
         budget_tracker: ``[used_count, total_budget]`` list mutated in-place.
         notes: Accumulated plan notes list, mutated in-place.
@@ -390,16 +432,40 @@ def _plan_cluster(
             content = response.content if isinstance(response.content, str) else str(response.content)
             obj = _extract_json_object(content)
             if obj is not None:
+                title = (obj.get("title") or "").strip()
+                description = (obj.get("description") or "").strip()
+                retrieval_query = (obj.get("retrieval_query") or "").strip()
+
+                # Reject specs missing any load-bearing field — the downstream
+                # writer agent needs ALL three (title to name the page,
+                # description for the TOC, retrieval_query to fetch context).
+                # An empty retrieval_query yields no retrieval evidence and
+                # forces the writer to either hallucinate or produce thin
+                # content, so we synthesise a deterministic fallback instead.
+                missing: list[str] = []
+                if not title:
+                    missing.append("title")
+                if not description:
+                    missing.append("description")
+                if not retrieval_query:
+                    missing.append("retrieval_query")
+                if missing:
+                    note = (
+                        f"cluster {cluster.cluster_id}: LLM response missing "
+                        f"{', '.join(missing)} — using fallback spec"
+                    )
+                    notes.append(note)
+                    logger.warning("[PLANNER] %s", note)
+                    spec, _ = _fallback_spec(cluster, note)
+                    return spec
+
                 spec = PageSpec(
                     cluster_id=cluster.cluster_id,
-                    title=obj.get("title", ""),
-                    description=obj.get("description", ""),
-                    retrieval_query=obj.get("retrieval_query", ""),
+                    title=title,
+                    description=description,
+                    retrieval_query=retrieval_query,
                 )
                 _inject_from_skeleton(spec, cluster)
-                if not spec.title:
-                    spec, note = _fallback_spec(cluster, f"cluster {cluster.cluster_id}: empty title in LLM response")
-                    notes.append(note)
                 return spec
 
             # LLM returned unparseable text
@@ -441,6 +507,20 @@ def _plan_cluster(
                     name=tool_name or "unknown",
                 )
             )
+
+        # After every batch of tool results, if the LLM keeps spending and
+        # has now drained the global budget, drop into the fallback path
+        # rather than spending another expensive LLM round that can no
+        # longer use tools anyway.
+        if budget_tracker[0] >= budget_tracker[1]:
+            note = (
+                f"cluster {cluster.cluster_id}: tool budget drained "
+                f"after a tool-call batch — using fallback spec"
+            )
+            notes.append(note)
+            logger.warning("[PLANNER] %s", note)
+            spec, _ = _fallback_spec(cluster, note)
+            return spec
 
     # Max rounds reached without a clean answer — fallback
     note = f"cluster {cluster.cluster_id}: exceeded tool rounds — using fallback spec"
@@ -520,7 +600,6 @@ def _run_planner_core(
             spec = _plan_cluster(
                 cluster=cluster,
                 pack=pack,
-                llm=base_llm,
                 llm_with_tools=llm_with_tools,
                 repo_root=repo_root,
                 budget_tracker=budget_tracker,

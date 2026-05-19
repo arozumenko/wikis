@@ -636,3 +636,122 @@ class TestBackwardsCompatCodeClusters:
         )
         assert len(pages) == 1
         assert report.pages_emitted == 1
+
+
+# ── LLM raises (Rio #268 1st pass) ───────────────────────────────────────────
+
+
+class TestLLMException:
+    """If the LLM invocation raises, the planner must catch it and synthesise
+    a fallback PageSpec rather than propagating the exception.  Without this
+    test the broad ``except Exception`` in _run_planner_core was uncovered."""
+
+    def test_llm_exception_yields_fallback_spec_with_note(self, tmp_path):
+        class RaisingLLM(FakeLLM):
+            def _generate(self, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("simulated upstream LLM failure")
+
+        cluster = _make_cluster(cluster_id=1, kind="code", dirs=["src/auth"])
+        skeleton = _make_skeleton([cluster])
+        pack = _make_pack(cluster_id=1)
+        llm = RaisingLLM(responses=[], record_calls=[])
+
+        pages, report = run_planner_with_report(
+            skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path)
+        )
+
+        assert len(pages) == 1
+        spec = pages[0]
+        assert spec.cluster_id == 1
+        assert spec.title  # non-empty title from fallback
+        assert spec.description
+        assert spec.retrieval_query
+        notes = report.notes
+        assert any("LLM call failed" in n for n in notes), (
+            f"expected an 'LLM call failed' note, got: {notes}"
+        )
+
+
+# ── Fallback spec wording (Rio #268 1st pass) ────────────────────────────────
+
+
+class TestFallbackSpecAlwaysHasContent:
+    """``_fallback_spec`` must never emit an empty description or empty
+    retrieval_query — both are load-bearing for the downstream writer."""
+
+    def test_fallback_with_empty_dirs_uses_artifact_names(self, tmp_path):
+        # No dirs (e.g. jira cluster); has artifact names.
+        art = _make_artifact(name="EPIC-1", source_path="EPIC-1.md")
+        cluster = _make_cluster(cluster_id=7, kind="jira", dirs=[], artifacts=[art])
+        skeleton = _make_skeleton([cluster])
+
+        class FailLLM(FakeLLM):
+            def _generate(self, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("force fallback")
+
+        llm = FailLLM(responses=[], record_calls=[])
+        pages, _report = run_planner_with_report(
+            skeleton, {}, llm=llm, repo_root=str(tmp_path)
+        )
+        assert len(pages) == 1
+        spec = pages[0]
+        assert spec.description and spec.description.strip()
+        assert spec.retrieval_query and spec.retrieval_query.strip()
+
+    def test_fallback_with_no_dirs_and_no_named_artifacts(self, tmp_path):
+        art = _make_artifact(name="", source_path="x.md")
+        cluster = _make_cluster(cluster_id=9, kind="confluence", dirs=[], artifacts=[art])
+        skeleton = _make_skeleton([cluster])
+
+        class FailLLM(FakeLLM):
+            def _generate(self, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("force fallback")
+
+        llm = FailLLM(responses=[], record_calls=[])
+        pages, _report = run_planner_with_report(
+            skeleton, {}, llm=llm, repo_root=str(tmp_path)
+        )
+        assert pages[0].description and pages[0].description.strip()
+        assert pages[0].retrieval_query and pages[0].retrieval_query.strip()
+
+
+# ── Empty-field LLM response (Rio #268 1st pass) ─────────────────────────────
+
+
+class TestEmptyFieldRejection:
+    """When the LLM returns valid JSON but with empty title/description/
+    retrieval_query, the planner must fall back rather than emit a half-empty
+    spec to the writer."""
+
+    def test_empty_retrieval_query_triggers_fallback(self, tmp_path):
+        cluster = _make_cluster(cluster_id=1, kind="code", dirs=["src/x"])
+        skeleton = _make_skeleton([cluster])
+        pack = _make_pack(cluster_id=1)
+
+        bad_response = '{"title": "X Components", "description": "Does X.", "retrieval_query": ""}'
+        llm = FakeLLM(responses=[bad_response], record_calls=[])
+        pages, report = run_planner_with_report(
+            skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path)
+        )
+
+        assert len(pages) == 1
+        spec = pages[0]
+        # Fallback retrieval_query must be non-empty.
+        assert spec.retrieval_query.strip()
+        assert any("missing" in n and "retrieval_query" in n for n in report.notes), (
+            f"expected a missing-field note: {report.notes}"
+        )
+
+    def test_empty_description_triggers_fallback(self, tmp_path):
+        cluster = _make_cluster(cluster_id=1, kind="code", dirs=["src/x"])
+        skeleton = _make_skeleton([cluster])
+        pack = _make_pack(cluster_id=1)
+
+        bad_response = '{"title": "X", "description": "", "retrieval_query": "x y z"}'
+        llm = FakeLLM(responses=[bad_response], record_calls=[])
+        pages, report = run_planner_with_report(
+            skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path)
+        )
+
+        assert pages[0].description.strip()
+        assert any("missing" in n and "description" in n for n in report.notes)
