@@ -11,6 +11,7 @@ mask_code_fences(text)                         -> str
 extract_toc_from_text(md_text, max_entries=20) -> list[str]
 extract_first_paragraph(chunks, cap=200)        -> str
 collect_attachments(chunks)                     -> list[str]
+parse_frontmatter(text, *, inline_lists, strip_quotes) -> tuple[dict, str]
 
 Design notes
 ------------
@@ -24,6 +25,10 @@ Design notes
 * ``extract_first_paragraph`` and ``collect_attachments`` were identical in
   evidence_md.py and evidence_confluence.py; the ``cap`` parameter replaces
   the per-module ``_FIRST_PARA_CHAR_CAP`` constant (default 200 matches both).
+* ``parse_frontmatter`` consolidates the three private ``_parse_frontmatter``
+  implementations from evidence_md.py, evidence_confluence.py, and
+  evidence_jira.py (#261). Feature flags preserve each caller's prior
+  behaviour — see the function docstring for the per-caller flag table.
 """
 
 from __future__ import annotations
@@ -32,6 +37,15 @@ import os
 import re
 
 from ..parsers.markdown_chunker import Chunk
+
+# ── Frontmatter regex constants ───────────────────────────────────────────────
+
+# Opening/closing ``---`` on its own line (optional trailing whitespace).
+_FM_OPEN_RE = re.compile(r"^---\s*$")
+# ``key: value`` pair — key starts with letter or underscore.
+_FM_KEY_VALUE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$")
+# Multi-line list item: any positive indentation followed by ``- text``.
+_FM_LIST_ITEM_RE = re.compile(r"^\s+-\s+(.+)$")
 
 # ── TOC extraction regexes ───────────────────────────────────────────────────
 # Match H1/H2 ATX headings with optional trailing hashes (``## Heading ##``).
@@ -43,6 +57,215 @@ TOC_HEADING_RE = re.compile(r"^(#{1,2})\s+(.*?)(?:\s+#+)?\s*$", re.MULTILINE)
 # unclosed fence at EOF — replaces the entire tail so headings inside are
 # still masked correctly.
 TOC_FENCE_RE = re.compile(r"```[\s\S]*?(?:```|\Z)|~~~[\s\S]*?(?:~~~|\Z)")
+
+
+# ── Frontmatter helpers ───────────────────────────────────────────────────────
+
+
+def _strip_yaml_quotes(value: str) -> str:
+    """Strip optional surrounding single/double quotes from a YAML scalar.
+
+    Used when ``strip_quotes=True`` is passed to ``parse_frontmatter``.
+    Jira frontmatter generators frequently quote strings containing special
+    characters; without stripping, the quotes leak into titles/labels/etc.
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_inline_list(value: str) -> list[str] | None:
+    """Parse an inline YAML list like ``[a, "b", 'c']``.
+
+    Returns ``None`` if *value* is not wrapped in ``[…]``.
+    Called only when ``inline_lists=True`` is passed to ``parse_frontmatter``.
+
+    Uses a small state machine so that commas inside quoted strings are treated
+    as literal characters rather than separators.  Both single and double quotes
+    are supported; a quote is closed only by its matching opener.
+
+    Tracks whether each item was *started* (saw a non-whitespace character or
+    an opening quote) so an explicit empty-quoted item like ``["", "x"]``
+    yields ``["", "x"]`` rather than ``["x"]``. Bare whitespace between
+    commas — like ``[a, , b]`` — is treated as no item and dropped.
+
+    Note: quote stripping of the extracted item strings is NOT performed here;
+    callers that pass ``strip_quotes=True`` to ``parse_frontmatter`` apply
+    ``_strip_yaml_quotes`` separately.
+    """
+    if not (value.startswith("[") and value.endswith("]")):
+        return None
+    inner = value[1:-1].strip()
+    if not inner:
+        return []
+    items: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    started = False  # an item exists once we see a non-space char or an opening quote
+    for ch in inner:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                current.append(ch)
+        elif ch in ("'", '"'):
+            quote = ch
+            started = True
+        elif ch == ",":
+            if started:
+                items.append("".join(current).strip())
+            current = []
+            started = False
+        elif ch.isspace():
+            # Whitespace contributes only if an item is already in progress.
+            if started:
+                current.append(ch)
+        else:
+            current.append(ch)
+            started = True
+    if started:
+        items.append("".join(current).strip())
+    return items
+
+
+def parse_frontmatter(
+    text: str,
+    *,
+    inline_lists: bool = False,
+    strip_quotes: bool = False,
+) -> tuple[dict, str]:
+    """Parse YAML-ish frontmatter from the top of *text*.
+
+    Returns ``(frontmatter_dict, body_text_after_frontmatter)``.
+
+    If no valid frontmatter block is found (no opening ``---``, or no closing
+    ``---``), returns ``({}, text)`` unchanged.
+
+    Handles:
+    - ``key: scalar_value`` pairs.
+    - Multi-line YAML list syntax (``  - item`` lines after an empty-value key).
+    - Blank lines inside a list block terminate the list for that key (and
+      clear ``current_key`` so a subsequent list item is treated as orphaned
+      rather than appended to the flushed list — per Rio's #252 fix).
+
+    Parameters
+    ----------
+    text : str
+        Raw document text, potentially starting with a ``---`` fence.
+    inline_lists : bool
+        When ``True``, recognise ``key: [a, "b", 'c']`` inline list syntax
+        (used by Jira scanner output).  When ``False`` (default), such values
+        are stored as literal scalar strings (md/Confluence behaviour).
+    strip_quotes : bool
+        When ``True``, strip matching surrounding single/double quotes from
+        scalar values and multi-line list items (used by Jira).  When
+        ``False`` (default), raw values are preserved (md/Confluence).
+
+    Per-caller flag table (#261)
+    ----------------------------
+    Caller              inline_lists  strip_quotes
+    evidence_md.py      False         False
+    evidence_confluence False         False
+    evidence_jira.py    True          True
+
+    Returns
+    -------
+    tuple[dict, str]
+        ``(frontmatter_dict, body_text)``
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return {}, text
+
+    first_line = lines[0].rstrip("\n").rstrip("\r")
+    if not _FM_OPEN_RE.match(first_line):
+        return {}, text
+
+    fm: dict = {}
+    current_key: str | None = None
+    current_list: list[str] | None = None
+    close_idx: int | None = None
+
+    for i, raw_line in enumerate(lines[1:], start=1):
+        line = raw_line.rstrip("\n").rstrip("\r")
+
+        # Closing ``---``
+        if _FM_OPEN_RE.match(line):
+            if current_key is not None and current_list is not None:
+                fm[current_key] = current_list
+            close_idx = i
+            break
+
+        # List item: any indented ``- item`` line whose preceding key context
+        # is still active. If the current value is a scalar, the prior parsers
+        # upgrade it to a list (drop the scalar, start fresh). This preserves
+        # the Confluence/md behaviour where:
+        #     key: scalar
+        #       - first
+        #       - second
+        # produces ``key: ["first", "second"]``.
+        list_m = _FM_LIST_ITEM_RE.match(line)
+        if list_m and current_key is not None:
+            if current_list is None:
+                current_list = []
+                fm.pop(current_key, None)
+                fm[current_key] = current_list
+            item = list_m.group(1).strip()
+            if strip_quotes:
+                item = _strip_yaml_quotes(item)
+            current_list.append(item)
+            continue
+
+        # Key: value pair
+        kv_m = _FM_KEY_VALUE_RE.match(line)
+        if kv_m:
+            if current_key is not None and current_list is not None:
+                fm[current_key] = current_list
+                current_list = None
+            current_key = kv_m.group(1)
+            val = kv_m.group(2).strip()
+
+            if val == "":
+                # Empty value — next lines may be list items
+                current_list = []
+                # Pre-store the list reference so it is visible during
+                # iteration (mirrors Jira parser's behaviour of assigning
+                # ``fields[key] = current_list`` immediately).
+                fm[current_key] = current_list
+            elif inline_lists and (inline := _parse_inline_list(val)) is not None:
+                # Inline list syntax: ``key: [a, b, c]``. Inline lists are
+                # complete on the line — no subsequent ``- item`` lines may
+                # extend them, so clear key context.
+                if strip_quotes:
+                    inline = [_strip_yaml_quotes(item) for item in inline]
+                current_key = None
+                current_list = None
+                fm[kv_m.group(1)] = inline
+            else:
+                # Scalar value. Keep ``current_key`` set so a subsequent
+                # ``- item`` line can upgrade this scalar to a list (matches
+                # the prior Confluence/md parser behaviour). ``current_list``
+                # stays None to signal "scalar, not list yet."
+                if strip_quotes:
+                    val = _strip_yaml_quotes(val)
+                current_list = None
+                fm[kv_m.group(1)] = val
+            continue
+
+        # Blank line inside a list terminates it.  Clear ``current_key`` too
+        # so a subsequent list item under the same key is treated as orphaned
+        # rather than re-entering the list-item branch — per Rio's #252 fix
+        # (reproduced in both evidence_md.py and evidence_confluence.py).
+        if current_list is not None and not line.strip():
+            fm[current_key] = current_list  # type: ignore[index]
+            current_list = None
+            current_key = None
+
+    if close_idx is None:
+        return {}, text
+
+    body = "".join(lines[close_idx + 1 :])
+    return fm, body
 
 
 # ── Path safety ───────────────────────────────────────────────────────────────

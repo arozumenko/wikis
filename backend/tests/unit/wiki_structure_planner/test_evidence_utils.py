@@ -1,9 +1,12 @@
-"""Unit tests for wiki_structure_planner/_evidence_utils.py (#253).
+"""Unit tests for wiki_structure_planner/_evidence_utils.py (#253, #261).
 
-Tests the four consolidated helper functions at the helper level,
-covering the same behaviour verified by the per-pack test suites
-(path traversal, fence masking, cap enforcement, deduplication)
-but without requiring cluster/pack fixtures.
+Tests the consolidated helper functions at the helper level, covering the same
+behaviour verified by the per-pack test suites (path traversal, fence masking,
+cap enforcement, deduplication) but without requiring cluster/pack fixtures.
+
+Also tests ``parse_frontmatter`` — the unified frontmatter parser that
+replaces the three private ``_parse_frontmatter`` implementations that lived
+in evidence_md.py, evidence_confluence.py, and evidence_jira.py (#261).
 
 These are fast, no-disk tests except for safe_join path-safety checks
 which write a tiny temp tree.
@@ -19,6 +22,7 @@ from app.core.wiki_structure_planner._evidence_utils import (
     extract_first_paragraph,
     extract_toc_from_text,
     mask_code_fences,
+    parse_frontmatter,
     safe_join,
 )
 
@@ -303,3 +307,272 @@ class TestCollectAttachments:
         ]
         result = collect_attachments(chunks)
         assert result == ["photo.jpg"]
+
+
+# ── parse_frontmatter ─────────────────────────────────────────────────────────
+#
+# Tests for the unified frontmatter parser (#261).  Each test covers one
+# behavioural axis; the per-caller flag table is:
+#
+#   evidence_md.py        inline_lists=False  strip_quotes=False
+#   evidence_confluence   inline_lists=False  strip_quotes=False
+#   evidence_jira.py      inline_lists=True   strip_quotes=True
+
+
+class TestParseFrontmatterNoFrontmatter:
+    """No frontmatter block at all → ({}, original_text)."""
+
+    def test_plain_text_returns_empty_dict_and_original(self):
+        text = "# Heading\n\nSome body text.\n"
+        fm, body = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm == {}
+        assert body == text
+
+    def test_empty_string_returns_empty_dict_and_original(self):
+        fm, body = parse_frontmatter("", inline_lists=False, strip_quotes=False)
+        assert fm == {}
+        assert body == ""
+
+    def test_text_starting_with_dashes_but_not_frontmatter(self):
+        # A line like "--- something ---" is not a valid frontmatter opener.
+        text = "--- not a fence\nSome text.\n"
+        fm, body = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm == {}
+        assert body == text
+
+
+class TestParseFrontmatterEmpty:
+    """Empty frontmatter block ``---\\n---\\n`` → ({}, body)."""
+
+    def test_empty_frontmatter_block(self):
+        text = "---\n---\n\nBody text.\n"
+        fm, body = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm == {}
+        assert body == "\nBody text.\n"
+
+
+class TestParseFrontmatterScalars:
+    """Scalar key: value pairs."""
+
+    def test_single_scalar(self):
+        text = "---\ntitle: My Document\n---\n\nBody.\n"
+        fm, body = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm["title"] == "My Document"
+        assert body == "\nBody.\n"
+
+    def test_multiple_scalars(self):
+        text = "---\ntitle: Doc\nauthor: Alice\nspace_key: ENG\n---\n\nBody.\n"
+        fm, body = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm["title"] == "Doc"
+        assert fm["author"] == "Alice"
+        assert fm["space_key"] == "ENG"
+
+    def test_scalar_value_stripped_of_whitespace(self):
+        text = "---\ntitle:   Padded Value   \n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm["title"] == "Padded Value"
+
+
+class TestParseFrontmatterMultiLineLists:
+    """Multi-line YAML list syntax (``  - item``)."""
+
+    def test_list_after_empty_value(self):
+        text = "---\nlabels:\n  - infra\n  - security\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm["labels"] == ["infra", "security"]
+
+    def test_list_items_stripped(self):
+        text = "---\nlabels:\n  -  padded item  \n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm["labels"] == ["padded item"]
+
+    def test_multiple_lists(self):
+        text = "---\nlabels:\n  - a\n  - b\nparents:\n  - X\n  - Y\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm["labels"] == ["a", "b"]
+        assert fm["parents"] == ["X", "Y"]
+
+    def test_mixed_scalars_and_lists(self):
+        text = "---\ntitle: My Page\nlabels:\n  - infra\n  - backend\nspace_key: ENG\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm["title"] == "My Page"
+        assert fm["labels"] == ["infra", "backend"]
+        assert fm["space_key"] == "ENG"
+
+    def test_any_positive_indent_accepted(self):
+        # Tab-indented and deeply-indented items must be accepted.
+        text = "---\nlabels:\n\t- tab-item\n      - deep-item\n  - normal\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert "tab-item" in fm["labels"]
+        assert "deep-item" in fm["labels"]
+        assert "normal" in fm["labels"]
+
+
+class TestParseFrontmatterScalarToListUpgrade:
+    """Scalar value followed by ``- item`` lines upgrades to a list.
+
+    Preserves the pre-#261 Confluence/md parser behaviour (Copilot review).
+    """
+
+    def test_scalar_then_list_items_upgrades_to_list(self):
+        text = "---\nlabels: oldscalar\n  - first\n  - second\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        # Scalar is dropped; list wins.
+        assert fm.get("labels") == ["first", "second"]
+
+    def test_scalar_with_no_following_list_stays_scalar(self):
+        text = "---\nlabels: just_a_scalar\ntitle: Doc\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm.get("labels") == "just_a_scalar"
+        assert fm.get("title") == "Doc"
+
+    def test_inline_list_does_not_accept_following_items(self):
+        # Inline lists are complete on their line — subsequent ``- item``
+        # lines are orphaned (current_key cleared after inline parse).
+        text = "---\nlabels: ['a', 'b']\n  - c\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=True, strip_quotes=True)
+        # The inline list wins; "c" is orphaned.
+        assert fm.get("labels") == ["a", "b"]
+
+
+class TestParseFrontmatterBlankLineHandling:
+    """Blank line mid-list terminates the list (Rio #252 fix)."""
+
+    def test_blank_line_terminates_list(self):
+        # Items "a" and "b" committed before the blank line; "c" after the
+        # blank is orphaned (current_key is None after the flush).
+        text = "---\nlabels:\n  - a\n  - b\n\n  - c\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        # "a" and "b" must be present; "c" is orphaned and dropped.
+        assert "a" in fm["labels"]
+        assert "b" in fm["labels"]
+        assert "c" not in fm.get("labels", [])
+
+    def test_scalar_after_blank_line_is_new_key(self):
+        # After a blank line clears current_key, a new key: value pair should
+        # start a fresh entry (not be confused with the previous list).
+        text = "---\nlabels:\n  - x\n\ntitle: After Blank\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm.get("labels") == ["x"]
+        assert fm.get("title") == "After Blank"
+
+
+class TestParseFrontmatterNoClosingFence:
+    """No closing ``---`` → ({}, original_text) — graceful fallback."""
+
+    def test_unclosed_frontmatter_returns_empty_dict(self):
+        text = "---\ntitle: Broken\nlabels:\n  - item1\n\n# Real Heading\n\nBody.\n"
+        fm, body = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm == {}
+        assert body == text
+
+
+class TestParseFrontmatterInlineLists:
+    """``inline_lists=True`` recognises ``key: [a, "b"]`` syntax."""
+
+    def test_inline_list_false_treats_as_scalar(self):
+        # Without inline_lists, ``[a, b]`` is stored as a literal string.
+        text = "---\nlabels: ['a', \"b\"]\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert isinstance(fm["labels"], str)
+        assert fm["labels"] == "['a', \"b\"]"
+
+    def test_inline_list_true_parses_list(self):
+        text = "---\nlabels: ['infra', \"security\"]\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=True, strip_quotes=True)
+        assert fm["labels"] == ["infra", "security"]
+
+    def test_inline_list_bare_items(self):
+        text = "---\ncomponents: [api, core, auth]\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=True, strip_quotes=False)
+        assert fm["components"] == ["api", "core", "auth"]
+
+    def test_inline_list_empty_brackets(self):
+        text = "---\nlabels: []\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=True, strip_quotes=False)
+        assert fm["labels"] == []
+
+    def test_inline_list_comma_inside_quotes_not_split(self):
+        # A comma inside a quoted string must NOT split the item.
+        text = '---\nlabels: ["payment,billing", security]\n---\n\nBody.\n'
+        fm, _ = parse_frontmatter(text, inline_lists=True, strip_quotes=True)
+        assert "payment,billing" in fm["labels"]
+        assert "security" in fm["labels"]
+        assert len(fm["labels"]) == 2
+
+
+class TestParseFrontmatterStripQuotes:
+    """``strip_quotes=True`` strips matching enclosing quotes from scalars."""
+
+    def test_strip_quotes_false_preserves_raw(self):
+        text = '---\nsummary: "Quoted Summary"\n---\n\nBody.\n'
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm["summary"] == '"Quoted Summary"'
+
+    def test_strip_quotes_true_removes_double_quotes(self):
+        text = '---\nsummary: "Quoted Summary"\n---\n\nBody.\n'
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=True)
+        assert fm["summary"] == "Quoted Summary"
+
+    def test_strip_quotes_true_removes_single_quotes(self):
+        text = "---\nstatus: 'In Progress'\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=True)
+        assert fm["status"] == "In Progress"
+
+    def test_strip_quotes_only_matching_pairs(self):
+        # Mismatched quotes are NOT stripped (opening and closing differ).
+        text = "---\nstatus: 'mixed\"\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=True)
+        assert fm["status"] == "'mixed\""
+
+    def test_strip_quotes_multiline_list_items(self):
+        text = "---\nlabels:\n  - 'first'\n  - \"second\"\n  - third\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=True)
+        assert fm["labels"] == ["first", "second", "third"]
+
+    def test_strip_quotes_false_multiline_list_items_preserved(self):
+        text = "---\nlabels:\n  - 'quoted'\n  - plain\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm["labels"] == ["'quoted'", "plain"]
+
+
+class TestParseFrontmatterJiraMode:
+    """Full Jira mode: inline_lists=True, strip_quotes=True."""
+
+    def test_jira_typical_epic_frontmatter(self):
+        text = (
+            "---\n"
+            "summary: Platform Modernisation\n"
+            "status: In Progress\n"
+            "issue_type: Epic\n"
+            "labels:\n"
+            "  - backend\n"
+            "  - platform\n"
+            "components:\n"
+            "  - Core API\n"
+            "  - Auth Service\n"
+            "fix_versions:\n"
+            "  - 3.0.0\n"
+            "---\n"
+            "\n"
+            "# Epic Body\n"
+        )
+        fm, body = parse_frontmatter(text, inline_lists=True, strip_quotes=True)
+        assert fm["summary"] == "Platform Modernisation"
+        assert fm["status"] == "In Progress"
+        assert fm["labels"] == ["backend", "platform"]
+        assert fm["components"] == ["Core API", "Auth Service"]
+        assert fm["fix_versions"] == ["3.0.0"]
+        assert "# Epic Body" in body
+
+    def test_jira_quoted_scalar(self):
+        text = "---\nsummary: \"Quoted Summary\"\nstatus: 'In Progress'\nissue_type: epic\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=True, strip_quotes=True)
+        assert fm["summary"] == "Quoted Summary"
+        assert fm["status"] == "In Progress"
+
+    def test_jira_inline_list_with_quoted_items(self):
+        text = "---\nlabels: ['infra', \"security\", 'auth']\ncomponents: [api, \"core\"]\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=True, strip_quotes=True)
+        assert fm["labels"] == ["infra", "security", "auth"]
+        assert fm["components"] == ["api", "core"]

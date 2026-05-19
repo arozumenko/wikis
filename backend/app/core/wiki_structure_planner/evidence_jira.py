@@ -40,7 +40,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ._evidence_utils import safe_join
+from ._evidence_utils import _parse_inline_list, parse_frontmatter, safe_join  # noqa: F401
 from .structure_skeleton import ArtifactInfo, Cluster
 
 logger = logging.getLogger(__name__)
@@ -149,127 +149,7 @@ def _read_file_safe(repo_root: str, rel_path: str) -> str | None:
         return None
 
 
-# ── Frontmatter parser ────────────────────────────────────────────────────────
-
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
-
-
-def _strip_yaml_quotes(value: str) -> str:
-    """Strip optional surrounding single/double quotes from a YAML scalar.
-
-    Confluence/Jira frontmatter generators frequently quote strings that
-    contain special characters; without stripping the quotes leak into
-    titles/labels/etc.
-    """
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-        return value[1:-1]
-    return value
-
-
-def _parse_inline_list(value: str) -> list[str] | None:
-    """Parse an inline YAML list like ``[a, "b", 'c']``.
-
-    Returns None if *value* is not a bracketed list.
-
-    Uses a small state-machine so that commas inside quoted strings are treated
-    as literal characters rather than separators — fixes #256.  Both single and
-    double quotes are supported; a quote is closed only by its matching opener.
-
-    Tracks whether each item was *started* (saw a non-whitespace character or
-    an opening quote) so an explicit empty-quoted item like ``["", "x"]``
-    yields ``["", "x"]`` rather than ``["x"]``. Bare whitespace between
-    commas — like ``[a, , b]`` — is treated as no item and dropped.
-    """
-    if not (value.startswith("[") and value.endswith("]")):
-        return None
-    inner = value[1:-1].strip()
-    if not inner:
-        return []
-    items: list[str] = []
-    current: list[str] = []
-    quote: str | None = None
-    started = False  # an item exists once we see a non-space char or an opening quote
-    for ch in inner:
-        if quote:
-            if ch == quote:
-                quote = None
-            else:
-                current.append(ch)
-        elif ch in ("'", '"'):
-            quote = ch
-            started = True
-        elif ch == ",":
-            if started:
-                items.append("".join(current).strip())
-            current = []
-            started = False
-        elif ch.isspace():
-            # Whitespace contributes only if an item is already in progress.
-            if started:
-                current.append(ch)
-        else:
-            current.append(ch)
-            started = True
-    if started:
-        items.append("".join(current).strip())
-    return items
-
-
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Extract YAML frontmatter and return (fields_dict, body_text).
-
-    Handles scalar values, multi-line YAML list syntax (``- item`` with
-    indentation), and inline list syntax (``[a, b]``). Optional surrounding
-    quotes on scalar values and list items are stripped. No external YAML
-    dependency — intentionally minimal so there are no import-time
-    side-effects and the scanner is predictable in unit tests.
-
-    Returns an empty dict and the full text when no frontmatter is present.
-    """
-    m = _FRONTMATTER_RE.match(text)
-    if not m:
-        return {}, text
-
-    raw_yaml = m.group(1)
-    body = text[m.end() :]
-    fields: dict = {}
-
-    current_key: str | None = None
-    current_list: list[str] | None = None
-
-    for line in raw_yaml.splitlines():
-        # List continuation — any positive indent followed by ``- item``.
-        list_item = re.match(r"^\s+-\s+(.+)$", line)
-        if list_item and current_key is not None and current_list is not None:
-            current_list.append(_strip_yaml_quotes(list_item.group(1).strip()))
-            continue
-
-        # New key
-        kv = re.match(r"^(\w[\w_]*)\s*:\s*(.*)$", line)
-        if kv:
-            # Flush previous list
-            if current_key is not None and current_list is not None:
-                fields[current_key] = current_list
-
-            key = kv.group(1)
-            value = kv.group(2).strip()
-
-            if value == "":
-                # Starts a multi-line list block
-                current_key = key
-                current_list = []
-                fields[key] = current_list
-            elif (inline := _parse_inline_list(value)) is not None:
-                current_key = None
-                current_list = None
-                fields[key] = inline
-            else:
-                current_key = None
-                current_list = None
-                fields[key] = _strip_yaml_quotes(value)
-
-    return fields, body
 
 
 def _extract_first_paragraph(body: str) -> str:
@@ -318,7 +198,7 @@ def _build_child_row(artifact: ArtifactInfo, repo_root: str) -> dict:
     if artifact.source_path:
         text = _read_file_safe(repo_root, artifact.source_path)
         if text:
-            fm, _ = _parse_frontmatter(text)
+            fm, _ = parse_frontmatter(text, inline_lists=True, strip_quotes=True)
             status = str(fm.get("status", "")).strip()
             # Fall back to frontmatter summary if artifact.summary is empty
             if not summary:
@@ -398,7 +278,7 @@ def build_jira_pack(
     if epic.source_path:
         text = _read_file_safe(repo_root, epic.source_path)
         if text:
-            fm, body = _parse_frontmatter(text)
+            fm, body = parse_frontmatter(text, inline_lists=True, strip_quotes=True)
 
             epic_title = _extract_title(fm, body, epic)
             epic_description = _extract_first_paragraph(body)
