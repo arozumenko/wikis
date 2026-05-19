@@ -228,31 +228,38 @@ def extract_citations(markdown: str) -> list[CitedClaim]:
     if not markdown or not markdown.strip():
         return []
 
-    # Split into paragraphs on blank lines
-    raw_paragraphs = _PARAGRAPH_SPLIT_RE.split(markdown)
+    # Mask fenced code blocks BEFORE splitting on blank lines. A fenced block
+    # is allowed to contain blank lines; if we split first, the orphaned half
+    # has no opening fence and ``mask_code_fences`` would leave its citation
+    # tokens exposed.  ``mask_code_fences`` replaces fence content with spaces
+    # while preserving overall string length, so offsets stay aligned with the
+    # raw text and we can use the masked string to drive paragraph splitting.
+    fence_masked = mask_code_fences(markdown)
+
+    # Collect (start, end) byte ranges for each masked-paragraph slice.
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for split_match in _PARAGRAPH_SPLIT_RE.finditer(fence_masked):
+        ranges.append((cursor, split_match.start()))
+        cursor = split_match.end()
+    ranges.append((cursor, len(markdown)))
 
     claims: list[CitedClaim] = []
-    para_index = 0
-
-    for raw_para in raw_paragraphs:
-        stripped = raw_para.strip()
-        if not stripped:
-            # Skip blank-line artifacts from splitting
+    for start, end in ranges:
+        raw_para = markdown[start:end]
+        if not raw_para.strip():
             continue
-
-        # Build a masked copy for citation extraction (do NOT modify raw text)
-        masked = mask_code_fences(raw_para)
-        masked = _mask_inline_code(masked)
-
-        citations = _extract_citations_from_masked(masked)
+        # Masked slice already has fences blanked; apply inline-code masking
+        # on top before extracting citations.
+        masked_para = _mask_inline_code(fence_masked[start:end])
+        citations = _extract_citations_from_masked(masked_para)
 
         claims.append(
             CitedClaim(
-                paragraph_index=para_index,
+                paragraph_index=len(claims),
                 paragraph_text=raw_para,
                 citations=citations,
             )
         )
-        para_index += 1
 
     return claims

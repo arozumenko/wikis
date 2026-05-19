@@ -388,3 +388,58 @@ class TestParagraphSplitting:
         # The content paragraph has the citation
         cited = [c for c in result if c.citations]
         assert cited[0].citations[0].path == "a.py"
+
+
+# ── Fenced blocks containing blank lines ─────────────────────────────────────
+
+
+class TestFencedBlockWithBlankLines:
+    """Regression: paragraph splitting must run AFTER fence masking, otherwise a
+    fenced block that contains a blank line gets torn into two fragments and
+    the orphan half leaks citation tokens to the verifier (Rio #265 1st pass)."""
+
+    def test_fence_with_blank_line_does_not_leak_citation(self):
+        md = "```python\nfoo()\n\nbar()  # [secret.py:99]\n```"
+        result = extract_citations(md)
+
+        for claim in result:
+            assert claim.citations == [], (
+                f"Citation leaked out of fenced block: {claim.citations}"
+            )
+
+    def test_real_cite_before_fenced_block_with_blank_line(self):
+        md = (
+            "Real claim [real.py:1].\n\n"
+            "```python\n"
+            "foo()\n"
+            "\n"
+            "bar()  # [fake.py:99]\n"
+            "```"
+        )
+        result = extract_citations(md)
+
+        cited = [c for c in result if c.citations]
+        assert len(cited) == 1
+        assert cited[0].citations[0].path == "real.py"
+
+    def test_fence_with_multiple_blank_lines(self):
+        md = (
+            "```\n"
+            "section_a\n"
+            "\n"
+            "[a.py:1]\n"
+            "\n"
+            "[b.py:2]\n"
+            "```"
+        )
+        result = extract_citations(md)
+
+        for claim in result:
+            assert claim.citations == []
+
+    def test_tilde_fence_with_blank_line(self):
+        md = "~~~\nfoo\n\n[hidden.py:7]\n~~~"
+        result = extract_citations(md)
+
+        for claim in result:
+            assert claim.citations == []
