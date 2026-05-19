@@ -59,8 +59,9 @@ Rules:
 - `description` must be 1-2 sentences summarising what the cluster implements \
   or documents (not what files it contains).
 - `retrieval_query` must be 3-8 keywords useful for dense/sparse retrieval.
-- Produce EXACTLY one JSON object per cluster, in cluster_id order.
-- Output ONLY the JSON lines — no markdown, no extra text.
+- Produce EXACTLY one JSON object for the current cluster shown in the
+  message. Do not reason about, reference, or emit pages for other clusters.
+- Output ONLY the JSON object — no markdown, no extra text.
 """
 
 # ── Kind-specific framing ─────────────────────────────────────────────────────

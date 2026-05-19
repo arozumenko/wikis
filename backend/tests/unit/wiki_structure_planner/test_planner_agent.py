@@ -332,33 +332,19 @@ class TestMixedKindSkeleton:
 
 
 class TestBudgetExhaustion:
-    def test_budget_exceeded_flag_set(self, tmp_path):
-        """When every cluster exhausts the budget, exceeded flag is True."""
-        # To exhaust the budget we need the LLM to make tool calls.
-        # We use a FakeLLM that always returns tool calls until budget runs out.
-        # Instead: simulate exhaustion by having many clusters with budget=0.
-        # With n=1 cluster, total budget = 3. We pre-consume 3 by making the
-        # budget tracker start at 3.
-
-        # Simpler approach: create a cluster skeleton where run_planner_with_report
-        # is called but we patch budget to 0 via monkey-patching.
-        # Actually the cleanest way: we pass a skeleton with many clusters and
-        # force the LLM to request tool calls each time.
-
-        # Use a simple approach: a ToolCallFakeLLM that first returns a tool call
-        # then a result. We'll test this by verifying the report tracks usage.
-
+    def test_no_tool_calls_means_budget_not_exceeded(self, tmp_path):
+        """Happy path: an LLM that answers from the evidence pack alone
+        leaves the tool budget untouched and ``tool_budget_exceeded`` stays
+        False.  The actual budget-exhaustion path is exercised by
+        ``test_tool_budget_exceeded_when_forced`` below."""
         cluster = _make_cluster(cluster_id=1, kind="code")
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
 
-        # Build an LLM that returns a response, consuming no tools.
-        # Then manually verify report.tool_budget_exceeded is False when no tools used.
         llm = FakeLLM(responses=[_json_response(1)], record_calls=[])
         pages, report = run_planner_with_report(
             skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path)
         )
-        # No tools were called, so not exceeded
         assert not report.tool_budget_exceeded
         assert report.tool_budget_used == 0
 

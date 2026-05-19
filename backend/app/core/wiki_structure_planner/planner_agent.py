@@ -112,13 +112,20 @@ _MAX_GREP_RESULTS = 10
 
 
 def _tool_read_file(repo_root: str, path: str) -> str:
-    """Read up to _MAX_FILE_LINES lines of a file inside repo_root."""
+    """Read up to _MAX_FILE_LINES lines of a file inside repo_root.
+
+    Streams the file line-by-line via ``itertools.islice`` so a multi-MB
+    source doesn't get fully loaded just to drop the tail.
+    """
     safe = safe_join(repo_root, path)
     if safe is None:
         return f"[error] path escapes repo_root: {path!r}"
     try:
-        lines = Path(safe).read_text(encoding="utf-8", errors="replace").splitlines()
-        return "\n".join(lines[:_MAX_FILE_LINES])
+        from itertools import islice  # noqa: PLC0415
+
+        with open(safe, encoding="utf-8", errors="replace") as fh:
+            head = list(islice(fh, _MAX_FILE_LINES))
+        return "".join(head).rstrip("\n")
     except (OSError, PermissionError) as exc:
         return f"[error] {exc}"
 
@@ -132,7 +139,9 @@ def _tool_get_signature(repo_root: str, symbol: str) -> str:
     import subprocess  # noqa: PLC0415
 
     _inc = ["--include=*.py", "--include=*.js", "--include=*.ts", "--include=*.go", "--include=*.java", "--include=*.rs"]
-    cmd = ["grep", "-rn", *_inc, "-m", "5", symbol, repo_root]  # noqa: S607
+    # ``-F`` matches the symbol literally; ``--`` terminates option parsing so
+    # symbols starting with ``-`` are not misread as flags.
+    cmd = ["grep", "-rn", "-F", *_inc, "-m", "5", "--", symbol, repo_root]  # noqa: S607
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)  # noqa: S603
         output = result.stdout.strip()
@@ -149,7 +158,9 @@ def _tool_grep(repo_root: str, pattern: str) -> str:
 
     _inc = ["--include=*.py", "--include=*.js", "--include=*.ts", "--include=*.go",
             "--include=*.java", "--include=*.rs", "--include=*.md"]
-    cmd = ["grep", "-rn", *_inc, "-m", str(_MAX_GREP_RESULTS), pattern, repo_root]  # noqa: S607
+    # ``--`` terminates option parsing so a pattern beginning with ``-`` is
+    # not misread as a flag.
+    cmd = ["grep", "-rn", *_inc, "-m", str(_MAX_GREP_RESULTS), "--", pattern, repo_root]  # noqa: S607
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)  # noqa: S603
         output = result.stdout.strip()
@@ -245,28 +256,37 @@ _JSON_OBJ_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     """Try to extract the first JSON object from *text*.
 
-    Strips markdown fences and handles trailing commas before attempting to
-    parse.  Returns ``None`` on failure.
+    Strips markdown fences, then tries to parse the whole string as JSON
+    before falling back to a regex scan for the first ``{...}`` block.
+    A second parse attempt after trailing-comma cleanup catches common LLM
+    sloppiness like ``{"title": "X",}``.  Returns ``None`` on failure.
     """
     # Strip markdown fences
     stripped = re.sub(r"```(?:json)?\s*", "", text).strip()
 
-    # Try direct parse first
-    try:
-        obj = json.loads(stripped)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
+    def _try_parse(candidate: str) -> dict[str, Any] | None:
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            # Try once more after stripping trailing commas before } or ].
+            cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
+            if cleaned == candidate:
+                return None
+            try:
+                obj = json.loads(cleaned)
+            except json.JSONDecodeError:
+                return None
+        return obj if isinstance(obj, dict) else None
+
+    direct = _try_parse(stripped)
+    if direct is not None:
+        return direct
 
     # Try to find first {...} block
     for m in _JSON_OBJ_RE.finditer(stripped):
-        try:
-            obj = json.loads(m.group(0))
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            pass
+        candidate = _try_parse(m.group(0))
+        if candidate is not None:
+            return candidate
 
     return None
 
@@ -433,36 +453,17 @@ def _plan_cluster(
 # ── Public entrypoint ─────────────────────────────────────────────────────────
 
 
-def run_planner(
+def _run_planner_core(
     skeleton: StructureSkeleton,
     evidence_packs: dict[int, EvidencePack],
     *,
     llm: BaseChatModel,
     repo_root: str,
-) -> list[PageSpec]:
-    """Run the unified planner agent over all clusters in *skeleton*.
+) -> tuple[list[PageSpec], PlanReport]:
+    """Shared implementation for ``run_planner`` / ``run_planner_with_report``.
 
-    The planner names each cluster, writes a 1-2 sentence description, and
-    produces a ``retrieval_query``.  The ``target_symbols``, ``target_folders``,
-    and ``target_docs`` fields are injected deterministically from the skeleton —
-    the LLM never produces them.
-
-    Total tool budget = ``3 × len(skeleton.clusters)`` across the whole run.
-
-    Args:
-        skeleton: Completed structure skeleton.  Uses ``skeleton.clusters``
-            (the new unified list) if non-empty; falls back to
-            ``skeleton.code_clusters`` for backwards compatibility.
-        evidence_packs: Pre-built evidence packs keyed by ``cluster_id``.
-        llm: Pre-configured LangChain chat model.
-        repo_root: Absolute path to the checked-out repository root.
-
-    Returns:
-        List of ``PageSpec`` objects — one per cluster, guaranteed non-empty
-        (fallback specs are synthesised for any missing cluster).
-
-    Raises:
-        ValueError: If *repo_root* is not a valid directory.
+    Resolves the cluster list, plans each cluster with a single tool budget,
+    fills in any missing specs with fallbacks, and assembles the report.
     """
     import os  # noqa: PLC0415
 
@@ -470,16 +471,21 @@ def run_planner(
         raise ValueError(f"repo_root must be a valid directory: {repo_root!r}")
 
     # ── Resolve cluster list ──────────────────────────────────────────────
-    clusters: list[Cluster]
     if skeleton.clusters:
-        clusters = skeleton.clusters
+        clusters: list[Cluster] = skeleton.clusters
     else:
         # Backwards compat: DirCluster is a Cluster subclass
         clusters = list(skeleton.code_clusters)
 
     if not clusters:
         logger.info("[PLANNER] no clusters — returning empty list")
-        return []
+        return [], PlanReport(
+            tool_budget_total=0,
+            tool_budget_used=0,
+            tool_budget_exceeded=False,
+            pages_emitted=0,
+            notes=[],
+        )
 
     n = len(clusters)
     budget_total = 3 * n
@@ -548,121 +554,7 @@ def run_planner(
             budget_total,
         )
 
-    pages = [specs_by_id[c.cluster_id] for c in clusters if c.cluster_id in specs_by_id]
-
-    report = PlanReport(
-        tool_budget_total=budget_total,
-        tool_budget_used=tool_budget_used,
-        tool_budget_exceeded=tool_budget_exceeded,
-        pages_emitted=len(pages),
-        notes=notes,
-    )
-
-    logger.info(
-        "[PLANNER] done: pages=%d tool_calls=%d/%d exceeded=%s notes=%d",
-        report.pages_emitted,
-        report.tool_budget_used,
-        report.tool_budget_total,
-        report.tool_budget_exceeded,
-        len(report.notes),
-    )
-
-    # Attach report as metadata for callers that need it (optional pattern)
-    # The primary return is the page list; the report is available for callers
-    # that want to inspect it.  We store it on the first page if present so tests
-    # can retrieve it without requiring a wrapper type change.
-    # NOTE: callers that want the full report should use run_planner_with_report().
-    return pages
-
-
-def run_planner_with_report(
-    skeleton: StructureSkeleton,
-    evidence_packs: dict[int, EvidencePack],
-    *,
-    llm: BaseChatModel,
-    repo_root: str,
-) -> tuple[list[PageSpec], PlanReport]:
-    """Same as ``run_planner`` but also returns the ``PlanReport``.
-
-    Preferred by callers that need budget / coverage metrics.
-    """
-    import os  # noqa: PLC0415
-
-    if not repo_root or not os.path.isdir(repo_root):
-        raise ValueError(f"repo_root must be a valid directory: {repo_root!r}")
-
-    clusters: list[Cluster]
-    if skeleton.clusters:
-        clusters = skeleton.clusters
-    else:
-        clusters = list(skeleton.code_clusters)
-
-    if not clusters:
-        report = PlanReport(
-            tool_budget_total=0,
-            tool_budget_used=0,
-            tool_budget_exceeded=False,
-            pages_emitted=0,
-            notes=[],
-        )
-        return [], report
-
-    n = len(clusters)
-    budget_total = 3 * n
-    budget_tracker: list[int] = [0, budget_total]
-    notes: list[str] = []
-
-    base_llm = _unwrap_llm(llm)
-    try:
-        llm_with_tools = base_llm.bind_tools(_TOOL_SCHEMAS)
-    except Exception:  # noqa: BLE001
-        llm_with_tools = base_llm
-
-    specs_by_id: dict[int, PageSpec] = {}
-
-    for cluster in clusters:
-        pack = evidence_packs.get(cluster.cluster_id)
-        if pack is None:
-            note = f"cluster {cluster.cluster_id} had no evidence pack — falling back to skeleton-only"
-            notes.append(note)
-            logger.warning("[PLANNER] %s", note)
-
-        try:
-            spec = _plan_cluster(
-                cluster=cluster,
-                pack=pack,
-                llm=base_llm,
-                llm_with_tools=llm_with_tools,
-                repo_root=repo_root,
-                budget_tracker=budget_tracker,
-                notes=notes,
-            )
-        except Exception as exc:  # noqa: BLE001
-            note = f"cluster {cluster.cluster_id}: LLM call failed ({exc}) — using fallback spec"
-            notes.append(note)
-            logger.error("[PLANNER] %s", note, exc_info=True)
-            spec, _ = _fallback_spec(cluster, note)
-
-        specs_by_id[cluster.cluster_id] = spec
-
-    for cluster in clusters:
-        if cluster.cluster_id not in specs_by_id:
-            note = f"cluster {cluster.cluster_id}: missing spec — synthesising fallback"
-            notes.append(note)
-            spec, _ = _fallback_spec(cluster, note)
-            specs_by_id[cluster.cluster_id] = spec
-
-    tool_budget_used = budget_tracker[0]
-    tool_budget_exceeded = tool_budget_used >= budget_total
-
-    if tool_budget_exceeded:
-        logger.warning(
-            "[PLANNER] tool budget exceeded: used=%d total=%d",
-            tool_budget_used,
-            budget_total,
-        )
-
-    pages = [specs_by_id[c.cluster_id] for c in clusters if c.cluster_id in specs_by_id]
+    pages = [specs_by_id[c.cluster_id] for c in clusters]
 
     report = PlanReport(
         tool_budget_total=budget_total,
@@ -682,6 +574,64 @@ def run_planner_with_report(
     )
 
     return pages, report
+
+
+def run_planner(
+    skeleton: StructureSkeleton,
+    evidence_packs: dict[int, EvidencePack],
+    *,
+    llm: BaseChatModel,
+    repo_root: str,
+) -> list[PageSpec]:
+    """Run the unified planner agent over all clusters in *skeleton*.
+
+    The planner names each cluster, writes a 1-2 sentence description, and
+    produces a ``retrieval_query``.  The ``target_symbols``, ``target_folders``,
+    and ``target_docs`` fields are injected deterministically from the skeleton —
+    the LLM never produces them.
+
+    The cluster list is resolved from ``skeleton.clusters`` (preferred) or
+    ``skeleton.code_clusters`` (backwards-compat fallback).  The total tool
+    budget is ``3 × len(resolved_clusters)`` and is shared across the whole
+    run; ``_plan_cluster`` decrements it as ``read_file`` / ``get_signature``
+    / ``grep`` calls fire, and once the budget hits zero the agent must
+    answer from the evidence pack alone.
+
+    Args:
+        skeleton: Completed structure skeleton.
+        evidence_packs: Pre-built evidence packs keyed by ``cluster_id``.
+        llm: Pre-configured LangChain chat model.
+        repo_root: Absolute path to the checked-out repository root.
+
+    Returns:
+        List of ``PageSpec`` objects — one per resolved cluster.  Empty when
+        the skeleton has neither ``clusters`` nor ``code_clusters``; otherwise
+        one spec per cluster (fallbacks synthesised for any cluster the LLM
+        could not produce a spec for).
+
+    Raises:
+        ValueError: If *repo_root* is not a valid directory.
+    """
+    pages, _report = _run_planner_core(
+        skeleton, evidence_packs, llm=llm, repo_root=repo_root
+    )
+    return pages
+
+
+def run_planner_with_report(
+    skeleton: StructureSkeleton,
+    evidence_packs: dict[int, EvidencePack],
+    *,
+    llm: BaseChatModel,
+    repo_root: str,
+) -> tuple[list[PageSpec], PlanReport]:
+    """Same as :func:`run_planner` but also returns the ``PlanReport``.
+
+    Preferred by callers that need budget / coverage metrics.
+    """
+    return _run_planner_core(
+        skeleton, evidence_packs, llm=llm, repo_root=repo_root
+    )
 
 
 # ── LLM unwrapping helper ─────────────────────────────────────────────────────
