@@ -27,7 +27,7 @@ Out of scope in this PR (#237)
 - LLM verifier pass (#12)
 - Source-kind gating (#13)
 - Link resolver (#14)
-- Wiring into wiki_service / wiki_management (#16)
+- Wiring into wiki_service / wiki_management (#243)
 """
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ class WikiContentWriter:
     llm_client : BaseChatModel | None
         Pre-configured LangChain chat model.  If ``None``, the agent will
         need to be provided one before ``generate_page`` can be called.
-        # TODO #16: make required once wired into wiki_service
+        # TODO #243: make required once wired into wiki_service
     max_iterations : int
         Hard iteration ceiling passed to the deepagent.  Defaults to
         ``BUDGET_HARD_CAP`` (the formula ensures the agent never needs more).
@@ -112,7 +112,7 @@ class WikiContentWriter:
     Notes
     -----
     Actual page generation (prompts, citation contract, verifier) is
-    implemented in subsequent issues (#11, #12, #13, #14) and wired in #16.
+    implemented in subsequent issues (#11, #12, #13, #14) and wired in #243.
     """
 
     def __init__(
@@ -164,7 +164,7 @@ class WikiContentWriter:
 
     # ── Future: generate_page ─────────────────────────────────────────────
 
-    # TODO #16: implement generate_page(page_spec, wiki_id) -> WikiPage
+    # TODO #243: implement generate_page(page_spec, wiki_id) -> WikiPage
     #   - compute budget from page_spec
     #   - build deepagent with tools.read_file / get_signature / etc.
     #   - run agent with max_iterations = compute_budget(page_spec)

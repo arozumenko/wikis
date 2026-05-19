@@ -115,6 +115,40 @@ class TestReadFile:
         assert isinstance(result.total_lines, int)
         assert result.total_lines == 3
 
+    def test_parent_traversal_rejected(self, tmp_path):
+        # Create a sibling file outside the simulated repo_root
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        tools = WriterTools(repo_root=str(repo))
+        result = tools.read_file("../outside.txt")
+        assert result.lines == []
+        assert result.error is not None
+        assert "escapes" in result.error
+
+    def test_absolute_path_rejected(self, tmp_path):
+        outside = tmp_path / "secret.txt"
+        outside.write_text("nope")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        tools = WriterTools(repo_root=str(repo))
+        result = tools.read_file(str(outside))
+        assert result.lines == []
+        assert result.error is not None
+
+    def test_symlink_escape_rejected(self, tmp_path):
+        outside = tmp_path / "secret.txt"
+        outside.write_text("nope")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        # Create a symlink inside repo that points outside
+        (repo / "link.txt").symlink_to(outside)
+        tools = WriterTools(repo_root=str(repo))
+        result = tools.read_file("link.txt")
+        assert result.lines == []
+        assert result.error is not None
+
 
 # ── SymbolSignature return type ──────────────────────────────────────────────
 
@@ -210,6 +244,33 @@ class TestGrep:
         assert match.line_number == 1
         assert match.line_text == "x = 1"
         assert match.score == 1.0
+
+    def test_grep_reads_search_score_metadata_key(self, tmp_path):
+        # GraphTextIndex / StorageTextIndex populate metadata["search_score"].
+        # Verify grep picks up that key (with fallback to legacy "score").
+        class _FakeDoc:
+            def __init__(self, content, meta):
+                self.page_content = content
+                self.metadata = meta
+
+        class _FakeIndex:
+            def __init__(self, docs):
+                self._docs = docs
+
+            def search(self, pattern, k=20):
+                return self._docs
+
+        docs = [
+            _FakeDoc("hit one", {"rel_path": "a.py", "start_line": 5, "search_score": 0.92}),
+            _FakeDoc("hit two", {"rel_path": "b.py", "start_line": 7, "score": 0.41}),
+            _FakeDoc("hit three", {"rel_path": "c.py", "start_line": 9}),
+        ]
+        tools = WriterTools(repo_root=str(tmp_path), graph_text_index=_FakeIndex(docs))
+        result = tools.grep("anything")
+        assert len(result) == 3
+        assert result[0].score == 0.92
+        assert result[1].score == 0.41
+        assert result[2].score == 0.0
 
 
 # ── DocChunk return type ─────────────────────────────────────────────────────

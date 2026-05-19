@@ -17,16 +17,36 @@ Stubs and TODOs
 ---------------
 ``get_callers``, ``get_callees``, ``get_signature``, ``list_doc_chunks``, and
 ``grep`` delegate to the code graph / FTS index and storage respectively.
-All signatures are final; the backends are wired in #16.
+All signatures are final; the backends are wired in #243 (epic #227 wiring &
+integration tests).
 """
 
 from __future__ import annotations
 
 import logging
 import mimetypes
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+def _safe_join(root: str, rel_path: str) -> str | None:
+    """Join *rel_path* under *root*; return None if it would escape the root.
+
+    Resolves symlinks and ``..`` so absolute paths and traversal attempts are
+    rejected before any file IO happens. Mirrors the pattern in
+    ``deep_research/research_tools.py``.
+    """
+    try:
+        full = os.path.realpath(os.path.join(root, rel_path))
+        root_real = os.path.realpath(root)
+        if not full.startswith(root_real + os.sep) and full != root_real:
+            return None
+        return full
+    except (ValueError, OSError):
+        return None
+
 
 logger = logging.getLogger(__name__)
 
@@ -155,13 +175,13 @@ class WriterTools:
         Absolute path to the checked-out repository root.
     storage : WikiStorageProtocol | None
         Optional opened storage instance for FTS and doc-chunk queries.
-        Wired in #16.
+        Wired in #243.
     code_graph : nx.DiGraph | None
         Optional NetworkX graph for signature/caller/callee resolution.
-        Wired in #16.
+        Wired in #243.
     graph_text_index : GraphTextIndex | StorageTextIndex | None
         Optional FTS index for ``grep``.
-        Wired in #16.
+        Wired in #243.
     """
 
     def __init__(
@@ -192,9 +212,16 @@ class WriterTools:
         line_range : (start, end) | None
             1-indexed inclusive line range. ``None`` returns all lines.
         """
-        abs_path = Path(self.repo_root) / path
+        safe_path = _safe_join(self.repo_root, path)
+        if safe_path is None:
+            return FileContent(
+                path=path,
+                lines=[],
+                total_lines=0,
+                error=f"path escapes repo_root: {path!r}",
+            )
         try:
-            text = abs_path.read_text(encoding="utf-8", errors="replace")
+            text = Path(safe_path).read_text(encoding="utf-8", errors="replace")
         except (OSError, PermissionError) as exc:
             return FileContent(path=path, lines=[], total_lines=0, error=str(exc))
 
@@ -218,7 +245,7 @@ class WriterTools:
         Resolves via the code graph when available; stubs with ``found=False``
         otherwise.
 
-        # TODO #16: wire to code_graph via GraphQueryService.resolve_symbol
+        # TODO #243: wire to code_graph via GraphQueryService.resolve_symbol
         """
         if self.code_graph is None:
             return SymbolSignature(
@@ -230,7 +257,7 @@ class WriterTools:
                 found=False,
             )
 
-        # TODO #16: resolve node_id via GraphQueryService, pull attrs
+        # TODO #243: resolve node_id via GraphQueryService, pull attrs
         from ..code_graph.graph_query_service import GraphQueryService
 
         gqs = GraphQueryService(self.code_graph, self.graph_text_index)
@@ -259,12 +286,12 @@ class WriterTools:
     def get_callers(self, symbol: str) -> SymbolCallers:
         """Return symbols that call *symbol*.
 
-        # TODO #16: wire to code_graph edges via GraphQueryService.get_relationships
+        # TODO #243: wire to code_graph edges via GraphQueryService.get_relationships
         """
         if self.code_graph is None:
             return SymbolCallers(symbol=symbol, callers=[])
 
-        # TODO #16: query incoming edges of type 'calls' / 'imports'
+        # TODO #243: query incoming edges of type 'calls' / 'imports'
         return SymbolCallers(symbol=symbol, callers=[])
 
     # ── get_callees ───────────────────────────────────────────────────────
@@ -272,12 +299,12 @@ class WriterTools:
     def get_callees(self, symbol: str) -> SymbolCallees:
         """Return symbols that *symbol* calls.
 
-        # TODO #16: wire to code_graph edges via GraphQueryService.get_relationships
+        # TODO #243: wire to code_graph edges via GraphQueryService.get_relationships
         """
         if self.code_graph is None:
             return SymbolCallees(symbol=symbol, callees=[])
 
-        # TODO #16: query outgoing edges of type 'calls' / 'imports'
+        # TODO #243: query outgoing edges of type 'calls' / 'imports'
         return SymbolCallees(symbol=symbol, callees=[])
 
     # ── grep ──────────────────────────────────────────────────────────────
@@ -287,7 +314,7 @@ class WriterTools:
 
         Falls back to empty list when no FTS index is available.
 
-        # TODO #16: wire to graph_text_index.search(pattern, k=k) or
+        # TODO #243: wire to graph_text_index.search(pattern, k=k) or
         #           storage.search_fts(pattern, k=k)
         """
         if self.graph_text_index is None and self.storage is None:
@@ -308,12 +335,12 @@ class WriterTools:
                         file_path=meta.get("rel_path", meta.get("source", "")),
                         line_number=int(meta.get("start_line", 0) or 0),
                         line_text=(doc.page_content or "")[:200],
-                        score=float(meta.get("score", 0.0)),
+                        score=float(meta.get("search_score", meta.get("score", 0.0))),
                     )
                 )
             return matches
 
-        # TODO #16: storage.search_fts path
+        # TODO #243: storage.search_fts path
         return []
 
     # ── list_doc_chunks ───────────────────────────────────────────────────
@@ -321,12 +348,12 @@ class WriterTools:
     def list_doc_chunks(self, doc_path: str) -> list[DocChunk]:
         """Return doc chunks for the given documentation file path.
 
-        # TODO #16: wire to storage.get_nodes_by_path_prefix(doc_path)
+        # TODO #243: wire to storage.get_nodes_by_path_prefix(doc_path)
         """
         if self.storage is None:
             return []
 
-        # TODO #16: fetch nodes for doc_path, split by heading/chunk boundary
+        # TODO #243: fetch nodes for doc_path, split by heading/chunk boundary
         return []
 
     # ── read_attachment_meta ──────────────────────────────────────────────
@@ -344,10 +371,10 @@ class WriterTools:
         """
         mime = _guess_mime(name)
 
-        # TODO #16: look up parent doc path from storage attachment registry
+        # TODO #243: look up parent doc path from storage attachment registry
         parent: str | None = None
         if self.storage is not None:
-            # TODO #16: storage.find_attachment_parent(name)
+            # TODO #243: storage.find_attachment_parent(name)
             pass
 
         return AttachmentMeta(name=name, mime=mime, parent=parent)
