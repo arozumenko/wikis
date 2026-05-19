@@ -92,6 +92,192 @@
         }
       }
     },
+    "/api/v1/wikis": {
+      "post": {
+        "summary": "Generate Wiki",
+        "operationId": "generate_wiki_api_v1_wikis_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerateWikiRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerateWikiResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        }
+      },
+      "get": {
+        "summary": "List Wikis",
+        "operationId": "list_wikis_api_v1_wikis_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/scan": {
+      "post": {
+        "summary": "Scan Source",
+        "description": "Validate a source configuration and return a preview.\n\nDrives Step 3 (Scan) of the ingestion wizard (#208). Persists nothing:\nno ``WikiRecord``, no invocation registration, no token write. The\nresponse carries reachability + a connector-specific preview shape.\n\nAll three source types are supported: ``git``, ``confluence``, ``jira``.\n\nRequest shape: ``source_type`` is **required** \u2014 it discriminates the\ntyped scope/auth variants (#215). Callers must include it explicitly;\nomitting it returns 422 (Pydantic ``union_tag_not_found``). Pre-#215\ncallers that relied on the implicit ``\"git\"`` default need to update.\n\nErrors (no ``responses=`` declaration intentionally \u2014 the 400 body\ndoesn't match :class:`ErrorResponse`'s top-level shape and the SPA\ncodegen would otherwise produce wrong client types.):\n\n* ``400`` \u2014 ``{\"detail\": {\"error\": <message>, \"reachable\": <bool>}}``\n  for unreachable / auth-fail / invalid-scope / invalid-JQL.\n* ``422`` \u2014 Pydantic validation error: ``source_type`` missing or not\n  ``\"git\"`` / ``\"confluence\"`` / ``\"jira\"``, or per-variant field\n  validation failed.\n\nTODO(follow-up): rate-limit / tmpdir-exhaustion guard. A malicious\nauthenticated user can fan out concurrent scans; each shallow clone\ncreates a tmpdir for the context-manager lifetime. Belongs at the\ngateway / network policy layer rather than in this handler.",
+        "operationId": "scan_source_api_v1_sources_scan_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/GitScanRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ConfluenceScanRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JiraScanRequest"
+                  }
+                ],
+                "discriminator": {
+                  "propertyName": "source_type",
+                  "mapping": {
+                    "git": "#/components/schemas/GitScanRequest",
+                    "confluence": "#/components/schemas/ConfluenceScanRequest",
+                    "jira": "#/components/schemas/JiraScanRequest"
+                  }
+                },
+                "title": "Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/invocations/{invocation_id}": {
       "get": {
         "summary": "Get Invocation",
@@ -366,52 +552,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ResearchResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/wikis": {
-      "get": {
-        "summary": "List Wikis",
-        "operationId": "list_wikis_api_v1_wikis_get",
-        "parameters": [
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WikiListResponse"
                 }
               }
             }
@@ -2444,6 +2584,43 @@
         "title": "AskResponse",
         "type": "object"
       },
+      "AtlassianAuth": {
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "title": "Access Token"
+          },
+          "refresh_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refresh Token"
+          },
+          "client_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "access_token"
+        ],
+        "title": "AtlassianAuth",
+        "description": "Auth for Confluence or Jira (OAuth2 access token + optional refresh).\n\n``extra=\"forbid\"`` ensures that GitAuth fields (e.g. ``pat``) are rejected\nwhen paired with ``source_type=\"confluence\"`` or ``source_type=\"jira\"``."
+      },
       "Body_import_wiki_api_v1_wikis_import_post": {
         "properties": {
           "bundle": {
@@ -2678,6 +2855,108 @@
         ],
         "title": "CodeMapSymbol",
         "type": "object"
+      },
+      "ConfluenceScanPreview": {
+        "properties": {
+          "spaces": {
+            "items": {
+              "$ref": "#/components/schemas/ConfluenceSpaceInfo"
+            },
+            "type": "array",
+            "title": "Spaces"
+          },
+          "total_pages": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Pages"
+          }
+        },
+        "type": "object",
+        "required": [
+          "spaces"
+        ],
+        "title": "ConfluenceScanPreview",
+        "description": "Preview returned for ``source_type == \"confluence\"``.\n\n``page_count`` on each space is the total returned by the Confluence API\nfor that space.  When the API paginates without a total-results field,\n``page_count`` is left as ``None`` and the caller should render it as\n``\"?\"``."
+      },
+      "ConfluenceScanRequest": {
+        "properties": {
+          "source_type": {
+            "type": "string",
+            "const": "confluence",
+            "title": "Source Type",
+            "default": "confluence"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ConfluenceScope"
+          },
+          "auth": {
+            "$ref": "#/components/schemas/AtlassianAuth"
+          }
+        },
+        "type": "object",
+        "required": [
+          "scope",
+          "auth"
+        ],
+        "title": "ConfluenceScanRequest",
+        "description": "Scan request for a Confluence instance."
+      },
+      "ConfluenceScope": {
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "title": "Base Url"
+          },
+          "space_keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Space Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "base_url"
+        ],
+        "title": "ConfluenceScope",
+        "description": "Scope for a Confluence source."
+      },
+      "ConfluenceSpaceInfo": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "page_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "name"
+        ],
+        "title": "ConfluenceSpaceInfo",
+        "description": "Per-space summary inside a :class:`ConfluenceScanPreview`."
       },
       "DeleteWikiResponse": {
         "description": "Response after deleting a wiki.",
@@ -2978,6 +3257,120 @@
         "title": "GenerateWikiResponse",
         "type": "object"
       },
+      "GitAuth": {
+        "properties": {
+          "pat": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pat"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "GitAuth",
+        "description": "Auth for a git source (optional PAT).\n\n``extra=\"forbid\"`` ensures that AtlassianAuth fields (e.g. ``access_token``)\nare rejected when paired with ``source_type=\"git\"``, making the discriminated\nunion enforce valid combos at validation time."
+      },
+      "GitScanPreview": {
+        "properties": {
+          "default_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Branch"
+          },
+          "resolved_branch": {
+            "type": "string",
+            "title": "Resolved Branch"
+          },
+          "commit_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Hash"
+          },
+          "file_count": {
+            "type": "integer",
+            "title": "File Count"
+          },
+          "top_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Top Paths"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "title": "Size Bytes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "resolved_branch",
+          "file_count",
+          "top_paths",
+          "size_bytes"
+        ],
+        "title": "GitScanPreview",
+        "description": "Preview returned for ``source_type == \"git\"``."
+      },
+      "GitScanRequest": {
+        "properties": {
+          "source_type": {
+            "type": "string",
+            "const": "git",
+            "title": "Source Type",
+            "default": "git"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/GitScope"
+          },
+          "auth": {
+            "$ref": "#/components/schemas/GitAuth"
+          }
+        },
+        "type": "object",
+        "required": [
+          "scope"
+        ],
+        "title": "GitScanRequest",
+        "description": "Scan request for a git repository."
+      },
+      "GitScope": {
+        "properties": {
+          "repo_url": {
+            "type": "string",
+            "title": "Repo Url"
+          },
+          "branch": {
+            "type": "string",
+            "title": "Branch",
+            "default": "main"
+          }
+        },
+        "type": "object",
+        "required": [
+          "repo_url"
+        ],
+        "title": "GitScope",
+        "description": "Scope for a git source."
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -3191,6 +3584,75 @@
         ],
         "title": "Invocation",
         "description": "Tracks the state of a background wiki generation job."
+      },
+      "JiraScanPreview": {
+        "properties": {
+          "matching_issues": {
+            "type": "integer",
+            "title": "Matching Issues"
+          },
+          "sample_issue_keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sample Issue Keys"
+          },
+          "jql_validated": {
+            "type": "boolean",
+            "title": "Jql Validated"
+          }
+        },
+        "type": "object",
+        "required": [
+          "matching_issues",
+          "sample_issue_keys",
+          "jql_validated"
+        ],
+        "title": "JiraScanPreview",
+        "description": "Preview returned for ``source_type == \"jira\"``."
+      },
+      "JiraScanRequest": {
+        "properties": {
+          "source_type": {
+            "type": "string",
+            "const": "jira",
+            "title": "Source Type",
+            "default": "jira"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/JiraScope"
+          },
+          "auth": {
+            "$ref": "#/components/schemas/AtlassianAuth"
+          }
+        },
+        "type": "object",
+        "required": [
+          "scope",
+          "auth"
+        ],
+        "title": "JiraScanRequest",
+        "description": "Scan request for a Jira instance."
+      },
+      "JiraScope": {
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "title": "Base Url"
+          },
+          "jql": {
+            "type": "string",
+            "title": "Jql"
+          }
+        },
+        "type": "object",
+        "required": [
+          "base_url",
+          "jql"
+        ],
+        "title": "JiraScope",
+        "description": "Scope for a Jira source."
       },
       "NodeChangeResponse": {
         "properties": {
@@ -3848,6 +4310,49 @@
         ],
         "title": "ResearchResponse",
         "type": "object"
+      },
+      "ScanResponse": {
+        "properties": {
+          "source_type": {
+            "type": "string",
+            "title": "Source Type"
+          },
+          "reachable": {
+            "type": "boolean",
+            "title": "Reachable"
+          },
+          "preview": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GitScanPreview"
+              },
+              {
+                "$ref": "#/components/schemas/ConfluenceScanPreview"
+              },
+              {
+                "$ref": "#/components/schemas/JiraScanPreview"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preview"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_type",
+          "reachable"
+        ],
+        "title": "ScanResponse",
+        "description": "Result of a source scan. ``preview`` shape varies by ``source_type``."
       },
       "SearchResultItem": {
         "properties": {

@@ -10,7 +10,6 @@
 import type { WikiSourceType } from '../../api/wiki';
 
 export type PatSource = 'none' | 'stored' | 'paste';
-export type PlannerMode = 'agentic' | 'graph_clustering';
 
 export interface GitFormState {
   repo_url: string;
@@ -33,7 +32,6 @@ export interface WizardFormData {
   git: GitFormState;
   confluence: ConfluenceFormState;
   jira: JiraFormState;
-  plannerMode: PlannerMode;
   wiki_title: string;
 }
 
@@ -48,7 +46,6 @@ export const INITIAL_FORM_DATA: WizardFormData = {
   },
   confluence: { space_keys: [] },
   jira: { jql: 'ORDER BY created DESC' },
-  plannerMode: 'agentic',
   wiki_title: '',
 };
 

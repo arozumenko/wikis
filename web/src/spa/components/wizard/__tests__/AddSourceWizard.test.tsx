@@ -182,9 +182,12 @@ describe('AddSourceWizard', () => {
         source_type: 'git',
         scope: { repo_url: 'https://github.com/owner/repo', branch: 'main' },
         auth: { pat: null },
-        structure_planner: 'agentic',
       }),
     );
+    // #242: the request must NOT include structure_planner — the
+    // unified pipeline is the only path and the UI no longer exposes
+    // a planner selector.
+    expect(mockGenerate.mock.calls[0][0]).not.toHaveProperty('structure_planner');
     expect(onSuccess).toHaveBeenCalledWith(
       expect.objectContaining({ wiki_id: 'owner--repo--main', invocation_id: 'inv-1' }),
     );

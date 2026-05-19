@@ -38,6 +38,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/wikis": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Wikis */
+        get: operations["list_wikis_api_v1_wikis_get"];
+        put?: never;
+        /** Generate Wiki */
+        post: operations["generate_wiki_api_v1_wikis_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/scan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Scan Source
+         * @description Validate a source configuration and return a preview.
+         *
+         *     Drives Step 3 (Scan) of the ingestion wizard (#208). Persists nothing:
+         *     no ``WikiRecord``, no invocation registration, no token write. The
+         *     response carries reachability + a connector-specific preview shape.
+         *
+         *     All three source types are supported: ``git``, ``confluence``, ``jira``.
+         *
+         *     Request shape: ``source_type`` is **required** — it discriminates the
+         *     typed scope/auth variants (#215). Callers must include it explicitly;
+         *     omitting it returns 422 (Pydantic ``union_tag_not_found``). Pre-#215
+         *     callers that relied on the implicit ``"git"`` default need to update.
+         *
+         *     Errors (no ``responses=`` declaration intentionally — the 400 body
+         *     doesn't match :class:`ErrorResponse`'s top-level shape and the SPA
+         *     codegen would otherwise produce wrong client types.):
+         *
+         *     * ``400`` — ``{"detail": {"error": <message>, "reachable": <bool>}}``
+         *       for unreachable / auth-fail / invalid-scope / invalid-JQL.
+         *     * ``422`` — Pydantic validation error: ``source_type`` missing or not
+         *       ``"git"`` / ``"confluence"`` / ``"jira"``, or per-variant field
+         *       validation failed.
+         *
+         *     TODO(follow-up): rate-limit / tmpdir-exhaustion guard. A malicious
+         *     authenticated user can fan out concurrent scans; each shallow clone
+         *     creates a tmpdir for the context-manager lifetime. Belongs at the
+         *     gateway / network policy layer rather than in this handler.
+         */
+        post: operations["scan_source_api_v1_sources_scan_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/invocations/{invocation_id}": {
         parameters: {
             query?: never;
@@ -101,23 +165,6 @@ export interface paths {
         put?: never;
         /** Research */
         post: operations["research_api_v1_research_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/wikis": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** List Wikis */
-        get: operations["list_wikis_api_v1_wikis_get"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -682,6 +729,21 @@ export interface components {
              */
             qa_id: string;
         };
+        /**
+         * AtlassianAuth
+         * @description Auth for Confluence or Jira (OAuth2 access token + optional refresh).
+         *
+         *     ``extra="forbid"`` ensures that GitAuth fields (e.g. ``pat``) are rejected
+         *     when paired with ``source_type="confluence"`` or ``source_type="jira"``.
+         */
+        AtlassianAuth: {
+            /** Access Token */
+            access_token: string;
+            /** Refresh Token */
+            refresh_token?: string | null;
+            /** Client Id */
+            client_id?: string | null;
+        };
         /** Body_import_wiki_api_v1_wikis_import_post */
         Body_import_wiki_api_v1_wikis_import_post: {
             /** Bundle */
@@ -809,6 +871,56 @@ export interface components {
             description: string;
             /** Relationships */
             relationships?: string[];
+        };
+        /**
+         * ConfluenceScanPreview
+         * @description Preview returned for ``source_type == "confluence"``.
+         *
+         *     ``page_count`` on each space is the total returned by the Confluence API
+         *     for that space.  When the API paginates without a total-results field,
+         *     ``page_count`` is left as ``None`` and the caller should render it as
+         *     ``"?"``.
+         */
+        ConfluenceScanPreview: {
+            /** Spaces */
+            spaces: components["schemas"]["ConfluenceSpaceInfo"][];
+            /** Total Pages */
+            total_pages?: number | null;
+        };
+        /**
+         * ConfluenceScanRequest
+         * @description Scan request for a Confluence instance.
+         */
+        ConfluenceScanRequest: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            source_type: "confluence";
+            scope: components["schemas"]["ConfluenceScope"];
+            auth: components["schemas"]["AtlassianAuth"];
+        };
+        /**
+         * ConfluenceScope
+         * @description Scope for a Confluence source.
+         */
+        ConfluenceScope: {
+            /** Base Url */
+            base_url: string;
+            /** Space Keys */
+            space_keys?: string[];
+        };
+        /**
+         * ConfluenceSpaceInfo
+         * @description Per-space summary inside a :class:`ConfluenceScanPreview`.
+         */
+        ConfluenceSpaceInfo: {
+            /** Key */
+            key: string;
+            /** Name */
+            name: string;
+            /** Page Count */
+            page_count?: number | null;
         };
         /**
          * DeleteWikiResponse
@@ -978,6 +1090,62 @@ export interface components {
             /** Message */
             message: string;
         };
+        /**
+         * GitAuth
+         * @description Auth for a git source (optional PAT).
+         *
+         *     ``extra="forbid"`` ensures that AtlassianAuth fields (e.g. ``access_token``)
+         *     are rejected when paired with ``source_type="git"``, making the discriminated
+         *     union enforce valid combos at validation time.
+         */
+        GitAuth: {
+            /** Pat */
+            pat?: string | null;
+        };
+        /**
+         * GitScanPreview
+         * @description Preview returned for ``source_type == "git"``.
+         */
+        GitScanPreview: {
+            /** Default Branch */
+            default_branch?: string | null;
+            /** Resolved Branch */
+            resolved_branch: string;
+            /** Commit Hash */
+            commit_hash?: string | null;
+            /** File Count */
+            file_count: number;
+            /** Top Paths */
+            top_paths: string[];
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /**
+         * GitScanRequest
+         * @description Scan request for a git repository.
+         */
+        GitScanRequest: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            source_type: "git";
+            scope: components["schemas"]["GitScope"];
+            auth?: components["schemas"]["GitAuth"];
+        };
+        /**
+         * GitScope
+         * @description Scope for a git source.
+         */
+        GitScope: {
+            /** Repo Url */
+            repo_url: string;
+            /**
+             * Branch
+             * @default main
+             */
+            branch: string;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -1093,6 +1261,41 @@ export interface components {
             estimated_tokens?: number | null;
             /** Model Context Limit */
             model_context_limit?: number | null;
+        };
+        /**
+         * JiraScanPreview
+         * @description Preview returned for ``source_type == "jira"``.
+         */
+        JiraScanPreview: {
+            /** Matching Issues */
+            matching_issues: number;
+            /** Sample Issue Keys */
+            sample_issue_keys: string[];
+            /** Jql Validated */
+            jql_validated: boolean;
+        };
+        /**
+         * JiraScanRequest
+         * @description Scan request for a Jira instance.
+         */
+        JiraScanRequest: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            source_type: "jira";
+            scope: components["schemas"]["JiraScope"];
+            auth: components["schemas"]["AtlassianAuth"];
+        };
+        /**
+         * JiraScope
+         * @description Scope for a Jira source.
+         */
+        JiraScope: {
+            /** Base Url */
+            base_url: string;
+            /** Jql */
+            jql: string;
         };
         /**
          * NodeChangeResponse
@@ -1381,6 +1584,20 @@ export interface components {
             research_steps?: string[];
             /** @default null */
             code_map: components["schemas"]["CodeMapData"] | null;
+        };
+        /**
+         * ScanResponse
+         * @description Result of a source scan. ``preview`` shape varies by ``source_type``.
+         */
+        ScanResponse: {
+            /** Source Type */
+            source_type: string;
+            /** Reachable */
+            reachable: boolean;
+            /** Preview */
+            preview?: components["schemas"]["GitScanPreview"] | components["schemas"]["ConfluenceScanPreview"] | components["schemas"]["JiraScanPreview"] | null;
+            /** Warnings */
+            warnings?: string[];
         };
         /**
          * SearchResultItem
@@ -1803,6 +2020,116 @@ export interface operations {
             };
         };
     };
+    list_wikis_api_v1_wikis_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    generate_wiki_api_v1_wikis_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GenerateWikiRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GenerateWikiResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    scan_source_api_v1_sources_scan_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GitScanRequest"] | components["schemas"]["ConfluenceScanRequest"] | components["schemas"]["JiraScanRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScanResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_invocation_api_v1_invocations__invocation_id__get: {
         parameters: {
             query?: never;
@@ -1963,37 +2290,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ResearchResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    list_wikis_api_v1_wikis_get: {
-        parameters: {
-            query?: never;
-            header?: {
-                authorization?: string | null;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["WikiListResponse"];
                 };
             };
             /** @description Validation Error */

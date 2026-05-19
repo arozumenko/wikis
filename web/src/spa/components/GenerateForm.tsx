@@ -1,5 +1,4 @@
 import { useCallback, useMemo, useState } from 'react';
-import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import {
   Alert,
   Autocomplete,
@@ -15,7 +14,6 @@ import {
   Tab,
   Tabs,
   TextField,
-  Tooltip,
   Typography,
 } from '@mui/material';
 import { useConnections } from '../hooks/useConnections';
@@ -26,34 +24,6 @@ import type { components } from '../api/types.generated';
 // Legacy shape — kept for backward compat with GeneratePage (direct URL mode)
 // ---------------------------------------------------------------------------
 type GenerateWikiRequest = components['schemas']['GenerateWikiRequest'];
-
-// ---------------------------------------------------------------------------
-// Planner options
-// ---------------------------------------------------------------------------
-
-type PlannerMode = 'agentic' | 'graph_clustering';
-
-const PLANNER_OPTIONS: ReadonlyArray<{
-  value: PlannerMode;
-  label: string;
-  shortHint: string;
-  description: string;
-}> = [
-  {
-    value: 'agentic',
-    label: 'Agentic',
-    shortHint: 'LLM-driven outline',
-    description:
-      'An LLM agent explores the repository and decides the wiki outline. Slower and uses more tokens, but adapts coverage to what the model finds important.',
-  },
-  {
-    value: 'graph_clustering',
-    label: 'Graph clustering',
-    shortHint: 'Leiden · fast · deterministic',
-    description:
-      'Builds a code graph, runs Leiden clustering, and turns each cluster into a wiki section. Faster and deterministic.',
-  },
-];
 
 // ---------------------------------------------------------------------------
 // PAT source options (Git tab)
@@ -133,18 +103,18 @@ function LegacyGenerateForm({
   const [repoUrl, setRepoUrl] = useState(initialUrl);
   const [branch, setBranch] = useState('main');
   const [accessToken, setAccessToken] = useState('');
-  const [plannerType, setPlannerType] = useState<'agent' | 'cluster'>('agent');
-  // excludeTests is passed to the legacy request shape; the toggle UI was removed
-  // in the multi-source form, so the setter is intentionally unused here.
-  const [excludeTests] = useState(true);
 
   const provider = detectProvider(repoUrl);
   const isLocal = provider === 'local';
-  const isCluster = plannerType === 'cluster';
 
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
+      // The unified pipeline is the only planner path (#242).  The
+      // backend still accepts ``structure_planner`` / ``planner_type``
+      // for one release cycle (logged as deprecated) — the UI no
+      // longer offers a choice but the generated OpenAPI types still
+      // mark them required-with-null, so we pass null explicitly.
       onSubmit({
         source_type: 'git',
         repo_url: repoUrl,
@@ -157,13 +127,13 @@ function LegacyGenerateForm({
         force_rebuild_index: false,
         llm_model: null,
         embedding_model: null,
-        structure_planner: plannerType === 'agent' ? 'agentic' : 'graph_clustering',
         visibility: 'personal',
-        planner_type: plannerType,
-        exclude_tests: isCluster ? excludeTests : null,
+        structure_planner: null,
+        planner_type: null,
+        exclude_tests: null,
       });
     },
-    [repoUrl, branch, provider, isLocal, accessToken, plannerType, isCluster, excludeTests, onSubmit],
+    [repoUrl, branch, provider, isLocal, accessToken, onSubmit],
   );
 
   return (
@@ -208,12 +178,6 @@ function LegacyGenerateForm({
         />
       )}
 
-      <PlannerSection
-        plannerMode={plannerType === 'agent' ? 'agentic' : 'graph_clustering'}
-        onChange={(m) => setPlannerType(m === 'agentic' ? 'agent' : 'cluster')}
-        disabled={disabled}
-      />
-
       <Button
         type="submit"
         variant="contained"
@@ -224,80 +188,6 @@ function LegacyGenerateForm({
       >
         Generate Wiki
       </Button>
-    </Box>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Planner section (shared between legacy and multi-source forms)
-// ---------------------------------------------------------------------------
-
-interface PlannerSectionProps {
-  plannerMode: PlannerMode;
-  onChange: (mode: PlannerMode) => void;
-  disabled?: boolean;
-}
-
-function PlannerSection({ plannerMode, onChange, disabled }: PlannerSectionProps) {
-  return (
-    <Box sx={{ mt: 2, width: '100%' }}>
-      <Stack direction="row" alignItems="center" spacing={0.75} sx={{ mb: 0.75 }}>
-        <Typography
-          component="span"
-          sx={{
-            fontSize: '0.75rem',
-            fontWeight: 600,
-            textTransform: 'uppercase',
-            letterSpacing: '0.04em',
-            color: 'text.secondary',
-          }}
-        >
-          Structure planner
-        </Typography>
-        <Tooltip
-          arrow
-          placement="top"
-          title={
-            <Stack spacing={1} sx={{ p: 0.5 }}>
-              {PLANNER_OPTIONS.map((opt) => (
-                <Box key={opt.value}>
-                  <Typography variant="caption" sx={{ fontWeight: 700, display: 'block' }}>
-                    {opt.label}
-                  </Typography>
-                  <Typography variant="caption">{opt.description}</Typography>
-                </Box>
-              ))}
-            </Stack>
-          }
-        >
-          <InfoOutlinedIcon
-            sx={{ fontSize: '1rem', color: 'text.secondary', cursor: 'help' }}
-          />
-        </Tooltip>
-      </Stack>
-
-      <Stack direction="row" spacing={1}>
-        {PLANNER_OPTIONS.map((opt) => (
-          <Button
-            key={opt.value}
-            variant={plannerMode === opt.value ? 'contained' : 'outlined'}
-            size="small"
-            disabled={disabled}
-            onClick={() => onChange(opt.value)}
-            sx={{ flex: 1, textTransform: 'none', flexDirection: 'column', py: 1 }}
-          >
-            <Typography component="span" sx={{ fontSize: '0.875rem', fontWeight: 600, lineHeight: 1.2 }}>
-              {opt.label}
-            </Typography>
-            <Typography
-              component="span"
-              sx={{ fontSize: '0.6875rem', color: plannerMode === opt.value ? 'inherit' : 'text.secondary', lineHeight: 1.2, mt: '2px' }}
-            >
-              {opt.shortHint}
-            </Typography>
-          </Button>
-        ))}
-      </Stack>
     </Box>
   );
 }
@@ -568,7 +458,6 @@ function MultiSourceGenerateForm({
   initialUrl = '',
 }: GenerateFormMultiSourceProps) {
   const [activeTab, setActiveTab] = useState<WikiSourceType>('git');
-  const [plannerMode, setPlannerMode] = useState<PlannerMode>('agentic');
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   // Git state
@@ -663,7 +552,6 @@ function MultiSourceGenerateForm({
           source_type: 'git',
           scope: { repo_url: repoUrl, branch },
           auth: { pat },
-          structure_planner: plannerMode,
         };
       } else {
         // Confluence or Jira — refresh Atlassian token first
@@ -686,14 +574,12 @@ function MultiSourceGenerateForm({
             source_type: 'confluence',
             scope: { base_url: baseUrl, space_keys: spaceKeys },
             auth: atlassianAuth,
-            structure_planner: plannerMode,
           };
         } else {
           body = {
             source_type: 'jira',
             scope: { base_url: baseUrl, jql },
             auth: atlassianAuth,
-            structure_planner: plannerMode,
           };
         }
       }
@@ -702,7 +588,7 @@ function MultiSourceGenerateForm({
     },
     [
       isValid, activeTab, patSource, selectedPatId, pastedPat,
-      repoUrl, branch, gitConnections, plannerMode,
+      repoUrl, branch, gitConnections,
       refreshAtlassianIfNeeded, spaceKeys, jql, onSubmitMultiSource,
     ],
   );
@@ -762,12 +648,6 @@ function MultiSourceGenerateForm({
           disabled={disabled}
         />
       )}
-
-      <PlannerSection
-        plannerMode={plannerMode}
-        onChange={setPlannerMode}
-        disabled={disabled}
-      />
 
       {submitError && (
         <Alert severity="error" sx={{ mt: 2 }} data-testid="submit-error">
