@@ -2818,7 +2818,7 @@ class OptimizedWikiGenerationAgent:
                 artifacts = [
                     ArtifactInfo(
                         kind="doc_section",
-                        name=f"{dc.dir_path}/{fname}",
+                        name=f"{dc.dir_path}/{fname}" if dc.dir_path else fname,
                         source_path=f"{dc.dir_path}/{fname}" if dc.dir_path else fname,
                         summary="",
                     )
