@@ -657,3 +657,119 @@ class TestSpanFenceInjectionSafe:
             f"outer fence should be ≥4 backticks to safely wrap a ``` span; "
             f"got {max_outer}"
         )
+
+
+# ── Rio review fixes ─────────────────────────────────────────────────────────
+
+
+class TestKeptOrderPreservesDuplicates:
+    """Regression for Rio #269 1st pass blocker 1: the post-loop reorder
+    block converted paragraph_index values into a set, silently deduping
+    any caller that passed two CitedClaim objects with the same
+    paragraph_index.  kept_claims must preserve every input claim that the
+    state machine kept, including duplicates."""
+
+    def test_duplicate_paragraph_index_preserved_in_kept(self, tmp_path):
+        # Two distinct CitedClaim objects that happen to share
+        # paragraph_index=0.  Both have no citations → both go to
+        # citation_missing → neither kept.  But for a CitedClaim WITH
+        # citations, both must survive when the verdict is supported.
+        target = tmp_path / "a.py"
+        target.write_text("def foo(): return 1\n")
+
+        cite = Citation(path="a.py", start_line=1, end_line=1)
+        c1 = CitedClaim(paragraph_index=0, paragraph_text="First version.", citations=[cite])
+        c2 = CitedClaim(paragraph_index=0, paragraph_text="Second version.", citations=[cite])
+
+        llm = FakeLLM(
+            responses=[
+                json.dumps([
+                    {"verdict": "supported", "reason": "ok"},
+                    {"verdict": "supported", "reason": "ok"},
+                ])
+            ]
+        )
+
+        kept, report = verify_citations([c1, c2], llm=llm, repo_root=str(tmp_path))
+
+        # Both must survive — neither must be silently deduplicated.
+        assert len(kept) == 2, f"expected 2 kept claims, got {len(kept)}: {kept}"
+        kept_texts = [c.paragraph_text for c in kept]
+        assert "First version." in kept_texts
+        assert "Second version." in kept_texts
+
+
+class TestSpanWarningDistinguishesCapVsEof:
+    """Regression for Rio #269 1st pass blocker 2: when the 200-line cap
+    fires, the warning must say "truncated by 200-line cap", not "clamped
+    to EOF".  An operator reading the log must be able to tell the two
+    cases apart."""
+
+    def test_two_hundred_line_cap_logs_cap_message(self, tmp_path, caplog):
+        big = tmp_path / "big.py"
+        big.write_text("\n".join(f"x{i}" for i in range(1, 501)) + "\n")  # 500 lines
+
+        from app.core.wiki_content_writer.citation_verifier import _read_span  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger="app.core.wiki_content_writer.citation_verifier"):
+            _read_span(str(tmp_path), "big.py", start_line=1, end_line=500)
+
+        msgs = [r.message for r in caplog.records]
+        assert any("truncated by 200-line cap" in m for m in msgs), msgs
+        assert not any("clamped to EOF" in m for m in msgs), msgs
+
+    def test_eof_clamp_logs_eof_message(self, tmp_path, caplog):
+        small = tmp_path / "small.py"
+        small.write_text("only one line\n")
+
+        from app.core.wiki_content_writer.citation_verifier import _read_span  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger="app.core.wiki_content_writer.citation_verifier"):
+            _read_span(str(tmp_path), "small.py", start_line=1, end_line=50)
+
+        msgs = [r.message for r in caplog.records]
+        assert any("clamped to EOF" in m for m in msgs), msgs
+        assert not any("truncated by 200-line cap" in m for m in msgs), msgs
+
+
+class TestEmptyFileDistinctReason:
+    """Regression for Rio #269 1st pass suggestion: a zero-byte cited file
+    is read successfully but yields no content.  The verdict reason must
+    say "empty cited spans" — not "could not be read", which is misleading
+    for an operator debugging citation issues."""
+
+    def test_empty_file_reason_says_empty_not_unread(self, tmp_path):
+        (tmp_path / "empty.py").write_text("")
+        cite = Citation(path="empty.py", start_line=1, end_line=10)
+        claim = CitedClaim(
+            paragraph_index=0,
+            paragraph_text="Empty span case.",
+            citations=[cite],
+        )
+
+        llm = FakeLLM(responses=[])
+        kept, report = verify_citations([claim], llm=llm, repo_root=str(tmp_path))
+
+        assert kept == []
+        assert len(report.verdicts) == 1
+        v = report.verdicts[0]
+        assert v.verdict == "citation_missing"
+        assert "empty" in v.reason.lower()
+        assert "could not be read" not in v.reason.lower()
+
+    def test_missing_file_reason_still_says_unread(self, tmp_path):
+        # No such file — read genuinely fails.
+        cite = Citation(path="nope.py", start_line=1, end_line=5)
+        claim = CitedClaim(
+            paragraph_index=0,
+            paragraph_text="Missing file case.",
+            citations=[cite],
+        )
+
+        llm = FakeLLM(responses=[])
+        kept, report = verify_citations([claim], llm=llm, repo_root=str(tmp_path))
+
+        assert kept == []
+        v = report.verdicts[0]
+        assert v.verdict == "citation_missing"
+        assert "could not be read" in v.reason.lower()

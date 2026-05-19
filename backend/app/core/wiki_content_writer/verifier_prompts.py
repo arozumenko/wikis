@@ -37,10 +37,14 @@ class SpanText:
     end_line : int
         Last line (1-indexed, inclusive) of the span.
     text : str
-        Content of the span.  May be empty if the file could not be read or
-        the lines were out of range (clamped to EOF).
+        Content of the span.  May be empty if the file could not be read,
+        the lines were out of range (clamped to EOF), or the file is empty.
     truncated : bool
         True when the span was hard-capped at 200 lines and text is incomplete.
+    read_failed : bool
+        True when the cited file could not be read at all (path unsafe,
+        file missing, or OS error).  Distinguishes a genuine unreadable
+        file from a successfully-read but zero-byte file.
     """
 
     citation_path: str
@@ -48,6 +52,7 @@ class SpanText:
     end_line: int
     text: str
     truncated: bool = False
+    read_failed: bool = False
 
 
 @dataclass

@@ -176,6 +176,7 @@ def _read_span(repo_root: str, citation_path: str, start_line: int, end_line: in
             start_line=start_line,
             end_line=end_line,
             text="",
+            read_failed=True,
         )
 
     # Read only the lines we actually need: skip up to start_line, then take
@@ -185,7 +186,6 @@ def _read_span(repo_root: str, citation_path: str, start_line: int, end_line: in
     lo_1based = max(1, start_line)
     requested = max(0, end_line - lo_1based + 1)
     capped = min(requested, _SPAN_LINE_CAP)
-    truncated = requested > _SPAN_LINE_CAP
 
     try:
         from itertools import islice  # noqa: PLC0415
@@ -199,20 +199,36 @@ def _read_span(repo_root: str, citation_path: str, start_line: int, end_line: in
             start_line=start_line,
             end_line=end_line,
             text="",
+            read_failed=True,
         )
 
-    # Determine clamped_end from how many lines we actually read.  If we
-    # received fewer than ``capped`` it means we hit EOF before end_line.
+    # Distinguish the two reasons we may have stopped short of end_line:
+    #   * The 200-line cap fired: we filled the buffer exactly, and the
+    #     request asked for more. We can't tell from here whether the file
+    #     has more content, but the user asked for more than the cap, so
+    #     "truncated by cap" is the right framing.
+    #   * EOF: we filled fewer lines than the cap. The file genuinely ran
+    #     out before end_line.
     actual_lines = len(selected)
     clamped_end = lo_1based + actual_lines - 1 if actual_lines else lo_1based - 1
+    truncated = actual_lines == capped and requested > _SPAN_LINE_CAP
     if clamped_end < end_line:
-        logger.warning(
-            "Citation span clamped to EOF: %s:%d-%d → ends at line %d",
-            citation_path,
-            start_line,
-            end_line,
-            clamped_end,
-        )
+        if truncated:
+            logger.warning(
+                "Citation span truncated by 200-line cap: %s:%d-%d → ends at line %d",
+                citation_path,
+                start_line,
+                end_line,
+                clamped_end,
+            )
+        else:
+            logger.warning(
+                "Citation span clamped to EOF: %s:%d-%d → ends at line %d",
+                citation_path,
+                start_line,
+                end_line,
+                clamped_end,
+            )
 
     span_text = "".join(selected)
 
@@ -368,25 +384,42 @@ def verify_citations(
     prepared: list[ClaimWithSpans] = []
     for claim in needs_llm:
         cws = _prepare_claim(claim, repo_root)
-        # Check: if all spans failed to read (empty text, safe_join returned None)
-        all_unreadable = all(not s.text for s in cws.spans) if cws.spans else False
-        if all_unreadable:
-            # Treat as citation_missing — no LLM call
+        # A claim is uninspectable when EVERY cited span yielded no text.
+        # That happens in two distinct cases:
+        #   (a) The file could not be read at all (path unsafe, missing,
+        #       OS error) — flagged by ``read_failed``.
+        #   (b) The file was read successfully but is empty / lines out of
+        #       range after clamping.
+        # Both still result in a strip, but the audit log needs to be honest
+        # about which case fired so an operator can tell "broken citation"
+        # from "real but empty cited file".
+        all_empty = all(not s.text for s in cws.spans) if cws.spans else False
+        if all_empty:
+            all_read_failed = all(s.read_failed for s in cws.spans)
+            if all_read_failed:
+                reason = (
+                    f"All cited paths could not be read: "
+                    f"{[c.path for c in claim.citations]}"
+                )
+            else:
+                reason = (
+                    f"All cited spans are empty (file exists but yielded "
+                    f"no content for the requested range): "
+                    f"{[c.path for c in claim.citations]}"
+                )
             verdict = VerifyVerdict(
                 paragraph_index=claim.paragraph_index,
                 verdict="citation_missing",
-                reason=(
-                    f"All cited paths could not be read: "
-                    f"{[c.path for c in claim.citations]}"
-                ),
+                reason=reason,
                 citations_checked=len(cws.spans),
             )
             report.verdicts.append(verdict)
             report.paragraphs_stripped += 1
             cited_paths = [c.path for c in claim.citations]
             logger.info(
-                "Stripped paragraph %d (citation_missing): unreadable paths; paths=%s",
+                "Stripped paragraph %d (citation_missing): %s; paths=%s",
                 claim.paragraph_index,
+                "unreadable paths" if all_read_failed else "empty cited spans",
                 cited_paths,
             )
         else:
@@ -424,14 +457,11 @@ def verify_citations(
                     )
 
     # ── Sort verdicts by paragraph_index for deterministic output ──────────
+    # ``kept`` is already in input order: pass 2 walked ``needs_llm`` in
+    # input order, pass 3 walked ``prepared`` in the same order, and only
+    # the batch loop appends to ``kept``.  We deliberately do NOT rebuild
+    # kept via a paragraph_index set — that would silently deduplicate any
+    # caller that passes two CitedClaim objects sharing a paragraph_index.
     report.verdicts.sort(key=lambda v: v.paragraph_index)
-
-    # kept_claims preserves original order from cited_claims
-    # Re-order kept to match input order (prepared may have interleaved citation_missing)
-    para_idx_to_claim = {c.paragraph_index: c for c in cited_claims}
-    kept_indices = {c.paragraph_index for c in kept}
-    kept = [para_idx_to_claim[idx] for idx in sorted(kept_indices)]
-
-    report.paragraphs_kept = len(kept)
 
     return kept, report
