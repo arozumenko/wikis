@@ -36,6 +36,11 @@ _INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 _ATTACHMENT_PLACEHOLDER_RE = re.compile(r"\[\[attachment:\s*([^\]]+)\]\]")
 _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 _LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+_REF_LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\[([^\]]*)\]")
+_REF_DEF_RE = re.compile(
+    r"^[ ]{0,3}\[([^\]]+)\]:\s+(\S+)(?:\s+\"[^\"]*\")?\s*$",
+    re.MULTILINE,
+)
 _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 _EXTERNAL_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*:", re.IGNORECASE)
@@ -44,7 +49,34 @@ _EXTERNAL_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*:", re.IGNORECASE)
 def _strip_code(md: str) -> str:
     md = _FENCED_BLOCK_RE.sub("", md)
     md = _INLINE_CODE_RE.sub("", md)
+    md = _strip_indented_code(md)
     return md
+
+
+def _strip_indented_code(md: str) -> str:
+    """Blank out CommonMark indented code blocks (4+ spaces or tab, after a blank line)."""
+    lines = md.split("\n")
+    out: list[str] = []
+    in_code = False
+    prev_blank = True
+    for line in lines:
+        stripped = line.strip()
+        is_blank = stripped == ""
+        is_indented = (line.startswith("    ") or line.startswith("\t")) and not is_blank
+        if not in_code and is_indented and prev_blank:
+            in_code = True
+        if in_code:
+            if is_indented:
+                out.append("")
+            elif is_blank:
+                out.append(line)
+            else:
+                in_code = False
+                out.append(line)
+        else:
+            out.append(line)
+        prev_blank = is_blank
+    return "\n".join(out)
 
 
 def _split_anchor(target: str) -> tuple[str, str | None]:
@@ -76,6 +108,44 @@ def _blank_spans(text: str, spans: list[tuple[int, int]]) -> str:
     return "".join(parts)
 
 
+def _classify_url_link(
+    text: str,
+    target_raw: str,
+    source_path: str | None,
+    url_to_file_index: dict[str, str] | None,
+) -> Link:
+    """Build a Link from a (text, raw URL/path) pair common to inline and reference-style links."""
+    path, anchor = _split_anchor(target_raw)
+    if _EXTERNAL_SCHEME_RE.match(target_raw):
+        if url_to_file_index and path in url_to_file_index:
+            resolved_path = url_to_file_index[path]
+            return Link(
+                kind="internal",
+                target=resolved_path,
+                text=text,
+                anchor=anchor,
+                source_path=source_path,
+                resolved=resolved_path,
+            )
+        return Link(
+            kind="external",
+            target=path,
+            text=text,
+            anchor=anchor,
+            source_path=source_path,
+            resolved=None,
+        )
+    resolved = _resolve_relative(path, source_path) if source_path else None
+    return Link(
+        kind="internal",
+        target=path,
+        text=text,
+        anchor=anchor,
+        source_path=source_path,
+        resolved=resolved,
+    )
+
+
 def extract_links(
     md_text: str,
     source_path: str | None = None,
@@ -88,6 +158,7 @@ def extract_links(
         source_path: Path of the source file (used to resolve relative links).
         url_to_file_index: Optional map of original URL → exported file path,
             used to localize Confluence/Jira links back to internal references.
+            Index keys are matched against the URL with any ``#fragment`` stripped.
 
     Returns:
         List of ``Link`` records in document order. ``target`` carries the
@@ -101,6 +172,15 @@ def extract_links(
 
     cleaned = _strip_code(md_text)
     found: list[tuple[int, Link]] = []
+
+    # Reference definitions: collect label → url, then blank the def lines.
+    refs: dict[str, str] = {}
+    ref_def_spans: list[tuple[int, int]] = []
+    for m in _REF_DEF_RE.finditer(cleaned):
+        refs[m.group(1).strip().lower()] = m.group(2)
+        ref_def_spans.append((m.start(), m.end()))
+    if ref_def_spans:
+        cleaned = _blank_spans(cleaned, ref_def_spans)
 
     placeholder_spans: list[tuple[int, int]] = []
     for m in _ATTACHMENT_PLACEHOLDER_RE.finditer(cleaned):
@@ -123,14 +203,15 @@ def extract_links(
     masked = _blank_spans(cleaned, placeholder_spans)
 
     for m in _IMAGE_RE.finditer(masked):
+        path, anchor = _split_anchor(m.group(2))
         found.append(
             (
                 m.start(),
                 Link(
                     kind="attachment",
-                    target=m.group(2),
+                    target=path,
                     text=m.group(1),
-                    anchor=None,
+                    anchor=anchor,
                     source_path=source_path,
                     resolved=None,
                 ),
@@ -138,57 +219,20 @@ def extract_links(
         )
 
     for m in _LINK_RE.finditer(masked):
-        text = m.group(1)
-        target_raw = m.group(2)
-        path, anchor = _split_anchor(target_raw)
-        if _EXTERNAL_SCHEME_RE.match(target_raw):
-            if url_to_file_index and target_raw in url_to_file_index:
-                # Localized: target carries the resolved file path so it has
-                # the same meaning as a non-localized internal link.
-                resolved_path = url_to_file_index[target_raw]
-                found.append(
-                    (
-                        m.start(),
-                        Link(
-                            kind="internal",
-                            target=resolved_path,
-                            text=text,
-                            anchor=anchor,
-                            source_path=source_path,
-                            resolved=resolved_path,
-                        ),
-                    )
-                )
-            else:
-                found.append(
-                    (
-                        m.start(),
-                        Link(
-                            kind="external",
-                            target=path,
-                            text=text,
-                            anchor=anchor,
-                            source_path=source_path,
-                            resolved=None,
-                        ),
-                    )
-                )
-            continue
-
-        resolved = _resolve_relative(path, source_path) if source_path else None
         found.append(
             (
                 m.start(),
-                Link(
-                    kind="internal",
-                    target=path,
-                    text=text,
-                    anchor=anchor,
-                    source_path=source_path,
-                    resolved=resolved,
-                ),
+                _classify_url_link(m.group(1), m.group(2), source_path, url_to_file_index),
             )
         )
+
+    for m in _REF_LINK_RE.finditer(masked):
+        text = m.group(1)
+        label = m.group(2).strip().lower() or text.strip().lower()
+        url = refs.get(label)
+        if not url:
+            continue
+        found.append((m.start(), _classify_url_link(text, url, source_path, url_to_file_index)))
 
     for m in _WIKILINK_RE.finditer(masked):
         inner = m.group(1).strip()

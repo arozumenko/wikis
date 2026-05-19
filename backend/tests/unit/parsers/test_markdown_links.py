@@ -167,6 +167,69 @@ class TestConfluenceJiraURLs:
         assert links[0].target == "https://example.com/page"
         assert links[0].anchor == "frag"
 
+    def test_url_with_fragment_localized_via_base_url(self):
+        base = "https://confluence.example.com/display/SPACE/Auth+Guide"
+        index = {base: "exported/auth-guide.md"}
+        links = extract_links(f"[Auth]({base}#section)", url_to_file_index=index)
+        assert links[0].kind == "internal"
+        assert links[0].target == "exported/auth-guide.md"
+        assert links[0].anchor == "section"
+
+
+class TestImageAnchor:
+    def test_image_target_strips_fragment(self):
+        links = extract_links("![alt](diagram.png#region)")
+        assert links[0].kind == "attachment"
+        assert links[0].target == "diagram.png"
+        assert links[0].anchor == "region"
+
+
+class TestReferenceStyleLinks:
+    def test_full_reference_link(self):
+        md = "See [the docs][docs] for details.\n\n[docs]: https://example.com/docs\n"
+        links = extract_links(md)
+        assert len(links) == 1
+        assert links[0].kind == "external"
+        assert links[0].target == "https://example.com/docs"
+        assert links[0].text == "the docs"
+
+    def test_collapsed_reference_link(self):
+        md = "Read the [Auth Guide][] for setup.\n\n[Auth Guide]: auth.md\n"
+        links = extract_links(md)
+        assert len(links) == 1
+        assert links[0].kind == "internal"
+        assert links[0].target == "auth.md"
+
+    def test_undefined_reference_ignored(self):
+        md = "See [the docs][nowhere] for details.\n"
+        assert extract_links(md) == []
+
+    def test_reference_label_case_insensitive(self):
+        md = "See [docs][DOCS].\n\n[Docs]: https://example.com\n"
+        links = extract_links(md)
+        assert len(links) == 1
+        assert links[0].target == "https://example.com"
+
+
+class TestIndentedCodeBlocks:
+    def test_indented_block_after_blank_line_ignored(self):
+        md = """
+Real link: [keep](keep.md)
+
+    [ignore](ignore.md)
+    [also-ignore](other.md)
+
+End paragraph.
+"""
+        targets = {link.target for link in extract_links(md)}
+        assert targets == {"keep.md"}
+
+    def test_tab_indented_block_ignored(self):
+        md = "Top text.\n\n\t[ignore](ignore.md)\n\nKeep [this](this.md).\n"
+        targets = {link.target for link in extract_links(md)}
+        assert "ignore.md" not in targets
+        assert "this.md" in targets
+
 
 class TestEdgeCases:
     def test_empty_input(self):
