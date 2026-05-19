@@ -243,6 +243,14 @@ class TestGetCallees:
         result = tools.get_callees("fn")
         assert result.callees == []
 
+    def test_has_found_field_defaulting_false(self, tmp_path):
+        # Symmetric with TestGetCallers — `found` discriminates "no
+        # callees" from "backend not wired".
+        tools = WriterTools(repo_root=str(tmp_path))
+        result = tools.get_callees("fn")
+        assert hasattr(result, "found")
+        assert result.found is False
+
 
 # ── GrepMatch return type ────────────────────────────────────────────────────
 
