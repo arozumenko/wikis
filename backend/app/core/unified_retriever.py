@@ -300,11 +300,11 @@ class UnifiedRetriever:
 
         .. deprecated::
             This is a compatibility shim for the legacy retrieval pipeline
-            (``search_codebase`` with ``apply_expansion=True``).  In the new
-            cluster-driven pipeline, page symbols are assigned by
-            ``cluster_planner`` and expanded by the smart expansion engine
-            (``expansion_engine.py``), making retriever-level expansion
-            redundant.  Will be removed in Phase 6.
+            (``search_codebase`` with ``apply_expansion=True``).  After #242
+            the unified planner pipeline assigns page symbols directly from
+            the skeleton, and the smart expansion engine
+            (``expansion_engine.py``) handles cluster-level expansion, so
+            retriever-level expansion is redundant in this code path.
 
         Mirrors ``ContentExpander.expand_retrieved_documents`` but uses
         ``repo_edges`` directly, avoiding NetworkX in-memory graph.

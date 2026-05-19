@@ -1,13 +1,9 @@
-"""Unified wiki pipeline orchestrator (#243).
+"""Unified wiki pipeline orchestrator (#243, default path since #242).
 
 Wires the unified planner → writer → source-kind gate → citation verifier
-into a single end-to-end pipeline that can be called from the existing
-``OptimizedWikiGenerationAgent`` via the ``WIKIS_UNIFIED_PIPELINE`` feature
-flag.
-
-The old planner paths (``plan_structure`` and ``plan_structure_graph_first``)
-are NOT removed here; this module adds a third code path that sits behind the
-opt-in flag.  Cleanup of the legacy paths is the responsibility of #242.
+into a single end-to-end pipeline.  This is the sole structure-planning
+path; the legacy graph-first, deepagents, and cluster-based paths were
+removed in #242.
 
 Public API
 ----------

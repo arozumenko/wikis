@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from .candidate_builder import (
+from .coverage_ledger import (
     CLASS_BRIDGE,
     CLASS_CODE,
     CLASS_DOCS,

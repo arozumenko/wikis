@@ -286,11 +286,14 @@ class DocCluster:
 class StructureSkeleton:
     """Complete deterministic skeleton ready for LLM refinement.
 
-    The new ``clusters`` field holds a heterogeneous list of ``Cluster``
-    objects of any source kind.  The legacy ``code_clusters`` and
-    ``doc_clusters`` fields are retained for backwards compatibility with
-    the existing planner paths (``plan_structure``,
-    ``plan_structure_graph_first``) until the unified planner (#236) ships.
+    The ``clusters`` field holds a heterogeneous list of ``Cluster``
+    objects of any source kind and is what the unified planner pipeline
+    (``OptimizedWikiGenerationAgent._generate_wiki_structure`` ->
+    ``run_planner_with_report``) consumes.  ``code_clusters`` and
+    ``doc_clusters`` are kept because ``build_skeleton`` still populates
+    them and the unified pipeline's degenerate-skeleton fallback path
+    promotes ``DocCluster`` entries into ``Cluster(kind="doc")`` objects
+    on the fly.
     """
 
     code_clusters: list[DirCluster]

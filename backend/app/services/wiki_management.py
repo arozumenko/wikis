@@ -3,13 +3,8 @@
 Metadata is stored in a relational database via SQLAlchemy async.
 Wiki artifact files (markdown pages) continue to live in ArtifactStorage.
 
-Unified pipeline (#243)
------------------------
-When ``WIKIS_UNIFIED_PIPELINE=1``, wiki generation uses the unified
-planner → writer → gate → verifier path inside ``wiki_graph_optimized.py``
-via :meth:`OptimizedWikiGenerationAgent._generate_wiki_structure_unified`.
-This service layer is unaffected by that flag — it only handles post-
-generation metadata (listing, deletion, FTS indexing).
+The unified pipeline (#242/#243) is the sole generation path; this service
+only handles post-generation metadata (listing, deletion, FTS indexing).
 """
 
 from __future__ import annotations

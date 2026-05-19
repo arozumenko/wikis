@@ -27,7 +27,7 @@ from .constants import ARCHITECTURAL_SYMBOLS, DOC_SYMBOL_TYPES
 # Page Identity Classification (capability-first clustering)
 # =============================================================================
 # These sets partition code symbols by their page-identity role.
-# Used by cluster_planner seed selection and candidate_builder classification.
+# Symbol-type priority weights — used by graph clustering / expansion and
 
 # Symbols that can anchor a page (drive page identity in mixed clusters).
 # Ordered by SYMBOL_TYPE_PRIORITY when selecting seeds.
