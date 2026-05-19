@@ -395,17 +395,25 @@ class TestIdentifierRule:
         assert "ID" not in identifiers
         assert "DB" not in identifiers
 
-    def test_common_english_camelcase_words_not_flagged(self):
-        """Common compound words like 'GitHub', 'JavaScript' should not trigger."""
+    def test_common_english_camelcase_words_flagged_when_not_seeded(self):
+        """``_CAMEL_CASE_RE`` matches two-segment title-case tokens by design
+        (``WikiContentWriter``), so common compounds like ``GitHub`` also match.
+        Callers who don't want these flagged should pre-seed ``known_symbols``."""
         claims = [_claim("The service is deployed on GitHub Actions.")]
         kept, report = apply_gate(claims, [], known_symbols=set())
 
-        # This test is intentionally lenient — the gate may flag these,
-        # but we want to know the behavior is consistent.
-        # The key invariant: at most 1 flag for the whole paragraph.
         grounded_flags = [f for f in report.flags if f.rule == "identifier_not_grounded"]
-        # We just verify the gate doesn't crash on common words
-        assert isinstance(grounded_flags, list)
+        flagged = {f.detail for f in grounded_flags}
+        assert "GitHub" in flagged
+
+    def test_common_english_camelcase_words_not_flagged_when_seeded(self):
+        """The caller can suppress proper-noun flags by pre-seeding known_symbols."""
+        claims = [_claim("The service is deployed on GitHub Actions.")]
+        kept, report = apply_gate(claims, [], known_symbols={"GitHub"})
+
+        grounded_flags = [f for f in report.flags if f.rule == "identifier_not_grounded"]
+        flagged = {f.detail for f in grounded_flags}
+        assert "GitHub" not in flagged
 
 
 # ── Mode configuration ────────────────────────────────────────────────────────
@@ -491,7 +499,8 @@ class TestDataclassStructure:
 
 class TestToolCallTrace:
     def test_only_read_file_and_grep_tools_contribute_to_grounding(self):
-        """get_signature, get_callers etc. are not grounding evidence."""
+        """get_signature, get_callers, etc. are not grounding evidence — only
+        ``read_file`` and ``grep`` result text feeds the identifier check."""
         trace = [
             ToolCall(
                 tool="get_signature",
@@ -502,14 +511,13 @@ class TestToolCallTrace:
         claims = [_claim("WikiContentWriter manages page generation.")]
         kept, report = apply_gate(claims, trace, known_symbols=set())
 
-        # get_signature result should not count as read-grounding
-        # The identifier should still be flagged if not in known_symbols
+        # get_signature result_text must NOT count as grounding, so the
+        # identifier should still be flagged.
         grounded_flags = [f for f in report.flags if f.rule == "identifier_not_grounded"]
-        # This is a design decision: get_signature is not a trace read, so identifier
-        # might still be ungrounded unless the implementation also checks get_signature results.
-        # The spec says "read_file / grep result" → get_signature excluded.
-        # We verify the flag exists (or not) consistently — implementation defines this.
-        assert isinstance(grounded_flags, list)
+        flagged = {f.detail for f in grounded_flags}
+        assert "WikiContentWriter" in flagged, (
+            f"get_signature should not ground identifiers; flagged: {flagged}"
+        )
 
     def test_empty_trace_means_no_read_grounding(self):
         claims = [_claim("See README for startup configuration.")]
@@ -556,3 +564,66 @@ class TestModeValidation:
         kept, report = apply_gate(claims, [], mode={"readme": "strip"})
         assert isinstance(kept, list)
         assert isinstance(report, GateReport)
+
+
+# ── README path boundary (Rio #266 1st pass) ─────────────────────────────────
+
+
+class TestReadmePathBoundary:
+    """``_README_PATH_RE`` must require a path-component boundary on the left;
+    otherwise a path like ``embedded_readme.md`` falsely satisfies rule 1
+    and a hallucinated README claim passes without a flag."""
+
+    def test_embedded_readme_in_filename_does_not_ground(self):
+        # The tool trace reads ``docs/embedded_readme.md``.  This is NOT a
+        # README file; it just happens to contain "readme" in the name.
+        trace = [_read_file("docs/embedded_readme.md", "...")]
+        claims = [_claim("See README for installation steps.", paths=["README.md"])]
+        kept, report = apply_gate(claims, trace)
+
+        readme_flags = [f for f in report.flags if f.rule == "readme_claim_without_read"]
+        assert len(readme_flags) == 1, (
+            f"expected readme_claim_without_read flag, got: {[f.rule for f in report.flags]}"
+        )
+
+    def test_real_readme_at_root_still_grounds(self):
+        trace = [_read_file("README.md", "...")]
+        claims = [_claim("See README for installation steps.")]
+        kept, report = apply_gate(claims, trace)
+
+        readme_flags = [f for f in report.flags if f.rule == "readme_claim_without_read"]
+        assert readme_flags == []
+
+    def test_real_readme_in_subdir_still_grounds(self):
+        trace = [_read_file("docs/README.md", "...")]
+        claims = [_claim("See README for installation steps.")]
+        kept, report = apply_gate(claims, trace)
+
+        readme_flags = [f for f in report.flags if f.rule == "readme_claim_without_read"]
+        assert readme_flags == []
+
+
+# ── UPPER_CASE trailing-underscore guard (Rio #266 1st pass) ─────────────────
+
+
+class TestUpperCaseTrailingUnderscore:
+    """``_UPPER_CASE_RE`` must not allow a trailing underscore — otherwise a
+    paragraph that ends an UPPER_CASE token in mid-sentence punctuation
+    weirdness (``...the GATEWAY_URL_ field...``) produces a spurious
+    ``identifier_not_grounded`` flag for ``GATEWAY_URL_`` even though
+    ``GATEWAY_URL`` is in ``known_symbols``."""
+
+    def test_known_symbol_followed_by_underscore_grounds(self):
+        # The claim text uses GATEWAY_URL_ (engineer typo); known_symbols
+        # contains GATEWAY_URL.  A correct regex should either not match
+        # the trailing-underscore form, or match only GATEWAY_URL.
+        claims = [_claim("The GATEWAY_URL_ env var configures the endpoint.")]
+        kept, report = apply_gate(claims, [], known_symbols={"GATEWAY_URL"})
+
+        grounded_flags = [
+            f for f in report.flags if f.rule == "identifier_not_grounded"
+        ]
+        flagged_idents = {f.detail for f in grounded_flags}
+        assert "GATEWAY_URL_" not in flagged_idents, (
+            f"GATEWAY_URL_ should not be a flagged identifier; flags: {flagged_idents}"
+        )

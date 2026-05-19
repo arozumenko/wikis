@@ -128,8 +128,11 @@ class GateReport:
 # README detection — word "readme" in any case (also README.md, README.rst etc.)
 _README_WORD_RE = re.compile(r"\bREADME\b", re.IGNORECASE)
 
-# README path pattern — matches readme variants in a file path
-_README_PATH_RE = re.compile(r"(?i)readme(\.(md|rst|txt))?$")
+# README path pattern — matches readme variants in a file path.  The
+# ``(?:^|/)`` anchor prevents false matches inside longer names like
+# ``embedded_readme.md`` or ``my_readme_helper.txt``; only the leaf name
+# (or a slash-prefixed leaf) counts as a real README read.
+_README_PATH_RE = re.compile(r"(?i)(?:^|/)readme(\.(md|rst|txt))?$")
 
 # SQL keyword patterns — triggers rule 2
 _SQL_KEYWORDS: list[tuple[re.Pattern[str], str]] = [
@@ -160,8 +163,10 @@ _CAMEL_CASE_RE = re.compile(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b")
 # underscore-delimited segment must be non-empty (so ``a_`` doesn't match).
 _SNAKE_CASE_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
 
-# UPPER_CASE env vars / constants: 3+ chars, contains at least one underscore.
-_UPPER_CASE_RE = re.compile(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b")
+# UPPER_CASE env vars / constants: 3+ chars, contains at least one underscore,
+# may NOT end with an underscore (otherwise ``GATEWAY_URL_`` matches and
+# misses grounding even though ``GATEWAY_URL`` is in known_symbols).
+_UPPER_CASE_RE = re.compile(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]*[A-Z0-9]\b")
 
 # Short tokens to skip — all-caps tokens of 2 chars or less are too noisy
 # (HTTP codes, abbreviations).
@@ -264,6 +269,14 @@ def apply_gate(
         Set of symbol names from the code graph's name index.  Identifiers
         found in this set are considered grounded.  Pass ``None`` to rely
         solely on the tool trace for grounding (identifier rule still runs).
+
+        Matching is a **case-sensitive substring match** against the symbol
+        set, so the caller must store the symbol exactly as it will appear
+        in writer prose (e.g. ``"GATEWAY_URL"`` not ``"gateway_url"``).
+        For prose-heavy doc pages, callers should pre-seed this set with
+        common proper-noun CamelCase tokens such as ``GitHub``, ``JavaScript``,
+        ``TypeScript`` — the ``_CAMEL_CASE_RE`` pattern matches those by
+        design (two title-case segments) and they will otherwise be flagged.
     mode :
         Per-rule action override.  Keys: ``"readme"``, ``"sql"``,
         ``"identifier"``.  Values: ``"flag"`` (default), ``"strip"``,
