@@ -50,6 +50,7 @@ from ._evidence_utils import (
     extract_first_paragraph,
     extract_toc_from_text,
     mask_code_fences,
+    parse_frontmatter,
     safe_join,
 )
 from .structure_skeleton import Cluster
@@ -134,118 +135,6 @@ class ConfluenceEvidencePack:
         return "\n".join(parts)
 
 
-# ── Frontmatter parser (stdlib-only) ─────────────────────────────────────────
-
-# Frontmatter shape produced by the Confluence scanner (#211):
-#
-#   ---
-#   title: My Page
-#   labels:
-#     - infra
-#     - security
-#   parents:
-#     - Engineering
-#     - Security
-#   original_url: https://confluence.example.com/...
-#   space_key: ENG
-#   ---
-#
-# Rules:
-# * Bounded by leading ``---`` / trailing ``---`` on their own lines.
-# * Simple ``key: value`` pairs (string values).
-# * YAML list items: lines starting with ``  - item`` under a key.
-# * Nested objects and multi-line strings: not emitted by scanner → punt.
-# * On any parse anomaly: return what was collected so far (graceful).
-
-_FM_OPEN_RE = re.compile(r"^---\s*$")
-_FM_KEY_VALUE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$")
-# Match list items at any positive indent — Confluence scanner emits 2-space
-# indent in practice but a stricter pattern would silently drop items if the
-# generator changes (Copilot review on #252).
-_FM_LIST_ITEM_RE = re.compile(r"^\s+-\s+(.+)$")
-
-
-def _parse_frontmatter(md_text: str) -> tuple[dict, str]:
-    """Parse YAML frontmatter from the top of *md_text*.
-
-    Returns ``(frontmatter_dict, body_text_after_frontmatter)``.
-
-    If no valid frontmatter block is found, returns ``({}, md_text)``.
-    Punts on nested YAML structures — the Confluence scanner does not emit
-    them so this parser does not need to handle them.
-    """
-    lines = md_text.splitlines(keepends=True)
-    if not lines:
-        return {}, md_text
-
-    # Must start with ``---``
-    first_line = lines[0].rstrip("\n").rstrip("\r")
-    if not _FM_OPEN_RE.match(first_line):
-        return {}, md_text
-
-    fm: dict = {}
-    current_key: str | None = None
-    current_list: list[str] | None = None
-    close_idx: int | None = None
-
-    for i, raw_line in enumerate(lines[1:], start=1):
-        line = raw_line.rstrip("\n").rstrip("\r")
-
-        # Closing ``---``
-        if _FM_OPEN_RE.match(line):
-            # Flush any in-progress list
-            if current_key is not None and current_list is not None:
-                fm[current_key] = current_list
-            close_idx = i
-            break
-
-        # List item: must come after a key that started a list
-        list_m = _FM_LIST_ITEM_RE.match(line)
-        if list_m and current_key is not None:
-            if current_list is None:
-                # Convert previously-stored scalar to a list if needed
-                current_list = []
-                # If key already had a scalar value, drop it (list wins)
-                fm.pop(current_key, None)
-            current_list.append(list_m.group(1).strip())
-            continue
-
-        # Key: value pair
-        kv_m = _FM_KEY_VALUE_RE.match(line)
-        if kv_m:
-            # Flush previous key if it was building a list
-            if current_key is not None and current_list is not None:
-                fm[current_key] = current_list
-                current_list = None
-            current_key = kv_m.group(1)
-            val = kv_m.group(2).strip()
-            if val:
-                # Scalar value (list may follow on next lines)
-                fm[current_key] = val
-            else:
-                # Empty value — next lines may be list items
-                pass
-            continue
-
-        # Anything else (blank lines, unrecognised): continue
-        if current_list is not None and not line.strip():
-            # Blank line inside a list terminates it. Clear `current_key`
-            # too — otherwise a subsequent list item under the same key
-            # would re-enter the list-item branch, repopulate the list as
-            # if starting fresh, and silently drop the already-flushed
-            # items (Rio review on #252).
-            fm[current_key] = current_list
-            current_list = None
-            current_key = None
-
-    if close_idx is None:
-        # No closing --- found; treat entire document as having no frontmatter
-        return {}, md_text
-
-    body = "".join(lines[close_idx + 1 :])
-    return fm, body
-
-
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 
@@ -294,7 +183,7 @@ def _process_page(
         return None
 
     # Parse frontmatter; body is the text after the closing ---
-    frontmatter, body = _parse_frontmatter(text)
+    frontmatter, body = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
 
     # Title: prefer frontmatter "title", then first H1 in body, else filename.
     # The H1 scan masks fenced code blocks so a `# install` line inside a

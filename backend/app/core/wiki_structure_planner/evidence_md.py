@@ -33,15 +33,15 @@ Design choices (see PR body for rationale)
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..parsers.markdown_chunker import Chunk, chunk_markdown
+from ..parsers.markdown_chunker import chunk_markdown
 from ._evidence_utils import (
     collect_attachments,
     extract_first_paragraph,
     extract_toc_from_text,
+    parse_frontmatter,
     safe_join,
 )
 from .structure_skeleton import Cluster
@@ -52,101 +52,6 @@ logger = logging.getLogger(__name__)
 
 # Approximate chars per token — conservative.
 _CHARS_PER_TOKEN = 4
-
-
-# ── Frontmatter parser (stdlib-only) ─────────────────────────────────────────
-#
-# Plain markdown files can carry YAML frontmatter (Jekyll/Hugo/MkDocs style).
-# The parser below is intentionally minimal — it handles the flat key/value
-# and multi-line list structure that static-site generators emit.  Nested
-# objects and multi-line strings are not supported (not needed here).
-#
-# Kept private to evidence_md.py (Option A from issue #255): the Confluence
-# parser (evidence_confluence._parse_frontmatter) and the Jira parser
-# (evidence_jira._parse_frontmatter) both share the same *goal* but differ in
-# meaningful ways — Jira's version adds inline-list handling `[a, b]` and
-# quote-stripping that Confluence's does not have, because the Jira scanner
-# emits different frontmatter shapes.  Consolidating into _evidence_utils
-# without a thorough audit risks silent behaviour changes for existing pack
-# tests; a follow-up issue should unify once the parsers have been
-# characterised properly.
-#
-# This copy is taken from evidence_confluence._parse_frontmatter verbatim
-# (which is the appropriate model for plain-markdown, not Jira).
-
-_FM_OPEN_RE = re.compile(r"^---\s*$")
-_FM_KEY_VALUE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$")
-_FM_LIST_ITEM_RE = re.compile(r"^\s+-\s+(.+)$")
-
-
-def _parse_frontmatter(md_text: str) -> tuple[dict, str]:
-    """Parse YAML frontmatter from the top of *md_text*.
-
-    Returns ``(frontmatter_dict, body_text_after_frontmatter)``.
-
-    If no valid frontmatter block is found (no opening ``---``, or no closing
-    ``---``), returns ``({}, md_text)`` unchanged.
-
-    Handles:
-    - ``key: scalar_value`` pairs.
-    - Multi-line YAML list syntax (``  - item`` lines after an empty-value key).
-    - Blank lines inside a list block terminate the list for that key.
-    """
-    lines = md_text.splitlines(keepends=True)
-    if not lines:
-        return {}, md_text
-
-    first_line = lines[0].rstrip("\n").rstrip("\r")
-    if not _FM_OPEN_RE.match(first_line):
-        return {}, md_text
-
-    fm: dict = {}
-    current_key: str | None = None
-    current_list: list[str] | None = None
-    close_idx: int | None = None
-
-    for i, raw_line in enumerate(lines[1:], start=1):
-        line = raw_line.rstrip("\n").rstrip("\r")
-
-        # Closing ``---``
-        if _FM_OPEN_RE.match(line):
-            if current_key is not None and current_list is not None:
-                fm[current_key] = current_list
-            close_idx = i
-            break
-
-        # List item: must come after a key that started a list
-        list_m = _FM_LIST_ITEM_RE.match(line)
-        if list_m and current_key is not None:
-            if current_list is None:
-                current_list = []
-                fm.pop(current_key, None)
-            current_list.append(list_m.group(1).strip())
-            continue
-
-        # Key: value pair
-        kv_m = _FM_KEY_VALUE_RE.match(line)
-        if kv_m:
-            if current_key is not None and current_list is not None:
-                fm[current_key] = current_list
-                current_list = None
-            current_key = kv_m.group(1)
-            val = kv_m.group(2).strip()
-            if val:
-                fm[current_key] = val
-            continue
-
-        # Blank line inside a list terminates it
-        if current_list is not None and not line.strip():
-            fm[current_key] = current_list
-            current_list = None
-            current_key = None
-
-    if close_idx is None:
-        return {}, md_text
-
-    body = "".join(lines[close_idx + 1 :])
-    return fm, body
 
 
 # ── MarkdownEvidencePack ──────────────────────────────────────────────────────
@@ -243,7 +148,7 @@ def _process_doc(repo_root: str, rel_path: str) -> dict | None:
     # carries YAML frontmatter but when it does (Jekyll/Hugo/MkDocs repos)
     # ``extract_first_paragraph`` was returning the raw YAML instead of the
     # actual opening prose.
-    frontmatter, body = _parse_frontmatter(text)
+    frontmatter, body = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
 
     chunks = chunk_markdown(body, doc_path=rel_path, frontmatter=frontmatter or None)
 
