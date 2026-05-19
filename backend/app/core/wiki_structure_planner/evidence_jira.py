@@ -40,7 +40,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ._evidence_utils import _parse_inline_list, parse_frontmatter, safe_join  # noqa: F401
+from ._evidence_utils import parse_frontmatter, safe_join
 from .structure_skeleton import ArtifactInfo, Cluster
 
 logger = logging.getLogger(__name__)

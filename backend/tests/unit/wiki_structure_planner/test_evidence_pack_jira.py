@@ -20,7 +20,6 @@ import pytest
 
 from app.core.wiki_structure_planner.evidence_jira import (
     JiraEvidencePack,
-    _parse_inline_list,
     build_jira_pack,
 )
 from app.core.wiki_structure_planner.structure_skeleton import (
@@ -598,78 +597,3 @@ class TestPathSafety:
         assert "root:" not in pack.epic_description
 
 
-# ── _parse_inline_list — quote-aware parser (#256) ────────────────────────────
-
-
-class TestParseInlineList:
-    """Regression tests for #256: comma inside quoted string must not split."""
-
-    def test_comma_inside_double_quotes_preserved(self):
-        """AC-1: ["payment,billing", security] → ["payment,billing", "security"]."""
-        result = _parse_inline_list('["payment,billing", security]')
-        assert result == ["payment,billing", "security"]
-
-    def test_both_quote_types_preserved(self):
-        """AC-2: ['a,b', "c,d"] → ["a,b", "c,d"]."""
-        result = _parse_inline_list("['a,b', \"c,d\"]")
-        assert result == ["a,b", "c,d"]
-
-    def test_unquoted_items_regression(self):
-        """AC-3: [a, b, c] (no quotes) → ["a", "b", "c"]."""
-        result = _parse_inline_list("[a, b, c]")
-        assert result == ["a", "b", "c"]
-
-    def test_mixed_quote_types_both_preserved(self):
-        """AC-4: mixed quote types with commas inside are both preserved."""
-        result = _parse_inline_list("[\"mixed,quote\", 'comma,inside']")
-        assert result == ["mixed,quote", "comma,inside"]
-
-    def test_empty_list(self):
-        """AC-5: [] → []."""
-        result = _parse_inline_list("[]")
-        assert result == []
-
-    def test_not_a_list_returns_none(self):
-        """AC-6: non-list input → None."""
-        result = _parse_inline_list("not a list")
-        assert result is None
-
-    def test_double_quoted_item_with_comma(self):
-        """Single item with comma inside double quotes → one-element list."""
-        result = _parse_inline_list('["a,b"]')
-        assert result == ["a,b"]
-
-    def test_mixed_quoted_and_unquoted(self):
-        """Quoted and unquoted items interleaved."""
-        result = _parse_inline_list("[\"x,y\", plain, 'z,w']")
-        assert result == ["x,y", "plain", "z,w"]
-
-    def test_whitespace_trimmed_from_unquoted(self):
-        """Whitespace around unquoted items is stripped."""
-        result = _parse_inline_list("[ a ,  b , c ]")
-        assert result == ["a", "b", "c"]
-
-    def test_empty_quoted_string_preserved(self):
-        """`[""]` — YAML flow sequences can carry empty-string elements."""
-        result = _parse_inline_list('[""]')
-        assert result == [""]
-
-    def test_empty_quoted_string_among_others(self):
-        """Empty-quoted item between two real ones."""
-        result = _parse_inline_list('["a", "", "b"]')
-        assert result == ["a", "", "b"]
-
-    def test_empty_single_quoted_string_preserved(self):
-        """Single-quoted variant of empty string."""
-        result = _parse_inline_list("['']")
-        assert result == [""]
-
-    def test_bare_empty_slot_dropped(self):
-        """`[a, , b]` — unquoted whitespace between commas is not an item."""
-        result = _parse_inline_list("[a, , b]")
-        assert result == ["a", "b"]
-
-    def test_not_a_list_plain_scalar_returns_none(self):
-        """Plain scalar value (no brackets) returns None."""
-        result = _parse_inline_list("payment-service")
-        assert result is None
