@@ -13,10 +13,6 @@ import {
   Alert,
   Box,
   Divider,
-  FormControl,
-  InputLabel,
-  MenuItem,
-  Select,
   Stack,
   TextField,
   Typography,
@@ -98,22 +94,6 @@ export function StepConfirm({
         helperText="Leave blank to derive from the source"
         inputProps={{ 'data-testid': 'wiki-title' }}
       />
-
-      <FormControl fullWidth margin="dense" disabled={disabled}>
-        <InputLabel id="planner-mode-label">Structure planner</InputLabel>
-        <Select
-          labelId="planner-mode-label"
-          value={data.plannerMode}
-          label="Structure planner"
-          onChange={(e) =>
-            onChange({ ...data, plannerMode: e.target.value as WizardFormData['plannerMode'] })
-          }
-          inputProps={{ 'data-testid': 'planner-mode-select' }}
-        >
-          <MenuItem value="agentic">Agentic (LLM-driven outline)</MenuItem>
-          <MenuItem value="graph_clustering">Graph clustering (Leiden)</MenuItem>
-        </Select>
-      </FormControl>
 
       {submitError && (
         <Alert severity="error" sx={{ mt: 2 }} data-testid="confirm-submit-error">

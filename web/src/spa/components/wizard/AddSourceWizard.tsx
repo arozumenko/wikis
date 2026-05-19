@@ -326,7 +326,6 @@ export function AddSourceWizard({
           },
           auth: { pat },
           ...(formData.wiki_title ? { wiki_title: formData.wiki_title } : {}),
-          structure_planner: formData.plannerMode,
         };
       } else {
         const fresh = await refreshAtlassianIfNeeded();
@@ -347,7 +346,6 @@ export function AddSourceWizard({
             scope: { base_url: baseUrl, space_keys: formData.confluence.space_keys },
             auth,
             ...(formData.wiki_title ? { wiki_title: formData.wiki_title } : {}),
-            structure_planner: formData.plannerMode,
           };
         } else {
           body = {
@@ -355,7 +353,6 @@ export function AddSourceWizard({
             scope: { base_url: baseUrl, jql: formData.jira.jql },
             auth,
             ...(formData.wiki_title ? { wiki_title: formData.wiki_title } : {}),
-            structure_planner: formData.plannerMode,
           };
         }
       }

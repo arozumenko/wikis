@@ -40,7 +40,6 @@ export interface GenerateWikiMultiSourceRequest {
   scope: GitScope | ConfluenceScope | JiraScope;
   auth: GitAuth | AtlassianAuth;
   wiki_title?: string;
-  structure_planner?: 'agentic' | 'graph_clustering';
 }
 
 export const generateWikiMultiSource = (req: GenerateWikiMultiSourceRequest) =>
