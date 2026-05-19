@@ -551,3 +551,122 @@ class TestDeduplication:
         pack = build_md_pack(cluster, repo_root=str(tmp_path))
         paths = [e["source_path"] for e in pack.doc_entries]
         assert paths.count("docs/guide.md") == 1
+
+
+# ── build_md_pack — YAML frontmatter stripping (#255) ─────────────────────────
+
+
+class TestFrontmatterStripping:
+    """Regression tests for #255: YAML frontmatter must not appear in first_paragraph.
+
+    Before the fix, chunk_markdown was called on the raw text so the
+    ``---…---`` block was emitted as a preamble chunk body, and
+    ``extract_first_paragraph`` returned the YAML text as the doc's opening
+    prose.  The planner LLM would then see ``Summary: --- title: ... ---``
+    instead of actual content.
+    """
+
+    def test_no_frontmatter_behaviour_unchanged(self, tmp_path):
+        """Regression: plain markdown with no frontmatter works as before."""
+        content = textwrap.dedent("""\
+            # User Guide
+
+            This is the real opening paragraph.
+        """)
+        _write_md(tmp_path, "docs/guide.md", content)
+        cluster = _make_doc_cluster([_doc_artifact("Guide", "docs/guide.md")])
+        pack = build_md_pack(cluster, repo_root=str(tmp_path))
+        entry = next(e for e in pack.doc_entries if e["source_path"] == "docs/guide.md")
+        assert "opening paragraph" in entry["first_paragraph"]
+        assert "---" not in entry["first_paragraph"]
+
+    def test_frontmatter_not_in_first_paragraph(self, tmp_path):
+        """Core regression: first_paragraph must not contain raw YAML frontmatter."""
+        content = textwrap.dedent("""\
+            ---
+            title: My Doc
+            author: Alice
+            ---
+
+            # My Doc
+
+            This is the actual opening prose.
+        """)
+        _write_md(tmp_path, "docs/fm.md", content)
+        cluster = _make_doc_cluster([_doc_artifact("FM Doc", "docs/fm.md")])
+        pack = build_md_pack(cluster, repo_root=str(tmp_path))
+        entry = next(e for e in pack.doc_entries if e["source_path"] == "docs/fm.md")
+        assert "---" not in entry["first_paragraph"]
+        assert "title:" not in entry["first_paragraph"]
+        assert "author:" not in entry["first_paragraph"]
+
+    def test_frontmatter_body_prose_used_as_first_paragraph(self, tmp_path):
+        """After stripping frontmatter, the real opening prose must appear."""
+        content = textwrap.dedent("""\
+            ---
+            title: Architecture Overview
+            labels:
+              - infra
+              - backend
+            ---
+
+            # Architecture Overview
+
+            The system uses a microservice architecture with event-driven communication.
+        """)
+        _write_md(tmp_path, "docs/arch.md", content)
+        cluster = _make_doc_cluster([_doc_artifact("Arch", "docs/arch.md")])
+        pack = build_md_pack(cluster, repo_root=str(tmp_path))
+        entry = next(e for e in pack.doc_entries if e["source_path"] == "docs/arch.md")
+        assert "microservice" in entry["first_paragraph"]
+
+    def test_frontmatter_title_used_as_doc_title(self, tmp_path):
+        """When frontmatter has a title, it should be preferred over the first H1."""
+        content = textwrap.dedent("""\
+            ---
+            title: Canonical Title From Frontmatter
+            ---
+
+            # H1 That Should Lose
+
+            Body text here.
+        """)
+        _write_md(tmp_path, "docs/titled.md", content)
+        cluster = _make_doc_cluster([_doc_artifact("Titled", "docs/titled.md")])
+        pack = build_md_pack(cluster, repo_root=str(tmp_path))
+        entry = next(e for e in pack.doc_entries if e["source_path"] == "docs/titled.md")
+        assert entry["title"] == "Canonical Title From Frontmatter"
+
+    def test_frontmatter_title_fallback_to_h1_when_no_title_key(self, tmp_path):
+        """Frontmatter without a title key falls back to first H1."""
+        content = textwrap.dedent("""\
+            ---
+            author: Bob
+            ---
+
+            # Heading From H1
+
+            Body text.
+        """)
+        _write_md(tmp_path, "docs/notitle.md", content)
+        cluster = _make_doc_cluster([_doc_artifact("NoTitle", "docs/notitle.md")])
+        pack = build_md_pack(cluster, repo_root=str(tmp_path))
+        entry = next(e for e in pack.doc_entries if e["source_path"] == "docs/notitle.md")
+        assert entry["title"] == "Heading From H1"
+
+    def test_unclosed_frontmatter_not_stripped(self, tmp_path):
+        """A ``---`` line without a closing ``---`` must be treated as regular content."""
+        content = textwrap.dedent("""\
+            ---
+            this is not real frontmatter because there is no closing fence
+
+            # Heading
+
+            Some body text.
+        """)
+        _write_md(tmp_path, "docs/badfront.md", content)
+        cluster = _make_doc_cluster([_doc_artifact("BadFront", "docs/badfront.md")])
+        pack = build_md_pack(cluster, repo_root=str(tmp_path))
+        entry = next(e for e in pack.doc_entries if e["source_path"] == "docs/badfront.md")
+        # No crash — result is some string (not necessarily empty)
+        assert isinstance(entry["first_paragraph"], str)
