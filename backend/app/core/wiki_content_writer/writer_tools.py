@@ -87,10 +87,17 @@ class CallerEntry:
 
 @dataclass
 class SymbolCallers:
-    """Result of ``get_callers``."""
+    """Result of ``get_callers``.
+
+    ``found`` discriminates between "the symbol exists but has no
+    callers" and "the backend isn't wired / lookup failed" — important
+    signal for #238 prompt rules so the writer can distinguish "no
+    callers" from "no answer."
+    """
 
     symbol: str
     callers: list[CallerEntry]
+    found: bool = False
 
 
 @dataclass
@@ -104,10 +111,14 @@ class CalleeEntry:
 
 @dataclass
 class SymbolCallees:
-    """Result of ``get_callees``."""
+    """Result of ``get_callees``.
+
+    See ``SymbolCallers`` for the ``found`` rationale.
+    """
 
     symbol: str
     callees: list[CalleeEntry]
+    found: bool = False
 
 
 @dataclass
@@ -230,6 +241,13 @@ class WriterTools:
 
         if line_range is not None:
             start, end = line_range
+            if start > end:
+                return FileContent(
+                    path=path,
+                    lines=[],
+                    total_lines=total,
+                    error=f"inverted line_range: start={start} > end={end}",
+                )
             # Convert 1-indexed inclusive to 0-indexed slice
             sliced = all_lines[max(0, start - 1) : end]
         else:
@@ -242,43 +260,18 @@ class WriterTools:
     def get_signature(self, symbol: str) -> SymbolSignature:
         """Return the signature, layer, and docstring for *symbol*.
 
-        Resolves via the code graph when available; stubs with ``found=False``
-        otherwise.
-
-        # TODO #243: wire to code_graph via GraphQueryService.resolve_symbol
+        Currently a stub: returns ``found=False`` regardless of whether
+        ``code_graph`` is set. Wiring to ``GraphQueryService`` happens in
+        #243 alongside the other graph-backed tools.
         """
-        if self.code_graph is None:
-            return SymbolSignature(
-                symbol=symbol,
-                signature="",
-                file_path="",
-                layer="",
-                docstring="",
-                found=False,
-            )
-
-        # TODO #243: resolve node_id via GraphQueryService, pull attrs
-        from ..code_graph.graph_query_service import GraphQueryService
-
-        gqs = GraphQueryService(self.code_graph, self.graph_text_index)
-        node_id = gqs.resolve_symbol(symbol)
-        if node_id is None:
-            return SymbolSignature(
-                symbol=symbol,
-                signature="",
-                file_path="",
-                layer="",
-                docstring="",
-                found=False,
-            )
-        attrs = gqs.get_node(node_id) or {}
+        # TODO #243: wire to code_graph via GraphQueryService.resolve_symbol
         return SymbolSignature(
             symbol=symbol,
-            signature=attrs.get("signature", attrs.get("source_text", "")[:200]),
-            file_path=attrs.get("rel_path", ""),
-            layer=attrs.get("layer", ""),
-            docstring=attrs.get("docstring", ""),
-            found=True,
+            signature="",
+            file_path="",
+            layer="",
+            docstring="",
+            found=False,
         )
 
     # ── get_callers ───────────────────────────────────────────────────────

@@ -149,6 +149,14 @@ class TestReadFile:
         assert result.lines == []
         assert result.error is not None
 
+    def test_inverted_line_range_returns_error(self, tmp_path):
+        (tmp_path / "x.py").write_text("a\nb\nc\nd\ne\n")
+        tools = WriterTools(repo_root=str(tmp_path))
+        result = tools.read_file("x.py", line_range=(5, 2))
+        assert result.lines == []
+        assert result.error is not None
+        assert "inverted" in result.error
+
 
 # ── SymbolSignature return type ──────────────────────────────────────────────
 
@@ -179,6 +187,14 @@ class TestGetSignature:
         result = tools.get_signature("MyClass")
         assert result.symbol == "MyClass"
 
+    def test_stub_returns_found_false_even_with_graph(self, tmp_path):
+        # Stub behaviour: until #243 wires GraphQueryService, the
+        # presence of a code_graph must not flip `found` to True.
+        graph = MagicMock()
+        tools = WriterTools(repo_root=str(tmp_path), code_graph=graph)
+        result = tools.get_signature("MyClass")
+        assert result.found is False
+
 
 # ── SymbolCallers / SymbolCallees return types ───────────────────────────────
 
@@ -200,6 +216,13 @@ class TestGetCallers:
         tools = WriterTools(repo_root=str(tmp_path))
         result = tools.get_callers("fn")
         assert result.callers == []
+
+    def test_has_found_field_defaulting_false(self, tmp_path):
+        # `found` discriminates "no callers" from "backend not wired".
+        tools = WriterTools(repo_root=str(tmp_path))
+        result = tools.get_callers("fn")
+        assert hasattr(result, "found")
+        assert result.found is False
 
 
 class TestGetCallees:
