@@ -115,10 +115,27 @@ _ITEM_TEMPLATE = """\
 
 _SPAN_TEMPLATE = """\
 [{path}:{start}-{end}]{truncation_note}
-```
+{fence}
 {text}
-```
+{fence}
 """
+
+
+def _pick_safe_fence(text: str) -> str:
+    """Return a backtick fence that the span text cannot accidentally close.
+
+    A cited span (especially in a markdown doc) may contain its own triple- or
+    quadruple-backtick fences.  Using a fixed 3-backtick fence around it would
+    let the span terminate our delimiter early and inject prompt instructions
+    into the verifier request.  CommonMark allows fences of arbitrary length:
+    we pick N+1 backticks where N is the longest run already in *text*.
+    """
+    import re as _re  # noqa: PLC0415
+
+    longest = 0
+    for run in _re.findall(r"`+", text):
+        longest = max(longest, len(run))
+    return "`" * max(3, longest + 1)
 
 
 def build_verifier_user_prompt(batch: list[ClaimWithSpans]) -> str:
@@ -152,6 +169,7 @@ def build_verifier_user_prompt(batch: list[ClaimWithSpans]) -> str:
                     start=span.start_line,
                     end=span.end_line,
                     truncation_note=trunc_note,
+                    fence=_pick_safe_fence(span_text),
                     text=span_text,
                 )
             )

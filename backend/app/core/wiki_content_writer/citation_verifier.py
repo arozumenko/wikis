@@ -178,9 +178,21 @@ def _read_span(repo_root: str, citation_path: str, start_line: int, end_line: in
             text="",
         )
 
+    # Read only the lines we actually need: skip up to start_line, then take
+    # min(span_length, _SPAN_LINE_CAP) lines.  This keeps a citation pointing
+    # into a huge generated/bundled file (lockfile, compiled JS, etc.) from
+    # forcing the verifier to load megabytes just to discard them.
+    lo_1based = max(1, start_line)
+    requested = max(0, end_line - lo_1based + 1)
+    capped = min(requested, _SPAN_LINE_CAP)
+    truncated = requested > _SPAN_LINE_CAP
+
     try:
+        from itertools import islice  # noqa: PLC0415
+
         with open(safe_path, encoding="utf-8", errors="replace") as fh:
-            all_lines = fh.readlines()
+            # Skip to start_line - 1, then take up to `capped` lines.
+            selected = list(islice(fh, lo_1based - 1, lo_1based - 1 + capped))
     except OSError:
         return SpanText(
             citation_path=citation_path,
@@ -189,30 +201,18 @@ def _read_span(repo_root: str, citation_path: str, start_line: int, end_line: in
             text="",
         )
 
-    file_len = len(all_lines)
-
-    # Clamp to actual file length (lines are 1-indexed)
-    clamped_end = min(end_line, file_len)
+    # Determine clamped_end from how many lines we actually read.  If we
+    # received fewer than ``capped`` it means we hit EOF before end_line.
+    actual_lines = len(selected)
+    clamped_end = lo_1based + actual_lines - 1 if actual_lines else lo_1based - 1
     if clamped_end < end_line:
         logger.warning(
-            "Citation span clamped: %s:%d-%d → %d (file has %d lines)",
+            "Citation span clamped to EOF: %s:%d-%d → ends at line %d",
             citation_path,
             start_line,
             end_line,
             clamped_end,
-            file_len,
         )
-
-    # Convert to 0-based slice
-    lo = max(0, start_line - 1)
-    hi = max(lo, clamped_end)  # hi is exclusive for slice
-
-    selected = all_lines[lo:hi]
-
-    truncated = False
-    if len(selected) > _SPAN_LINE_CAP:
-        selected = selected[:_SPAN_LINE_CAP]
-        truncated = True
 
     span_text = "".join(selected)
 
@@ -334,6 +334,9 @@ def verify_citations(
         excluded).
         ``report`` — all verdicts plus aggregate counts and LLM call count.
     """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+
     report = VerifyReport(paragraphs_total=len(cited_claims))
 
     if not cited_claims:
