@@ -132,9 +132,9 @@ function buildSummaryRows(data: WizardFormData): [string, string][] {
     const authLabel =
       data.git.patSource === 'none'
         ? 'No auth (public)'
-        : data.git.patSource === 'stored'
-          ? 'Stored PAT'
-          : 'Pasted PAT (not stored)';
+        : data.git.pastedPat.trim()
+          ? 'Pasted PAT (not stored)'
+          : 'Pasted PAT (empty — will submit as no auth)';
     rows.push(['Auth', authLabel]);
   } else if (data.source_type === 'confluence') {
     rows.push(['Spaces', data.confluence.space_keys.join(', ') || '(none)']);

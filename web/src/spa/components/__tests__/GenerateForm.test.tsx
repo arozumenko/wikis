@@ -105,9 +105,15 @@ describe('GenerateForm — multi-source', () => {
     expect(screen.getByTestId('generate-submit')).toBeInTheDocument();
   });
 
-  it('submit button is enabled on Git tab (with no URL validation yet)', () => {
+  it('submit button is disabled on Git tab until a valid repo URL is entered', async () => {
+    // Updated behaviour (#276 Copilot review): submit is gated by ``isValid``
+    // so users cannot trigger a no-op POST with an empty form.
+    const user = userEvent.setup();
     renderForm();
-    // Button should not be disabled because atlassian is not required for git
+
+    expect(screen.getByTestId('generate-submit')).toBeDisabled();
+
+    await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
     expect(screen.getByTestId('generate-submit')).not.toBeDisabled();
   });
 
@@ -223,27 +229,42 @@ describe('GenerateForm — multi-source', () => {
     expect((body.auth as { pat: string | null }).pat).toBe('ghp_supersecret');
   });
 
-  it('builds git request with stored PAT', async () => {
+  it('submit is disabled when "Paste token once" is chosen with an empty token', async () => {
+    // Copilot regression on #276: an empty pastedPat used to silently submit
+    // as no-auth. Now the Submit button stays disabled until a token is
+    // entered.
     const user = userEvent.setup();
-    withGitConnections();
-    const { submit } = renderForm();
+    noConnections();
+    renderForm();
 
     await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
-
-    // Switch auth to "stored"
     await user.click(screen.getByRole('combobox', { name: /authentication/i }));
-    await user.click(await screen.findByText(/Use stored PAT/i));
+    await user.click(await screen.findByText(/Paste token once/i));
 
-    // Select the stored connection
-    await user.click(screen.getByRole('combobox', { name: /stored pat/i }));
-    await user.click(await screen.findByText('My Repo'));
+    // Token field is empty — submit must be disabled.
+    expect(screen.getByTestId('generate-submit')).toBeDisabled();
 
-    await user.click(screen.getByTestId('generate-submit'));
+    // Once a token is provided, submit re-enables.
+    await user.type(screen.getByTestId('pasted-pat-input'), 'ghp_realtoken');
+    expect(screen.getByTestId('generate-submit')).not.toBeDisabled();
+  });
 
-    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
-    const body = submit.mock.calls[0][0] as GenerateWikiMultiSourceRequest;
-    expect(body.source_type).toBe('git');
-    expect((body.auth as { pat: string | null }).pat).toBe('ghp_testtoken');
+  it('auth dropdown no longer offers stored PAT', async () => {
+    // Regression: the stored-PAT path was removed because there is no
+    // longer a UI to store PATs in the first place. The dropdown must
+    // only offer "No auth" and "Paste token once".
+    const user = userEvent.setup();
+    withGitConnections();
+    renderForm();
+
+    await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
+    await user.click(screen.getByRole('combobox', { name: /authentication/i }));
+
+    const options = await screen.findAllByRole('option');
+    const optionTexts = options.map((o) => o.textContent ?? '');
+    expect(optionTexts.some((t) => /Use stored PAT/i.test(t))).toBe(false);
+    expect(optionTexts.some((t) => /No auth/i.test(t))).toBe(true);
+    expect(optionTexts.some((t) => /Paste token once/i.test(t))).toBe(true);
   });
 
   // -------------------------------------------------------------------------
