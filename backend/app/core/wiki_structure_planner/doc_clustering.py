@@ -84,6 +84,14 @@ def _louvain_or_components(
         )
         return [set(comp) for comp in nx.connected_components(graph)]
 
+    # Target cluster count = nodes / 3.  Empirically this lands close to the
+    # "one wiki page per ~3 docs" cardinality the unified planner produces
+    # downstream — fewer than that and clusters become noisy, more than that
+    # and we get too many tiny wiki pages.  Sweep four Louvain resolutions and
+    # keep the run whose community count is closest to the target.  Tiny
+    # graphs (n ≤ 5) all hit the same target (1 or 2 clusters) regardless of
+    # resolution and behave as if Louvain was a one-shot call.
+    target = graph.number_of_nodes() // 3
     best: list[set[str]] = []
     best_n = None
     for resolution in (0.5, 1.0, 1.5, 2.0):
@@ -99,7 +107,7 @@ def _louvain_or_components(
         except Exception:
             continue
         n = len(communities)
-        if best_n is None or abs(n - graph.number_of_nodes() // 3) < abs(best_n - graph.number_of_nodes() // 3):
+        if best_n is None or abs(n - target) < abs(best_n - target):
             best = communities
             best_n = n
 
@@ -209,10 +217,14 @@ def _add_link_edges(
         target = link.resolved or link.target
         if not target:
             continue
-        # Normalize: forward slashes, drop a single "./" prefix, then normpath.
-        # Reject targets that resolve outside the cluster's path set (e.g.
-        # `../other.md` from a doc whose source_path is at the root).
+        # Normalize: forward slashes, strip any fragment/anchor (`#section`),
+        # drop a single "./" prefix, then normpath.  Reject targets that
+        # resolve outside the cluster's path set (e.g. `../other.md` from a
+        # doc whose source_path is at the root).
         target = target.replace("\\", "/")
+        target = target.split("#", 1)[0]
+        if not target:
+            continue
         target = target.removeprefix("./")
         target = posixpath.normpath(target)
         if target.startswith("..") or target == ".":
@@ -310,7 +322,26 @@ def cluster_confluence_pages(
     path_to_artifacts: dict[str, list[ArtifactInfo]] = defaultdict(list)
     for a in artifacts:
         path_to_artifacts[a.source_path].append(a)
-    name_to_path = {a.name: a.source_path for a in artifacts}
+
+    # Build the name → path index.  If two pages share a title (common in
+    # large Confluence spaces where the same heading appears under multiple
+    # parents), warn and keep the first occurrence — silent last-writer-wins
+    # would misdirect parent → child edges to whichever page happened to be
+    # last in iteration order.
+    name_to_path: dict[str, str] = {}
+    for a in artifacts:
+        if a.name in name_to_path and name_to_path[a.name] != a.source_path:
+            logger.warning(
+                "[DOC_CLUSTER] confluence: duplicate page title %r at %r and %r; "
+                "parent→child edges will target %r",
+                a.name,
+                name_to_path[a.name],
+                a.source_path,
+                name_to_path[a.name],
+            )
+            continue
+        name_to_path[a.name] = a.source_path
+
     path_set = set(path_to_artifacts)
 
     graph = nx.Graph()
@@ -323,39 +354,58 @@ def cluster_confluence_pages(
         if a.parent_path:
             parent_groups[a.parent_path].append(a.source_path)
 
+    # Track synthetic parent-hub nodes so we can drop them after clustering.
+    # When the real parent page is not in the artifact set (common — Confluence
+    # exports often start one level below the root), we still need a single
+    # connection point so siblings cohesively land in the same community.
+    # A synthetic hub adds O(N) edges, never O(N²), and is removed from each
+    # community before the cluster is built so it doesn't show up in output.
+    synthetic_parents: set[str] = set()
+
     for parent_path_val, children in parent_groups.items():
-        # Connect all siblings under the same parent to each other
-        for i, c1 in enumerate(children):
-            for c2 in children[i + 1 :]:
-                if graph.has_edge(c1, c2):
-                    graph[c1][c2]["weight"] += _PARENT_CHILD_EDGE_WEIGHT
-                else:
-                    graph.add_edge(c1, c2, weight=_PARENT_CHILD_EDGE_WEIGHT)
         # parent_path is a breadcrumb like "Engineering / Security / Auth".
         # The immediate parent is the LAST segment after the final separator.
         # If a page named like that segment exists in the artifact set,
-        # connect children to it. We accept "/" or ">" as separators since
-        # different scanner configurations use different conventions.
+        # connect each child to it directly. We accept "/" or ">" as
+        # separators since different scanner configurations differ.
         parent_title = _last_breadcrumb_segment(parent_path_val)
         if parent_title and parent_title in name_to_path:
             parent_src = name_to_path[parent_title]
-            for child in children:
-                if graph.has_edge(parent_src, child):
-                    graph[parent_src][child]["weight"] += _PARENT_CHILD_EDGE_WEIGHT
-                else:
-                    graph.add_edge(parent_src, child, weight=_PARENT_CHILD_EDGE_WEIGHT)
+            edge_weight = _PARENT_CHILD_EDGE_WEIGHT
+        else:
+            # No real parent in the artifact set — synthesize a hub node so
+            # siblings still cluster together without an O(N²) edge clique.
+            # The synthetic edge weight is matched to the link weight (rather
+            # than the parent weight) so a cross-parent inline link can still
+            # merge two synthetic communities; a REAL parent always wins.
+            parent_src = f"__synthetic_parent::{parent_path_val}"
+            synthetic_parents.add(parent_src)
+            graph.add_node(parent_src)
+            edge_weight = _LINK_EDGE_WEIGHT
+
+        for child in children:
+            if graph.has_edge(parent_src, child):
+                graph[parent_src][child]["weight"] += edge_weight
+            else:
+                graph.add_edge(parent_src, child, weight=edge_weight)
 
     # 2. Inline link edges
     for source_path in path_set:
         _add_link_edges(graph, source_path, repo_root, path_set)
 
     logger.debug(
-        "[DOC_CLUSTER] confluence: %d nodes, %d edges",
+        "[DOC_CLUSTER] confluence: %d nodes (%d synthetic), %d edges",
         graph.number_of_nodes(),
+        len(synthetic_parents),
         graph.number_of_edges(),
     )
 
     communities = _louvain_or_components(graph)
+    # Strip synthetic hub nodes — they only existed to seed clustering and
+    # have no corresponding artifact, so they would otherwise emit an empty
+    # cluster (or a ghost artifact) in the output.
+    if synthetic_parents:
+        communities = [c - synthetic_parents for c in communities if c - synthetic_parents]
     clusters = _communities_to_clusters(communities, path_to_artifacts, "confluence")
 
     logger.info(

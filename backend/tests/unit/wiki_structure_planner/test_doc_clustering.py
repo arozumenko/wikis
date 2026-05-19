@@ -456,3 +456,106 @@ class TestDuplicateSourcePath:
 
         total = sum(c.total_artifacts for c in result)
         assert total == len(arts)
+
+
+# ── Confluence sibling clique avoidance ──────────────────────────────────────
+
+
+class TestConfluenceSiblingEdges:
+    """Siblings under a common parent must NOT be connected directly.
+
+    Regression: an earlier draft connected every sibling to every other
+    sibling under the same ``parent_path``.  In a flat space of N pages
+    that produces O(N²) edges, blows up memory, and flattens the Louvain
+    signal — the whole space collapses into one community.
+    """
+
+    def test_no_direct_sibling_edges_in_flat_space(self, tmp_path):
+        # Three siblings under "Eng" with no internal links between them.
+        for name in ("a.md", "b.md", "c.md"):
+            (tmp_path / name).write_text("# stub\n")
+
+        arts = [
+            _confluence_artifact("A", "a.md", parent_path="Eng"),
+            _confluence_artifact("B", "b.md", parent_path="Eng"),
+            _confluence_artifact("C", "c.md", parent_path="Eng"),
+        ]
+
+        result = cluster_confluence_pages(arts, repo_root=str(tmp_path))
+
+        # Every artifact still produces a cluster contribution.
+        total = sum(c.total_artifacts for c in result)
+        assert total == len(arts)
+
+    def test_flat_space_does_not_collapse_into_one_cluster_when_links_disagree(
+        self, tmp_path
+    ):
+        # Two pairs of pages with internal links inside each pair, no link
+        # between the pairs.  With the previous all-pairs sibling clique
+        # the graph would be ~complete and Louvain would emit a single
+        # community.  Without it, the link structure dominates.
+        (tmp_path / "a1.md").write_text("# a1\n\n[a2](a2.md)\n")
+        (tmp_path / "a2.md").write_text("# a2\n\n[a1](a1.md)\n")
+        (tmp_path / "b1.md").write_text("# b1\n\n[b2](b2.md)\n")
+        (tmp_path / "b2.md").write_text("# b2\n\n[b1](b1.md)\n")
+
+        arts = [
+            _confluence_artifact("A1", "a1.md", parent_path="Eng"),
+            _confluence_artifact("A2", "a2.md", parent_path="Eng"),
+            _confluence_artifact("B1", "b1.md", parent_path="Eng"),
+            _confluence_artifact("B2", "b2.md", parent_path="Eng"),
+        ]
+
+        result = cluster_confluence_pages(arts, repo_root=str(tmp_path))
+
+        # No artifact is lost.
+        total = sum(c.total_artifacts for c in result)
+        assert total == len(arts)
+
+
+# ── #anchor stripping in link normalization ──────────────────────────────────
+
+
+class TestLinkAnchorStripping:
+    """A markdown link like ``[x](other.md#section)`` should still produce an
+    edge to ``other.md``.  Earlier versions left the fragment attached and
+    the path-set lookup missed."""
+
+    def test_anchor_in_internal_link_resolves_to_file(self, tmp_path):
+        (tmp_path / "a.md").write_text("# A\n\n[link](b.md#section)\n")
+        (tmp_path / "b.md").write_text("# B\n")
+        arts = [_md_artifact("A", "a.md"), _md_artifact("B", "b.md")]
+
+        result = cluster_markdown_docs(arts, repo_root=str(tmp_path))
+
+        # Both docs should now land in the same cluster (the link survives).
+        assert len(result) == 1
+        assert result[0].total_artifacts == 2
+
+
+# ── Duplicate Confluence title warning ───────────────────────────────────────
+
+
+class TestConfluenceDuplicateTitleWarning:
+    """When two Confluence pages share a title, the name→path index keeps
+    the first occurrence and logs a warning instead of silently
+    last-writer-wins."""
+
+    def test_duplicate_title_emits_warning(self, tmp_path, caplog):
+        for name in ("first.md", "second.md", "child.md"):
+            (tmp_path / name).write_text("# stub\n")
+
+        arts = [
+            _confluence_artifact("Auth", "first.md", parent_path="Eng"),
+            _confluence_artifact("Auth", "second.md", parent_path="Eng"),
+            _confluence_artifact("Child", "child.md", parent_path="Auth"),
+        ]
+
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="app.core.wiki_structure_planner.doc_clustering"):
+            cluster_confluence_pages(arts, repo_root=str(tmp_path))
+
+        assert any(
+            "duplicate page title" in rec.message.lower() for rec in caplog.records
+        ), f"expected warning, got: {[r.message for r in caplog.records]}"
