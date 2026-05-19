@@ -217,9 +217,8 @@ class SourceScanService:
                 "scope.space_keys must be a list of non-empty strings"
             )
 
-        client_kwargs = _atlassian_client_kwargs(request.auth)
-
         try:
+            client_kwargs = _atlassian_client_kwargs(request.auth)
             async with AtlassianClient(base_url=base_url, **client_kwargs) as client:
                 # Fetch spaces — filter to requested keys when provided.
                 spaces_data = await client.get(
@@ -242,6 +241,13 @@ class SourceScanService:
                     )
 
         except SourceAuthError as exc:
+            raise ScanError(str(exc), reachable=False) from exc
+        except ValueError as exc:
+            # AtlassianClient raises ValueError for malformed auth combos.
+            # The AtlassianAuth pydantic validator should catch this earlier,
+            # but a direct service call (or future model drift) could still
+            # bypass it — translate to ScanError so the response is a clean
+            # 4xx rather than an uncaught 500.
             raise ScanError(str(exc), reachable=False) from exc
         except (SourceNotFoundError, SourceUnavailableError, SourceConnectionError) as exc:
             raise ScanError(str(exc), reachable=False) from exc
@@ -286,9 +292,8 @@ class SourceScanService:
         if not jql:
             raise ScanError("scope.jql must be a non-empty string")
 
-        client_kwargs = _atlassian_client_kwargs(request.auth)
-
         try:
+            client_kwargs = _atlassian_client_kwargs(request.auth)
             async with AtlassianClient(base_url=base_url, **client_kwargs) as client:
                 data = await client.get(
                     "/rest/api/3/search",
@@ -299,6 +304,10 @@ class SourceScanService:
                     },
                 )
         except SourceAuthError as exc:
+            raise ScanError(str(exc), reachable=False) from exc
+        except ValueError as exc:
+            # AtlassianClient raises ValueError on malformed auth — see the
+            # Confluence scan path for the same translation rationale.
             raise ScanError(str(exc), reachable=False) from exc
         except (
             SourceNotFoundError,

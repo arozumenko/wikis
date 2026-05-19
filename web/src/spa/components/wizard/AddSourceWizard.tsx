@@ -158,7 +158,7 @@ export function AddSourceWizard({
       Boolean(
         formData.atlassianBasic.siteUrl.trim() &&
           formData.atlassianBasic.email.trim() &&
-          formData.atlassianBasic.apiToken,
+          formData.atlassianBasic.apiToken.trim(),
       ));
 
   const configureValid = useMemo(() => {
@@ -214,7 +214,7 @@ export function AddSourceWizard({
       baseUrl = formData.atlassianBasic.siteUrl.trim();
       atlassianAuth = {
         email: formData.atlassianBasic.email.trim(),
-        api_token: formData.atlassianBasic.apiToken,
+        api_token: formData.atlassianBasic.apiToken.trim(),
       };
     } else {
       if (!atlassian) return null;
@@ -346,7 +346,7 @@ export function AddSourceWizard({
           baseUrl = formData.atlassianBasic.siteUrl.trim();
           auth = {
             email: formData.atlassianBasic.email.trim(),
-            api_token: formData.atlassianBasic.apiToken,
+            api_token: formData.atlassianBasic.apiToken.trim(),
           };
         } else {
           const fresh = await refreshAtlassianIfNeeded();

@@ -648,4 +648,54 @@ describe('AddSourceWizard', () => {
     const statsAlert = screen.getByTestId('confirm-scan-stats');
     expect(statsAlert).toHaveTextContent('Preview: 47 matching issues, JQL validated.');
   });
+
+  it('#28: Confluence with API-token mode trims trailing whitespace from the token', async () => {
+    // Regression for Rio review on #277: an API token pasted with a
+    // trailing newline (common from clipboard) used to reach the backend
+    // verbatim and silently 401.  The wizard now trims at the boundary.
+    const user = userEvent.setup();
+    mockUseConnections.mockReturnValue({
+      atlassian: null,
+      refreshAtlassianIfNeeded: mockRefreshAtlassianIfNeeded,
+    });
+
+    mockScanSource.mockResolvedValue({
+      source_type: 'confluence',
+      reachable: true,
+      preview: { spaces: [], total_pages: null },
+      warnings: [],
+    });
+    mockGenerate.mockResolvedValue({
+      wiki_id: 'wiki-1',
+      invocation_id: 'inv-1',
+      status: 'generating',
+      message: 'ok',
+    });
+
+    renderWizard();
+    await user.click(screen.getByTestId('connector-confluence'));
+    await user.click(screen.getByTestId('atlassian-tab-api-token'));
+    await user.type(screen.getByTestId('atlassian-basic-site-url'), 'https://acme.atlassian.net');
+    await user.type(screen.getByTestId('atlassian-basic-email'), 'alice@acme.com');
+    // userEvent.type processes literal "\n" inside a single string as
+    // Enter; using {Enter} as the explicit token followed by a space
+    // injects a trailing newline-like whitespace character into the
+    // value. Easier: fire a controlled change with whitespace appended.
+    const tokenField = screen.getByTestId('atlassian-basic-api-token');
+    await user.type(tokenField, 'atk-123  ');
+    // Space-keys autocomplete needs at least one entry.
+    await user.type(screen.getByTestId('space-keys-input'), 'ENG{Enter}');
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('scan-success');
+    await user.click(screen.getByTestId('wizard-next'));
+    await user.click(screen.getByTestId('wizard-submit'));
+
+    await waitFor(() => expect(mockGenerate).toHaveBeenCalledTimes(1));
+    const body = mockGenerate.mock.calls[0][0];
+    expect(body.source_type).toBe('confluence');
+    expect(body.auth).toEqual({
+      email: 'alice@acme.com',
+      api_token: 'atk-123',
+    });
+  });
 });
