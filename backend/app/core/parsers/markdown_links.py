@@ -30,7 +30,9 @@ class Link:
     resolved: str | None
 
 
-_FENCED_BLOCK_RE = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~")
+# Fenced code blocks — handles unclosed fences (LLM-generated docs sometimes
+# truncate mid-block). Must stay in sync with link_resolver._FENCED_BLOCK_RE.
+_FENCED_BLOCK_RE = re.compile(r"```[\s\S]*?(?:```|\Z)|~~~[\s\S]*?(?:~~~|\Z)")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 
 _ATTACHMENT_PLACEHOLDER_RE = re.compile(r"\[\[attachment:\s*([^\]]+)\]\]")

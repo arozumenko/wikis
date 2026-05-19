@@ -131,10 +131,17 @@ def _find_best_match(target: str, index: list[str]) -> tuple[str | None, float]:
 # Matches [[…]] patterns (including pipe variants) for targeted replacement.
 _WIKILINK_FULL_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
-# Code-fence / inline-code regex — must stay in sync with markdown_links.py
-# (#228). Kept local + position-preserving so the rewriter sees the same
-# spans extract_links() used when deciding which [[…]] to surface.
-_FENCED_BLOCK_RE = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~")
+# Code-fence / inline-code regex — fenced + inline must stay in sync with
+# markdown_links.py (#228). Kept local + position-preserving so the rewriter
+# sees the same spans extract_links() used when deciding which [[…]] to
+# surface. Indented-code masking is *not* mirrored here on purpose: the
+# pairing loop can only rewrite wikilinks extract_links returns, so unmasked
+# indented matches harmlessly fail to pair and are ignored.
+#
+# The `(?:```|$)` tail handles unclosed fences — common in LLM output where
+# a doc cuts off mid-code-block. Without the alternation a `[[…]]` after the
+# unclosed fence is incorrectly surfaced as a real wikilink.
+_FENCED_BLOCK_RE = re.compile(r"```[\s\S]*?(?:```|\Z)|~~~[\s\S]*?(?:~~~|\Z)")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 
 
@@ -229,8 +236,11 @@ def _rewrite_page(
             splices.append((match.start(), match.end(), f"[[{new_inner}]]"))
         else:
             positioned.append((match.start(), LinkResolution(target=target, action=LinkAction.MISSING)))
-            # Missing — strip [[…]] but keep the human-readable anchor text.
-            splices.append((match.start(), match.end(), link.text))
+            # Missing — strip [[…]] keeping readable text. Prefer the
+            # pipe-display when present; otherwise the clean target so the
+            # `#anchor` portion of `[[Page#section]]` doesn't leak into prose.
+            replacement = display if display is not None else target
+            splices.append((match.start(), match.end(), replacement))
 
     # Apply splices end-to-start so earlier offsets remain valid.
     result = body

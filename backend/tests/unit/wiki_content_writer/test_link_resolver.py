@@ -340,3 +340,47 @@ class TestCodeFenceBleed:
         # Real-prose occurrence kept as MATCHED.
         assert "[[Foo]]" in rewritten
         assert report.pages["My Page"].links[0].action == LinkAction.MATCHED
+
+    def test_unclosed_fence_does_not_leak_wikilinks(self):
+        # Rio 1st-review case: LLM output truncated mid-code-block.
+        # The wikilink inside the un-terminated fence must NOT be rewritten.
+        body = "Prose [[Real Link]].\n```\n[[Fake Link]]\n(no closing fence)"
+        report = _single_page(body, ["Real Link"])
+        rewritten = report.pages["My Page"].rewritten
+        assert "Prose [[Real Link]]." in rewritten
+        assert "[[Fake Link]]" in rewritten  # preserved verbatim
+
+    def test_unclosed_tilde_fence_does_not_leak_wikilinks(self):
+        body = "Real [[Foo]].\n~~~\n[[Bar]]\n"  # no closing ~~~
+        report = _single_page(body, ["Foo"])
+        rewritten = report.pages["My Page"].rewritten
+        assert "Real [[Foo]]." in rewritten
+        assert "[[Bar]]" in rewritten
+
+
+# ── TestMissingAnchorReplacement (Rio FYI) ───────────────────────────────────
+
+
+class TestMissingAnchorReplacement:
+    def test_missing_link_with_anchor_uses_clean_target(self):
+        # [[Page#section]] missing → "Page" in prose (not "Page#section").
+        body = "See [[Deleted Page#overview]] for context."
+        report = _single_page(body, [])
+        rewritten = report.pages["My Page"].rewritten
+        assert "Deleted Page" in rewritten
+        assert "#overview" not in rewritten
+
+    def test_missing_link_with_pipe_display_uses_display(self):
+        body = "See [[Some Page|the doc]] for context."
+        report = _single_page(body, [])
+        rewritten = report.pages["My Page"].rewritten
+        assert "the doc" in rewritten
+        # Target name does not leak into prose when display was provided.
+        assert "Some Page" not in rewritten
+
+    def test_missing_link_with_anchor_and_pipe_uses_display(self):
+        body = "See [[Gone#section|the gone page]] for context."
+        report = _single_page(body, [])
+        rewritten = report.pages["My Page"].rewritten
+        assert "the gone page" in rewritten
+        assert "#section" not in rewritten

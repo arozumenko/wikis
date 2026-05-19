@@ -147,6 +147,14 @@ Real link: [keep](keep.md)
         assert "Real Page" in targets
         assert "Fake Page" not in targets
 
+    def test_unclosed_fence_strips_to_end_of_doc(self):
+        # LLM output truncated mid-code-block — `[[Fake]]` after an unclosed
+        # ``` must still be stripped, otherwise downstream rewriters surface it.
+        md = "Real [[Page]].\n```\n[[Fake]]\n(no closing fence)"
+        targets = {link.target for link in extract_links(md)}
+        assert "Page" in targets
+        assert "Fake" not in targets
+
 
 class TestConfluenceJiraURLs:
     def test_external_url_with_match_resolves_to_internal(self):
