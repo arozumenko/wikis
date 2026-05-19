@@ -6,8 +6,6 @@ Class-based pytest grouping.
 
 from __future__ import annotations
 
-import pytest
-
 from app.core.wiki_content_writer.link_resolver import (
     LinkAction,
     LinkResolution,
@@ -15,7 +13,6 @@ from app.core.wiki_content_writer.link_resolver import (
     ResolverReport,
     resolve_wikilinks,
 )
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -54,7 +51,7 @@ class TestMatchedLinks:
         report = resolve_wikilinks(pages, index)
 
         page_report = report.pages["P"]
-        actions = {l.target: l.action for l in page_report.links}
+        actions = {lr.target: lr.action for lr in page_report.links}
         assert actions["Auth Guide"] == LinkAction.MATCHED
         assert actions["API Reference"] == LinkAction.MATCHED
         assert page_report.rewritten == body
@@ -89,7 +86,7 @@ class TestMissingLinks:
         report = resolve_wikilinks(pages, [])
 
         page_report = report.pages["P"]
-        assert all(l.action == LinkAction.MISSING for l in page_report.links)
+        assert all(lr.action == LinkAction.MISSING for lr in page_report.links)
         assert "[[" not in page_report.rewritten
         assert "Page A" in page_report.rewritten
         assert "Page B" in page_report.rewritten
@@ -155,16 +152,13 @@ class TestAmbiguousLinks:
 
 class TestMixedLinks:
     def test_mixed_matched_ambiguous_missing_in_one_page(self):
-        body = (
-            "Start [[Auth Guide]] then [[auth guide]] "
-            "and finally [[Totally Bogus Page]]."
-        )
+        body = "Start [[Auth Guide]] then [[auth guide]] and finally [[Totally Bogus Page]]."
         pages = {"P": body}
         index = ["Auth Guide", "API Reference"]
         report = resolve_wikilinks(pages, index)
 
         page_report = report.pages["P"]
-        actions = {l.target: l.action for l in page_report.links}
+        actions = {lr.target: lr.action for lr in page_report.links}
 
         assert actions["Auth Guide"] == LinkAction.MATCHED
         assert actions["auth guide"] == LinkAction.AMBIGUOUS
@@ -254,8 +248,8 @@ class TestReportShape:
         index = ["A", "B"]
         report = resolve_wikilinks(pages, index)
         page = report.pages["P"]
-        matched = [l for l in page.links if l.action == LinkAction.MATCHED]
-        missing = [l for l in page.links if l.action == LinkAction.MISSING]
+        matched = [lr for lr in page.links if lr.action == LinkAction.MATCHED]
+        missing = [lr for lr in page.links if lr.action == LinkAction.MISSING]
         assert len(matched) == 2
         assert len(missing) == 1
 
@@ -268,3 +262,81 @@ class TestReportShape:
         report = resolve_wikilinks(pages, index)
         assert report.total_matched == 3
         assert report.total_missing == 1
+
+
+# ── TestAmbiguousPreservation (Copilot-flagged) ──────────────────────────────
+
+
+class TestAmbiguousPreservation:
+    def test_pipe_display_preserved_through_ambiguous_rewrite(self):
+        # [[target|display]] should retain |display when target is normalised.
+        body = "Read [[auth guide|the auth doc]] now."
+        report = _single_page(body, ["Auth Guide"])
+        rewritten = report.pages["My Page"].rewritten
+        assert "[[Auth Guide|the auth doc]]" in rewritten
+        assert "the auth doc" in rewritten
+
+    def test_anchor_preserved_through_ambiguous_rewrite(self):
+        body = "Jump to [[auth guide#oauth-flow]] section."
+        report = _single_page(body, ["Auth Guide"])
+        rewritten = report.pages["My Page"].rewritten
+        assert "[[Auth Guide#oauth-flow]]" in rewritten
+
+    def test_anchor_and_display_both_preserved(self):
+        body = "See [[auth guide#oauth-flow|OAuth section]]."
+        report = _single_page(body, ["Auth Guide"])
+        rewritten = report.pages["My Page"].rewritten
+        assert "[[Auth Guide#oauth-flow|OAuth section]]" in rewritten
+
+    def test_score_field_populated_for_ambiguous(self):
+        body = "[[auth gide]]"  # typo
+        report = _single_page(body, ["Auth Guide"])
+        link = report.pages["My Page"].links[0]
+        assert link.action == LinkAction.AMBIGUOUS
+        assert 0.0 < link.score <= 1.0
+
+
+# ── TestDocumentOrder (Copilot-flagged) ──────────────────────────────────────
+
+
+class TestDocumentOrder:
+    def test_resolutions_returned_in_document_order(self):
+        body = "First [[Zebra]], then [[Apple]], then [[Banana]]."
+        index = ["Zebra", "Apple", "Banana"]
+        report = _single_page(body, index)
+        targets_in_order = [r.target for r in report.pages["My Page"].links]
+        assert targets_in_order == ["Zebra", "Apple", "Banana"]
+
+    def test_duplicates_keep_occurrence_order(self):
+        body = "[[A]] [[B]] [[A]] [[C]] [[B]]"
+        index = ["A", "B", "C"]
+        report = _single_page(body, index)
+        targets_in_order = [r.target for r in report.pages["My Page"].links]
+        assert targets_in_order == ["A", "B", "A", "C", "B"]
+
+
+# ── TestCodeFenceBleed (Copilot-flagged) ─────────────────────────────────────
+
+
+class TestCodeFenceBleed:
+    def test_wikilink_in_code_fence_does_not_pull_real_link_into_fence(self):
+        # The same target appears in a code block AND in real prose.
+        # The rewriter must rewrite only the real-prose occurrence,
+        # leaving the code-block text untouched.
+        body = "Example:\n```\n[[Auth Guide]]\n```\nReal link: [[auth guide]]."
+        report = _single_page(body, ["Auth Guide"])
+        rewritten = report.pages["My Page"].rewritten
+        # Code block must be unchanged.
+        assert "```\n[[Auth Guide]]\n```" in rewritten
+        # Real link must be normalised to canonical title.
+        assert "Real link: [[Auth Guide]]." in rewritten
+
+    def test_inline_code_wikilink_not_rewritten(self):
+        body = "Use `[[foo]]` syntax. Real link: [[Foo]]."
+        report = _single_page(body, ["Foo"])
+        rewritten = report.pages["My Page"].rewritten
+        # Inline-code occurrence stays.
+        assert "`[[foo]]`" in rewritten
+        # Real-prose occurrence kept as MATCHED.
+        assert "[[Foo]]" in rewritten
+        assert report.pages["My Page"].links[0].action == LinkAction.MATCHED

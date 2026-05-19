@@ -18,17 +18,16 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 from app.core.parsers.markdown_links import Link, extract_links
-
 
 # ---------------------------------------------------------------------------
 # Public types
 # ---------------------------------------------------------------------------
 
 
-class LinkAction(str, Enum):
+class LinkAction(StrEnum):
     MATCHED = "matched"
     AMBIGUOUS = "ambiguous"
     MISSING = "missing"
@@ -42,6 +41,9 @@ class LinkResolution:
     action: LinkAction
     # Canonical title when action is AMBIGUOUS; None otherwise.
     best_match: str | None = None
+    # Slug-similarity score for AMBIGUOUS matches; 0.0 otherwise. Useful
+    # for downstream logging when deciding whether a rewrite was confident.
+    score: float = 0.0
 
 
 @dataclass
@@ -60,30 +62,15 @@ class ResolverReport:
 
     @property
     def total_matched(self) -> int:
-        return sum(
-            1
-            for pr in self.pages.values()
-            for lr in pr.links
-            if lr.action == LinkAction.MATCHED
-        )
+        return sum(1 for pr in self.pages.values() for lr in pr.links if lr.action == LinkAction.MATCHED)
 
     @property
     def total_ambiguous(self) -> int:
-        return sum(
-            1
-            for pr in self.pages.values()
-            for lr in pr.links
-            if lr.action == LinkAction.AMBIGUOUS
-        )
+        return sum(1 for pr in self.pages.values() for lr in pr.links if lr.action == LinkAction.AMBIGUOUS)
 
     @property
     def total_missing(self) -> int:
-        return sum(
-            1
-            for pr in self.pages.values()
-            for lr in pr.links
-            if lr.action == LinkAction.MISSING
-        )
+        return sum(1 for pr in self.pages.values() for lr in pr.links if lr.action == LinkAction.MISSING)
 
 
 # ---------------------------------------------------------------------------
@@ -144,34 +131,57 @@ def _find_best_match(target: str, index: list[str]) -> tuple[str | None, float]:
 # Matches [[…]] patterns (including pipe variants) for targeted replacement.
 _WIKILINK_FULL_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
+# Code-fence / inline-code regex — must stay in sync with markdown_links.py
+# (#228). Kept local + position-preserving so the rewriter sees the same
+# spans extract_links() used when deciding which [[…]] to surface.
+_FENCED_BLOCK_RE = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~")
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 
-def _rewrite_page(body: str, links: list[Link], index_set: set[str], index: list[str]) -> tuple[str, list[LinkResolution]]:
+
+def _mask_code_spans(text: str) -> str:
+    """Blank out fenced and inline code spans, preserving offsets."""
+
+    def _blank(m: re.Match[str]) -> str:
+        return " " * (m.end() - m.start())
+
+    text = _FENCED_BLOCK_RE.sub(_blank, text)
+    text = _INLINE_CODE_RE.sub(_blank, text)
+    return text
+
+
+def _rebuild_inner(target: str, anchor: str | None, display: str | None) -> str:
+    """Reassemble the inner text of a [[…]] from its parts."""
+    body = target
+    if anchor:
+        body = f"{body}#{anchor}"
+    if display is not None and display != target:
+        body = f"{body}|{display}"
+    return body
+
+
+def _rewrite_page(
+    body: str, links: list[Link], index_set: set[str], index: list[str]
+) -> tuple[str, list[LinkResolution]]:
     """Rewrite *body* resolving each wikilink; return (rewritten_body, resolutions)."""
-    resolutions: list[LinkResolution] = []
-
     if not links:
-        return body, resolutions
+        return body, []
 
-    # Process substitutions in reverse offset order so earlier slices stay valid.
-    # We re-scan the original text to find match spans for each link target.
-    # Because extract_links gives us document-order links (one per occurrence),
-    # we need to match them 1-to-1 against regex matches in the original text.
-    wikilink_matches = list(_WIKILINK_FULL_RE.finditer(body))
+    # Mask code spans so the rewriter only sees real wikilinks — same view
+    # extract_links() worked from. Offsets are preserved by the blank fill,
+    # so splice ranges remain valid against the original body.
+    masked = _mask_code_spans(body)
+    wikilink_matches = list(_WIKILINK_FULL_RE.finditer(masked))
 
     # Filter to only the wikilink-kind links from extract_links output.
-    wiki_links = [l for l in links if l.kind == "wikilink"]
+    wiki_links = [link for link in links if link.kind == "wikilink"]
 
     # Pair each Link with its corresponding regex match (same document order).
     pairs: list[tuple[re.Match[str], Link]] = []
     match_idx = 0
     for link in wiki_links:
-        # Advance through regex matches to find the one corresponding to this link.
-        # extract_links and _WIKILINK_FULL_RE both iterate left-to-right, so they
-        # stay in sync — we just need to align them.
         while match_idx < len(wikilink_matches):
             m = wikilink_matches[match_idx]
             inner = m.group(1).strip()
-            # Reconstruct candidate target from the raw inner text.
             raw_target = inner.split("|", 1)[0].strip()
             raw_target_clean = raw_target.split("#", 1)[0].strip()
             if raw_target_clean == link.target or raw_target == link.target:
@@ -180,38 +190,54 @@ def _rewrite_page(body: str, links: list[Link], index_set: set[str], index: list
                 break
             match_idx += 1
 
-    # Sort pairs in reverse so we can safely splice from the end.
-    pairs_rev = sorted(pairs, key=lambda p: p[0].start(), reverse=True)
+    # Build resolutions in document order alongside positions; apply splices
+    # in reverse order so earlier offsets stay valid.
+    positioned: list[tuple[int, LinkResolution]] = []
+    splices: list[tuple[int, int, str]] = []  # (start, end, replacement)
 
-    result = body
-    for match, link in pairs_rev:
+    for match, link in pairs:
         target = link.target
-        display = link.text  # may differ from target when pipe syntax used
+        anchor = link.anchor
+        # Detect pipe-display syntax: when no pipe is present,
+        # `Link.text` mirrors the inner text — which already contains the
+        # anchor. Compare against the no-pipe reconstruction so an
+        # anchor-only [[X#a]] isn't mistaken for [[X|display]].
+        no_pipe_form = f"{target}#{anchor}" if anchor else target
+        had_display = link.text != no_pipe_form
+        display = link.text if had_display else None
 
         if target in index_set:
-            # Exact match — keep verbatim.
-            resolutions.append(LinkResolution(target=target, action=LinkAction.MATCHED))
+            positioned.append((match.start(), LinkResolution(target=target, action=LinkAction.MATCHED)))
             continue
 
         best_title, score = _find_best_match(target, index)
 
         if best_title is not None:
-            # Ambiguous — rewrite to canonical title, keep link syntax.
-            resolutions.append(
-                LinkResolution(
-                    target=target,
-                    action=LinkAction.AMBIGUOUS,
-                    best_match=best_title,
+            positioned.append(
+                (
+                    match.start(),
+                    LinkResolution(
+                        target=target,
+                        action=LinkAction.AMBIGUOUS,
+                        best_match=best_title,
+                        score=score,
+                    ),
                 )
             )
-            result = result[: match.start()] + f"[[{best_title}]]" + result[match.end() :]
+            # Preserve anchor / display while normalising target.
+            new_inner = _rebuild_inner(best_title, anchor, display)
+            splices.append((match.start(), match.end(), f"[[{new_inner}]]"))
         else:
-            # Missing — strip brackets, keep display/anchor text.
-            resolutions.append(LinkResolution(target=target, action=LinkAction.MISSING))
-            result = result[: match.start()] + display + result[match.end() :]
+            positioned.append((match.start(), LinkResolution(target=target, action=LinkAction.MISSING)))
+            # Missing — strip [[…]] but keep the human-readable anchor text.
+            splices.append((match.start(), match.end(), link.text))
 
-    # Restore document order.
-    resolutions.sort(key=lambda r: r.target)
+    # Apply splices end-to-start so earlier offsets remain valid.
+    result = body
+    for start, end, replacement in sorted(splices, key=lambda s: s[0], reverse=True):
+        result = result[:start] + replacement + result[end:]
+
+    resolutions = [r for _, r in positioned]
     return result, resolutions
 
 
