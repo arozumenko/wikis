@@ -1,5 +1,5 @@
 """
-Coverage Ledger + Compact LLM Refiner — Phase 6.
+Coverage Ledger + Compact LLM Refiner.
 
 1. **CoverageLedger** tracks what the current set of pages covers:
    - Architectural symbol coverage (identity + supporting)
@@ -11,7 +11,8 @@ Coverage Ledger + Compact LLM Refiner — Phase 6.
    receives a section summary + quality flags and returns structured
    page actions.
 
-Gated behind ``FeatureFlags.coverage_ledger``.
+Used by ``page_validator`` and other advisory passes; no longer behind
+a feature flag after #242 collapsed the legacy planner paths.
 """
 
 from __future__ import annotations
@@ -20,9 +21,6 @@ import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
-
-from dataclasses import dataclass as _dataclass
-from typing import Dict as _Dict
 
 from ..constants import (
     DOC_CLUSTER_SYMBOLS,
@@ -39,7 +37,7 @@ CLASS_DOCS = "docs"
 CLASS_BRIDGE = "bridge"
 
 
-@_dataclass
+@dataclass
 class CandidateRecord:
     """Minimal record for a micro-cluster candidate (formerly in candidate_builder).
 
@@ -49,7 +47,7 @@ class CandidateRecord:
 
     macro_id: int
     micro_id: int
-    node_ids: list
+    node_ids: List[str]
     classification: str = ""
     code_identity_score: float = 0.0
     implementation_evidence: float = 0.0
@@ -57,11 +55,7 @@ class CandidateRecord:
     public_api_presence: float = 0.0
     utility_contamination: float = 0.0
     file_spread: int = 0
-    node_details: list = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.node_details is None:
-            self.node_details = []
+    node_details: List[Dict[str, Any]] = field(default_factory=list)
 
 logger = logging.getLogger(__name__)
 

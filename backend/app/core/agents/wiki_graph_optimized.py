@@ -2113,8 +2113,30 @@ class OptimizedWikiGenerationAgent:
         )
 
         if not result.pages:
-            logger.warning("[UNIFIED] pipeline produced 0 pages — falling back")
-            return None
+            # An empty repo (or one whose clusters all produced empty page
+            # specs) is a legitimate outcome — return a degenerate
+            # WikiStructureSpec with no pages instead of falling back to
+            # None and forcing the caller to raise.  This preserves the
+            # invocation as success=True with an empty wiki so the user
+            # gets a clear "nothing to generate" message rather than a
+            # RuntimeError.
+            from ..state.wiki_state import (  # noqa: PLC0415
+                SectionSpec,
+                WikiStructureSpec as StateWikiStructureSpec,
+            )
+            logger.warning("[UNIFIED] pipeline produced 0 pages — emitting empty WikiStructureSpec")
+            empty_structure = StateWikiStructureSpec(
+                wiki_title=repo_name or "Generated Wiki",
+                overview="No pages were generated — the repository contains no clusters the planner could group.",
+                sections=[SectionSpec(section_name="Overview", rationale="empty", pages=[])],
+                total_pages=0,
+            )
+            return {
+                "wiki_structure_spec": empty_structure,
+                "wiki_pages": [],
+                "structure_planning_complete": True,
+                "current_phase": "structure_complete",
+            }
 
         # ── Convert GeneratedPage → WikiStructureSpec + WikiPage ──────
         from ..state.wiki_state import (  # noqa: PLC0415

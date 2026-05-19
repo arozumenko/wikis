@@ -1,14 +1,14 @@
 """
-Wiki Structure Planner Engine - Using langchain-ai/deepagents
+Wiki Structure Planner Engine — residual scaffolding.
 
-This is the lean implementation for generating wiki structures using DeepAgents.
-It follows the same pattern as deep_research:
-- Minimal system prompt with clear workflow
-- FilesystemMiddleware for repository exploration (ls, glob, grep, read_file)
-- No pre-embedded context - agent discovers via tools
-- Structured JSON output
-
-Events are captured via LangGraph's stream for progress tracking.
+After #242 collapsed the legacy planners, the DeepAgents-based
+``plan_structure()`` workflow this engine used to drive is gone.
+What remains here is a thin holder for ``StructurePlannerConfig`` plus
+``_validate_structure`` and a handful of helper methods that the
+unified pipeline's page validator and config plumbing still import.
+There is no longer a public ``plan_structure()`` / ``plan_structure_graph_first()``
+entry point — see ``OptimizedWikiGenerationAgent._generate_wiki_structure``
+for the only production planner path.
 """
 
 from __future__ import annotations
@@ -63,23 +63,16 @@ class StructurePlannerConfig:
 
 class WikiStructurePlannerEngine:
     """
-    Lean engine for generating wiki structures using DeepAgents.
+    Residual engine container after #242 — kept for the helper methods
+    (``_validate_structure``, ``_unwrap_chat_model``, etc.) that downstream
+    advisory passes and tests still import.
 
-    This implementation:
-    - Uses FilesystemMiddleware for repo exploration (ls, glob, grep, read_file)
-    - Does NOT embed large context in prompts
-    - Lets the agent discover structure via tools
-    - Returns structured WikiStructureSpec JSON
-
-    Usage:
-        engine = WikiStructurePlannerEngine(
-            repo_root="/path/to/repo",
-            llm_client=chat_model,
-            config=StructurePlannerConfig(page_budget=25)
-        )
-
-        result = engine.plan_structure()
-        # result is a dict ready for WikiStructureSpec.model_validate()
+    There is no longer a ``plan_structure()`` or ``plan_structure_graph_first()``
+    method on this class — the unified pipeline in
+    ``OptimizedWikiGenerationAgent._generate_wiki_structure`` is the only
+    production planner path.  Do not instantiate this class as an entry
+    point; construct ``StructurePlannerConfig`` directly when configuring
+    the unified pipeline's page budget / iteration limits.
     """
 
     def __init__(

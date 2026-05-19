@@ -71,6 +71,11 @@ class GenerateInProgressError(Exception):
 class WikiService:
     """Orchestrates wiki generation from repository analysis."""
 
+    # #242: deprecation warning sentinel — flipped True after the first
+    # request that still supplies ``planner_type``, suppressing the warning
+    # for the remainder of the process to avoid log spam from older clients.
+    _planner_type_deprecation_logged: bool = False
+
     def __init__(self, settings: Settings, storage: ArtifactStorage, wiki_management: Any = None) -> None:
         self.settings = settings
         self.storage = storage
@@ -428,15 +433,18 @@ class WikiService:
             await self._emit_progress(invocation, "configuring", 0.05, "Preparing wiki generation")
 
             # The unified pipeline is the only path (#242).
-            # planner_type from the request is a no-op; log a deprecation warning
-            # the first time a caller still sends it so operators can update clients.
+            # planner_type from the request is a no-op; log a deprecation
+            # warning ONCE per process (via a class-level sentinel) so older
+            # clients in production don't spam the log.
             planner_type = request.planner_type if request.planner_type is not None else self.settings.planner_type
-            if request.planner_type is not None:
+            if request.planner_type is not None and not WikiService._planner_type_deprecation_logged:
                 logger.warning(
                     "DEPRECATED: planner_type=%r was supplied but is ignored — "
-                    "the unified pipeline is now the only path (#242).",
+                    "the unified pipeline is now the only path (#242). This warning "
+                    "is suppressed for the rest of this process.",
                     request.planner_type,
                 )
+                WikiService._planner_type_deprecation_logged = True
             exclude_tests = False
 
             await self._emit_progress(invocation, "indexing", 0.1, "Cloning repository and building index")
