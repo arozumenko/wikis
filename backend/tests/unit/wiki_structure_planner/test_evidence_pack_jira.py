@@ -621,7 +621,7 @@ class TestParseInlineList:
 
     def test_mixed_quote_types_both_preserved(self):
         """AC-4: mixed quote types with commas inside are both preserved."""
-        result = _parse_inline_list('["mixed,quote", \'comma,inside\']')
+        result = _parse_inline_list("[\"mixed,quote\", 'comma,inside']")
         assert result == ["mixed,quote", "comma,inside"]
 
     def test_empty_list(self):
@@ -634,20 +634,40 @@ class TestParseInlineList:
         result = _parse_inline_list("not a list")
         assert result is None
 
-    def test_single_quoted_item_with_comma(self):
-        """Single item with comma inside quotes → one-element list."""
+    def test_double_quoted_item_with_comma(self):
+        """Single item with comma inside double quotes → one-element list."""
         result = _parse_inline_list('["a,b"]')
         assert result == ["a,b"]
 
     def test_mixed_quoted_and_unquoted(self):
         """Quoted and unquoted items interleaved."""
-        result = _parse_inline_list('["x,y", plain, \'z,w\']')
+        result = _parse_inline_list("[\"x,y\", plain, 'z,w']")
         assert result == ["x,y", "plain", "z,w"]
 
     def test_whitespace_trimmed_from_unquoted(self):
         """Whitespace around unquoted items is stripped."""
         result = _parse_inline_list("[ a ,  b , c ]")
         assert result == ["a", "b", "c"]
+
+    def test_empty_quoted_string_preserved(self):
+        """`[""]` — YAML flow sequences can carry empty-string elements."""
+        result = _parse_inline_list('[""]')
+        assert result == [""]
+
+    def test_empty_quoted_string_among_others(self):
+        """Empty-quoted item between two real ones."""
+        result = _parse_inline_list('["a", "", "b"]')
+        assert result == ["a", "", "b"]
+
+    def test_empty_single_quoted_string_preserved(self):
+        """Single-quoted variant of empty string."""
+        result = _parse_inline_list("['']")
+        assert result == [""]
+
+    def test_bare_empty_slot_dropped(self):
+        """`[a, , b]` — unquoted whitespace between commas is not an item."""
+        result = _parse_inline_list("[a, , b]")
+        assert result == ["a", "b"]
 
     def test_not_a_list_plain_scalar_returns_none(self):
         """Plain scalar value (no brackets) returns None."""

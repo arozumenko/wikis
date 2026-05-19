@@ -175,6 +175,11 @@ def _parse_inline_list(value: str) -> list[str] | None:
     Uses a small state-machine so that commas inside quoted strings are treated
     as literal characters rather than separators — fixes #256.  Both single and
     double quotes are supported; a quote is closed only by its matching opener.
+
+    Tracks whether each item was *started* (saw a non-whitespace character or
+    an opening quote) so an explicit empty-quoted item like ``["", "x"]``
+    yields ``["", "x"]`` rather than ``["x"]``. Bare whitespace between
+    commas — like ``[a, , b]`` — is treated as no item and dropped.
     """
     if not (value.startswith("[") and value.endswith("]")):
         return None
@@ -184,6 +189,7 @@ def _parse_inline_list(value: str) -> list[str] | None:
     items: list[str] = []
     current: list[str] = []
     quote: str | None = None
+    started = False  # an item exists once we see a non-space char or an opening quote
     for ch in inner:
         if quote:
             if ch == quote:
@@ -192,14 +198,22 @@ def _parse_inline_list(value: str) -> list[str] | None:
                 current.append(ch)
         elif ch in ("'", '"'):
             quote = ch
+            started = True
         elif ch == ",":
-            items.append("".join(current).strip())
+            if started:
+                items.append("".join(current).strip())
             current = []
+            started = False
+        elif ch.isspace():
+            # Whitespace contributes only if an item is already in progress.
+            if started:
+                current.append(ch)
         else:
             current.append(ch)
-    if current:
+            started = True
+    if started:
         items.append("".join(current).strip())
-    return [item for item in items if item]
+    return items
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
