@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ._evidence_utils import safe_join
 from .structure_skeleton import ArtifactInfo, Cluster
 
 logger = logging.getLogger(__name__)
@@ -51,26 +52,6 @@ _SQL_CREATE_PATTERN = re.compile(
 
 # Approximate chars per token — conservative (LLaMA-family tokenisers are closer to 3.5).
 _CHARS_PER_TOKEN = 4
-
-
-# ── Path safety ───────────────────────────────────────────────────────────────
-
-
-def _safe_join(root: str, rel_path: str) -> str | None:
-    """Join *rel_path* under *root*; return None if it would escape the root.
-
-    Resolves symlinks and ``..`` so absolute paths and traversal attempts are
-    rejected before any file IO happens. Mirrors the pattern in
-    ``wiki_content_writer/writer_tools.py``.
-    """
-    try:
-        full = os.path.realpath(os.path.join(root, rel_path))
-        root_real = os.path.realpath(root)
-        if not full.startswith(root_real + os.sep) and full != root_real:
-            return None
-        return full
-    except (ValueError, OSError):
-        return None
 
 
 # ── EvidencePack ──────────────────────────────────────────────────────────────
@@ -164,7 +145,7 @@ def _read_file_head(repo_root: str, rel_path: str, max_lines: int = 40) -> str |
     """
     import itertools
 
-    safe = _safe_join(repo_root, rel_path)
+    safe = safe_join(repo_root, rel_path)
     if safe is None:
         logger.debug("evidence: path escape rejected: %r", rel_path)
         return None
@@ -178,7 +159,7 @@ def _read_file_head(repo_root: str, rel_path: str, max_lines: int = 40) -> str |
 
 def _find_readme(repo_root: str, dir_path: str) -> str | None:
     """Return content of the first README found in *dir_path* under *repo_root*, or None."""
-    safe_dir = _safe_join(repo_root, dir_path)
+    safe_dir = safe_join(repo_root, dir_path)
     if safe_dir is None:
         return None
     try:
@@ -196,7 +177,7 @@ def _find_readme(repo_root: str, dir_path: str) -> str | None:
 
 def _extract_sql_blocks(repo_root: str, dir_path: str) -> list[str]:
     """Return all CREATE TABLE blocks from *.sql files directly under *dir_path*."""
-    safe_dir = _safe_join(repo_root, dir_path)
+    safe_dir = safe_join(repo_root, dir_path)
     if safe_dir is None:
         return []
     blocks: list[str] = []
@@ -208,7 +189,7 @@ def _extract_sql_blocks(repo_root: str, dir_path: str) -> list[str]:
         if not entry.lower().endswith(".sql"):
             continue
         sql_rel = os.path.join(dir_path, entry)
-        safe_sql = _safe_join(repo_root, sql_rel)
+        safe_sql = safe_join(repo_root, sql_rel)
         if safe_sql is None:
             continue
         try:

@@ -36,11 +36,11 @@ Design choices
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ._evidence_utils import safe_join
 from .structure_skeleton import ArtifactInfo, Cluster
 
 logger = logging.getLogger(__name__)
@@ -55,26 +55,6 @@ _FIRST_PARA_CHAR_CAP = 400
 
 # Maximum child rows before we start truncating.
 _MAX_CHILD_ROWS = 50
-
-
-# ── Path safety ───────────────────────────────────────────────────────────────
-
-
-def _safe_join(root: str, rel_path: str) -> str | None:
-    """Join *rel_path* under *root*; return None if it would escape the root.
-
-    Resolves symlinks and ``..`` so absolute paths and traversal attempts are
-    rejected before any file IO happens.  Mirrors the canonical implementation
-    in ``evidence.py:60``.
-    """
-    try:
-        full = os.path.realpath(os.path.join(root, rel_path))
-        root_real = os.path.realpath(root)
-        if not full.startswith(root_real + os.sep) and full != root_real:
-            return None
-        return full
-    except (ValueError, OSError):
-        return None
 
 
 # ── JiraEvidencePack ──────────────────────────────────────────────────────────
@@ -159,7 +139,7 @@ def _escape_table_cell(value: str) -> str:
 
 def _read_file_safe(repo_root: str, rel_path: str) -> str | None:
     """Read the full content of *rel_path* under *repo_root*, or None on error."""
-    safe = _safe_join(repo_root, rel_path)
+    safe = safe_join(repo_root, rel_path)
     if safe is None:
         logger.debug("evidence_jira: path escape rejected: %r", rel_path)
         return None
