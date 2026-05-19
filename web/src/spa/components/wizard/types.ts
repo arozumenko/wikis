@@ -9,13 +9,12 @@
 
 import type { WikiSourceType } from '../../api/wiki';
 
-export type PatSource = 'none' | 'stored' | 'paste';
+export type PatSource = 'none' | 'paste';
 
 export interface GitFormState {
   repo_url: string;
   branch: string;
   patSource: PatSource;
-  selectedPatId: string;
   pastedPat: string;
 }
 
@@ -41,7 +40,6 @@ export const INITIAL_FORM_DATA: WizardFormData = {
     repo_url: '',
     branch: 'main',
     patSource: 'none',
-    selectedPatId: '',
     pastedPat: '',
   },
   confluence: { space_keys: [] },

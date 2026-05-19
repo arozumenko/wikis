@@ -118,11 +118,7 @@ export function AddSourceWizard({
   // route through this guard once the user has invested real work.
   const [confirmDiscardOpen, setConfirmDiscardOpen] = useState(false);
 
-  const { atlassian, connections, refreshAtlassianIfNeeded } = useConnections();
-  const gitConnections = useMemo(
-    () => connections.filter((c) => c.provider === 'git'),
-    [connections],
-  );
+  const { atlassian, refreshAtlassianIfNeeded } = useConnections();
 
   // ---------------------------------------------------------------------
   // Per-step validation
@@ -157,10 +153,6 @@ export function AddSourceWizard({
     if (atlassianMissing) return false;
     if (formData.source_type === 'git') {
       if (urlError) return false;
-      if (formData.git.patSource === 'stored') {
-        if (gitConnections.length === 0) return false;
-        if (!formData.git.selectedPatId) return false;
-      }
       return true;
     }
     if (formData.source_type === 'confluence') return !spaceKeysError;
@@ -169,9 +161,6 @@ export function AddSourceWizard({
   }, [
     atlassianMissing,
     formData.source_type,
-    formData.git.patSource,
-    formData.git.selectedPatId,
-    gitConnections.length,
     urlError,
     spaceKeysError,
     jqlError,
@@ -191,12 +180,8 @@ export function AddSourceWizard({
   const buildScanRequest = useCallback((): ScanRequest | null => {
     if (!configureValid) return null;
     if (formData.source_type === 'git') {
-      let pat: string | null = null;
-      if (formData.git.patSource === 'stored' && formData.git.selectedPatId) {
-        pat = gitConnections.find((c) => c.id === formData.git.selectedPatId)?.pat ?? null;
-      } else if (formData.git.patSource === 'paste') {
-        pat = formData.git.pastedPat || null;
-      }
+      const pat: string | null =
+        formData.git.patSource === 'paste' ? formData.git.pastedPat || null : null;
       return {
         source_type: 'git',
         scope: { repo_url: formData.git.repo_url.trim(), branch: formData.git.branch || 'main' },
@@ -228,7 +213,6 @@ export function AddSourceWizard({
     formData.git,
     formData.confluence.space_keys,
     formData.jira.jql,
-    gitConnections,
     atlassian,
   ]);
 
@@ -275,7 +259,6 @@ export function AddSourceWizard({
         (g.repo_url || '') !== (initialUrl ?? '') ||
         g.branch !== g0.branch ||
         g.patSource !== g0.patSource ||
-        g.selectedPatId !== g0.selectedPatId ||
         g.pastedPat !== g0.pastedPat
       );
     }
@@ -312,12 +295,8 @@ export function AddSourceWizard({
     try {
       let body: GenerateWikiMultiSourceRequest;
       if (formData.source_type === 'git') {
-        let pat: string | null = null;
-        if (formData.git.patSource === 'stored' && formData.git.selectedPatId) {
-          pat = gitConnections.find((c) => c.id === formData.git.selectedPatId)?.pat ?? null;
-        } else if (formData.git.patSource === 'paste') {
-          pat = formData.git.pastedPat || null;
-        }
+        const pat: string | null =
+          formData.git.patSource === 'paste' ? formData.git.pastedPat || null : null;
         body = {
           source_type: 'git',
           scope: {
@@ -382,7 +361,7 @@ export function AddSourceWizard({
     } finally {
       setSubmitting(false);
     }
-  }, [formData, gitConnections, refreshAtlassianIfNeeded, onSuccess, onAlreadyExists]);
+  }, [formData, refreshAtlassianIfNeeded, onSuccess, onAlreadyExists]);
 
   // ---------------------------------------------------------------------
   // Render

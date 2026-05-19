@@ -10,7 +10,6 @@ import {
   InputLabel,
   MenuItem,
   Select,
-  Stack,
   Tab,
   Tabs,
   TextField,
@@ -29,7 +28,7 @@ type GenerateWikiRequest = components['schemas']['GenerateWikiRequest'];
 // PAT source options (Git tab)
 // ---------------------------------------------------------------------------
 
-type PatSource = 'stored' | 'paste' | 'none';
+type PatSource = 'paste' | 'none';
 
 // ---------------------------------------------------------------------------
 // Props
@@ -203,8 +202,6 @@ interface GitTabProps {
   setBranch: (v: string) => void;
   patSource: PatSource;
   setPatSource: (v: PatSource) => void;
-  selectedPatId: string;
-  setSelectedPatId: (v: string) => void;
   pastedPat: string;
   setPastedPat: (v: string) => void;
   urlError: string | null;
@@ -215,14 +212,10 @@ function GitTab({
   repoUrl, setRepoUrl,
   branch, setBranch,
   patSource, setPatSource,
-  selectedPatId, setSelectedPatId,
   pastedPat, setPastedPat,
   urlError,
   disabled,
 }: GitTabProps) {
-  const { connections } = useConnections();
-  const gitConnections = connections.filter((c) => c.provider === 'git');
-
   return (
     <Box>
       <TextField
@@ -259,36 +252,9 @@ function GitTab({
           inputProps={{ 'data-testid': 'pat-source-select' }}
         >
           <MenuItem value="none">No auth (public repo)</MenuItem>
-          <MenuItem value="stored">Use stored PAT</MenuItem>
           <MenuItem value="paste">Paste token once (not stored)</MenuItem>
         </Select>
       </FormControl>
-
-      {patSource === 'stored' && gitConnections.length === 0 && (
-        <Alert severity="info" sx={{ mt: 1 }} data-testid="git-no-pat-alert">
-          No stored Git PATs found. Switch to &ldquo;Paste token once&rdquo; above to
-          provide a token without storing it.
-        </Alert>
-      )}
-
-      {patSource === 'stored' && gitConnections.length > 0 && (
-        <FormControl fullWidth margin="normal" disabled={disabled}>
-          <InputLabel id="pat-select-label">Stored PAT</InputLabel>
-          <Select
-            labelId="pat-select-label"
-            value={selectedPatId}
-            label="Stored PAT"
-            onChange={(e) => setSelectedPatId(e.target.value)}
-            inputProps={{ 'data-testid': 'stored-pat-select' }}
-          >
-            {gitConnections.map((c) => (
-              <MenuItem key={c.id} value={c.id}>
-                {c.label || c.repo_url}
-              </MenuItem>
-            ))}
-          </Select>
-        </FormControl>
-      )}
 
       {patSource === 'paste' && (
         <TextField
@@ -464,7 +430,6 @@ function MultiSourceGenerateForm({
   const [repoUrl, setRepoUrl] = useState(initialUrl);
   const [branch, setBranch] = useState('main');
   const [patSource, setPatSource] = useState<PatSource>('none');
-  const [selectedPatId, setSelectedPatId] = useState('');
   const [pastedPat, setPastedPat] = useState('');
 
   // Confluence state
@@ -476,8 +441,7 @@ function MultiSourceGenerateForm({
   // Validation
   const [touched, setTouched] = useState(false);
 
-  const { atlassian, connections, refreshAtlassianIfNeeded } = useConnections();
-  const gitConnections = connections.filter((c) => c.provider === 'git');
+  const { atlassian, refreshAtlassianIfNeeded } = useConnections();
 
   // ---------------------------------------------------------------------------
   // Derived validation
@@ -512,19 +476,12 @@ function MultiSourceGenerateForm({
     if (atlassianMissing) return false;
     if (activeTab === 'git') {
       if (!repoUrl || !isUrlish(repoUrl)) return false;
-      if (patSource === 'stored') {
-        if (gitConnections.length === 0) return false;
-        if (!selectedPatId) return false;
-      }
       return true;
     }
     if (activeTab === 'confluence') return spaceKeys.length > 0;
     if (activeTab === 'jira') return jql.trim().length > 0;
     return false;
-  }, [
-    atlassianMissing, activeTab, repoUrl, patSource,
-    gitConnections.length, selectedPatId, spaceKeys, jql,
-  ]);
+  }, [atlassianMissing, activeTab, repoUrl, spaceKeys, jql]);
 
   // ---------------------------------------------------------------------------
   // Submit
@@ -541,13 +498,7 @@ function MultiSourceGenerateForm({
       let body: GenerateWikiMultiSourceRequest;
 
       if (activeTab === 'git') {
-        let pat: string | null = null;
-        if (patSource === 'stored' && selectedPatId) {
-          const conn = gitConnections.find((c) => c.id === selectedPatId);
-          pat = conn?.pat ?? null;
-        } else if (patSource === 'paste') {
-          pat = pastedPat || null;
-        }
+        const pat: string | null = patSource === 'paste' ? pastedPat || null : null;
         body = {
           source_type: 'git',
           scope: { repo_url: repoUrl, branch },
@@ -587,8 +538,8 @@ function MultiSourceGenerateForm({
       await onSubmitMultiSource(body);
     },
     [
-      isValid, activeTab, patSource, selectedPatId, pastedPat,
-      repoUrl, branch, gitConnections,
+      isValid, activeTab, patSource, pastedPat,
+      repoUrl, branch,
       refreshAtlassianIfNeeded, spaceKeys, jql, onSubmitMultiSource,
     ],
   );
@@ -622,8 +573,6 @@ function MultiSourceGenerateForm({
           setBranch={setBranch}
           patSource={patSource}
           setPatSource={setPatSource}
-          selectedPatId={selectedPatId}
-          setSelectedPatId={setSelectedPatId}
           pastedPat={pastedPat}
           setPastedPat={setPastedPat}
           urlError={urlError}

@@ -223,27 +223,22 @@ describe('GenerateForm — multi-source', () => {
     expect((body.auth as { pat: string | null }).pat).toBe('ghp_supersecret');
   });
 
-  it('builds git request with stored PAT', async () => {
+  it('auth dropdown no longer offers stored PAT', async () => {
+    // Regression: the stored-PAT path was removed because there is no
+    // longer a UI to store PATs in the first place. The dropdown must
+    // only offer "No auth" and "Paste token once".
     const user = userEvent.setup();
     withGitConnections();
-    const { submit } = renderForm();
+    renderForm();
 
     await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
-
-    // Switch auth to "stored"
     await user.click(screen.getByRole('combobox', { name: /authentication/i }));
-    await user.click(await screen.findByText(/Use stored PAT/i));
 
-    // Select the stored connection
-    await user.click(screen.getByRole('combobox', { name: /stored pat/i }));
-    await user.click(await screen.findByText('My Repo'));
-
-    await user.click(screen.getByTestId('generate-submit'));
-
-    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
-    const body = submit.mock.calls[0][0] as GenerateWikiMultiSourceRequest;
-    expect(body.source_type).toBe('git');
-    expect((body.auth as { pat: string | null }).pat).toBe('ghp_testtoken');
+    const options = await screen.findAllByRole('option');
+    const optionTexts = options.map((o) => o.textContent ?? '');
+    expect(optionTexts.some((t) => /Use stored PAT/i.test(t))).toBe(false);
+    expect(optionTexts.some((t) => /No auth/i.test(t))).toBe(true);
+    expect(optionTexts.some((t) => /Paste token once/i.test(t))).toBe(true);
   });
 
   // -------------------------------------------------------------------------
