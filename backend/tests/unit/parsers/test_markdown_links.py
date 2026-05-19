@@ -154,11 +154,18 @@ class TestConfluenceJiraURLs:
         index = {url: "exported/auth-guide.md"}
         links = extract_links(f"[Auth]({url})", url_to_file_index=index)
         assert links[0].kind == "internal"
+        assert links[0].target == "exported/auth-guide.md"
         assert links[0].resolved == "exported/auth-guide.md"
 
     def test_external_url_no_match_stays_external(self):
         links = extract_links("[External](https://example.com)", url_to_file_index={})
         assert links[0].kind == "external"
+
+    def test_external_url_with_fragment_splits_anchor(self):
+        links = extract_links("[Section](https://example.com/page#frag)")
+        assert links[0].kind == "external"
+        assert links[0].target == "https://example.com/page"
+        assert links[0].anchor == "frag"
 
 
 class TestEdgeCases:
@@ -190,6 +197,12 @@ class TestEdgeCases:
             resolved=None,
         )
         assert link.kind == "internal"
+
+    def test_links_returned_in_document_order(self):
+        md = "First [[Wiki A]], then ![img](a.png), then [link](other.md), then [[Wiki B]]."
+        links = extract_links(md)
+        kinds_in_order = [link.kind for link in links]
+        assert kinds_in_order == ["wikilink", "attachment", "internal", "wikilink"]
 
     def test_source_code_wikilinks_excluded(self):
         # [[source/...]] is reserved for source-code refs in generated wikis;

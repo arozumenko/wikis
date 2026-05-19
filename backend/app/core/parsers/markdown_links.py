@@ -90,26 +90,32 @@ def extract_links(
             used to localize Confluence/Jira links back to internal references.
 
     Returns:
-        List of ``Link`` records in document order, grouped by kind
-        (attachment placeholders, images, standard links, wikilinks).
+        List of ``Link`` records in document order. ``target`` carries the
+        canonical reference for the link's kind (file path for internal,
+        full URL for external, page title for wikilink, filename or
+        relative path for attachment); the ``#anchor`` portion is split
+        out into ``anchor`` for all kinds.
     """
     if not md_text:
         return []
 
     cleaned = _strip_code(md_text)
-    links: list[Link] = []
+    found: list[tuple[int, Link]] = []
 
     placeholder_spans: list[tuple[int, int]] = []
     for m in _ATTACHMENT_PLACEHOLDER_RE.finditer(cleaned):
         target = m.group(1).strip()
-        links.append(
-            Link(
-                kind="attachment",
-                target=target,
-                text=target,
-                anchor=None,
-                source_path=source_path,
-                resolved=None,
+        found.append(
+            (
+                m.start(),
+                Link(
+                    kind="attachment",
+                    target=target,
+                    text=target,
+                    anchor=None,
+                    source_path=source_path,
+                    resolved=None,
+                ),
             )
         )
         placeholder_spans.append((m.start(), m.end()))
@@ -117,14 +123,17 @@ def extract_links(
     masked = _blank_spans(cleaned, placeholder_spans)
 
     for m in _IMAGE_RE.finditer(masked):
-        links.append(
-            Link(
-                kind="attachment",
-                target=m.group(2),
-                text=m.group(1),
-                anchor=None,
-                source_path=source_path,
-                resolved=None,
+        found.append(
+            (
+                m.start(),
+                Link(
+                    kind="attachment",
+                    target=m.group(2),
+                    text=m.group(1),
+                    anchor=None,
+                    source_path=source_path,
+                    resolved=None,
+                ),
             )
         )
 
@@ -134,38 +143,50 @@ def extract_links(
         path, anchor = _split_anchor(target_raw)
         if _EXTERNAL_SCHEME_RE.match(target_raw):
             if url_to_file_index and target_raw in url_to_file_index:
-                links.append(
-                    Link(
-                        kind="internal",
-                        target=target_raw,
-                        text=text,
-                        anchor=anchor,
-                        source_path=source_path,
-                        resolved=url_to_file_index[target_raw],
+                # Localized: target carries the resolved file path so it has
+                # the same meaning as a non-localized internal link.
+                resolved_path = url_to_file_index[target_raw]
+                found.append(
+                    (
+                        m.start(),
+                        Link(
+                            kind="internal",
+                            target=resolved_path,
+                            text=text,
+                            anchor=anchor,
+                            source_path=source_path,
+                            resolved=resolved_path,
+                        ),
                     )
                 )
             else:
-                links.append(
-                    Link(
-                        kind="external",
-                        target=target_raw,
-                        text=text,
-                        anchor=anchor,
-                        source_path=source_path,
-                        resolved=None,
+                found.append(
+                    (
+                        m.start(),
+                        Link(
+                            kind="external",
+                            target=path,
+                            text=text,
+                            anchor=anchor,
+                            source_path=source_path,
+                            resolved=None,
+                        ),
                     )
                 )
             continue
 
         resolved = _resolve_relative(path, source_path) if source_path else None
-        links.append(
-            Link(
-                kind="internal",
-                target=path,
-                text=text,
-                anchor=anchor,
-                source_path=source_path,
-                resolved=resolved,
+        found.append(
+            (
+                m.start(),
+                Link(
+                    kind="internal",
+                    target=path,
+                    text=text,
+                    anchor=anchor,
+                    source_path=source_path,
+                    resolved=resolved,
+                ),
             )
         )
 
@@ -181,15 +202,19 @@ def extract_links(
             target = inner
             text = inner
         target_clean, anchor = _split_anchor(target)
-        links.append(
-            Link(
-                kind="wikilink",
-                target=target_clean.strip(),
-                text=text,
-                anchor=anchor,
-                source_path=source_path,
-                resolved=None,
+        found.append(
+            (
+                m.start(),
+                Link(
+                    kind="wikilink",
+                    target=target_clean.strip(),
+                    text=text,
+                    anchor=anchor,
+                    source_path=source_path,
+                    resolved=None,
+                ),
             )
         )
 
-    return links
+    found.sort(key=lambda pair: pair[0])
+    return [link for _, link in found]
