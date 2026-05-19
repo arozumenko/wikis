@@ -40,46 +40,26 @@ Design choices (see PR body for rationale)
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..parsers.markdown_chunker import Chunk, chunk_markdown
+from ..parsers.markdown_chunker import chunk_markdown
+from ._evidence_utils import (
+    collect_attachments,
+    extract_first_paragraph,
+    extract_toc_from_text,
+    mask_code_fences,
+    safe_join,
+)
 from .structure_skeleton import Cluster
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Hard cap on first_paragraph per page (chars, not tokens).
-_FIRST_PARA_CHAR_CAP = 200
-
 # Approximate chars per token — conservative (matches evidence.py / evidence_md.py).
 _CHARS_PER_TOKEN = 4
-
-# TOC entries are short; allow up to this many before per-page truncation.
-_MAX_TOC_ENTRIES_PER_PAGE = 20
-
-
-# ── Path safety ───────────────────────────────────────────────────────────────
-
-
-def _safe_join(root: str, rel_path: str) -> str | None:
-    """Join *rel_path* under *root*; return None if it would escape the root.
-
-    Resolves symlinks and ``..`` so absolute paths and traversal attempts are
-    rejected before any file IO happens.  Mirrors the canonical implementation
-    in ``evidence.py:60``.
-    """
-    try:
-        full = os.path.realpath(os.path.join(root, rel_path))
-        root_real = os.path.realpath(root)
-        if not full.startswith(root_real + os.sep) and full != root_real:
-            return None
-        return full
-    except (ValueError, OSError):
-        return None
 
 
 # ── ConfluenceEvidencePack ────────────────────────────────────────────────────
@@ -271,7 +251,7 @@ def _parse_frontmatter(md_text: str) -> tuple[dict, str]:
 
 def _read_file_safe(repo_root: str, rel_path: str) -> str | None:
     """Read the full content of *rel_path* under *repo_root*, or None on error."""
-    safe = _safe_join(repo_root, rel_path)
+    safe = safe_join(repo_root, rel_path)
     if safe is None:
         logger.debug("evidence_confluence: path escape rejected: %r", rel_path)
         return None
@@ -279,66 +259,6 @@ def _read_file_safe(repo_root: str, rel_path: str) -> str | None:
         return Path(safe).read_text(encoding="utf-8", errors="replace")
     except (OSError, PermissionError):
         return None
-
-
-_TOC_HEADING_RE = re.compile(r"^(#{1,2})\s+(.*?)(?:\s+#+)?\s*$", re.MULTILINE)
-_TOC_FENCE_RE = re.compile(r"```[\s\S]*?(?:```|\Z)|~~~[\s\S]*?(?:~~~|\Z)")
-
-
-def _extract_toc(md_text: str) -> list[str]:
-    """Return H1/H2 heading names from raw markdown in document order.
-
-    Scans the raw text directly (same pattern as evidence_md.py) so
-    structural-only docs still surface their TOC. H3+ are excluded by
-    design. Fenced code blocks are masked so a ``# install`` line inside
-    ```bash isn't picked up.
-
-    Headings are NOT deduplicated by name — a Confluence page with two
-    `## Overview` sections under different H1s legitimately has both in
-    its TOC. Matches the precedent set by ``evidence_md.py`` so the
-    planner agent (#236) sees a consistent shape across pack kinds.
-    """
-
-    def _blank(m: re.Match[str]) -> str:
-        return " " * (m.end() - m.start())
-
-    masked = _TOC_FENCE_RE.sub(_blank, md_text)
-    toc: list[str] = []
-    for m in _TOC_HEADING_RE.finditer(masked):
-        heading = m.group(2).strip()
-        if heading:
-            toc.append(heading)
-    return toc[:_MAX_TOC_ENTRIES_PER_PAGE]
-
-
-def _extract_first_paragraph(chunks: list[Chunk]) -> str:
-    """Return first non-empty body text from *chunks*, capped at 200 chars.
-
-    Prefers preamble chunk (heading_path=[]) if present and non-empty;
-    falls back to the first heading section's body.  Mirrors the pattern
-    from evidence_md.py.
-    """
-    for chunk in chunks:
-        stripped = chunk.body.strip()
-        if stripped:
-            return stripped[:_FIRST_PARA_CHAR_CAP]
-    return ""
-
-
-def _collect_attachments(chunks: list[Chunk]) -> list[str]:
-    """Return a sorted, deduplicated list of attachment filenames from all chunks.
-
-    Attachment content is never read — only the filenames/paths extracted by
-    chunk_markdown's ``[[attachment: …]]`` pass-through are included.
-    """
-    seen: set[str] = set()
-    result: list[str] = []
-    for chunk in chunks:
-        for name in chunk.attachments:
-            if name not in seen:
-                seen.add(name)
-                result.append(name)
-    return sorted(result)
 
 
 def _parse_labels(frontmatter: dict) -> list[str]:
@@ -383,7 +303,7 @@ def _process_page(
     if frontmatter:
         title = str(frontmatter.get("title", "")).strip()
     if not title:
-        masked_body = _TOC_FENCE_RE.sub(lambda m: " " * (m.end() - m.start()), body)
+        masked_body = mask_code_fences(body)
         h1_m = re.search(r"^# (.+)$", masked_body, re.MULTILINE)
         if h1_m:
             title = h1_m.group(1).strip()
@@ -393,13 +313,13 @@ def _process_page(
     labels = _parse_labels(frontmatter)
 
     # TOC scanned from the full raw text (same as evidence_md.py approach)
-    toc = _extract_toc(text)
+    toc = extract_toc_from_text(text)
 
     # first_paragraph + attachments come from chunk_markdown on the body text
     # (after stripping frontmatter so preamble text is the actual opening prose)
     chunks = chunk_markdown(body, doc_path=rel_path, frontmatter=frontmatter if frontmatter else None)
-    first_paragraph = _extract_first_paragraph(chunks)
-    attachments = _collect_attachments(chunks)
+    first_paragraph = extract_first_paragraph(chunks)
+    attachments = collect_attachments(chunks)
 
     return {
         "source_path": rel_path,
