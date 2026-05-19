@@ -147,16 +147,24 @@ export function AddSourceWizard({
 
   const atlassianRequired =
     formData.source_type === 'confluence' || formData.source_type === 'jira';
-  const atlassianMissing = atlassianRequired && !atlassian;
+
+  // The Atlassian auth surface is ready when either:
+  // - OAuth mode AND a connection exists in useConnections, OR
+  // - API-token mode AND all three basic-auth fields are filled.
+  const atlassianReady =
+    !atlassianRequired ||
+    (formData.atlassianAuthMode === 'oauth' && Boolean(atlassian)) ||
+    (formData.atlassianAuthMode === 'api_token' &&
+      Boolean(
+        formData.atlassianBasic.siteUrl.trim() &&
+          formData.atlassianBasic.email.trim() &&
+          formData.atlassianBasic.apiToken,
+      ));
 
   const configureValid = useMemo(() => {
-    if (atlassianMissing) return false;
+    if (atlassianRequired && !atlassianReady) return false;
     if (formData.source_type === 'git') {
       if (urlError) return false;
-      // If the user picked "Paste token once", a blank token must NOT
-      // silently submit as no-auth — block the Next button until a token
-      // is entered. The mismatch between intent and submit shape was
-      // surfaced by Copilot on PR #276.
       if (formData.git.patSource === 'paste' && !formData.git.pastedPat.trim()) {
         return false;
       }
@@ -166,7 +174,8 @@ export function AddSourceWizard({
     if (formData.source_type === 'jira') return !jqlError;
     return false;
   }, [
-    atlassianMissing,
+    atlassianRequired,
+    atlassianReady,
     formData.source_type,
     formData.git.patSource,
     formData.git.pastedPat,
@@ -197,13 +206,25 @@ export function AddSourceWizard({
         auth: { pat },
       };
     }
-    if (!atlassian) return null;
-    const baseUrl = atlassian.accessible_resources[0]?.url ?? atlassian.site_name;
-    const atlassianAuth: AtlassianAuth = {
-      access_token: atlassian.access_token,
-      refresh_token: atlassian.refresh_token,
-      client_id: null,
-    };
+
+    // Atlassian path — branch on auth mode.
+    let baseUrl: string;
+    let atlassianAuth: AtlassianAuth;
+    if (formData.atlassianAuthMode === 'api_token') {
+      baseUrl = formData.atlassianBasic.siteUrl.trim();
+      atlassianAuth = {
+        email: formData.atlassianBasic.email.trim(),
+        api_token: formData.atlassianBasic.apiToken,
+      };
+    } else {
+      if (!atlassian) return null;
+      baseUrl = atlassian.accessible_resources[0]?.url ?? atlassian.site_name;
+      atlassianAuth = {
+        access_token: atlassian.access_token,
+        refresh_token: atlassian.refresh_token,
+        client_id: null,
+      };
+    }
     if (formData.source_type === 'confluence') {
       return {
         source_type: 'confluence',
@@ -222,6 +243,8 @@ export function AddSourceWizard({
     formData.git,
     formData.confluence.space_keys,
     formData.jira.jql,
+    formData.atlassianAuthMode,
+    formData.atlassianBasic,
     atlassian,
   ]);
 
@@ -316,18 +339,29 @@ export function AddSourceWizard({
           ...(formData.wiki_title ? { wiki_title: formData.wiki_title } : {}),
         };
       } else {
-        const fresh = await refreshAtlassianIfNeeded();
-        if (!fresh) {
-          setSubmitError('Atlassian connection lost. Please go back and reconnect.');
-          setSubmitting(false);
-          return;
+        // Atlassian path: choose auth shape based on the wizard's mode.
+        let baseUrl: string;
+        let auth: AtlassianAuth;
+        if (formData.atlassianAuthMode === 'api_token') {
+          baseUrl = formData.atlassianBasic.siteUrl.trim();
+          auth = {
+            email: formData.atlassianBasic.email.trim(),
+            api_token: formData.atlassianBasic.apiToken,
+          };
+        } else {
+          const fresh = await refreshAtlassianIfNeeded();
+          if (!fresh) {
+            setSubmitError('Atlassian connection lost. Please go back and reconnect.');
+            setSubmitting(false);
+            return;
+          }
+          baseUrl = fresh.accessible_resources[0]?.url ?? fresh.site_name;
+          auth = {
+            access_token: fresh.access_token,
+            refresh_token: fresh.refresh_token,
+            client_id: null,
+          };
         }
-        const baseUrl = fresh.accessible_resources[0]?.url ?? fresh.site_name;
-        const auth: AtlassianAuth = {
-          access_token: fresh.access_token,
-          refresh_token: fresh.refresh_token,
-          client_id: null,
-        };
         if (formData.source_type === 'confluence') {
           body = {
             source_type: 'confluence',

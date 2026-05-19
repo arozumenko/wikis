@@ -2587,7 +2587,14 @@
       "AtlassianAuth": {
         "properties": {
           "access_token": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Access Token"
           },
           "refresh_token": {
@@ -2611,15 +2618,34 @@
               }
             ],
             "title": "Client Id"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "api_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Token"
           }
         },
         "additionalProperties": false,
         "type": "object",
-        "required": [
-          "access_token"
-        ],
         "title": "AtlassianAuth",
-        "description": "Auth for Confluence or Jira (OAuth2 access token + optional refresh).\n\n``extra=\"forbid\"`` ensures that GitAuth fields (e.g. ``pat``) are rejected\nwhen paired with ``source_type=\"confluence\"`` or ``source_type=\"jira\"``."
+        "description": "Auth for Confluence or Jira \u2014 OAuth 2.0 access token OR API-token basic auth.\n\nAtlassian Cloud accepts two authentication shapes:\n\n1. **OAuth 2.0** \u2014 ``access_token`` (with optional ``refresh_token`` +\n   ``client_id`` for automatic refresh).  This is what the in-app\n   \"Connect to Atlassian\" flow produces.\n2. **API-token Basic auth** \u2014 ``email`` + ``api_token``, the shape\n   expected by clients like ``atlassian-python-api``.  Users generate\n   API tokens at https://id.atlassian.com/manage-profile/security/api-tokens\n   and supply their account email; the backend sends an HTTP Basic\n   ``Authorization: Basic base64(email:api_token)`` header.\n\nExactly one shape must be supplied (validated below).  ``extra=\"forbid\"``\nkeeps GitAuth fields (e.g. ``pat``) from sneaking in when the source is\nAtlassian."
       },
       "Body_import_wiki_api_v1_wikis_import_post": {
         "properties": {

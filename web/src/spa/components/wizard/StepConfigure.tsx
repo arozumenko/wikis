@@ -46,6 +46,10 @@ export function StepConfigure({
           onChange={(confluence) => onChange({ ...data, confluence })}
           spaceKeysError={spaceKeysError}
           disabled={disabled}
+          authMode={data.atlassianAuthMode}
+          onAuthModeChange={(atlassianAuthMode) => onChange({ ...data, atlassianAuthMode })}
+          basicAuth={data.atlassianBasic}
+          onBasicAuthChange={(atlassianBasic) => onChange({ ...data, atlassianBasic })}
         />
       )}
       {data.source_type === 'jira' && (
@@ -54,6 +58,10 @@ export function StepConfigure({
           onChange={(jira) => onChange({ ...data, jira })}
           jqlError={jqlError}
           disabled={disabled}
+          authMode={data.atlassianAuthMode}
+          onAuthModeChange={(atlassianAuthMode) => onChange({ ...data, atlassianAuthMode })}
+          basicAuth={data.atlassianBasic}
+          onBasicAuthChange={(atlassianBasic) => onChange({ ...data, atlassianBasic })}
         />
       )}
     </Box>

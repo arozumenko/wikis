@@ -26,11 +26,32 @@ export interface JiraFormState {
   jql: string;
 }
 
+/**
+ * Atlassian credentials chosen at the Configure step.  The wizard supports
+ * two authentication shapes:
+ *
+ * - ``"oauth"``: uses the in-app OAuth flow; credentials come from
+ *   ``useConnections().atlassian`` and are NOT mirrored into this form
+ *   state (kept as the single source of truth in the connections store).
+ * - ``"api_token"``: HTTP Basic auth using an Atlassian-issued API token
+ *   (see https://id.atlassian.com/manage-profile/security/api-tokens).
+ *   ``siteUrl``, ``email``, and ``apiToken`` are required.
+ */
+export type AtlassianAuthMode = 'oauth' | 'api_token';
+
+export interface AtlassianBasicAuthFormState {
+  siteUrl: string;
+  email: string;
+  apiToken: string;
+}
+
 export interface WizardFormData {
   source_type: WikiSourceType;
   git: GitFormState;
   confluence: ConfluenceFormState;
   jira: JiraFormState;
+  atlassianAuthMode: AtlassianAuthMode;
+  atlassianBasic: AtlassianBasicAuthFormState;
   wiki_title: string;
 }
 
@@ -44,6 +65,8 @@ export const INITIAL_FORM_DATA: WizardFormData = {
   },
   confluence: { space_keys: [] },
   jira: { jql: 'ORDER BY created DESC' },
+  atlassianAuthMode: 'oauth',
+  atlassianBasic: { siteUrl: '', email: '', apiToken: '' },
   wiki_title: '',
 };
 

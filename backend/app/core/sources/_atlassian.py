@@ -57,35 +57,73 @@ class AtlassianClient:
     """Async HTTP client for Atlassian Cloud REST APIs.
 
     Wraps httpx.AsyncClient with:
-    - OAuth 2.0 Bearer auth
+
+    - **OAuth 2.0 Bearer auth** when constructed with an ``access_token``
+      (with optional ``refresh_token`` + ``client_id`` for automatic
+      re-auth on HTTP 401).
+    - **HTTP Basic auth (email + API token)** when constructed with
+      ``email`` + ``api_token`` — the shape used by
+      ``atlassian-python-api`` clients.  No refresh logic applies; an
+      HTTP 401 maps directly to ``SourceAuthError``.
     - Automatic retry on HTTP 429 (up to 3 attempts, honouring Retry-After)
-    - Automatic token refresh on HTTP 401 (one retry after refresh)
-    - Consistent exception mapping across all status codes
+      for both auth modes.
+    - Consistent exception mapping across all status codes.
 
     Usage::
 
-        async with AtlassianClient(base_url, access_token) as client:
+        # OAuth
+        async with AtlassianClient(base_url, access_token=tok) as client:
             data = await client.get("/wiki/rest/api/space", params={"limit": 1})
+
+        # API token
+        async with AtlassianClient(base_url, email=e, api_token=t) as client:
+            ...
 
     Args:
         base_url: Tenant URL, e.g. ``"https://example.atlassian.net"`` (no trailing slash).
-        access_token: Current OAuth 2.0 access token.
-        refresh_token: Refresh token for automatic re-auth (optional).
+        access_token: OAuth 2.0 access token (mutually exclusive with email/api_token).
+        refresh_token: Refresh token for automatic re-auth (OAuth only).
         client_id: OAuth 2.0 client ID — required when *refresh_token* is set.
+        email: Atlassian account email (API-token mode).
+        api_token: API token issued at id.atlassian.com/manage-profile/security/api-tokens.
     """
 
     def __init__(
         self,
         base_url: str,
-        access_token: str,
+        access_token: str | None = None,
         refresh_token: str | None = None,
         client_id: str | None = None,
+        *,
+        email: str | None = None,
+        api_token: str | None = None,
     ) -> None:
+        # Enforce exactly one auth shape at construction so callers can't
+        # accidentally pass both.
+        oauth_supplied = access_token is not None
+        basic_supplied = email is not None and api_token is not None
+        if oauth_supplied and basic_supplied:
+            raise ValueError(
+                "AtlassianClient: pass either access_token or "
+                "(email, api_token), not both"
+            )
+        if not oauth_supplied and not basic_supplied:
+            raise ValueError(
+                "AtlassianClient: an access_token or (email, api_token) "
+                "pair is required"
+            )
+
         self._base_url = base_url.rstrip("/")
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._client_id = client_id
+        self._email = email
+        self._api_token = api_token
         self._client: httpx.AsyncClient | None = None
+
+    @property
+    def _uses_basic_auth(self) -> bool:
+        return self._email is not None and self._api_token is not None
 
     async def __aenter__(self) -> "AtlassianClient":
         self._client = httpx.AsyncClient(timeout=30.0)
@@ -101,6 +139,16 @@ class AtlassianClient:
     # ------------------------------------------------------------------
 
     def _auth_headers(self) -> dict[str, str]:
+        if self._uses_basic_auth:
+            import base64  # noqa: PLC0415
+
+            token = base64.b64encode(
+                f"{self._email}:{self._api_token}".encode("utf-8")
+            ).decode("ascii")
+            return {
+                "Authorization": f"Basic {token}",
+                "Accept": "application/json",
+            }
         return {
             "Authorization": f"Bearer {self._access_token}",
             "Accept": "application/json",
@@ -222,10 +270,21 @@ class AtlassianClient:
                 continue
 
             if resp.status_code == 401:
-                # Try refresh exactly once
+                # Try refresh exactly once.  Basic auth (email + API token)
+                # has no refresh path — fail fast with a clearer message
+                # pointing at the likely real cause: an invalid or revoked
+                # API token.
                 can_refresh = bool(self._refresh_token and self._client_id)
                 if not can_refresh:
-                    raise SourceAuthError("Atlassian authentication failed and no refresh token available")
+                    if self._uses_basic_auth:
+                        raise SourceAuthError(
+                            "Atlassian rejected the API token. Check the "
+                            "email + api_token pair and that the token "
+                            "has not been revoked."
+                        )
+                    raise SourceAuthError(
+                        "Atlassian authentication failed and no refresh token available"
+                    )
                 try:
                     await self._refresh()
                 except SourceAuthError:

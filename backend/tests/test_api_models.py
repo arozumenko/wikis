@@ -181,3 +181,55 @@ class TestAllModelsProduceSchema:
     def test_json_schema(self, model_cls):
         schema = model_cls.model_json_schema()
         assert "properties" in schema or "anyOf" in schema
+
+
+# ---------------------------------------------------------------------------
+# AtlassianAuth — OAuth + API-token (basic auth) shapes (#28)
+# ---------------------------------------------------------------------------
+
+
+class TestAtlassianAuthShapes:
+    """The model accepts OAuth (access_token) OR basic-auth (email + api_token)
+    but NOT both, NOT neither, and rejects half-filled basic-auth pairs."""
+
+    def test_oauth_only_accepted(self):
+        from app.models.api import AtlassianAuth
+
+        auth = AtlassianAuth(access_token="oauth-abc")
+        assert auth.uses_basic_auth is False
+        assert auth.access_token == "oauth-abc"
+
+    def test_basic_auth_only_accepted(self):
+        from app.models.api import AtlassianAuth
+
+        auth = AtlassianAuth(email="alice@example.com", api_token="atk-123")
+        assert auth.uses_basic_auth is True
+        assert auth.access_token is None
+
+    def test_both_oauth_and_basic_rejected(self):
+        from app.models.api import AtlassianAuth
+
+        with pytest.raises(ValidationError, match="not both"):
+            AtlassianAuth(
+                access_token="oauth",
+                email="a@b.com",
+                api_token="atk",
+            )
+
+    def test_neither_rejected(self):
+        from app.models.api import AtlassianAuth
+
+        with pytest.raises(ValidationError, match="provide either"):
+            AtlassianAuth()
+
+    def test_email_without_api_token_rejected(self):
+        from app.models.api import AtlassianAuth
+
+        with pytest.raises(ValidationError, match="api_token is required"):
+            AtlassianAuth(email="a@b.com")
+
+    def test_api_token_without_email_rejected(self):
+        from app.models.api import AtlassianAuth
+
+        with pytest.raises(ValidationError, match="email is required"):
+            AtlassianAuth(api_token="atk")

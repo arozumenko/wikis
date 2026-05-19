@@ -395,3 +395,86 @@ async def test_refresh_missing_access_token_raises_source_auth_error():
             access_token="tok", refresh_token="ref", client_id="cid"
         ) as c:
             await c._refresh()
+
+
+# ---------------------------------------------------------------------------
+# API-token basic auth (#28)
+# ---------------------------------------------------------------------------
+
+
+def _basic_client(email: str = "alice@example.com", api_token: str = "tok-basic") -> AtlassianClient:
+    return AtlassianClient(base_url=_BASE, email=email, api_token=api_token)
+
+
+class TestBasicAuthConstruction:
+    def test_basic_auth_constructs_cleanly(self):
+        c = _basic_client()
+        assert c._uses_basic_auth is True
+        assert c._access_token is None
+
+    def test_both_oauth_and_basic_rejected(self):
+        with pytest.raises(ValueError, match="not both"):
+            AtlassianClient(
+                base_url=_BASE,
+                access_token="oauth",
+                email="a@b.com",
+                api_token="t",
+            )
+
+    def test_neither_auth_rejected(self):
+        with pytest.raises(ValueError, match="is required"):
+            AtlassianClient(base_url=_BASE)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_basic_auth_sends_authorization_basic_header():
+    """A successful request with email+api_token must produce the
+    base64-encoded ``Authorization: Basic <email:token>`` header."""
+    import base64
+
+    expected = base64.b64encode(b"alice@example.com:tok-basic").decode()
+
+    route = respx.get(f"{_BASE}/wiki/rest/api/space").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+
+    async with _basic_client() as c:
+        await c.get("/wiki/rest/api/space")
+
+    assert route.called
+    sent = route.calls.last.request.headers["authorization"]
+    assert sent == f"Basic {expected}"
+    assert "Bearer" not in sent
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_basic_auth_401_does_not_attempt_refresh():
+    """A 401 with basic auth must NOT call the refresh endpoint and
+    must raise SourceAuthError with a basic-auth-specific message."""
+    respx.get(f"{_BASE}/wiki/rest/api/space").mock(
+        return_value=httpx.Response(401, json={"errorMessages": ["unauthorised"]})
+    )
+    refresh_route = respx.post(_REFRESH_URL)
+
+    with pytest.raises(SourceAuthError, match="API token"):
+        async with _basic_client() as c:
+            await c.get("/wiki/rest/api/space")
+
+    assert refresh_route.called is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_basic_auth_429_still_retries():
+    """Rate-limit retry must work for basic auth too (orthogonal to auth type)."""
+    respx.get(f"{_BASE}/wiki/rest/api/space").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "0"}),
+            httpx.Response(200, json={"results": []}),
+        ]
+    )
+    async with _basic_client() as c:
+        out = await c.get("/wiki/rest/api/space")
+    assert out == {"results": []}
