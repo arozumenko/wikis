@@ -1082,11 +1082,19 @@ class WikiService:
                         # The orchestrator unconditionally constructs a
                         # PagePatcher path; without an LLM we can't run
                         # the edit regime. Fail the run loudly here.
+                        #
+                        # The outer finally still fires on this ``return``,
+                        # so we set ``invocation.error`` first — otherwise
+                        # the finally would forward ``error=None`` to
+                        # ``mark_status`` and the dashboard would show
+                        # "failed" with no message. Mirrors the exception-path
+                        # contract from #226.
+                        err_msg = "LLM unavailable — incremental refresh requires LLM"
                         invocation.status = "failed"
+                        invocation.error = err_msg
                         invocation.completed_at = datetime.now()
                         await invocation.emit(events.task_status(
-                            invocation.id, "failed",
-                            "LLM unavailable — incremental refresh requires LLM",
+                            invocation.id, "failed", err_msg,
                         ))
                         return
 

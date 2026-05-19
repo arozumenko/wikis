@@ -308,3 +308,65 @@ async def test_incremental_refresh_terminal_status_on_failure(tmp_path) -> None:
     assert "storage exploded" in error_value, (
         f"expected exception message in error; got {error_value!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# patcher-is-None early-return must also set invocation.error (followup #273)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_incremental_refresh_patcher_none_writes_error(tmp_path) -> None:
+    """When ``create_llm`` raises, the patcher-is-None early-return path
+    must still capture a non-None ``error`` so the dashboard shows why the
+    refresh failed.  Without the fix, ``mark_status`` was forwarded
+    ``error=None`` and the user saw "failed" with no message.
+    """
+    wiki_management = MagicMock()
+    wiki_management.get_wiki = AsyncMock(return_value=_make_wiki_record())
+    wiki_management.register_wiki = AsyncMock()
+    wiki_management.mark_status = AsyncMock(return_value=True)
+
+    service = _make_service(wiki_management)
+    cache_key = "testcachekey"
+    db_path = tmp_path / f"{cache_key}.wiki.db"
+    db_path.touch()
+
+    cache_index = {
+        "refs": {"owner/repo:main": "owner/repo:main"},
+        "owner/repo:main": cache_key,
+    }
+    (tmp_path / "cache_index.json").write_text(json.dumps(cache_index))
+    service.settings.cache_dir = str(tmp_path)
+
+    # Force the LLM-init except block to fire → llm = None → patcher = None
+    # → early-return path executes inside _run().
+    with patch(
+        "app.services.llm_factory.create_llm",
+        side_effect=RuntimeError("no llm creds configured"),
+    ):
+        result = await service.incremental_refresh(
+            wiki_id="owner--repo--main",
+            parsed_nodes=[],
+            management=wiki_management,
+            owner_id="user-1",
+        )
+
+        assert result is not None
+        inv, _stats = result
+        task = service._tasks.get(inv.id)
+        assert task is not None
+        await task
+
+    final_calls = wiki_management.mark_status.await_args_list
+    assert len(final_calls) >= 1
+    last_call = final_calls[-1]
+    assert last_call.kwargs["wiki_id"] == "owner--repo--main"
+    assert last_call.kwargs["status"] == "failed"
+    error_value = last_call.kwargs.get("error")
+    assert error_value is not None, (
+        f"expected non-None error from patcher-is-None path; got {error_value!r}"
+    )
+    assert "LLM" in error_value, (
+        f"expected the LLM-unavailable message in error; got {error_value!r}"
+    )
