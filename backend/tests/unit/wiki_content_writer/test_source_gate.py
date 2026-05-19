@@ -527,3 +527,32 @@ class TestToolCallTrace:
         grounded_flags = [f for f in report.flags if f.rule == "identifier_not_grounded"]
         identifiers = {f.detail for f in grounded_flags}
         assert "GATEWAY_URL" not in identifiers
+
+
+# ── Mode validation ──────────────────────────────────────────────────────────
+
+
+class TestModeValidation:
+    """``apply_gate`` should reject malformed ``mode`` dicts up front so a
+    typo cannot silently produce an invalid ``GateFlag.action``."""
+
+    def test_unknown_rule_key_raises(self):
+        claims = [_claim("Some claim.")]
+        import pytest
+
+        with pytest.raises(ValueError, match="Unknown gate rule"):
+            apply_gate(claims, [], mode={"readme_typo": "flag"})
+
+    def test_invalid_action_raises(self):
+        claims = [_claim("Some claim.")]
+        import pytest
+
+        with pytest.raises(ValueError, match="Invalid gate action"):
+            apply_gate(claims, [], mode={"readme": "verfier"})  # typo
+
+    def test_valid_mode_accepted(self):
+        """Sanity: a well-formed mode dict is accepted without error."""
+        claims = [_claim("Plain text.")]
+        kept, report = apply_gate(claims, [], mode={"readme": "strip"})
+        assert isinstance(kept, list)
+        assert isinstance(report, GateReport)

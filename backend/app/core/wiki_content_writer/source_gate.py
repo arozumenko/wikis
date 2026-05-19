@@ -156,8 +156,8 @@ _SQL_EXT_RE = re.compile(r"\.sql$", re.IGNORECASE)
 _CAMEL_CASE_RE = re.compile(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b")
 
 # snake_case function/variable: contains at least one underscore and
-# consists of lowercase letters, digits, and underscores only, with
-# minimum length of 4 characters to reduce false positives.
+# consists of lowercase letters, digits, and underscores only.  Each
+# underscore-delimited segment must be non-empty (so ``a_`` doesn't match).
 _SNAKE_CASE_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
 
 # UPPER_CASE env vars / constants: 3+ chars, contains at least one underscore.
@@ -237,6 +237,9 @@ _DEFAULT_MODE: dict[str, str] = {
     "identifier": "flag",
 }
 
+_VALID_ACTIONS: frozenset[str] = frozenset({"flag", "strip", "verifier"})
+_VALID_RULES: frozenset[str] = frozenset(_DEFAULT_MODE.keys())
+
 
 def apply_gate(
     cited_claims: list[CitedClaim],
@@ -272,10 +275,21 @@ def apply_gate(
         ``kept_claims`` — paragraphs not stripped by any ``"strip"``-mode rule.
         ``report`` — all flags and the indices of stripped paragraphs.
     """
+    if mode:
+        for rule_key, action in mode.items():
+            if rule_key not in _VALID_RULES:
+                raise ValueError(
+                    f"Unknown gate rule {rule_key!r}; expected one of {sorted(_VALID_RULES)}"
+                )
+            if action not in _VALID_ACTIONS:
+                raise ValueError(
+                    f"Invalid gate action {action!r} for rule {rule_key!r}; "
+                    f"expected one of {sorted(_VALID_ACTIONS)}"
+                )
     effective_mode = {**_DEFAULT_MODE, **(mode or {})}
-    readme_mode = effective_mode.get("readme", "flag")
-    sql_mode = effective_mode.get("sql", "flag")
-    identifier_mode = effective_mode.get("identifier", "flag")
+    readme_mode = effective_mode["readme"]
+    sql_mode = effective_mode["sql"]
+    identifier_mode = effective_mode["identifier"]
 
     # Pre-compute expensive trace queries once
     has_readme_read = _trace_has_readme_read(tool_trace)
