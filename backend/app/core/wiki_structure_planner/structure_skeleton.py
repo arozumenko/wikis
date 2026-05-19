@@ -21,7 +21,8 @@ import logging
 import math
 import os
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 
 import networkx as nx
 
@@ -32,6 +33,14 @@ from ..constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Valid discriminator values ─────────────────────────────────────────────────
+ArtifactKind = Literal["symbol", "doc_section", "confluence_page", "jira_issue"]
+ClusterKind = Literal["code", "doc", "confluence", "jira"]
+
+_VALID_ARTIFACT_KINDS: frozenset[str] = frozenset(
+    {"symbol", "doc_section", "confluence_page", "jira_issue"}
+)
 
 # ── Symbol type filter ────────────────────────────────────────────────
 # Architectural types only – no methods, no doc symbols.
@@ -149,15 +158,100 @@ class SymbolInfo:
 
 
 @dataclass
-class DirCluster:
-    """A group of directories that should become one wiki page."""
+class ArtifactInfo:
+    """Source-kind–tagged artifact for the unified planner pipeline.
+
+    A single representation that can model code symbols, markdown doc
+    sections, Confluence pages, and Jira issues, so the planner treats
+    all source kinds uniformly.
+
+    The ``kind`` discriminator is validated at construction time; passing
+    an unknown value raises ``ValueError``.
+    """
+
+    kind: ArtifactKind  # "symbol" | "doc_section" | "confluence_page" | "jira_issue"
+    name: str  # symbol name, heading title, page title, or issue key
+    source_path: str  # repo-relative path to the source file
+    layer: str = ""  # architectural layer (code symbols only; blank otherwise)
+    connections: int = 0  # graph degree (code symbols only; 0 otherwise)
+    summary: str = ""  # one-line description / first heading paragraph
+
+    def __post_init__(self) -> None:
+        if self.kind not in _VALID_ARTIFACT_KINDS:
+            raise ValueError(
+                f"Invalid ArtifactInfo.kind {self.kind!r}. "
+                f"Must be one of: {sorted(_VALID_ARTIFACT_KINDS)}"
+            )
+
+
+@dataclass
+class Cluster:
+    """A source-kind–aware group of artifacts that becomes one wiki page.
+
+    Replaces ``DirCluster`` as the canonical cluster type.  The ``kind``
+    field discriminates how the cluster was built and which evidence-pack
+    strategy applies during planning.
+    """
 
     cluster_id: int
+    kind: ClusterKind  # "code" | "doc" | "confluence" | "jira"
     dirs: list[str]
-    symbols: list[SymbolInfo]
-    total_symbols: int
+    artifacts: list[ArtifactInfo]
+    total_artifacts: int
     primary_languages: list[str]
     depth_range: tuple[int, int]  # (min_depth, max_depth)
+
+
+@dataclass
+class DirCluster(Cluster):
+    """Backwards-compatible code cluster.
+
+    Preserves the original ``symbols`` / ``total_symbols`` API for callers
+    that have not yet been migrated to ``Cluster``.  Internally the symbols
+    are stored in ``artifacts`` as ``ArtifactInfo(kind="symbol", …)``; the
+    ``symbols`` property reconstructs ``SymbolInfo`` objects on demand.
+    """
+
+    # Stored separately so existing code that reads .symbols still works.
+    _symbols: list[SymbolInfo] = field(default_factory=list, repr=False)
+    total_symbols: int = 0
+
+    def __init__(
+        self,
+        cluster_id: int,
+        dirs: list[str],
+        symbols: list[SymbolInfo],
+        total_symbols: int,
+        primary_languages: list[str],
+        depth_range: tuple[int, int],
+    ) -> None:
+        artifacts = [
+            ArtifactInfo(
+                kind="symbol",
+                name=s.name,
+                source_path=s.rel_path,
+                layer=s.layer,
+                connections=s.connections,
+                summary=s.docstring.split("\n")[0][:200] if s.docstring else "",
+            )
+            for s in symbols
+        ]
+        super().__init__(
+            cluster_id=cluster_id,
+            kind="code",
+            dirs=dirs,
+            artifacts=artifacts,
+            total_artifacts=len(symbols),
+            primary_languages=primary_languages,
+            depth_range=depth_range,
+        )
+        self._symbols = symbols
+        self.total_symbols = total_symbols
+
+    @property
+    def symbols(self) -> list[SymbolInfo]:
+        """Original SymbolInfo list for backwards-compatible consumers."""
+        return self._symbols
 
 
 @dataclass
@@ -172,7 +266,14 @@ class DocCluster:
 
 @dataclass
 class StructureSkeleton:
-    """Complete deterministic skeleton ready for LLM refinement."""
+    """Complete deterministic skeleton ready for LLM refinement.
+
+    The new ``clusters`` field holds a heterogeneous list of ``Cluster``
+    objects of any source kind.  The legacy ``code_clusters`` and
+    ``doc_clusters`` fields are retained for backwards compatibility with
+    the existing planner paths (``plan_structure``,
+    ``plan_structure_graph_first``) until the unified planner (#236) ships.
+    """
 
     code_clusters: list[DirCluster]
     doc_clusters: list[DocCluster]
@@ -182,6 +283,7 @@ class StructureSkeleton:
     repo_languages: list[str]
     effective_depth: int
     repo_name: str = ""
+    clusters: list[Cluster] = field(default_factory=list)
 
 
 # =====================================================================

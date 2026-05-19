@@ -34,6 +34,8 @@ from .structure_prompts import (
 )
 from .structure_refiner import refine_with_llm
 from .structure_skeleton import (
+    ArtifactInfo,
+    Cluster,
     DirCluster,
     DocCluster,
     StructureSkeleton,
@@ -49,6 +51,8 @@ __all__ = [
     "get_structure_task_prompt",
     "build_skeleton",
     "StructureSkeleton",
+    "ArtifactInfo",
+    "Cluster",
     "DirCluster",
     "DocCluster",
     "SymbolInfo",
