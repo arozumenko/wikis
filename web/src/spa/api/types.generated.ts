@@ -731,18 +731,34 @@ export interface components {
         };
         /**
          * AtlassianAuth
-         * @description Auth for Confluence or Jira (OAuth2 access token + optional refresh).
+         * @description Auth for Confluence or Jira — OAuth 2.0 access token OR API-token basic auth.
          *
-         *     ``extra="forbid"`` ensures that GitAuth fields (e.g. ``pat``) are rejected
-         *     when paired with ``source_type="confluence"`` or ``source_type="jira"``.
+         *     Atlassian Cloud accepts two authentication shapes:
+         *
+         *     1. **OAuth 2.0** — ``access_token`` (with optional ``refresh_token`` +
+         *        ``client_id`` for automatic refresh).  This is what the in-app
+         *        "Connect to Atlassian" flow produces.
+         *     2. **API-token Basic auth** — ``email`` + ``api_token``, the shape
+         *        expected by clients like ``atlassian-python-api``.  Users generate
+         *        API tokens at https://id.atlassian.com/manage-profile/security/api-tokens
+         *        and supply their account email; the backend sends an HTTP Basic
+         *        ``Authorization: Basic base64(email:api_token)`` header.
+         *
+         *     Exactly one shape must be supplied (validated below).  ``extra="forbid"``
+         *     keeps GitAuth fields (e.g. ``pat``) from sneaking in when the source is
+         *     Atlassian.
          */
         AtlassianAuth: {
             /** Access Token */
-            access_token: string;
+            access_token?: string | null;
             /** Refresh Token */
             refresh_token?: string | null;
             /** Client Id */
             client_id?: string | null;
+            /** Email */
+            email?: string | null;
+            /** Api Token */
+            api_token?: string | null;
         };
         /** Body_import_wiki_api_v1_wikis_import_post */
         Body_import_wiki_api_v1_wikis_import_post: {

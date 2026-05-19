@@ -29,6 +29,7 @@ from app.core.sources.exceptions import (
 )
 from app.core.sources.git_toolkit import GitToolkit
 from app.models.api import (
+    AtlassianAuth,
     ConfluenceScanPreview,
     ConfluenceSpaceInfo,
     ConfluenceScanRequest,
@@ -216,17 +217,9 @@ class SourceScanService:
                 "scope.space_keys must be a list of non-empty strings"
             )
 
-        access_token: str = request.auth.access_token
-        refresh_token: str | None = request.auth.refresh_token or None
-        client_id: str | None = request.auth.client_id or None
-
         try:
-            async with AtlassianClient(
-                base_url=base_url,
-                access_token=access_token,
-                refresh_token=refresh_token,
-                client_id=client_id,
-            ) as client:
+            client_kwargs = _atlassian_client_kwargs(request.auth)
+            async with AtlassianClient(base_url=base_url, **client_kwargs) as client:
                 # Fetch spaces — filter to requested keys when provided.
                 spaces_data = await client.get(
                     "/wiki/rest/api/space",
@@ -248,6 +241,13 @@ class SourceScanService:
                     )
 
         except SourceAuthError as exc:
+            raise ScanError(str(exc), reachable=False) from exc
+        except ValueError as exc:
+            # AtlassianClient raises ValueError for malformed auth combos.
+            # The AtlassianAuth pydantic validator should catch this earlier,
+            # but a direct service call (or future model drift) could still
+            # bypass it — translate to ScanError so the response is a clean
+            # 4xx rather than an uncaught 500.
             raise ScanError(str(exc), reachable=False) from exc
         except (SourceNotFoundError, SourceUnavailableError, SourceConnectionError) as exc:
             raise ScanError(str(exc), reachable=False) from exc
@@ -292,17 +292,9 @@ class SourceScanService:
         if not jql:
             raise ScanError("scope.jql must be a non-empty string")
 
-        access_token: str = request.auth.access_token
-        refresh_token: str | None = request.auth.refresh_token or None
-        client_id: str | None = request.auth.client_id or None
-
         try:
-            async with AtlassianClient(
-                base_url=base_url,
-                access_token=access_token,
-                refresh_token=refresh_token,
-                client_id=client_id,
-            ) as client:
+            client_kwargs = _atlassian_client_kwargs(request.auth)
+            async with AtlassianClient(base_url=base_url, **client_kwargs) as client:
                 data = await client.get(
                     "/rest/api/3/search",
                     params={
@@ -312,6 +304,10 @@ class SourceScanService:
                     },
                 )
         except SourceAuthError as exc:
+            raise ScanError(str(exc), reachable=False) from exc
+        except ValueError as exc:
+            # AtlassianClient raises ValueError on malformed auth — see the
+            # Confluence scan path for the same translation rationale.
             raise ScanError(str(exc), reachable=False) from exc
         except (
             SourceNotFoundError,
@@ -336,6 +332,24 @@ class SourceScanService:
             reachable=True,
             preview=preview,
         )
+
+
+def _atlassian_client_kwargs(auth: AtlassianAuth) -> dict[str, str | None]:
+    """Convert an AtlassianAuth into the kwargs ``AtlassianClient`` accepts.
+
+    Returns either the OAuth bundle (``access_token`` + optional
+    ``refresh_token`` / ``client_id``) or the basic-auth bundle
+    (``email`` + ``api_token``).  The two shapes are mutually exclusive —
+    ``AtlassianAuth``'s model validator already enforced that, so we
+    just pick the correct one here.
+    """
+    if auth.uses_basic_auth:
+        return {"email": auth.email, "api_token": auth.api_token}
+    return {
+        "access_token": auth.access_token,
+        "refresh_token": auth.refresh_token or None,
+        "client_id": auth.client_id or None,
+    }
 
 
 async def _confluence_page_count(client: AtlassianClient, space_key: str) -> int | None:

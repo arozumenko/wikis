@@ -29,10 +29,19 @@ export interface GitAuth {
   pat: string | null;
 }
 
+/**
+ * AtlassianAuth — mirrors the backend's pydantic model.  Exactly one auth
+ * shape must be supplied: OAuth (``access_token`` + optional refresh) OR
+ * API-token basic auth (``email`` + ``api_token``).  The backend's model
+ * validator rejects requests that supply both, neither, or a half-filled
+ * basic-auth pair.
+ */
 export interface AtlassianAuth {
-  access_token: string;
-  refresh_token: string | null;
-  client_id: string | null;
+  access_token?: string | null;
+  refresh_token?: string | null;
+  client_id?: string | null;
+  email?: string | null;
+  api_token?: string | null;
 }
 
 export interface GenerateWikiMultiSourceRequest {

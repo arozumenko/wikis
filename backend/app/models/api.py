@@ -102,17 +102,63 @@ class GitAuth(BaseModel):
 
 
 class AtlassianAuth(BaseModel):
-    """Auth for Confluence or Jira (OAuth2 access token + optional refresh).
+    """Auth for Confluence or Jira — OAuth 2.0 access token OR API-token basic auth.
 
-    ``extra="forbid"`` ensures that GitAuth fields (e.g. ``pat``) are rejected
-    when paired with ``source_type="confluence"`` or ``source_type="jira"``.
+    Atlassian Cloud accepts two authentication shapes:
+
+    1. **OAuth 2.0** — ``access_token`` (with optional ``refresh_token`` +
+       ``client_id`` for automatic refresh).  This is what the in-app
+       "Connect to Atlassian" flow produces.
+    2. **API-token Basic auth** — ``email`` + ``api_token``, the shape
+       expected by clients like ``atlassian-python-api``.  Users generate
+       API tokens at https://id.atlassian.com/manage-profile/security/api-tokens
+       and supply their account email; the backend sends an HTTP Basic
+       ``Authorization: Basic base64(email:api_token)`` header.
+
+    Exactly one shape must be supplied (validated below).  ``extra="forbid"``
+    keeps GitAuth fields (e.g. ``pat``) from sneaking in when the source is
+    Atlassian.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    access_token: str
+    # OAuth fields
+    access_token: str | None = None
     refresh_token: str | None = None
     client_id: str | None = None
+
+    # API-token (basic auth) fields
+    email: str | None = None
+    api_token: str | None = None
+
+    @model_validator(mode="after")
+    def _check_one_auth_shape(self) -> "AtlassianAuth":
+        # Half-filled basic-auth pairs first — give a precise error
+        # instead of the generic "provide one or the other" message.
+        if self.email and not self.api_token:
+            raise ValueError("AtlassianAuth: api_token is required when email is set")
+        if self.api_token and not self.email:
+            raise ValueError("AtlassianAuth: email is required when api_token is set")
+
+        has_oauth = bool(self.access_token)
+        has_basic = bool(self.email and self.api_token)
+
+        if has_oauth and has_basic:
+            raise ValueError(
+                "AtlassianAuth: provide either OAuth (access_token) or "
+                "API-token (email + api_token), not both"
+            )
+        if not has_oauth and not has_basic:
+            raise ValueError(
+                "AtlassianAuth: provide either an OAuth access_token or "
+                "(email + api_token) for API-token basic auth"
+            )
+        return self
+
+    @property
+    def uses_basic_auth(self) -> bool:
+        """True when the caller supplied API-token (email + api_token) creds."""
+        return self.email is not None and self.api_token is not None
 
 
 # ---------------------------------------------------------------------------

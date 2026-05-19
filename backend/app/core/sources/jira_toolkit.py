@@ -55,9 +55,11 @@ class JiraToolkit(SourceToolkit):
 
     Args:
         base_url: Tenant root URL, e.g. ``"https://example.atlassian.net"``.
-        access_token: OAuth 2.0 access token.
+        access_token: OAuth 2.0 access token (mutually exclusive with email/api_token).
         refresh_token: Optional refresh token for automatic re-auth.
         client_id: OAuth 2.0 client ID (required when *refresh_token* set).
+        email: Atlassian account email — pair with *api_token* for HTTP Basic auth.
+        api_token: API token from id.atlassian.com (paired with *email*).
         jql: JQL query to filter issues (default: ``"ORDER BY created DESC"``).
     """
 
@@ -66,15 +68,20 @@ class JiraToolkit(SourceToolkit):
     def __init__(
         self,
         base_url: str,
-        access_token: str,
+        access_token: str | None = None,
         refresh_token: str | None = None,
         client_id: str | None = None,
+        *,
+        email: str | None = None,
+        api_token: str | None = None,
         jql: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._client_id = client_id
+        self._email = email
+        self._api_token = api_token
         self._jql = jql or _DEFAULT_JQL
 
     @classmethod
@@ -82,14 +89,17 @@ class JiraToolkit(SourceToolkit):
         """Instantiate from a plain credentials dict.
 
         Args:
-            config: Keys: ``base_url``, ``access_token`` (required);
-                ``refresh_token``, ``client_id``, ``jql`` (optional).
+            config: ``base_url`` (required); plus either ``access_token``
+                (OAuth) or ``email`` + ``api_token`` (basic auth);
+                ``refresh_token``, ``client_id``, ``jql`` are optional.
         """
         return cls(
             base_url=config["base_url"],
-            access_token=config["access_token"],
+            access_token=config.get("access_token"),
             refresh_token=config.get("refresh_token"),
             client_id=config.get("client_id"),
+            email=config.get("email"),
+            api_token=config.get("api_token"),
             jql=config.get("jql"),
         )
 
@@ -99,6 +109,8 @@ class JiraToolkit(SourceToolkit):
             access_token=self._access_token,
             refresh_token=self._refresh_token,
             client_id=self._client_id,
+            email=self._email,
+            api_token=self._api_token,
         )
 
     async def test_connection(self) -> str:
