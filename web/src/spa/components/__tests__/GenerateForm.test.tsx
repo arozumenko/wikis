@@ -105,9 +105,15 @@ describe('GenerateForm — multi-source', () => {
     expect(screen.getByTestId('generate-submit')).toBeInTheDocument();
   });
 
-  it('submit button is enabled on Git tab (with no URL validation yet)', () => {
+  it('submit button is disabled on Git tab until a valid repo URL is entered', async () => {
+    // Updated behaviour (#276 Copilot review): submit is gated by ``isValid``
+    // so users cannot trigger a no-op POST with an empty form.
+    const user = userEvent.setup();
     renderForm();
-    // Button should not be disabled because atlassian is not required for git
+
+    expect(screen.getByTestId('generate-submit')).toBeDisabled();
+
+    await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
     expect(screen.getByTestId('generate-submit')).not.toBeDisabled();
   });
 
@@ -221,6 +227,26 @@ describe('GenerateForm — multi-source', () => {
     const body = submit.mock.calls[0][0] as GenerateWikiMultiSourceRequest;
     expect(body.source_type).toBe('git');
     expect((body.auth as { pat: string | null }).pat).toBe('ghp_supersecret');
+  });
+
+  it('submit is disabled when "Paste token once" is chosen with an empty token', async () => {
+    // Copilot regression on #276: an empty pastedPat used to silently submit
+    // as no-auth. Now the Submit button stays disabled until a token is
+    // entered.
+    const user = userEvent.setup();
+    noConnections();
+    renderForm();
+
+    await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
+    await user.click(screen.getByRole('combobox', { name: /authentication/i }));
+    await user.click(await screen.findByText(/Paste token once/i));
+
+    // Token field is empty — submit must be disabled.
+    expect(screen.getByTestId('generate-submit')).toBeDisabled();
+
+    // Once a token is provided, submit re-enables.
+    await user.type(screen.getByTestId('pasted-pat-input'), 'ghp_realtoken');
+    expect(screen.getByTestId('generate-submit')).not.toBeDisabled();
   });
 
   it('auth dropdown no longer offers stored PAT', async () => {

@@ -153,6 +153,13 @@ export function AddSourceWizard({
     if (atlassianMissing) return false;
     if (formData.source_type === 'git') {
       if (urlError) return false;
+      // If the user picked "Paste token once", a blank token must NOT
+      // silently submit as no-auth — block the Next button until a token
+      // is entered. The mismatch between intent and submit shape was
+      // surfaced by Copilot on PR #276.
+      if (formData.git.patSource === 'paste' && !formData.git.pastedPat.trim()) {
+        return false;
+      }
       return true;
     }
     if (formData.source_type === 'confluence') return !spaceKeysError;
@@ -161,6 +168,8 @@ export function AddSourceWizard({
   }, [
     atlassianMissing,
     formData.source_type,
+    formData.git.patSource,
+    formData.git.pastedPat,
     urlError,
     spaceKeysError,
     jqlError,

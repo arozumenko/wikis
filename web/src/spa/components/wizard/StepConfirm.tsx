@@ -130,7 +130,11 @@ function buildSummaryRows(data: WizardFormData): [string, string][] {
     rows.push(['Repository', data.git.repo_url]);
     rows.push(['Branch', data.git.branch || 'main']);
     const authLabel =
-      data.git.patSource === 'none' ? 'No auth (public)' : 'Pasted PAT (not stored)';
+      data.git.patSource === 'none'
+        ? 'No auth (public)'
+        : data.git.pastedPat.trim()
+          ? 'Pasted PAT (not stored)'
+          : 'Pasted PAT (empty — will submit as no auth)';
     rows.push(['Auth', authLabel]);
   } else if (data.source_type === 'confluence') {
     rows.push(['Spaces', data.confluence.space_keys.join(', ') || '(none)']);

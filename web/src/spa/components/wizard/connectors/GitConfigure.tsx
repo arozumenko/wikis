@@ -66,11 +66,17 @@ export function GitConfigure({ data, onChange, urlError, disabled }: GitConfigur
           label="Personal Access Token"
           value={data.pastedPat}
           onChange={(e) => set('pastedPat', e.target.value)}
+          required
           fullWidth
           margin="normal"
           type="password"
           disabled={disabled}
-          helperText="Token will not be stored"
+          error={!data.pastedPat.trim()}
+          helperText={
+            !data.pastedPat.trim()
+              ? 'Token is required for the "Paste token once" option'
+              : 'Token will not be stored'
+          }
           inputProps={{ 'data-testid': 'pasted-pat-input' }}
         />
       )}

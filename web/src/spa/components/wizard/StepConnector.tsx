@@ -25,73 +25,88 @@ import StickyNote2OutlinedIcon from '@mui/icons-material/StickyNote2Outlined';
 import type { WikiSourceType } from '../../api/wiki';
 
 // ---------------------------------------------------------------------------
-// Connector catalogue
+// Connector catalogue (discriminated union — TS guarantees that only
+// `disabled: false` entries carry a real WikiSourceType id, so flipping a
+// placeholder's `disabled` flag without also widening the API shape is a
+// compile error.)
 // ---------------------------------------------------------------------------
 
-interface ConnectorOption {
-  id: WikiSourceType | 'ado' | 'local_git' | 'notion';
-  label: string;
-  description: string;
-  icon: React.ReactNode;
-  iconColor: string;
-  testId: string;
-  disabled: boolean;
-}
+type PlaceholderId = 'ado' | 'local_git' | 'notion';
+
+type ConnectorOption =
+  | {
+      disabled: false;
+      id: WikiSourceType;
+      label: string;
+      description: string;
+      icon: React.ReactNode;
+      iconColor: string;
+      testId: string;
+    }
+  | {
+      disabled: true;
+      id: PlaceholderId;
+      label: string;
+      description: string;
+      icon: React.ReactNode;
+      iconColor: string;
+      testId: string;
+    };
 
 const CONNECTORS: ConnectorOption[] = [
   {
+    disabled: false,
     id: 'git',
     label: 'Git',
     description: 'GitHub, GitLab, Bitbucket, or a local path',
     icon: <GitHubIcon sx={{ fontSize: 28 }} />,
     iconColor: 'text.primary',
     testId: 'connector-git',
-    disabled: false,
   },
   {
+    disabled: false,
     id: 'confluence',
     label: 'Confluence',
     description: 'Atlassian Cloud spaces',
     icon: <ArticleOutlinedIcon sx={{ fontSize: 28 }} />,
     iconColor: '#2684FF',
     testId: 'connector-confluence',
-    disabled: false,
   },
   {
+    disabled: false,
     id: 'jira',
     label: 'Jira',
     description: 'Issues matching a JQL query',
     icon: <BugReportOutlinedIcon sx={{ fontSize: 28 }} />,
     iconColor: '#0052CC',
     testId: 'connector-jira',
-    disabled: false,
   },
   {
+    disabled: true,
     id: 'ado',
     label: 'Azure DevOps',
     description: 'Repos & boards',
     icon: <CloudOutlinedIcon sx={{ fontSize: 28 }} />,
     iconColor: '#0078D7',
     testId: 'connector-ado',
-    disabled: true,
   },
   {
+    disabled: true,
     id: 'local_git',
     label: 'Local Git',
     description: 'Filesystem path',
     icon: <FolderOutlinedIcon sx={{ fontSize: 28 }} />,
     iconColor: '#FB923C',
     testId: 'connector-local-git',
-    disabled: true,
   },
   {
+    disabled: true,
     id: 'notion',
     label: 'Notion',
     description: 'Databases & pages',
     icon: <StickyNote2OutlinedIcon sx={{ fontSize: 28 }} />,
     iconColor: 'text.primary',
     testId: 'connector-notion',
-    disabled: true,
   },
 ];
 
@@ -143,7 +158,9 @@ export function StepConnector({ selected, onSelect }: StepConnectorProps) {
               }}
             >
               <CardActionArea
-                onClick={() => !c.disabled && onSelect(c.id as WikiSourceType)}
+                onClick={() => {
+                  if (!c.disabled) onSelect(c.id);
+                }}
                 disabled={c.disabled}
                 data-testid={c.testId}
                 sx={{ p: 1.75, minHeight: 120 }}

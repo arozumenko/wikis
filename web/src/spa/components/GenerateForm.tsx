@@ -261,11 +261,17 @@ function GitTab({
           label="Personal Access Token"
           value={pastedPat}
           onChange={(e) => setPastedPat(e.target.value)}
+          required
           fullWidth
           margin="normal"
           type="password"
           disabled={disabled}
-          helperText="Token will not be stored"
+          error={!pastedPat.trim()}
+          helperText={
+            !pastedPat.trim()
+              ? 'Token is required for the "Paste token once" option'
+              : 'Token will not be stored'
+          }
           inputProps={{ 'data-testid': 'pasted-pat-input' }}
         />
       )}
@@ -476,12 +482,15 @@ function MultiSourceGenerateForm({
     if (atlassianMissing) return false;
     if (activeTab === 'git') {
       if (!repoUrl || !isUrlish(repoUrl)) return false;
+      // "Paste token once" must require an actual token — empty would
+      // silently submit as no-auth (Copilot on PR #276).
+      if (patSource === 'paste' && !pastedPat.trim()) return false;
       return true;
     }
     if (activeTab === 'confluence') return spaceKeys.length > 0;
     if (activeTab === 'jira') return jql.trim().length > 0;
     return false;
-  }, [atlassianMissing, activeTab, repoUrl, spaceKeys, jql]);
+  }, [atlassianMissing, activeTab, repoUrl, patSource, pastedPat, spaceKeys, jql]);
 
   // ---------------------------------------------------------------------------
   // Submit
@@ -610,7 +619,7 @@ function MultiSourceGenerateForm({
         size="large"
         fullWidth
         sx={{ mt: 2.5 }}
-        disabled={disabled || atlassianMissing}
+        disabled={disabled || atlassianMissing || !isValid}
         data-testid="generate-submit"
       >
         Generate Wiki
