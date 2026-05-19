@@ -697,5 +697,15 @@ describe('AddSourceWizard', () => {
       email: 'alice@acme.com',
       api_token: 'atk-123',
     });
+
+    // Rio 2nd-pass: also assert the scan-time payload trims the token,
+    // so a future removal of the trim in buildScanRequest is caught too.
+    const scanCalls = mockScanSource.mock.calls;
+    expect(scanCalls.length).toBeGreaterThan(0);
+    const scanBody = scanCalls[0][0];
+    expect(scanBody.auth).toEqual({
+      email: 'alice@acme.com',
+      api_token: 'atk-123',
+    });
   });
 });
