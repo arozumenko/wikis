@@ -407,3 +407,52 @@ class TestClusterJiraIssues:
 
         total = sum(c.total_artifacts for c in result)
         assert total == 3
+
+
+# ── Duplicate source_path preservation ───────────────────────────────────────
+
+
+class TestDuplicateSourcePath:
+    """Multiple artifacts sharing a source_path must all survive clustering.
+
+    This guards against a regression where the path→artifact map collapsed
+    duplicates: doc_section artifacts (one per heading) often share the same
+    file path, and dropping any of them silently loses page content.
+    """
+
+    def test_markdown_duplicate_source_path_preserved(self, tmp_path):
+        doc = tmp_path / "shared.md"
+        doc.write_text("# Shared\n\n## A\n\nText.\n\n## B\n\nMore.\n")
+        arts = [
+            _md_artifact("Shared#A", "shared.md", "Heading A section"),
+            _md_artifact("Shared#B", "shared.md", "Heading B section"),
+        ]
+
+        result = cluster_markdown_docs(arts, repo_root=str(tmp_path))
+
+        total = sum(c.total_artifacts for c in result)
+        assert total == len(arts)
+
+    def test_confluence_duplicate_source_path_preserved(self, tmp_path):
+        page = tmp_path / "page.md"
+        page.write_text("# Page\n\nContent.\n")
+        arts = [
+            _confluence_artifact("Page#Intro", "page.md", parent_path="Eng"),
+            _confluence_artifact("Page#Body", "page.md", parent_path="Eng"),
+        ]
+
+        result = cluster_confluence_pages(arts, repo_root=str(tmp_path))
+
+        total = sum(c.total_artifacts for c in result)
+        assert total == len(arts)
+
+    def test_jira_duplicate_source_path_preserved(self):
+        arts = [
+            _jira_artifact("EPIC-1#a", "EPIC-1.md", issue_type="epic"),
+            _jira_artifact("EPIC-1#b", "EPIC-1.md", issue_type="epic"),
+        ]
+
+        result = cluster_jira_issues(arts)
+
+        total = sum(c.total_artifacts for c in result)
+        assert total == len(arts)

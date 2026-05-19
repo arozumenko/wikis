@@ -22,7 +22,7 @@ Algorithm (shared)
 2. Add edges specific to the source kind:
    - markdown: internal links parsed by ``extract_links``
    - confluence: parent-child hierarchy + internal links
-   - jira: epic → story/subtask membership + cross-issue links
+   - jira: epic → story/subtask membership
 3. Run Louvain via ``nx.community.louvain_communities``. If the graph has
    too few edges (or Louvain fails) fall back to connected-component
    partitioning so every artifact ends up in exactly one cluster.
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
 from collections import defaultdict
 from pathlib import Path
 
@@ -111,23 +112,25 @@ def _louvain_or_components(
 
 def _communities_to_clusters(
     communities: list[set[str]],
-    path_to_artifact: dict[str, ArtifactInfo],
+    path_to_artifacts: dict[str, list[ArtifactInfo]],
     cluster_kind: str,
 ) -> list[Cluster]:
     """Convert Louvain communities to ``Cluster`` objects.
 
     Args:
         communities: Each set contains artifact ``source_path`` keys.
-        path_to_artifact: Maps source_path → ArtifactInfo.
+        path_to_artifacts: Maps source_path → list of ArtifactInfo. Multiple
+            artifacts can share a source_path (e.g. doc_section artifacts for
+            different headings in the same file); all of them are expanded
+            into the resulting cluster so `sum(c.total_artifacts) ==
+            len(input_artifacts)`.
         cluster_kind: One of ``"doc"``, ``"confluence"``, ``"jira"``.
     """
     result: list[Cluster] = []
     for cid, community in enumerate(communities, start=1):
-        artifacts = [
-            path_to_artifact[path]
-            for path in sorted(community)
-            if path in path_to_artifact
-        ]
+        artifacts: list[ArtifactInfo] = []
+        for path in sorted(community):
+            artifacts.extend(path_to_artifacts.get(path, []))
         if not artifacts:
             continue
 
@@ -163,6 +166,20 @@ def _communities_to_clusters(
     return result
 
 
+def _last_breadcrumb_segment(breadcrumb: str) -> str:
+    """Return the immediate-parent page title from a Confluence breadcrumb.
+
+    Confluence frontmatter stores ``parent_path`` as a delimited breadcrumb
+    (e.g. ``"Engineering / Security"`` or ``"Engineering > Backend > Auth"``).
+    The immediate parent is the last segment after splitting on either ``/``
+    or ``>``; returns the trimmed string, or ``""`` if no segments.
+    """
+    # Try ``>`` first (Confluence default in some scanners), then ``/``.
+    sep = ">" if ">" in breadcrumb else "/"
+    parts = [p.strip() for p in breadcrumb.split(sep) if p.strip()]
+    return parts[-1] if parts else ""
+
+
 def _read_doc_content(source_path: str, repo_root: str) -> str | None:
     """Safely read a doc file from disk.  Returns None if path is unsafe or missing."""
     abs_path = safe_join(repo_root, source_path)
@@ -192,8 +209,14 @@ def _add_link_edges(
         target = link.resolved or link.target
         if not target:
             continue
-        # Normalize to forward slashes and strip leading "./"
-        target = target.replace("\\", "/").lstrip("./")
+        # Normalize: forward slashes, drop a single "./" prefix, then normpath.
+        # Reject targets that resolve outside the cluster's path set (e.g.
+        # `../other.md` from a doc whose source_path is at the root).
+        target = target.replace("\\", "/")
+        target = target.removeprefix("./")
+        target = posixpath.normpath(target)
+        if target.startswith("..") or target == ".":
+            continue
         if target in path_set:
             if graph.has_edge(source_path, target):
                 graph[source_path][target]["weight"] += weight
@@ -228,8 +251,13 @@ def cluster_markdown_docs(
     if not artifacts:
         return []
 
-    path_to_artifact = {a.source_path: a for a in artifacts}
-    path_set = set(path_to_artifact)
+    # Multiple artifacts can share a source_path (e.g. doc_section entries
+    # per heading in the same file); the graph is keyed by path but every
+    # artifact is preserved in the resulting clusters.
+    path_to_artifacts: dict[str, list[ArtifactInfo]] = defaultdict(list)
+    for a in artifacts:
+        path_to_artifacts[a.source_path].append(a)
+    path_set = set(path_to_artifacts)
 
     graph = nx.Graph()
     for path in path_set:
@@ -245,7 +273,7 @@ def cluster_markdown_docs(
     )
 
     communities = _louvain_or_components(graph)
-    clusters = _communities_to_clusters(communities, path_to_artifact, "doc")
+    clusters = _communities_to_clusters(communities, path_to_artifacts, "doc")
 
     logger.info(
         "[DOC_CLUSTER] markdown → %d clusters from %d artifacts",
@@ -279,9 +307,11 @@ def cluster_confluence_pages(
     if not artifacts:
         return []
 
-    path_to_artifact = {a.source_path: a for a in artifacts}
+    path_to_artifacts: dict[str, list[ArtifactInfo]] = defaultdict(list)
+    for a in artifacts:
+        path_to_artifacts[a.source_path].append(a)
     name_to_path = {a.name: a.source_path for a in artifacts}
-    path_set = set(path_to_artifact)
+    path_set = set(path_to_artifacts)
 
     graph = nx.Graph()
     for path in path_set:
@@ -301,9 +331,14 @@ def cluster_confluence_pages(
                     graph[c1][c2]["weight"] += _PARENT_CHILD_EDGE_WEIGHT
                 else:
                     graph.add_edge(c1, c2, weight=_PARENT_CHILD_EDGE_WEIGHT)
-        # If the parent itself is in the artifact set (by name), connect children to it
-        if parent_path_val in name_to_path:
-            parent_src = name_to_path[parent_path_val]
+        # parent_path is a breadcrumb like "Engineering / Security / Auth".
+        # The immediate parent is the LAST segment after the final separator.
+        # If a page named like that segment exists in the artifact set,
+        # connect children to it. We accept "/" or ">" as separators since
+        # different scanner configurations use different conventions.
+        parent_title = _last_breadcrumb_segment(parent_path_val)
+        if parent_title and parent_title in name_to_path:
+            parent_src = name_to_path[parent_title]
             for child in children:
                 if graph.has_edge(parent_src, child):
                     graph[parent_src][child]["weight"] += _PARENT_CHILD_EDGE_WEIGHT
@@ -321,7 +356,7 @@ def cluster_confluence_pages(
     )
 
     communities = _louvain_or_components(graph)
-    clusters = _communities_to_clusters(communities, path_to_artifact, "confluence")
+    clusters = _communities_to_clusters(communities, path_to_artifacts, "confluence")
 
     logger.info(
         "[DOC_CLUSTER] confluence → %d clusters from %d artifacts",
@@ -353,11 +388,13 @@ def cluster_jira_issues(
     if not artifacts:
         return []
 
-    path_to_artifact = {a.source_path: a for a in artifacts}
+    path_to_artifacts: dict[str, list[ArtifactInfo]] = defaultdict(list)
+    for a in artifacts:
+        path_to_artifacts[a.source_path].append(a)
     name_to_path = {a.name: a.source_path for a in artifacts}
 
     graph = nx.Graph()
-    for path in path_to_artifact:
+    for path in path_to_artifacts:
         graph.add_node(path)
 
     # Epic → child edges
@@ -377,7 +414,7 @@ def cluster_jira_issues(
     )
 
     communities = _louvain_or_components(graph)
-    clusters = _communities_to_clusters(communities, path_to_artifact, "jira")
+    clusters = _communities_to_clusters(communities, path_to_artifacts, "jira")
 
     logger.info(
         "[DOC_CLUSTER] jira → %d clusters from %d artifacts",
