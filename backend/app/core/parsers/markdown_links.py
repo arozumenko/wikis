@@ -44,6 +44,7 @@ _REF_DEF_RE = re.compile(
 _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 _EXTERNAL_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*:", re.IGNORECASE)
+_LIST_MARKER_RE = re.compile(r"^\s*(?:\d+[.)]\s|[-*+]\s)")
 
 
 def _strip_code(md: str) -> str:
@@ -54,16 +55,29 @@ def _strip_code(md: str) -> str:
 
 
 def _strip_indented_code(md: str) -> str:
-    """Blank out CommonMark indented code blocks (4+ spaces or tab, after a blank line)."""
+    """Blank out CommonMark indented code blocks (4+ spaces or tab, after a blank line).
+
+    Skips list-continuation paragraphs: an indented paragraph after a blank line
+    inside a list item is continuation prose, not code. A non-blank, non-indented
+    line that isn't itself a list marker ends the list context.
+    """
     lines = md.split("\n")
     out: list[str] = []
     in_code = False
     prev_blank = True
+    in_list = False
     for line in lines:
         stripped = line.strip()
         is_blank = stripped == ""
         is_indented = (line.startswith("    ") or line.startswith("\t")) and not is_blank
-        if not in_code and is_indented and prev_blank:
+        is_list_marker = bool(_LIST_MARKER_RE.match(line))
+
+        if is_list_marker:
+            in_list = True
+        elif not is_blank and not is_indented:
+            in_list = False
+
+        if not in_code and is_indented and prev_blank and not in_list:
             in_code = True
         if in_code:
             if is_indented:

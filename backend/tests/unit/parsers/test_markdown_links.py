@@ -230,6 +230,45 @@ End paragraph.
         assert "ignore.md" not in targets
         assert "this.md" in targets
 
+    def test_list_item_continuation_paragraph_preserved(self):
+        md = """\
+1. Clone the repo
+
+    Run [setup](setup.md) to configure.
+
+2. Start the service
+"""
+        targets = {link.target for link in extract_links(md)}
+        assert "setup.md" in targets
+
+    def test_multiple_list_continuation_paragraphs_preserved(self):
+        md = """\
+- First item
+
+    First paragraph [link1](a.md).
+
+    Second paragraph [link2](b.md).
+
+- Second item
+"""
+        targets = {link.target for link in extract_links(md)}
+        assert targets == {"a.md", "b.md"}
+
+    def test_indented_code_after_list_ends_still_stripped(self):
+        md = """\
+1. Item one
+2. Item two
+
+Regular paragraph here.
+
+    [ignore](ignore.md)
+
+Real [keep](keep.md).
+"""
+        targets = {link.target for link in extract_links(md)}
+        assert "ignore.md" not in targets
+        assert "keep.md" in targets
+
 
 class TestEdgeCases:
     def test_empty_input(self):
