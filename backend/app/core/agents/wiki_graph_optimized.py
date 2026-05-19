@@ -2718,7 +2718,11 @@ class OptimizedWikiGenerationAgent:
         )
         from ..wiki_structure_planner.evidence_jira import build_jira_pack  # noqa: PLC0415
         from ..wiki_structure_planner.evidence_md import build_md_pack  # noqa: PLC0415
-        from ..wiki_structure_planner.structure_skeleton import build_skeleton  # noqa: PLC0415
+        from ..wiki_structure_planner.structure_skeleton import (  # noqa: PLC0415
+            ArtifactInfo,
+            Cluster,
+            build_skeleton,
+        )
         from ..wiki_structure_planner.structure_tools import detect_effective_depth  # noqa: PLC0415
         from .unified_wiki_pipeline import run_unified_pipeline  # noqa: PLC0415
 
@@ -2795,15 +2799,43 @@ class OptimizedWikiGenerationAgent:
         )
 
         # ── Phase 2: build evidence packs ────────────────────────────
-        # ``skeleton.clusters`` is the unified list (filled when the new
-        # source-kind-aware path runs). The legacy fallback must merge
-        # BOTH ``code_clusters`` AND ``doc_clusters`` — otherwise a repo
-        # with only markdown / confluence / jira artifacts (no code) ends
-        # up with zero pages even though doc_clusters is populated.
+        # ``skeleton.clusters`` is the unified source-kind-aware list.  The
+        # legacy ``build_skeleton`` path populates ``code_clusters`` (which
+        # are ``DirCluster`` — a ``Cluster`` subclass with cluster_id/kind)
+        # AND ``doc_clusters`` (which are ``DocCluster`` — a SEPARATE
+        # dataclass with dir_path/doc_files/file_count and NO cluster_id /
+        # kind / artifacts).  Concatenating them naively would crash the
+        # evidence-pack dispatch on the first ``cluster.cluster_id`` access
+        # of a DocCluster.  So when we fall back, convert each DocCluster
+        # into a proper ``Cluster(kind="doc")`` first.
         if skeleton.clusters:
             clusters = list(skeleton.clusters)
         else:
-            clusters = list(skeleton.code_clusters) + list(skeleton.doc_clusters)
+            clusters = list(skeleton.code_clusters)
+            # Reserve cluster_ids above any existing DirCluster ids.
+            next_id = max((c.cluster_id for c in skeleton.code_clusters), default=0) + 1
+            for dc in skeleton.doc_clusters:
+                artifacts = [
+                    ArtifactInfo(
+                        kind="doc_section",
+                        name=f"{dc.dir_path}/{fname}",
+                        source_path=f"{dc.dir_path}/{fname}" if dc.dir_path else fname,
+                        summary="",
+                    )
+                    for fname in dc.doc_files
+                ]
+                clusters.append(
+                    Cluster(
+                        cluster_id=next_id,
+                        kind="doc",
+                        dirs=[dc.dir_path] if dc.dir_path else [],
+                        artifacts=artifacts,
+                        total_artifacts=len(artifacts),
+                        primary_languages=[],
+                        depth_range=(0, 0),
+                    )
+                )
+                next_id += 1
         evidence_packs: dict[int, Any] = {}
         for cluster in clusters:
             cid = cluster.cluster_id
@@ -2881,6 +2913,42 @@ class OptimizedWikiGenerationAgent:
                         self.progress_callback(
                             "generating", 0.40,
                             f"Writing: {title}",
+                        )
+                    except Exception:
+                        pass
+            elif ev_type == "writer.page_done":
+                title = event.get("title", "")
+                n_paragraphs = event.get("n_paragraphs", 0)
+                if self.progress_callback:
+                    try:
+                        self.progress_callback(
+                            "generating", 0.55,
+                            f"Drafted: {title} ({n_paragraphs} paragraphs)",
+                        )
+                    except Exception:
+                        pass
+            elif ev_type == "gate.page_done":
+                title = event.get("title", "")
+                n_flagged = event.get("n_flagged", 0)
+                n_stripped = event.get("n_stripped", 0)
+                if self.progress_callback and (n_flagged or n_stripped):
+                    try:
+                        self.progress_callback(
+                            "generating", 0.65,
+                            f"Gate: {title} — {n_flagged} flagged, {n_stripped} stripped",
+                        )
+                    except Exception:
+                        pass
+            elif ev_type == "verifier.page_done":
+                title = event.get("title", "")
+                n_kept = event.get("n_kept", 0)
+                n_stripped = event.get("n_stripped", 0)
+                n_partial = event.get("n_partial", 0)
+                if self.progress_callback:
+                    try:
+                        self.progress_callback(
+                            "generating", 0.78,
+                            f"Verified: {title} — kept={n_kept} stripped={n_stripped} partial={n_partial}",
                         )
                     except Exception:
                         pass

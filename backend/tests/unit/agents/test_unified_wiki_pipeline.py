@@ -644,32 +644,50 @@ class TestDispatchSkipWhenUnifiedPipelinePopulatedPages:
 # ── doc/confluence/jira cluster fallback (Copilot #270) ──────────────────────
 
 
-class TestSkeletonFallbackIncludesDocClusters:
-    """Regression for Copilot review on #270: when ``skeleton.clusters`` is
-    empty (legacy build_skeleton path), the fallback must merge BOTH
-    ``code_clusters`` AND ``doc_clusters``.  Without this, a markdown /
-    confluence / jira-only repo produces zero pages even though doc_clusters
-    is populated.  This is verified at the source layer by inspecting the
-    cluster-resolution expression in wiki_graph_optimized.py."""
+class TestSkeletonFallbackPromotesDocClusters:
+    """Regression for Rio review on #270: when ``skeleton.clusters`` is
+    empty (legacy build_skeleton path), the fallback must promote each
+    ``DocCluster`` into a proper ``Cluster(kind="doc")`` before the
+    evidence-pack dispatch.  A naive ``code_clusters + doc_clusters``
+    concatenation crashes on the first ``cluster.cluster_id`` access
+    because ``DocCluster`` and ``Cluster`` are unrelated dataclasses
+    (``DocCluster`` has only ``dir_path``, ``doc_files``, ``doc_types``,
+    ``file_count``).
 
-    def test_fallback_expression_concatenates_both_lists(self):
-        # Brittle but pragmatic: the function is hundreds of lines deep
-        # inside _generate_wiki_structure_unified and the easiest reliable
-        # regression check is a source-level grep for the fixed pattern.
+    Locates the source file via importlib instead of a hardcoded /tmp
+    path so the test runs under CI as well as the local dev tree.
+    """
+
+    def test_fallback_promotes_doc_clusters_to_real_clusters(self):
+        # Locate wiki_graph_optimized.py via the imported module — works
+        # whether the test runs in CI, /tmp/wikis-243, or anywhere else.
         from pathlib import Path  # noqa: PLC0415
 
-        src = Path(
-            "/tmp/wikis-243/backend/app/core/agents/wiki_graph_optimized.py"
+        from app.core.agents import wiki_graph_optimized  # noqa: PLC0415
+
+        src = Path(wiki_graph_optimized.__file__)
+        text = src.read_text()
+
+        # The fix promotes each DocCluster into a Cluster(kind="doc") with
+        # cluster_id, kind, artifacts — the attributes the evidence-pack
+        # dispatch reads.  We check by grepping for the promotion call.
+        assert "Cluster(" in text and "kind=\"doc\"" in text, (
+            "expected the unified fallback to construct Cluster(kind=\"doc\") "
+            "objects from DocCluster entries; a raw concatenation crashes on "
+            "DocCluster.cluster_id (AttributeError) and yields zero pages"
         )
-        text = src.read_text() if src.exists() else ""
-        # Either the file is absent (running under a different workspace)
-        # or it must contain the fixed code path.
-        if not text:
-            pytest.skip("wiki_graph_optimized.py not at the expected path")
-        assert (
-            "list(skeleton.code_clusters) + list(skeleton.doc_clusters)" in text
-        ), (
-            "expected the unified skeleton-cluster fallback to concatenate "
-            "code_clusters and doc_clusters; otherwise doc-only repos "
-            "produce zero pages"
+
+    def test_doccluster_cannot_be_passed_through_directly(self):
+        """A DocCluster has no cluster_id / kind / artifacts, so even if
+        someone tries to bypass the promotion the failure is loud."""
+        from app.core.wiki_structure_planner.structure_skeleton import (  # noqa: PLC0415
+            DocCluster,
         )
+
+        dc = DocCluster(dir_path="docs", doc_files=[], doc_types=[], file_count=0)
+        with pytest.raises(AttributeError):
+            _ = dc.cluster_id  # noqa: B018
+        with pytest.raises(AttributeError):
+            _ = dc.kind  # noqa: B018
+        with pytest.raises(AttributeError):
+            _ = dc.artifacts  # noqa: B018
