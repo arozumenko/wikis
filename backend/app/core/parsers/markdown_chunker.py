@@ -44,6 +44,24 @@ _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 # Pre-existing attachment placeholder (already canonical; pass through).
 _ATTACHMENT_PLACEHOLDER_RE = re.compile(r"\[\[attachment:\s*([^\]]+)\]\]")
 
+# Fenced code blocks — masked with offset-preserving blanks before heading
+# scan so shell/python `# install` lines inside fences aren't taken as H1
+# split points.
+_FENCED_BLOCK_RE = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~")
+
+
+def _mask_fenced_code(text: str) -> str:
+    """Replace fenced-code-block characters with spaces, preserving offsets.
+
+    Heading detection then ignores text inside code fences while every
+    other regex / slice can still operate on the same offset space.
+    """
+
+    def _blank(m: re.Match[str]) -> str:
+        return " " * (m.end() - m.start())
+
+    return _FENCED_BLOCK_RE.sub(_blank, text)
+
 
 # ── Public types ─────────────────────────────────────────────────────────────
 
@@ -98,7 +116,7 @@ def _normalise_attachments(body: str) -> tuple[str, set[str]]:
     Pre-existing ``[[attachment: …]]`` placeholders are left in place and also
     collected. Returns the transformed body and the set of attachment paths.
     """
-    attachments: set[str] = []
+    attachments: list[str] = []
 
     # Collect pre-existing placeholders first so they are not double-processed.
     existing_spans: list[tuple[int, int]] = []
@@ -214,8 +232,10 @@ def chunk_markdown(
             ``original_url``, ``space_key``.
 
     Returns:
-        List of :class:`Chunk` objects in document order. Always returns at
-        least one chunk (an empty body chunk for empty input).
+        List of :class:`Chunk` objects in document order. Returns a single
+        empty-body chunk for whitespace-only / empty input so downstream
+        consumers can still address the document. Heading-only sections
+        with no body are skipped to avoid zero-token chunks.
     """
     if not md_text or not md_text.strip():
         return [
@@ -230,12 +250,14 @@ def chunk_markdown(
             )
         ]
 
-    # Collect all H1/H2 heading positions and their text.
-    # H3 positions are handled inside _split_with_h3_fallback only.
+    # Scan headings against a code-fence-masked copy so `# install` inside
+    # a fenced block doesn't split. Offsets stay valid against md_text.
+    masked = _mask_fenced_code(md_text)
+
     sections: list[tuple[int, list[str]]] = []  # (char_start, heading_path)
     h1_active: str | None = None
 
-    for m in _HEADING_RE.finditer(md_text):
+    for m in _HEADING_RE.finditer(masked):
         level = len(m.group(1))
         name = m.group(2).strip()
         if level == 1:
@@ -266,6 +288,10 @@ def chunk_markdown(
         # Strip the heading line itself before passing body to helper.
         section_text = md_text[start:end]
         section_text = _HEADING_RE.sub("", section_text, count=1).lstrip("\n")
+        # Skip whitespace-only sections so empty headings don't emit
+        # zero-token chunks that downstream consumers must filter.
+        if not section_text.strip():
+            continue
 
         new_chunks, idx = _split_with_h3_fallback(doc_path, heading_path, section_text, frontmatter, idx)
         chunks.extend(new_chunks)

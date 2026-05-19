@@ -238,10 +238,44 @@ class TestEdgeCases:
         assert len(chunks) == 1
         assert chunks[0].heading_path == []
 
-    def test_single_heading_no_body(self):
+    def test_single_heading_no_body_returns_no_chunk(self):
+        # Empty H1 section is skipped per Copilot review; downstream
+        # consumers don't need to filter zero-token chunks.
         chunks = chunk_markdown("# Title", doc_path="doc.md")
+        assert chunks == []
+
+    def test_heading_inside_fenced_code_not_a_split(self):
+        # `# install` inside a ```bash block must NOT be taken as an H1.
+        md = "# Real Heading\n\nIntro text.\n\n```bash\n# install\nrun setup\n```\n\nMore prose.\n"
+        chunks = chunk_markdown(md, doc_path="doc.md")
         assert len(chunks) == 1
-        assert chunks[0].heading_path == ["Title"]
+        assert chunks[0].heading_path == ["Real Heading"]
+        # The code block body is preserved verbatim.
+        assert "# install" in chunks[0].body
+
+    def test_heading_inside_tilde_fenced_code_not_a_split(self):
+        md = "# Outer\n\n~~~\n## Fake H2\n~~~\n"
+        chunks = chunk_markdown(md, doc_path="doc.md")
+        assert len(chunks) == 1
+        assert chunks[0].heading_path == ["Outer"]
+
+    def test_empty_h1_section_produces_no_chunk(self):
+        # H1 with no body content should be skipped, not emit a zero-token chunk.
+        md = "# A\n\n# B\n\nReal content under B.\n"
+        chunks = chunk_markdown(md, doc_path="doc.md")
+        # Only the H1 "B" section should produce a chunk.
+        assert len(chunks) == 1
+        assert chunks[0].heading_path == ["B"]
+        assert "Real content under B." in chunks[0].body
+
+    def test_back_to_back_empty_h2_sections_skipped(self):
+        md = "# H1\n\n## A\n\n## B\n\n## C\n\nProse for C.\n"
+        chunks = chunk_markdown(md, doc_path="doc.md")
+        # Only the C section has body.
+        paths = [c.heading_path for c in chunks]
+        assert ["H1", "C"] in paths
+        assert ["H1", "A"] not in paths
+        assert ["H1", "B"] not in paths
 
     def test_chunk_dataclass_fields_present(self):
         chunks = chunk_markdown("# H\n\nText.", doc_path="doc.md")
