@@ -168,13 +168,52 @@ def _strip_yaml_quotes(value: str) -> str:
 
 
 def _parse_inline_list(value: str) -> list[str] | None:
-    """Parse an inline YAML list like ``[a, "b", 'c']``. Returns None if not a list."""
+    """Parse an inline YAML list like ``[a, "b", 'c']``.
+
+    Returns None if *value* is not a bracketed list.
+
+    Uses a small state-machine so that commas inside quoted strings are treated
+    as literal characters rather than separators — fixes #256.  Both single and
+    double quotes are supported; a quote is closed only by its matching opener.
+
+    Tracks whether each item was *started* (saw a non-whitespace character or
+    an opening quote) so an explicit empty-quoted item like ``["", "x"]``
+    yields ``["", "x"]`` rather than ``["x"]``. Bare whitespace between
+    commas — like ``[a, , b]`` — is treated as no item and dropped.
+    """
     if not (value.startswith("[") and value.endswith("]")):
         return None
     inner = value[1:-1].strip()
     if not inner:
         return []
-    return [_strip_yaml_quotes(item.strip()) for item in inner.split(",") if item.strip()]
+    items: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    started = False  # an item exists once we see a non-space char or an opening quote
+    for ch in inner:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                current.append(ch)
+        elif ch in ("'", '"'):
+            quote = ch
+            started = True
+        elif ch == ",":
+            if started:
+                items.append("".join(current).strip())
+            current = []
+            started = False
+        elif ch.isspace():
+            # Whitespace contributes only if an item is already in progress.
+            if started:
+                current.append(ch)
+        else:
+            current.append(ch)
+            started = True
+    if started:
+        items.append("".join(current).strip())
+    return items
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
