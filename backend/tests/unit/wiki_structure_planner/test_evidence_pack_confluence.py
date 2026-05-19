@@ -28,7 +28,6 @@ from app.core.wiki_structure_planner.structure_skeleton import (
     Cluster,
 )
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -271,9 +270,7 @@ class TestConfluenceEvidencePackDataclass:
 class TestBuildConfluencePackBasic:
     def test_returns_confluence_evidence_pack(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _SIMPLE_PAGE)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Getting Started", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Getting Started", "confluence/page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert isinstance(pack, ConfluenceEvidencePack)
 
@@ -288,9 +285,7 @@ class TestBuildConfluencePackBasic:
 
     def test_pack_kind_is_confluence(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _SIMPLE_PAGE)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Getting Started", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Getting Started", "confluence/page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.kind == "confluence"
 
@@ -346,17 +341,13 @@ class TestBuildConfluencePackBasic:
 class TestTitleExtraction:
     def test_title_from_frontmatter(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _SIMPLE_PAGE)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Getting Started", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Getting Started", "confluence/page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["title"] == "Getting Started"
 
     def test_title_falls_back_to_first_h1(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _PAGE_NO_FRONTMATTER)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("No Frontmatter Page", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("No Frontmatter Page", "confluence/page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["title"] == "No Frontmatter Page"
 
@@ -364,11 +355,27 @@ class TestTitleExtraction:
         # Page with no frontmatter title and no H1
         content = "Just some text without headings.\n"
         _write_md(tmp_path, "confluence/my-page.md", content)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("my-page.md", "confluence/my-page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("my-page.md", "confluence/my-page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["title"] == "my-page.md"
+
+    def test_h1_inside_fenced_code_not_taken_as_title(self, tmp_path):
+        # Rio / Copilot FYI: `# Not really` inside ```bash before any real
+        # H1 must not become the title.
+        content = (
+            "Some prose without a heading yet.\n\n"
+            "```bash\n"
+            "# Not really a heading, this is a shell comment\n"
+            "echo hi\n"
+            "```\n\n"
+            "# Real Title\n\n"
+            "Body.\n"
+        )
+        _write_md(tmp_path, "confluence/code-title.md", content)
+        cluster = _make_confluence_cluster([_confluence_artifact("CodeTitle", "confluence/code-title.md")])
+        pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
+        assert pack.page_entries[0]["title"] == "Real Title"
+        assert "Not really" not in pack.page_entries[0]["title"]
 
 
 # ── build_confluence_pack — space_key + parent_path ───────────────────────────
@@ -377,9 +384,7 @@ class TestTitleExtraction:
 class TestSpaceKeyAndParentPath:
     def test_space_key_propagated_from_artifact(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _SIMPLE_PAGE)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Page", "confluence/page.md", space_key="CUSTOM")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Page", "confluence/page.md", space_key="CUSTOM")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["space_key"] == "CUSTOM"
 
@@ -399,9 +404,7 @@ class TestSpaceKeyAndParentPath:
 
     def test_empty_parent_path_preserved(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _SIMPLE_PAGE)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Page", "confluence/page.md", parent_path="")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Page", "confluence/page.md", parent_path="")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["parent_path"] == ""
 
@@ -412,9 +415,7 @@ class TestSpaceKeyAndParentPath:
 class TestLabelParsing:
     def test_labels_parsed_as_list_from_frontmatter(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _SIMPLE_PAGE)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Getting Started", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Getting Started", "confluence/page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         labels = pack.page_entries[0]["labels"]
         assert "onboarding" in labels
@@ -423,12 +424,37 @@ class TestLabelParsing:
     def test_single_label_as_scalar_parsed(self, tmp_path):
         """labels: security (not a list) should still parse as ["security"]."""
         _write_md(tmp_path, "confluence/sec.md", _PAGE_SINGLE_LABEL)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Security Policy", "confluence/sec.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Security Policy", "confluence/sec.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         labels = pack.page_entries[0]["labels"]
         assert labels == ["security"]
+
+    def test_list_items_with_arbitrary_indent_parsed(self, tmp_path):
+        # Rio / Copilot FYI: `_FM_LIST_ITEM_RE` was previously `\s{1,4}` —
+        # any indent outside 1-4 silently dropped items. Now `\s+` so any
+        # positive indent (including tabs and 6+ spaces from nested generators)
+        # is accepted.
+        content = textwrap.dedent("""\
+            ---
+            title: Mixed Indent
+            space_key: ENG
+            labels:
+                  - deeply-indented
+            \t- tab-indented
+              - normal-indented
+            ---
+
+            # Mixed Indent
+
+            Body.
+        """)
+        _write_md(tmp_path, "confluence/mixed.md", content)
+        cluster = _make_confluence_cluster([_confluence_artifact("Mixed", "confluence/mixed.md")])
+        pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
+        labels = pack.page_entries[0]["labels"]
+        assert "deeply-indented" in labels
+        assert "tab-indented" in labels
+        assert "normal-indented" in labels
 
     def test_no_labels_in_frontmatter_returns_empty(self, tmp_path):
         content = textwrap.dedent("""\
@@ -442,17 +468,13 @@ class TestLabelParsing:
             Content here.
         """)
         _write_md(tmp_path, "confluence/page.md", content)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("No Labels Page", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("No Labels Page", "confluence/page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["labels"] == []
 
     def test_no_frontmatter_returns_empty_labels(self, tmp_path):
         _write_md(tmp_path, "confluence/plain.md", _PAGE_NO_FRONTMATTER)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("No Frontmatter Page", "confluence/plain.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("No Frontmatter Page", "confluence/plain.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["labels"] == []
 
@@ -463,9 +485,7 @@ class TestLabelParsing:
 class TestHeadingToc:
     def test_h1_and_h2_headings_in_toc(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _SIMPLE_PAGE)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Getting Started", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Getting Started", "confluence/page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         toc = pack.page_entries[0]["toc"]
         assert "Getting Started" in toc
@@ -488,9 +508,7 @@ class TestHeadingToc:
             #### Deep Subsection
         """)
         _write_md(tmp_path, "confluence/deep.md", content)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Deep Page", "confluence/deep.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Deep Page", "confluence/deep.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         toc = pack.page_entries[0]["toc"]
         assert "Main" in toc
@@ -515,9 +533,7 @@ class TestHeadingToc:
             ## Another Real Heading
         """)
         _write_md(tmp_path, "confluence/code.md", content)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Code Page", "confluence/code.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Code Page", "confluence/code.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         toc = pack.page_entries[0]["toc"]
         assert "Real Heading" in toc
@@ -535,9 +551,7 @@ class TestHeadingToc:
             This page has no headings, just plain text.
         """)
         _write_md(tmp_path, "confluence/flat.md", content)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Flat Page", "confluence/flat.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Flat Page", "confluence/flat.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["toc"] == []
 
@@ -548,9 +562,7 @@ class TestHeadingToc:
 class TestFirstParagraph:
     def test_first_paragraph_extracted(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _SIMPLE_PAGE)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Getting Started", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Getting Started", "confluence/page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         first_para = pack.page_entries[0]["first_paragraph"]
         assert first_para  # non-empty
@@ -569,9 +581,7 @@ class TestFirstParagraph:
             {long_text}
         """)
         _write_md(tmp_path, "confluence/long.md", content)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Long Page", "confluence/long.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Long Page", "confluence/long.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         first_para = pack.page_entries[0]["first_paragraph"]
         assert len(first_para) <= 200
@@ -584,9 +594,7 @@ class TestFirstParagraph:
             ---
         """)
         _write_md(tmp_path, "confluence/empty.md", content)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Empty Page", "confluence/empty.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Empty Page", "confluence/empty.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         # Should not raise; first_paragraph can be empty string
         assert isinstance(pack.page_entries[0]["first_paragraph"], str)
@@ -598,9 +606,7 @@ class TestFirstParagraph:
 class TestAttachments:
     def test_image_attachment_filenames_collected(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _PAGE_WITH_ATTACHMENTS)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Architecture Diagrams", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Architecture Diagrams", "confluence/page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         attachments = pack.page_entries[0]["attachments"]
         assert "system-diagram.png" in attachments
@@ -610,18 +616,14 @@ class TestAttachments:
         """The attachment file should not exist; we only record filenames."""
         _write_md(tmp_path, "confluence/page.md", _PAGE_WITH_ATTACHMENTS)
         # Intentionally do NOT write system-diagram.png or components.png
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Architecture Diagrams", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Architecture Diagrams", "confluence/page.md")])
         # Should not raise even though attachment files don't exist
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert isinstance(pack, ConfluenceEvidencePack)
 
     def test_no_attachments_returns_empty_list(self, tmp_path):
         _write_md(tmp_path, "confluence/page.md", _SIMPLE_PAGE)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Getting Started", "confluence/page.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Getting Started", "confluence/page.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["attachments"] == []
 
@@ -641,9 +643,7 @@ class TestAttachments:
             ![Same again](diagram.png)
         """)
         _write_md(tmp_path, "confluence/dup.md", content)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Dup Attachments", "confluence/dup.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Dup Attachments", "confluence/dup.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         attachments = pack.page_entries[0]["attachments"]
         assert attachments.count("diagram.png") == 1
@@ -678,20 +678,21 @@ class TestTokenBudget:
             """)
             _write_md(tmp_path, f"confluence/page{i}.md", content)
 
-        artifacts = [
-            _confluence_artifact(f"Page {i}", f"confluence/page{i}.md")
-            for i in range(20)
-        ]
+        artifacts = [_confluence_artifact(f"Page {i}", f"confluence/page{i}.md") for i in range(20)]
         cluster = _make_confluence_cluster(artifacts)
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path), token_budget=1000)
         serialized = pack.serialize()
-        # Rough token estimate: 4 chars per token; allow 2x slack
-        approx_tokens = len(serialized) / 4
-        assert approx_tokens < 1000 * 2
+        # Tight assertion (Copilot review): trim must actually engage.
+        char_budget = 1000 * 4
+        overhead = 300  # per-entry headers + section labels
+        assert len(serialized) <= char_budget + overhead
+        # Trim engaged: pages dropped from the original 20.
+        assert len(pack.page_entries) < 20
 
     def test_at_least_one_entry_even_if_over_budget(self, tmp_path):
         # Single huge page — budget cannot be met, but pack must not be empty
-        content = textwrap.dedent("""\
+        content = (
+            textwrap.dedent("""\
             ---
             title: Huge Page
             space_key: ENG
@@ -699,11 +700,11 @@ class TestTokenBudget:
 
             # Huge Page
 
-        """) + "## Section\n\nContent.\n" * 500
-        _write_md(tmp_path, "confluence/huge.md", content)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Huge Page", "confluence/huge.md")]
+        """)
+            + "## Section\n\nContent.\n" * 500
         )
+        _write_md(tmp_path, "confluence/huge.md", content)
+        cluster = _make_confluence_cluster([_confluence_artifact("Huge Page", "confluence/huge.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path), token_budget=100)
         # Must still produce at least one entry
         assert len(pack.page_entries) >= 1
@@ -714,18 +715,14 @@ class TestTokenBudget:
 
 class TestPathSafety:
     def test_traversal_in_source_path_rejected(self, tmp_path):
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Evil", "../../etc/passwd")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Evil", "../../etc/passwd")])
         # Must not raise; traversal path simply skipped
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         source_paths = [e["source_path"] for e in pack.page_entries]
         assert "../../etc/passwd" not in source_paths
 
     def test_absolute_source_path_rejected(self, tmp_path):
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("AbsPath", "/etc/passwd")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("AbsPath", "/etc/passwd")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         source_paths = [e["source_path"] for e in pack.page_entries]
         assert "/etc/passwd" not in source_paths
@@ -738,9 +735,7 @@ class TestPathSafety:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks not supported on this platform")
 
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Evil", "confluence/evil_link.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Evil", "confluence/evil_link.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         # If entry was somehow included, it must not contain /etc/passwd content
         for entry in pack.page_entries:
@@ -753,9 +748,7 @@ class TestPathSafety:
 class TestErrorHandling:
     def test_missing_file_skipped_gracefully(self, tmp_path):
         """File referenced by artifact does not exist — should not raise."""
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Ghost Page", "confluence/ghost.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Ghost Page", "confluence/ghost.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         # Missing file is silently skipped; pack is still valid
         assert isinstance(pack, ConfluenceEvidencePack)
@@ -774,9 +767,7 @@ class TestErrorHandling:
             Some content.
         """)
         _write_md(tmp_path, "confluence/broken.md", content)
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Broken Page", "confluence/broken.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Broken Page", "confluence/broken.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert isinstance(pack, ConfluenceEvidencePack)
 
@@ -795,8 +786,6 @@ class TestErrorHandling:
 
     def test_empty_file_handled(self, tmp_path):
         _write_md(tmp_path, "confluence/empty.md", "")
-        cluster = _make_confluence_cluster(
-            [_confluence_artifact("Empty", "confluence/empty.md")]
-        )
+        cluster = _make_confluence_cluster([_confluence_artifact("Empty", "confluence/empty.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert isinstance(pack, ConfluenceEvidencePack)

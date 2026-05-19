@@ -116,9 +116,7 @@ class ConfluenceEvidencePack:
         The format is intentionally simple — the planner agent (#236) wraps
         this inside its own prompt template.
         """
-        parts: list[str] = [
-            f"[ConfluenceEvidencePack cluster={self.cluster_id} kind={self.kind}]"
-        ]
+        parts: list[str] = [f"[ConfluenceEvidencePack cluster={self.cluster_id} kind={self.kind}]"]
 
         for entry in self.page_entries:
             src = entry.get("source_path", "")
@@ -181,7 +179,10 @@ class ConfluenceEvidencePack:
 
 _FM_OPEN_RE = re.compile(r"^---\s*$")
 _FM_KEY_VALUE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$")
-_FM_LIST_ITEM_RE = re.compile(r"^\s{1,4}-\s+(.+)$")
+# Match list items at any positive indent — Confluence scanner emits 2-space
+# indent in practice but a stricter pattern would silently drop items if the
+# generator changes (Copilot review on #252).
+_FM_LIST_ITEM_RE = re.compile(r"^\s+-\s+(.+)$")
 
 
 def _parse_frontmatter(md_text: str) -> tuple[dict, str]:
@@ -261,11 +262,6 @@ def _parse_frontmatter(md_text: str) -> tuple[dict, str]:
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
-
-
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate from char count."""
-    return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
 def _read_file_safe(repo_root: str, rel_path: str) -> str | None:
@@ -372,13 +368,15 @@ def _process_page(
     # Parse frontmatter; body is the text after the closing ---
     frontmatter, body = _parse_frontmatter(text)
 
-    # Title: prefer frontmatter "title", then first H1 in full text, else filename
+    # Title: prefer frontmatter "title", then first H1 in body, else filename.
+    # The H1 scan masks fenced code blocks so a `# install` line inside a
+    # ```bash example doesn't become the page title.
     title: str = ""
     if frontmatter:
         title = str(frontmatter.get("title", "")).strip()
     if not title:
-        # Scan full text (including frontmatter region) for first H1
-        h1_m = re.search(r"^# (.+)$", text, re.MULTILINE)
+        masked_body = _TOC_FENCE_RE.sub(lambda m: " " * (m.end() - m.start()), body)
+        h1_m = re.search(r"^# (.+)$", masked_body, re.MULTILINE)
         if h1_m:
             title = h1_m.group(1).strip()
     if not title:
@@ -417,27 +415,40 @@ def _enforce_total_budget(pack: ConfluenceEvidencePack, char_budget: int) -> Non
 
     At least one entry is always kept (even if over budget) so the pack is
     never empty for a non-empty cluster.
+
+    Implementation note: serialise once up front and track length deltas as
+    list items are popped, rather than re-serialising the whole pack on
+    every loop iteration. Re-serialising is O(n²) on cluster size; the delta
+    is O(1) per pop.
     """
-    if len(pack.serialize()) <= char_budget:
+    current_len = len(pack.serialize())
+    if current_len <= char_budget:
         return
 
     # Phase 1: trim attachment lists per entry (least informative per char)
     for entry in pack.page_entries:
-        while len(pack.serialize()) > char_budget and len(entry.get("attachments", [])) > 1:
-            entry["attachments"].pop()
-        if len(pack.serialize()) <= char_budget:
+        attachments: list[str] = entry.get("attachments", [])
+        while current_len > char_budget and len(attachments) > 1:
+            dropped = attachments.pop()
+            current_len -= len(dropped) + 5  # "  - {dropped}\n" overhead
+        if current_len <= char_budget:
             return
 
     # Phase 2: trim TOC entries per entry
     for entry in pack.page_entries:
-        while len(pack.serialize()) > char_budget and len(entry.get("toc", [])) > 2:
-            entry["toc"].pop()
-        if len(pack.serialize()) <= char_budget:
+        toc: list[str] = entry.get("toc", [])
+        while current_len > char_budget and len(toc) > 2:
+            dropped = toc.pop()
+            current_len -= len(dropped) + 5
+        if current_len <= char_budget:
             return
 
-    # Phase 3: drop whole entries from the tail
-    while len(pack.serialize()) > char_budget and len(pack.page_entries) > 1:
+    # Phase 3: drop whole entries from the tail. Re-measure once per drop —
+    # computing an exact delta for a whole entry is fiddly and whole-entry
+    # drops are rare so the cost is acceptable.
+    while current_len > char_budget and len(pack.page_entries) > 1:
         pack.page_entries.pop()
+        current_len = len(pack.serialize())
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
