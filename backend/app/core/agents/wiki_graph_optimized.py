@@ -455,13 +455,24 @@ class OptimizedWikiGenerationAgent:
 
         logger.info("📄 Dispatching page generation")
 
-        # Unified pipeline (#243) populates wiki_pages upstream.  Skip the
-        # legacy dispatch entirely so we don't generate every page twice.
-        if state.get("wiki_pages"):
+        # After #242 the unified pipeline is the only planner path, and it
+        # ALWAYS attaches both ``wiki_structure_spec`` and ``wiki_pages`` to
+        # state before this dispatcher runs.  ``wiki_pages`` defaults to
+        # ``[]`` via WikiState's ``default_factory``, so we cannot tell
+        # "default empty" from "unified produced 0 pages" by looking at
+        # the list alone — both look the same.
+        #
+        # We rely on ``wiki_structure_spec`` instead: if it's set (even with
+        # zero pages), structure planning ran to completion and we route
+        # directly to ``finalize_wiki``.  The legacy ``generate_page_content``
+        # fan-out is dead code preserved only because removing the node
+        # would be a larger structural change; we never take that path.
+        if state.get("wiki_structure_spec") is not None:
+            wiki_pages_n = len(state.get("wiki_pages") or [])
             logger.info(
-                "[UNIFIED] wiki_pages already populated upstream "
-                "(%d pages); skipping legacy page generation",
-                len(state["wiki_pages"]),
+                "[UNIFIED] structure planning complete (%d pages); "
+                "routing directly to finalize_wiki",
+                wiki_pages_n,
             )
             return "finalize_wiki"
 

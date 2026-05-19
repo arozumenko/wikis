@@ -617,10 +617,14 @@ class TestDispatchSkipWhenUnifiedPipelinePopulatedPages:
         result = agent.dispatch_page_generation(state, MagicMock())
         assert result == "finalize_wiki"
 
-    def test_dispatch_normal_path_returns_sends_when_no_wiki_pages(self):
-        """Sanity: when wiki_pages is absent, the dispatcher hits the legacy
-        path (or raises if structure is missing — we only check it does NOT
-        short-circuit to finalize_wiki)."""
+    def test_dispatch_returns_finalize_when_pipeline_produced_zero_pages(self):
+        """Regression for Rio review on #271: when the unified pipeline
+        produces 0 pages (empty repo / no clusters) and emits a degenerate
+        ``WikiStructureSpec`` with ``wiki_pages=[]``, the dispatcher must
+        STILL route to ``finalize_wiki``.  Returning ``[]`` here would
+        silently complete the graph without firing finalize_wiki or
+        export_wiki, leaving the invocation success=True with 0 artifacts
+        exported."""
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from app.core.agents.wiki_graph_optimized import (  # noqa: PLC0415
@@ -628,17 +632,29 @@ class TestDispatchSkipWhenUnifiedPipelinePopulatedPages:
         )
 
         agent = OptimizedWikiGenerationAgent.__new__(OptimizedWikiGenerationAgent)
-        state = {}  # neither wiki_pages nor wiki_structure_spec
+        state = {
+            "wiki_pages": [],
+            "wiki_structure_spec": MagicMock(),
+        }
 
-        # Without wiki_pages, the missing-structure guard fires.  What matters
-        # is that we did NOT take the unified short-circuit.
-        try:
-            result = agent.dispatch_page_generation(state, MagicMock())
-        except RuntimeError as exc:
-            # Expected legacy-path error.
-            assert "wiki_structure_spec" in str(exc)
-            return
-        assert result != "finalize_wiki"
+        result = agent.dispatch_page_generation(state, MagicMock())
+        assert result == "finalize_wiki"
+
+    def test_dispatch_raises_when_no_structure_at_all(self):
+        """Sanity: if neither wiki_pages nor wiki_structure_spec are in
+        state (catastrophic upstream failure), the dispatcher still raises
+        the explicit RuntimeError so generate_wiki() catches it cleanly."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from app.core.agents.wiki_graph_optimized import (  # noqa: PLC0415
+            OptimizedWikiGenerationAgent,
+        )
+
+        agent = OptimizedWikiGenerationAgent.__new__(OptimizedWikiGenerationAgent)
+        state = {}
+
+        with pytest.raises(RuntimeError, match="wiki_structure_spec"):
+            agent.dispatch_page_generation(state, MagicMock())
 
 
 # ── doc/confluence/jira cluster fallback (Copilot #270) ──────────────────────

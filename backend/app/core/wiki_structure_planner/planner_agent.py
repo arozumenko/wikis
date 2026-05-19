@@ -1,18 +1,17 @@
 """Unified planner agent (#236).
 
-Replaces the two existing planning paths:
-- ``_create_agent`` in ``structure_engine.py`` (LLM path — repo-crawl, up to 100 iters)
-- ``refine_with_llm`` in ``structure_refiner.py`` (graph-first path — single LLM call)
-
-The unified planner is evidence-first: each cluster arrives with a pre-built
-evidence pack (~1K tokens).  The agent may call tools only when a pack is
+The only planner path after #242 collapsed the legacy LLM-driven and
+graph-first alternatives.  Evidence-first: each cluster arrives with a
+pre-built evidence pack (~1K tokens).  The agent may call escape-hatch
+tools (``read_file``, ``get_signature``, ``grep``) only when a pack is
 insufficient, subject to a hard total budget of ``3 × n_clusters``.
 
 Public API
 ----------
 ``run_planner(skeleton, evidence_packs, *, llm, repo_root) -> list[PageSpec]``
+``run_planner_with_report(...)`` — same, but also returns the ``PlanReport``.
 
-``PlanReport``  — budget / coverage summary attached to the returned specs.
+``PlanReport``  — budget / coverage summary.
 ``PageSpec``    — one wiki page specification (title, description, retrieval_query,
                   plus deterministic target_* fields from the skeleton).
 """
