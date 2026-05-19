@@ -168,13 +168,38 @@ def _strip_yaml_quotes(value: str) -> str:
 
 
 def _parse_inline_list(value: str) -> list[str] | None:
-    """Parse an inline YAML list like ``[a, "b", 'c']``. Returns None if not a list."""
+    """Parse an inline YAML list like ``[a, "b", 'c']``.
+
+    Returns None if *value* is not a bracketed list.
+
+    Uses a small state-machine so that commas inside quoted strings are treated
+    as literal characters rather than separators — fixes #256.  Both single and
+    double quotes are supported; a quote is closed only by its matching opener.
+    """
     if not (value.startswith("[") and value.endswith("]")):
         return None
     inner = value[1:-1].strip()
     if not inner:
         return []
-    return [_strip_yaml_quotes(item.strip()) for item in inner.split(",") if item.strip()]
+    items: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    for ch in inner:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                current.append(ch)
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == ",":
+            items.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        items.append("".join(current).strip())
+    return [item for item in items if item]
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
