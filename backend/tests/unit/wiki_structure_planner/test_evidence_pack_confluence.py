@@ -478,6 +478,36 @@ class TestLabelParsing:
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["labels"] == []
 
+    def test_blank_line_mid_list_does_not_drop_prior_items(self, tmp_path):
+        # Rio 1st-review (#252): a blank line inside a list flushed the
+        # committed list but left `current_key` set, so the next list item
+        # repopulated the list as if fresh, silently dropping "a" and "b".
+        # The bug is not triggered by the scanner today, but the parser
+        # advertises graceful handling of malformed input.
+        content = textwrap.dedent("""\
+            ---
+            title: Blank Mid List
+            space_key: ENG
+            labels:
+              - a
+              - b
+
+              - c
+            ---
+
+            # Body
+        """)
+        _write_md(tmp_path, "confluence/blank-list.md", content)
+        cluster = _make_confluence_cluster([_confluence_artifact("Blank", "confluence/blank-list.md")])
+        pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
+        labels = pack.page_entries[0]["labels"]
+        # All three items committed before AND after the blank are present.
+        assert "a" in labels
+        assert "b" in labels
+        # `c` after the blank is currently treated as orphan list content
+        # (`current_key` is None, so the line is ignored). That's an
+        # accepted limitation — what matters is the prior items survive.
+
 
 # ── build_confluence_pack — heading TOC ──────────────────────────────────────
 
@@ -554,6 +584,36 @@ class TestHeadingToc:
         cluster = _make_confluence_cluster([_confluence_artifact("Flat Page", "confluence/flat.md")])
         pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
         assert pack.page_entries[0]["toc"] == []
+
+    def test_repeated_h2_under_different_h1_preserved(self, tmp_path):
+        # Rio 1st-review: removing dedup so the planner sees the actual
+        # structure, matching `evidence_md.py` (#250) precedent.
+        content = textwrap.dedent("""\
+            ---
+            title: Multi-Section
+            space_key: ENG
+            ---
+
+            # Auth
+
+            ## Overview
+
+            ## Details
+
+            # Storage
+
+            ## Overview
+
+            ## Details
+        """)
+        _write_md(tmp_path, "confluence/multi.md", content)
+        cluster = _make_confluence_cluster([_confluence_artifact("Multi", "confluence/multi.md")])
+        pack = build_confluence_pack(cluster, repo_root=str(tmp_path))
+        toc = pack.page_entries[0]["toc"]
+        # Both occurrences of "Overview" and "Details" must appear so the
+        # planner can see that two distinct H1s each have those subsections.
+        assert toc.count("Overview") == 2
+        assert toc.count("Details") == 2
 
 
 # ── build_confluence_pack — first paragraph ───────────────────────────────────

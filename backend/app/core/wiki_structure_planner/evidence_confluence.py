@@ -249,9 +249,14 @@ def _parse_frontmatter(md_text: str) -> tuple[dict, str]:
 
         # Anything else (blank lines, unrecognised): continue
         if current_list is not None and not line.strip():
-            # Blank line inside a list terminates it
+            # Blank line inside a list terminates it. Clear `current_key`
+            # too — otherwise a subsequent list item under the same key
+            # would re-enter the list-item branch, repopulate the list as
+            # if starting fresh, and silently drop the already-flushed
+            # items (Rio review on #252).
             fm[current_key] = current_list
             current_list = None
+            current_key = None
 
     if close_idx is None:
         # No closing --- found; treat entire document as having no frontmatter
@@ -284,21 +289,24 @@ def _extract_toc(md_text: str) -> list[str]:
     """Return H1/H2 heading names from raw markdown in document order.
 
     Scans the raw text directly (same pattern as evidence_md.py) so
-    structural-only docs still surface their TOC.  H3+ are excluded by
-    design.  Fenced code blocks are masked so a ``# install`` line inside
+    structural-only docs still surface their TOC. H3+ are excluded by
+    design. Fenced code blocks are masked so a ``# install`` line inside
     ```bash isn't picked up.
+
+    Headings are NOT deduplicated by name — a Confluence page with two
+    `## Overview` sections under different H1s legitimately has both in
+    its TOC. Matches the precedent set by ``evidence_md.py`` so the
+    planner agent (#236) sees a consistent shape across pack kinds.
     """
 
     def _blank(m: re.Match[str]) -> str:
         return " " * (m.end() - m.start())
 
     masked = _TOC_FENCE_RE.sub(_blank, md_text)
-    seen: set[str] = set()
     toc: list[str] = []
     for m in _TOC_HEADING_RE.finditer(masked):
         heading = m.group(2).strip()
-        if heading and heading not in seen:
-            seen.add(heading)
+        if heading:
             toc.append(heading)
     return toc[:_MAX_TOC_ENTRIES_PER_PAGE]
 
