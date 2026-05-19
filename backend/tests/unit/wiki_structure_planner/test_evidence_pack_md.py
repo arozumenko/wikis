@@ -446,9 +446,13 @@ class TestTokenBudget:
             ]
         )
         pack = build_md_pack(cluster, repo_root=str(tmp_path), token_budget=1000)
-        approx_tokens = len(pack.serialize()) / 4
-        # Generous slack for estimation but must not be 10x over
-        assert approx_tokens < 1000 * 3
+        # Tight check against the char budget (token_budget * 4 chars/token).
+        # Allow a small constant overhead for per-entry headers, but not
+        # the 3× slack the previous version had — that masked trimming
+        # regressions (Copilot review of #250).
+        char_budget = 1000 * 4
+        overhead = 200  # ~50 tokens of headers across multiple entries
+        assert len(pack.serialize()) <= char_budget + overhead
 
     def test_small_cluster_well_under_budget(self, tmp_path):
         _write_md(tmp_path, "docs/quick.md", "# Quick\n\nA short note.\n")

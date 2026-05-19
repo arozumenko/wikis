@@ -167,6 +167,10 @@ def _extract_toc(md_text: str) -> list[str]:
     chunker drops per the "skip empty sections" rule from #231 / Rio's
     review of #248) still surface their TOC.
 
+    Headings are NOT deduplicated by name — a doc with two `## Setup`
+    sections under different H1s legitimately has both in its TOC, and
+    losing one would distort the structure the planner sees.
+
     H3+ are excluded by design. Fenced code blocks are masked so a
     ``# install`` line inside ```bash isn't picked up.
     """
@@ -175,12 +179,10 @@ def _extract_toc(md_text: str) -> list[str]:
         return " " * (m.end() - m.start())
 
     masked = _TOC_FENCE_RE.sub(_blank, md_text)
-    seen: set[str] = set()
     toc: list[str] = []
     for m in _TOC_HEADING_RE.finditer(masked):
         heading = m.group(2).strip()
-        if heading and heading not in seen:
-            seen.add(heading)
+        if heading:
             toc.append(heading)
     return toc[:_MAX_TOC_ENTRIES_PER_DOC]
 
@@ -225,16 +227,15 @@ def _process_doc(repo_root: str, rel_path: str) -> dict | None:
 
     chunks = chunk_markdown(text, doc_path=rel_path)
 
-    # Title: prefer frontmatter "title" from first chunk, then first H1, else filename.
+    # Title: first H1 of the first non-preamble chunk, falling back to
+    # filename. Frontmatter parsing is intentionally out of scope here —
+    # plain markdown rarely carries YAML frontmatter, and Confluence /
+    # Jira packs (#234 / #235) handle that themselves.
     title = ""
-    if chunks and chunks[0].frontmatter:
-        title = str(chunks[0].frontmatter.get("title", "")).strip()
-    if not title:
-        # First heading_path entry of the first non-preamble chunk is the H1/root heading.
-        for chunk in chunks:
-            if chunk.heading_path:
-                title = chunk.heading_path[0]
-                break
+    for chunk in chunks:
+        if chunk.heading_path:
+            title = chunk.heading_path[0]
+            break
     if not title:
         title = Path(rel_path).name
 
@@ -257,28 +258,43 @@ def _enforce_total_budget(pack: MarkdownEvidencePack, char_budget: int) -> None:
 
     At least one entry is always kept (even if over budget) so the pack is
     never empty for a non-empty cluster.
+
+    Implementation note: we serialise once up front and then track the
+    delta as we pop list items, rather than re-serialising the whole pack
+    on every loop iteration. Re-serialising would be O(n²) on cluster
+    size; the delta is O(1) per pop.
     """
-    # Quick exit: already under budget.
-    if len(pack.serialize()) <= char_budget:
+    current_len = len(pack.serialize())
+    if current_len <= char_budget:
         return
 
     # Phase 1: trim attachment lists per entry (least informative per char).
     for entry in pack.doc_entries:
-        while len(pack.serialize()) > char_budget and len(entry.get("attachments", [])) > 1:
-            entry["attachments"].pop()
-        if len(pack.serialize()) <= char_budget:
+        attachments: list[str] = entry.get("attachments", [])
+        while current_len > char_budget and len(attachments) > 1:
+            dropped = attachments.pop()
+            # Removed line is `"  - {dropped}\n"` — see serialize().
+            current_len -= len(dropped) + 5
+        if current_len <= char_budget:
             return
 
     # Phase 2: trim TOC entries per entry.
     for entry in pack.doc_entries:
-        while len(pack.serialize()) > char_budget and len(entry.get("toc", [])) > 2:
-            entry["toc"].pop()
-        if len(pack.serialize()) <= char_budget:
+        toc: list[str] = entry.get("toc", [])
+        while current_len > char_budget and len(toc) > 2:
+            dropped = toc.pop()
+            current_len -= len(dropped) + 5
+
+        if current_len <= char_budget:
             return
 
-    # Phase 3: drop whole entries from the tail (cheapest to discard).
-    while len(pack.serialize()) > char_budget and len(pack.doc_entries) > 1:
+    # Phase 3: drop whole entries from the tail. Re-measure once per drop
+    # because computing an exact serialised-size delta for a whole entry
+    # is fiddly (header + multiple sections); whole-entry drops are rare
+    # so the cost is fine.
+    while current_len > char_budget and len(pack.doc_entries) > 1:
         pack.doc_entries.pop()
+        current_len = len(pack.serialize())
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
