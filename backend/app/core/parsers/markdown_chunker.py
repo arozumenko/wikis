@@ -38,8 +38,11 @@ _H3_FALLBACK_TOKENS = 2000
 # H1/H2/H3 ATX heading lines (with optional trailing #).
 _HEADING_RE = re.compile(r"^(#{1,3})\s+(.*?)(?:\s+#+)?\s*$", re.MULTILINE)
 
-# Markdown image syntax: ![alt text](path/to/file.ext)
-_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+# Markdown image syntax: ![alt text](path/to/file.ext) — path is lazy
+# so an optional `"title"` (preceded by whitespace) doesn't get folded into
+# it. Allows spaces in paths, which Confluence attachment exports use
+# routinely (e.g. `![Diagram](My Diagram.png)`).
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+?)(?:\s+\"[^\"]*\")?\)")
 
 # Pre-existing attachment placeholder (already canonical; pass through).
 _ATTACHMENT_PLACEHOLDER_RE = re.compile(r"\[\[attachment:\s*([^\]]+)\]\]")
@@ -114,7 +117,9 @@ def _normalise_attachments(body: str) -> tuple[str, set[str]]:
     """Rewrite ``![alt](path)`` to ``[[attachment: path]]`` and collect names.
 
     Pre-existing ``[[attachment: …]]`` placeholders are left in place and also
-    collected. Returns the transformed body and the set of attachment paths.
+    collected. Image syntax inside fenced code blocks is preserved verbatim
+    and excluded from the attachment set — those are examples, not real
+    attachments. Returns the transformed body and the set of attachment paths.
     """
     attachments: list[str] = []
 
@@ -125,12 +130,18 @@ def _normalise_attachments(body: str) -> tuple[str, set[str]]:
         existing_spans.append((m.start(), m.end()))
         existing_names.append(m.group(1).strip())
 
+    # Code-fence spans — image syntax inside is left untouched.
+    code_spans: list[tuple[int, int]] = [(m.start(), m.end()) for m in _FENCED_BLOCK_RE.finditer(body)]
+
     def _in_existing(start: int) -> bool:
         return any(s <= start < e for s, e in existing_spans)
 
+    def _in_code(start: int) -> bool:
+        return any(s <= start < e for s, e in code_spans)
+
     parts: list[tuple[int, int, str]] = []  # (start, end, replacement)
     for m in _IMAGE_RE.finditer(body):
-        if _in_existing(m.start()):
+        if _in_existing(m.start()) or _in_code(m.start()):
             continue
         path = m.group(2)
         parts.append((m.start(), m.end(), f"[[attachment: {path}]]"))
@@ -184,8 +195,11 @@ def _split_with_h3_fallback(
         chunks.append(_build_chunk(doc_path, heading_path, raw_body, frontmatter, idx))
         return chunks, idx + 1
 
-    # Find H3 positions in the body.
-    h3_positions = [(m.start(), m.group(2).strip()) for m in _HEADING_RE.finditer(raw_body) if len(m.group(1)) == 3]
+    # Mask fenced code so a `### fake_h3` inside a code block isn't taken
+    # as a split point. Mirrors the same mask used by the top-level H1/H2
+    # scan in `chunk_markdown`.
+    masked_body = _mask_fenced_code(raw_body)
+    h3_positions = [(m.start(), m.group(2).strip()) for m in _HEADING_RE.finditer(masked_body) if len(m.group(1)) == 3]
 
     if not h3_positions:
         # No H3s to fall back on; emit as one oversized chunk.

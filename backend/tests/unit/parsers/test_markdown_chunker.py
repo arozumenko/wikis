@@ -121,6 +121,17 @@ class TestH3Fallback:
         assert len(h3_chunks) >= 1
         assert h3_chunks[0].heading_path == ["Root", "Parent", "Child"]
 
+    def test_h3_inside_fenced_code_block_not_a_split(self):
+        # Rio 1st-review: H3 fallback runs on a >2000-token body and was
+        # scanning raw text. A ``` block with `### example` inside would
+        # be mis-split. Now the scan masks fenced code first.
+        big_body = " ".join(["word"] * 2100)
+        md = f"# Title\n\n## Big\n\n{big_body}\n\n```bash\n### fake_h3_in_code\n```\n\nMore prose."
+        chunks = chunk_markdown(md, doc_path="doc.md")
+        # No chunk should have "fake_h3_in_code" as a heading level.
+        paths = [c.heading_path for c in chunks]
+        assert not any("fake_h3_in_code" in path for path in paths)
+
 
 # ── Frontmatter preservation ─────────────────────────────────────────────────
 
@@ -214,6 +225,40 @@ class TestAttachmentHandling:
         chunk_b = next(c for c in chunks if "B" in c.heading_path)
         assert "img.png" in chunk_a.attachments
         assert "img.png" not in chunk_b.attachments
+
+    def test_image_path_with_spaces_captured(self):
+        # Confluence-style attachment names commonly include spaces. The
+        # path portion must match even when it contains whitespace.
+        md = "# Section\n\n![Diagram](my diagram.png)"
+        chunks = chunk_markdown(md, doc_path="doc.md")
+        assert "[[attachment: my diagram.png]]" in chunks[0].body
+        assert "my diagram.png" in chunks[0].attachments
+
+    def test_image_with_title_attribute_path_only(self):
+        md = '# Section\n\n![alt](photo.jpg "Photo title")\n'
+        chunks = chunk_markdown(md, doc_path="doc.md")
+        assert "[[attachment: photo.jpg]]" in chunks[0].body
+        assert "photo.jpg" in chunks[0].attachments
+
+    def test_image_with_spaces_and_title(self):
+        md = '# Section\n\n![Diagram](my diagram.png "The diagram")\n'
+        chunks = chunk_markdown(md, doc_path="doc.md")
+        assert "[[attachment: my diagram.png]]" in chunks[0].body
+        assert "my diagram.png" in chunks[0].attachments
+
+    def test_image_inside_code_fence_left_alone(self):
+        # Image syntax inside a ``` block is an example, not a real
+        # attachment — must not be normalised and must not show up in
+        # `Chunk.attachments`.
+        md = "# Section\n\n```\n![example](code.png)\n```\n\nReal: ![real](real.png)"
+        chunks = chunk_markdown(md, doc_path="doc.md")
+        # Code-block syntax preserved verbatim.
+        assert "![example](code.png)" in chunks[0].body
+        # Real image normalised.
+        assert "[[attachment: real.png]]" in chunks[0].body
+        # Only the real attachment is collected.
+        assert "real.png" in chunks[0].attachments
+        assert "code.png" not in chunks[0].attachments
 
 
 # ── Edge cases ───────────────────────────────────────────────────────────────
