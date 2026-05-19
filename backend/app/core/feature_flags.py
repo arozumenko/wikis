@@ -1,13 +1,9 @@
 """
-Feature flags for clustering improvements.
+Feature flags for wiki generation pipeline.
 
 All flags default to **enabled** — the improved Leiden-based pipeline
 runs by default.  Set the corresponding ``WIKIS_CLUSTER_*`` environment
 variable to ``0`` / ``false`` / ``no`` to disable individual flags.
-
-When the UI selects the "cluster" planner type, all Leiden-related
-flags are implicitly ON.  The ``exclude_tests`` flag is derived from
-the UI toggle.
 
 Usage::
 
@@ -67,14 +63,8 @@ class FeatureFlags:
     #: Replace Louvain two-pass pipeline with hierarchical Leiden.
     hierarchical_leiden: bool = True
 
-    #: Enable deterministic candidate builder + page-quality validator.
-    capability_validation: bool = True
-
     #: Enable shared smart-expansion layer in cluster expansion.
     smart_expansion: bool = True
-
-    #: Enable explicit coverage tracking via the coverage ledger.
-    coverage_ledger: bool = True
 
     #: Enable language-specific heuristics for page shaping.
     language_hints: bool = True
@@ -275,22 +265,13 @@ class FeatureFlags:
     #: break IDs on minor churn. Tunable via WIKIS_CLUSTER_STABILITY_THRESHOLD.
     cluster_stability_threshold: float = 0.5
 
-    # ── Unified pipeline (#243) ────────────────────────────────────────
-
-    #: Opt-in: replace the old two planner paths with the unified
-    #: planner → writer → gate → verifier pipeline.  Default **off**
-    #: until the full writer agent ships in a follow-up PR.
-    #: Enable via ``WIKIS_UNIFIED_PIPELINE=1``.
-    unified_pipeline: bool = False
 
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
     return FeatureFlags(
         hierarchical_leiden=_env_bool("WIKIS_CLUSTER_HIERARCHICAL_LEIDEN"),
-        capability_validation=_env_bool("WIKIS_CLUSTER_CAPABILITY_VALIDATION"),
         smart_expansion=_env_bool("WIKIS_CLUSTER_SMART_EXPANSION"),
-        coverage_ledger=_env_bool("WIKIS_CLUSTER_COVERAGE_LEDGER"),
         language_hints=_env_bool("WIKIS_CLUSTER_LANGUAGE_HINTS"),
         exclude_tests=_env_bool("WIKIS_EXCLUDE_TESTS"),
         pg_ts_rank_cap=_env_float("WIKI_TS_RANK_CAP", 1.0),
@@ -329,5 +310,4 @@ def get_feature_flags() -> FeatureFlags:
         cluster_stability_threshold=_env_float(
             "WIKIS_CLUSTER_STABILITY_THRESHOLD", 0.5,
         ),
-        unified_pipeline=_env_bool("WIKIS_UNIFIED_PIPELINE", False),
     )

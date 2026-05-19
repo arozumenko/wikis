@@ -21,13 +21,47 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from dataclasses import dataclass as _dataclass
+from typing import Dict as _Dict
+
 from ..constants import (
     DOC_CLUSTER_SYMBOLS,
     PAGE_IDENTITY_SYMBOLS,
     SUPPORTING_CODE_SYMBOLS,
     SYMBOL_TYPE_PRIORITY,
 )
-from .candidate_builder import CandidateRecord
+
+
+# Classification labels (formerly in candidate_builder, moved here for #242).
+CLASS_CODE = "code"
+CLASS_MIXED = "mixed"
+CLASS_DOCS = "docs"
+CLASS_BRIDGE = "bridge"
+
+
+@_dataclass
+class CandidateRecord:
+    """Minimal record for a micro-cluster candidate (formerly in candidate_builder).
+
+    Retained for coverage_ledger / page_validator compat after candidate_builder
+    was removed in #242.
+    """
+
+    macro_id: int
+    micro_id: int
+    node_ids: list
+    classification: str = ""
+    code_identity_score: float = 0.0
+    implementation_evidence: float = 0.0
+    docs_dominance: float = 0.0
+    public_api_presence: float = 0.0
+    utility_contamination: float = 0.0
+    file_spread: int = 0
+    node_details: list = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.node_details is None:
+            self.node_details = []
 
 logger = logging.getLogger(__name__)
 

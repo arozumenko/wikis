@@ -427,28 +427,17 @@ class WikiService:
 
             await self._emit_progress(invocation, "configuring", 0.05, "Preparing wiki generation")
 
-            # Resolve generation options (request overrides → config defaults).
+            # The unified pipeline is the only path (#242).
+            # planner_type from the request is a no-op; log a deprecation warning
+            # the first time a caller still sends it so operators can update clients.
             planner_type = request.planner_type if request.planner_type is not None else self.settings.planner_type
-
-            # When the unified-pipeline feature flag is on (set via
-            # WIKIS_UNIFIED_PIPELINE=1), the unified planner+writer+gate+verifier
-            # pipeline (#243) runs inside the subprocess regardless of planner_type.
-            # The env var is inherited by the subprocess automatically.
-            from app.core.feature_flags import get_feature_flags  # noqa: PLC0415
-            if get_feature_flags().unified_pipeline:
-                logger.info(
-                    "WIKIS_UNIFIED_PIPELINE=1 — unified pipeline will override planner_type=%r in subprocess",
-                    planner_type,
+            if request.planner_type is not None:
+                logger.warning(
+                    "DEPRECATED: planner_type=%r was supplied but is ignored — "
+                    "the unified pipeline is now the only path (#242).",
+                    request.planner_type,
                 )
-
-            # exclude_tests only applies to the cluster planner; agent planner ignores it.
-            if planner_type == "cluster":
-                exclude_tests = (
-                    request.exclude_tests if request.exclude_tests is not None
-                    else self.settings.cluster_exclude_tests
-                )
-            else:
-                exclude_tests = False
+            exclude_tests = False
 
             await self._emit_progress(invocation, "indexing", 0.1, "Cloning repository and building index")
 
