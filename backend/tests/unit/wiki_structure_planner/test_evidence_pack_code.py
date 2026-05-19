@@ -26,7 +26,6 @@ from app.core.wiki_structure_planner.structure_skeleton import (
     Cluster,
 )
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -82,11 +81,13 @@ class TestEvidencePackDataclass:
         result = pack.serialize()
         assert isinstance(result, str)
 
-    def test_serialize_empty_pack_returns_non_empty(self):
-        # Even an empty pack should return some metadata.
+    def test_serialize_empty_pack_carries_cluster_metadata(self):
+        # Empty packs must still emit the cluster header so downstream
+        # consumers can identify which cluster the pack is for.
         pack = EvidencePack(cluster_id=2, kind="code")
         result = pack.serialize()
-        assert "2" in result or len(result) > 0
+        assert "cluster=2" in result
+        assert "kind=code" in result
 
     def test_serialize_includes_signatures(self):
         pack = EvidencePack(
@@ -124,9 +125,7 @@ class TestEvidencePackDataclass:
 
 class TestBuildPackBasic:
     def test_returns_evidence_pack(self, tmp_path):
-        cluster = _make_cluster(
-            [_artifact("Foo", "src/core/foo.py", "public_api", connections=3)]
-        )
+        cluster = _make_cluster([_artifact("Foo", "src/core/foo.py", "public_api", connections=3)])
         pack = build_pack(cluster, repo_root=str(tmp_path))
         assert isinstance(pack, EvidencePack)
 
@@ -157,56 +156,63 @@ class TestBuildPackBasic:
 
 class TestSignatureSelection:
     def test_signatures_extracted_from_artifacts(self, tmp_path):
-        cluster = _make_cluster([
-            _artifact("Foo", "src/foo.py", "public_api", connections=5, summary="Does foo"),
-            _artifact("Bar", "src/bar.py", "core_type", connections=2, summary="Does bar"),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("Foo", "src/foo.py", "public_api", connections=5, summary="Does foo"),
+                _artifact("Bar", "src/bar.py", "core_type", connections=2, summary="Does bar"),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         names = [s[0] for s in pack.signatures]
         assert "Foo" in names
         assert "Bar" in names
 
     def test_entry_point_ranked_first(self, tmp_path):
-        cluster = _make_cluster([
-            _artifact("CoreUtil", "src/util.py", "core_type", connections=10),
-            _artifact("MainEntry", "src/main.py", "entry_point", connections=1),
-            _artifact("PubApi", "src/api.py", "public_api", connections=5),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("CoreUtil", "src/util.py", "core_type", connections=10),
+                _artifact("MainEntry", "src/main.py", "entry_point", connections=1),
+                _artifact("PubApi", "src/api.py", "public_api", connections=5),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         names = [s[0] for s in pack.signatures]
         assert names[0] == "MainEntry"
 
     def test_public_api_ranked_before_core_type(self, tmp_path):
-        cluster = _make_cluster([
-            _artifact("CoreThing", "src/core.py", "core_type", connections=20),
-            _artifact("ApiHandler", "src/api.py", "public_api", connections=1),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("CoreThing", "src/core.py", "core_type", connections=20),
+                _artifact("ApiHandler", "src/api.py", "public_api", connections=1),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         names = [s[0] for s in pack.signatures]
         assert names.index("ApiHandler") < names.index("CoreThing")
 
     def test_within_same_layer_higher_connections_ranked_first(self, tmp_path):
-        cluster = _make_cluster([
-            _artifact("LowConn", "src/a.py", "public_api", connections=1),
-            _artifact("HighConn", "src/b.py", "public_api", connections=50),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("LowConn", "src/a.py", "public_api", connections=1),
+                _artifact("HighConn", "src/b.py", "public_api", connections=50),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         names = [s[0] for s in pack.signatures]
         assert names[0] == "HighConn"
 
     def test_top_k_limits_signatures(self, tmp_path):
-        artifacts = [
-            _artifact(f"Sym{i}", f"src/sym{i}.py", "core_type", connections=i)
-            for i in range(30)
-        ]
+        artifacts = [_artifact(f"Sym{i}", f"src/sym{i}.py", "core_type", connections=i) for i in range(30)]
         cluster = _make_cluster(artifacts)
         pack = build_pack(cluster, repo_root=str(tmp_path), top_k=10)
         assert len(pack.signatures) <= 10
 
     def test_signature_tuple_has_expected_fields(self, tmp_path):
-        cluster = _make_cluster([
-            _artifact("Foo", "src/foo.py", "public_api", connections=3, summary="Does foo"),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("Foo", "src/foo.py", "public_api", connections=3, summary="Does foo"),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         assert len(pack.signatures) >= 1
         sig = pack.signatures[0]
@@ -230,9 +236,11 @@ class TestFileHeadReading:
     def test_reads_entry_point_file_head(self, tmp_path):
         content = "\n".join(f"line {i}" for i in range(60))
         self._setup_files(tmp_path, {"src/main.py": content})
-        cluster = _make_cluster([
-            _artifact("Main", "src/main.py", "entry_point", connections=1),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("Main", "src/main.py", "entry_point", connections=1),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         assert len(pack.file_heads) >= 1
         head_paths = [fh[0] for fh in pack.file_heads]
@@ -241,9 +249,11 @@ class TestFileHeadReading:
     def test_reads_public_api_file_head(self, tmp_path):
         content = "def api_func():\n    pass\n"
         self._setup_files(tmp_path, {"src/api.py": content})
-        cluster = _make_cluster([
-            _artifact("ApiFunc", "src/api.py", "public_api", connections=2),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("ApiFunc", "src/api.py", "public_api", connections=2),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         head_paths = [fh[0] for fh in pack.file_heads]
         assert "src/api.py" in head_paths
@@ -251,9 +261,11 @@ class TestFileHeadReading:
     def test_skips_core_type_file_head(self, tmp_path):
         content = "class CoreThing:\n    pass\n"
         self._setup_files(tmp_path, {"src/core.py": content})
-        cluster = _make_cluster([
-            _artifact("CoreThing", "src/core.py", "core_type", connections=3),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("CoreThing", "src/core.py", "core_type", connections=3),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         head_paths = [fh[0] for fh in pack.file_heads]
         assert "src/core.py" not in head_paths
@@ -261,9 +273,11 @@ class TestFileHeadReading:
     def test_head_limited_to_40_lines(self, tmp_path):
         content = "\n".join(f"line {i}" for i in range(100))
         self._setup_files(tmp_path, {"src/main.py": content})
-        cluster = _make_cluster([
-            _artifact("Main", "src/main.py", "entry_point"),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("Main", "src/main.py", "entry_point"),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         head_text = next(fh[1] for fh in pack.file_heads if fh[0] == "src/main.py")
         assert len(head_text.splitlines()) <= 40
@@ -271,19 +285,23 @@ class TestFileHeadReading:
     def test_deduplicates_same_file_multiple_symbols(self, tmp_path):
         content = "def foo():\n    pass\ndef bar():\n    pass\n"
         self._setup_files(tmp_path, {"src/api.py": content})
-        cluster = _make_cluster([
-            _artifact("Foo", "src/api.py", "public_api", connections=1),
-            _artifact("Bar", "src/api.py", "public_api", connections=2),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("Foo", "src/api.py", "public_api", connections=1),
+                _artifact("Bar", "src/api.py", "public_api", connections=2),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         head_paths = [fh[0] for fh in pack.file_heads]
         assert head_paths.count("src/api.py") == 1
 
     def test_missing_file_omitted_gracefully(self, tmp_path):
         # File referenced by artifact doesn't exist on disk — should not raise.
-        cluster = _make_cluster([
-            _artifact("Ghost", "src/ghost.py", "entry_point"),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("Ghost", "src/ghost.py", "entry_point"),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         # Should not raise; file simply absent from heads
         assert isinstance(pack, EvidencePack)
@@ -336,7 +354,7 @@ class TestReadmeExcerpt:
         assert "README lowercase" in pack.readme_excerpt
 
     def test_picks_first_cluster_dir_readme(self, tmp_path):
-        # When multiple dirs have READMEs, use the first one found.
+        # When multiple dirs have READMEs, the first dir in cluster.dirs wins.
         for d in ["src/a", "src/b"]:
             readme = tmp_path / d / "README.md"
             readme.parent.mkdir(parents=True, exist_ok=True)
@@ -349,8 +367,9 @@ class TestReadmeExcerpt:
             dirs=["src/a", "src/b"],
         )
         pack = build_pack(cluster, repo_root=str(tmp_path))
-        # Should find at least one README
-        assert pack.readme_excerpt != ""
+        # Determinism: src/a is listed first in cluster.dirs → its README wins.
+        assert "README in src/a" in pack.readme_excerpt
+        assert "README in src/b" not in pack.readme_excerpt
 
 
 # ── build_pack — SQL CREATE TABLE extraction ──────────────────────────────────
@@ -435,15 +454,62 @@ class TestTruncation:
 
     def test_truncation_preserves_entry_point_over_infrastructure(self, tmp_path):
         # Mix of high-priority and low-priority symbols; truncation should keep entry_point.
-        artifacts = (
-            [_artifact(f"Infra{i}", f"src/infra{i}.py", "infrastructure", connections=100 + i, summary="y" * 300)
-             for i in range(20)]
-            + [_artifact("EntryMain", "src/main.py", "entry_point", connections=1, summary="main")]
-        )
+        artifacts = [
+            _artifact(f"Infra{i}", f"src/infra{i}.py", "infrastructure", connections=100 + i, summary="y" * 300)
+            for i in range(20)
+        ] + [_artifact("EntryMain", "src/main.py", "entry_point", connections=1, summary="main")]
         cluster = _make_cluster(artifacts)
         pack = build_pack(cluster, repo_root=str(tmp_path), token_budget=300)
         names = [s[0] for s in pack.signatures]
         assert "EntryMain" in names
+
+    def test_total_pack_respects_budget_with_large_readme(self, tmp_path):
+        # Large README + file heads + SQL — total pack must stay near budget.
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "README.md").write_text("README line.\n" * 500)
+        (tmp_path / "src" / "schema.sql").write_text("CREATE TABLE t1 (id INT);\n" * 200)
+        (tmp_path / "src" / "main.py").write_text("def main():\n    pass\n" * 200)
+        cluster = _make_cluster(
+            [_artifact("Main", "src/main.py", "entry_point")],
+            dirs=["src"],
+        )
+        pack = build_pack(cluster, repo_root=str(tmp_path), token_budget=400)
+        # Allow modest overshoot (1.5x) for token-estimation slack but
+        # enforce that giant inputs no longer bloat the pack to 10x+.
+        assert len(pack.serialize()) / 4 < 400 * 1.5
+
+
+# ── build_pack — heterogeneous cluster filter ─────────────────────────────────
+
+
+class TestSymbolFilter:
+    def test_doc_artifacts_excluded_from_code_pack(self, tmp_path):
+        # A mixed cluster (symbol + doc_section) must produce a code pack
+        # with ONLY symbol signatures — doc artifacts don't belong here.
+        from app.core.wiki_structure_planner.structure_skeleton import ArtifactInfo
+
+        cluster = _make_cluster(
+            [
+                _artifact("RealCode", "src/code.py", "public_api"),
+                ArtifactInfo(
+                    kind="doc_section",
+                    name="Docs Page",
+                    source_path="docs/intro.md",
+                    summary="intro",
+                ),
+                ArtifactInfo(
+                    kind="jira_issue",
+                    name="PROJ-123",
+                    source_path="jira/PROJ-123.md",
+                    issue_type="story",
+                ),
+            ]
+        )
+        pack = build_pack(cluster, repo_root=str(tmp_path))
+        names = [s[0] for s in pack.signatures]
+        assert "RealCode" in names
+        assert "Docs Page" not in names
+        assert "PROJ-123" not in names
 
 
 # ── Path safety ───────────────────────────────────────────────────────────────
@@ -452,18 +518,22 @@ class TestTruncation:
 class TestPathSafety:
     def test_traversal_in_source_path_rejected(self, tmp_path):
         # Artifact pointing outside repo_root via ../traversal.
-        cluster = _make_cluster([
-            _artifact("Evil", "../../etc/passwd", "entry_point"),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("Evil", "../../etc/passwd", "entry_point"),
+            ]
+        )
         # Should not raise; traversal path simply skipped.
         pack = build_pack(cluster, repo_root=str(tmp_path))
         head_paths = [fh[0] for fh in pack.file_heads]
         assert "../../etc/passwd" not in head_paths
 
     def test_absolute_source_path_rejected(self, tmp_path):
-        cluster = _make_cluster([
-            _artifact("AbsPath", "/etc/passwd", "public_api"),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("AbsPath", "/etc/passwd", "public_api"),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         head_paths = [fh[0] for fh in pack.file_heads]
         assert "/etc/passwd" not in head_paths
@@ -491,9 +561,11 @@ class TestPathSafety:
             link.symlink_to("/etc/passwd")
         except (OSError, NotImplementedError):
             pytest.skip("symlinks not supported on this platform")
-        cluster = _make_cluster([
-            _artifact("Evil", "src/evil_link.py", "entry_point"),
-        ])
+        cluster = _make_cluster(
+            [
+                _artifact("Evil", "src/evil_link.py", "entry_point"),
+            ]
+        )
         pack = build_pack(cluster, repo_root=str(tmp_path))
         # File head should not contain /etc/passwd content.
         for _, head in pack.file_heads:

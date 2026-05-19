@@ -159,17 +159,21 @@ def _read_file_head(repo_root: str, rel_path: str, max_lines: int = 40) -> str |
     """Read up to *max_lines* lines from *rel_path* under *repo_root*.
 
     Returns None when the path is unsafe or the file cannot be read.
+    Uses streaming reads so a large source file is not fully loaded just
+    to keep the first few dozen lines.
     """
+    import itertools
+
     safe = _safe_join(repo_root, rel_path)
     if safe is None:
         logger.debug("evidence: path escape rejected: %r", rel_path)
         return None
     try:
-        text = Path(safe).read_text(encoding="utf-8", errors="replace")
+        with open(safe, encoding="utf-8", errors="replace") as fh:
+            lines = list(itertools.islice(fh, max_lines))
     except (OSError, PermissionError):
         return None
-    lines = text.splitlines()
-    return "\n".join(lines[:max_lines])
+    return "".join(lines).rstrip("\n")
 
 
 def _find_readme(repo_root: str, dir_path: str) -> str | None:
@@ -217,6 +221,7 @@ def _extract_sql_blocks(repo_root: str, dir_path: str) -> list[str]:
 
 
 def _estimate_tokens(text: str) -> int:
+    """Rough token estimate from char count. Used for total-pack budgeting."""
     return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
@@ -235,6 +240,69 @@ def _truncate_signatures_to_budget(
         dropped = result.pop()  # remove lowest-priority entry
         total -= len(f"  {dropped[2]:16s} {dropped[0]} ({dropped[1]}) — {dropped[3]}") + 1
     return result
+
+
+# Per-section character caps (rough fractions of the total budget).
+# When the total is 1500 tokens × 4 chars/token = 6000 chars, these split:
+#   signatures 40%, file_heads 35%, README 15%, SQL 10%.
+_SECTION_FRACTIONS = {
+    "signatures": 0.40,
+    "file_heads": 0.35,
+    "readme": 0.15,
+    "sql": 0.10,
+}
+
+
+def _enforce_total_budget(pack: EvidencePack, char_budget: int) -> None:
+    """Cap each section then trim from the lowest priority if total still over.
+
+    Order of truncation when over-budget: SQL → README → file_heads → signatures.
+    Signatures are most informative for naming, so they're shed last.
+    """
+    file_head_cap = int(char_budget * _SECTION_FRACTIONS["file_heads"])
+    readme_cap = int(char_budget * _SECTION_FRACTIONS["readme"])
+    sql_cap = int(char_budget * _SECTION_FRACTIONS["sql"])
+
+    pack.file_heads = _cap_file_heads(pack.file_heads, file_head_cap)
+    pack.readme_excerpt = pack.readme_excerpt[:readme_cap]
+    pack.sql_blocks = _cap_sql_blocks(pack.sql_blocks, sql_cap)
+
+    while len(pack.serialize()) > char_budget:
+        if pack.sql_blocks:
+            pack.sql_blocks.pop()
+        elif pack.readme_excerpt:
+            pack.readme_excerpt = ""
+        elif pack.file_heads:
+            pack.file_heads.pop()
+        elif len(pack.signatures) > 1:
+            pack.signatures.pop()
+        else:
+            break  # one signature minimum, accept overflow
+
+
+def _cap_file_heads(file_heads: list[tuple[str, str]], char_cap: int) -> list[tuple[str, str]]:
+    """Keep file heads until adding the next one would exceed char_cap."""
+    capped: list[tuple[str, str]] = []
+    total = 0
+    for path, head in file_heads:
+        entry_len = len(path) + len(head) + 6  # rough header overhead
+        if total + entry_len > char_cap and capped:
+            break
+        capped.append((path, head))
+        total += entry_len
+    return capped
+
+
+def _cap_sql_blocks(blocks: list[str], char_cap: int) -> list[str]:
+    """Keep SQL blocks while remaining under char_cap."""
+    capped: list[str] = []
+    total = 0
+    for block in blocks:
+        if total + len(block) > char_cap and capped:
+            break
+        capped.append(block)
+        total += len(block)
+    return capped
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -274,12 +342,12 @@ def build_pack(
     char_budget = token_budget * _CHARS_PER_TOKEN
 
     # ── 1. Signatures (sorted by layer priority, capped at top_k) ────────
-    sorted_arts = _sorted_artifacts(cluster.artifacts)
+    # Code clusters can hold heterogeneous artifacts; filter to symbols so
+    # doc / jira / confluence entries don't leak into the signatures block.
+    symbol_artifacts = [a for a in cluster.artifacts if a.kind == "symbol"]
+    sorted_arts = _sorted_artifacts(symbol_artifacts)
     top_artifacts = sorted_arts[:top_k]
-    signatures: list[tuple[str, str, str, str]] = [
-        (a.name, a.source_path, a.layer, a.summary)
-        for a in top_artifacts
-    ]
+    signatures: list[tuple[str, str, str, str]] = [(a.name, a.source_path, a.layer, a.summary) for a in top_artifacts]
 
     # ── 2. File heads (entry_point / public_api layers only, deduplicated) ─
     seen_paths: set[str] = set()
@@ -307,12 +375,12 @@ def build_pack(
     for dir_path in cluster.dirs:
         sql_blocks.extend(_extract_sql_blocks(repo_root, dir_path))
 
-    # ── 5. Truncate signatures if over budget ─────────────────────────────
-    # Reserve budget proportionally for each section; signatures get ~40%.
-    sig_budget_chars = int(char_budget * 0.40)
+    # ── 5. Per-section caps + total-budget enforcement ────────────────────
+    # Signatures are most informative for naming, so they're shed last.
+    sig_budget_chars = int(char_budget * _SECTION_FRACTIONS["signatures"])
     signatures = _truncate_signatures_to_budget(signatures, sig_budget_chars)
 
-    return EvidencePack(
+    pack = EvidencePack(
         cluster_id=cluster.cluster_id,
         kind=kind,
         signatures=signatures,
@@ -320,3 +388,5 @@ def build_pack(
         readme_excerpt=readme_excerpt,
         sql_blocks=sql_blocks,
     )
+    _enforce_total_budget(pack, char_budget)
+    return pack
