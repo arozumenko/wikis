@@ -408,6 +408,33 @@ class TestParseFrontmatterMultiLineLists:
         assert "normal" in fm["labels"]
 
 
+class TestParseFrontmatterScalarToListUpgrade:
+    """Scalar value followed by ``- item`` lines upgrades to a list.
+
+    Preserves the pre-#261 Confluence/md parser behaviour (Copilot review).
+    """
+
+    def test_scalar_then_list_items_upgrades_to_list(self):
+        text = "---\nlabels: oldscalar\n  - first\n  - second\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        # Scalar is dropped; list wins.
+        assert fm.get("labels") == ["first", "second"]
+
+    def test_scalar_with_no_following_list_stays_scalar(self):
+        text = "---\nlabels: just_a_scalar\ntitle: Doc\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=False, strip_quotes=False)
+        assert fm.get("labels") == "just_a_scalar"
+        assert fm.get("title") == "Doc"
+
+    def test_inline_list_does_not_accept_following_items(self):
+        # Inline lists are complete on their line — subsequent ``- item``
+        # lines are orphaned (current_key cleared after inline parse).
+        text = "---\nlabels: ['a', 'b']\n  - c\n---\n\nBody.\n"
+        fm, _ = parse_frontmatter(text, inline_lists=True, strip_quotes=True)
+        # The inline list wins; "c" is orphaned.
+        assert fm.get("labels") == ["a", "b"]
+
+
 class TestParseFrontmatterBlankLineHandling:
     """Blank line mid-list terminates the list (Rio #252 fix)."""
 
@@ -539,7 +566,7 @@ class TestParseFrontmatterJiraMode:
         assert "# Epic Body" in body
 
     def test_jira_quoted_scalar(self):
-        text = '---\nsummary: "Quoted Summary"\nstatus: \'In Progress\'\nissue_type: epic\n---\n\nBody.\n'
+        text = "---\nsummary: \"Quoted Summary\"\nstatus: 'In Progress'\nissue_type: epic\n---\n\nBody.\n"
         fm, _ = parse_frontmatter(text, inline_lists=True, strip_quotes=True)
         assert fm["summary"] == "Quoted Summary"
         assert fm["status"] == "In Progress"

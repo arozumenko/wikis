@@ -196,9 +196,20 @@ def parse_frontmatter(
             close_idx = i
             break
 
-        # List item: must come after a key that started a list
+        # List item: any indented ``- item`` line whose preceding key context
+        # is still active. If the current value is a scalar, the prior parsers
+        # upgrade it to a list (drop the scalar, start fresh). This preserves
+        # the Confluence/md behaviour where:
+        #     key: scalar
+        #       - first
+        #       - second
+        # produces ``key: ["first", "second"]``.
         list_m = _FM_LIST_ITEM_RE.match(line)
-        if list_m and current_key is not None and current_list is not None:
+        if list_m and current_key is not None:
+            if current_list is None:
+                current_list = []
+                fm.pop(current_key, None)
+                fm[current_key] = current_list
             item = list_m.group(1).strip()
             if strip_quotes:
                 item = _strip_yaml_quotes(item)
@@ -222,17 +233,21 @@ def parse_frontmatter(
                 # ``fields[key] = current_list`` immediately).
                 fm[current_key] = current_list
             elif inline_lists and (inline := _parse_inline_list(val)) is not None:
-                # Inline list syntax: ``key: [a, b, c]``
+                # Inline list syntax: ``key: [a, b, c]``. Inline lists are
+                # complete on the line — no subsequent ``- item`` lines may
+                # extend them, so clear key context.
                 if strip_quotes:
                     inline = [_strip_yaml_quotes(item) for item in inline]
                 current_key = None
                 current_list = None
                 fm[kv_m.group(1)] = inline
             else:
-                # Scalar value
+                # Scalar value. Keep ``current_key`` set so a subsequent
+                # ``- item`` line can upgrade this scalar to a list (matches
+                # the prior Confluence/md parser behaviour). ``current_list``
+                # stays None to signal "scalar, not list yet."
                 if strip_quotes:
                     val = _strip_yaml_quotes(val)
-                current_key = None
                 current_list = None
                 fm[kv_m.group(1)] = val
             continue
