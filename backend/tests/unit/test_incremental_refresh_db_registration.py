@@ -296,6 +296,15 @@ async def test_incremental_refresh_terminal_status_on_failure(tmp_path) -> None:
     last_call = final_calls[-1]
     assert last_call.kwargs["wiki_id"] == "owner--repo--main"
     assert last_call.kwargs["status"] == "failed"
-    # error kwarg must be present (may be None — invocation.error is set in
-    # some paths but mark_status is always called with it for symmetry)
-    assert "error" in last_call.kwargs
+    # #226: the exception path must capture the exception message on
+    # invocation.error so mark_status forwards it to the WikiRecord and
+    # the dashboard shows the failure reason. Previously the exception
+    # path forgot to set invocation.error, so the DB silently stored
+    # error=None on every refresh failure.
+    error_value = last_call.kwargs.get("error")
+    assert error_value is not None, (
+        f"expected non-None error in mark_status call; got {error_value!r}"
+    )
+    assert "storage exploded" in error_value, (
+        f"expected exception message in error; got {error_value!r}"
+    )

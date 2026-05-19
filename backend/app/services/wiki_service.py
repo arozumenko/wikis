@@ -1188,7 +1188,13 @@ class WikiService:
                     "Incremental refresh complete",
                 ))
             except Exception as exc:  # noqa: BLE001
+                # Mirror _run_generation: capture the exception string on the
+                # invocation so the finally block's mark_status call writes a
+                # non-None ``error`` to WikiRecord and the dashboard surfaces
+                # the failure reason. Previously this path silently flipped
+                # the wiki to "failed" with error=None (#226).
                 invocation.status = "failed"
+                invocation.error = str(exc)
                 invocation.completed_at = datetime.now()
                 logger.exception(
                     "[incremental_refresh] run failed for wiki %s", wiki_id,
