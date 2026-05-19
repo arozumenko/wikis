@@ -394,6 +394,32 @@ class OptimizedWikiGenerationAgent:
                 except Exception:
                     pass
 
+            # ── Unified pipeline path (WIKIS_UNIFIED_PIPELINE=1) ─────
+            from ..feature_flags import get_feature_flags as _get_flags  # noqa: PLC0415
+
+            if _get_flags().unified_pipeline:
+                logger.info("Structure planner: unified pipeline (WIKIS_UNIFIED_PIPELINE=1)")
+                try:
+                    repository_files_for_unified = self._get_repository_file_paths()
+                    unified_result = self._generate_wiki_structure_unified(
+                        repository_files=repository_files_for_unified,
+                        config=config,
+                    )
+                    if unified_result is not None:
+                        logger.info(
+                            "WikiStructureSpec created successfully (unified pipeline, pages=%d)",
+                            len(unified_result.get("wiki_pages", [])),
+                        )
+                        return unified_result
+                    logger.warning(
+                        "Unified pipeline returned no result, falling back to existing planners"
+                    )
+                except Exception as _unified_err:
+                    logger.warning(
+                        "Unified pipeline failed, falling back to existing planners: %s",
+                        _unified_err,
+                    )
+
             # ── Cluster planner path ──────────────────────────────────
             planner_type = state.get("planner_type", self.planner_type)
             exclude_tests = state.get("exclude_tests", self.exclude_tests)
@@ -617,10 +643,31 @@ class OptimizedWikiGenerationAgent:
         else:
             return 25  # default for small repos
 
-    def dispatch_page_generation(self, state: WikiState, config: RunnableConfig) -> list[Send]:
-        """Dispatch parallel page generation using Send"""
+    def dispatch_page_generation(
+        self, state: WikiState, config: RunnableConfig
+    ) -> list[Send] | str:
+        """Dispatch parallel page generation using Send.
+
+        Returns a list of ``Send`` calls into ``generate_page_content`` for the
+        normal path.  When the unified pipeline has already produced pages
+        upstream (``state["wiki_pages"]`` is non-empty), returns the string
+        ``"finalize_wiki"`` so LangGraph routes directly to the reducer and
+        the legacy per-page generator does NOT run a second pass — re-running
+        it would double every page via ``WikiState.wiki_pages``'s
+        ``operator.add`` accumulator.
+        """
 
         logger.info("📄 Dispatching page generation")
+
+        # Unified pipeline (#243) populates wiki_pages upstream.  Skip the
+        # legacy dispatch entirely so we don't generate every page twice.
+        if state.get("wiki_pages"):
+            logger.info(
+                "[UNIFIED] wiki_pages already populated upstream "
+                "(%d pages); skipping legacy page generation",
+                len(state["wiki_pages"]),
+            )
+            return "finalize_wiki"
 
         if not state.get("wiki_structure_spec"):
             # Raising here propagates cleanly through the LangGraph executor and is caught
@@ -1180,7 +1227,9 @@ class OptimizedWikiGenerationAgent:
 
         # Page Generation (map)
         builder.add_conditional_edges(
-            "generate_wiki_structure", self.dispatch_page_generation, ["generate_page_content"]
+            "generate_wiki_structure",
+            self.dispatch_page_generation,
+            ["generate_page_content", "finalize_wiki"],
         )
 
         # Reduce → finalize → export
@@ -2626,6 +2675,379 @@ class OptimizedWikiGenerationAgent:
         structure = WikiStructureSpec.model_validate(data)
 
         return structure
+
+    # -----------------------------------------------------------------
+    # Unified Pipeline Path (#243)
+    # -----------------------------------------------------------------
+
+    def _generate_wiki_structure_unified(
+        self,
+        repository_files: list[str],
+        config: RunnableConfig,
+    ) -> dict[str, Any] | None:
+        """Run the unified planner → writer → gate → verifier pipeline.
+
+        This method is the third structure-planning path, controlled by
+        ``WIKIS_UNIFIED_PIPELINE=1``.  It replaces both the graph-first
+        and the deepagents paths when the flag is enabled.
+
+        The method builds a skeleton, constructs evidence packs in parallel,
+        runs the unified pipeline (planner + writer + gate + verifier), and
+        returns a state dict containing both ``wiki_structure_spec`` and
+        ``wiki_pages`` so ``finalize_wiki`` can operate without an
+        additional page-generation pass.
+
+        Returns ``None`` on failure so the caller can fall through to the
+        existing planners.
+
+        Args:
+            repository_files: All file paths in the repo (relative).
+            config: LangGraph runnable config (unused but kept for symmetry
+                with other _generate_* methods).
+
+        Returns:
+            State dict with ``wiki_structure_spec``, ``wiki_pages``,
+            ``structure_planning_complete``, ``current_phase``; or ``None``
+            if the unified pipeline fails.
+        """
+        import time as _time  # noqa: PLC0415
+
+        from ..wiki_structure_planner.evidence import build_pack  # noqa: PLC0415
+        from ..wiki_structure_planner.evidence_confluence import (  # noqa: PLC0415
+            build_confluence_pack,
+        )
+        from ..wiki_structure_planner.evidence_jira import build_jira_pack  # noqa: PLC0415
+        from ..wiki_structure_planner.evidence_md import build_md_pack  # noqa: PLC0415
+        from ..wiki_structure_planner.structure_skeleton import (  # noqa: PLC0415
+            ArtifactInfo,
+            Cluster,
+            build_skeleton,
+        )
+        from ..wiki_structure_planner.structure_tools import detect_effective_depth  # noqa: PLC0415
+        from .unified_wiki_pipeline import run_unified_pipeline  # noqa: PLC0415
+
+        t0 = _time.time()
+
+        # ── Resolve repo root ─────────────────────────────────────────
+        repo_root_getter = getattr(self.indexer, "get_repo_root", None)
+        repo_root = repo_root_getter() if callable(repo_root_getter) else None
+        if not repo_root or not os.path.isdir(repo_root):
+            logger.error("[UNIFIED] repo_root not available or invalid: %r", repo_root)
+            return None
+
+        # ── Resolve code graph ────────────────────────────────────────
+        code_graph = (
+            getattr(self.retriever_stack, "relationship_graph", None)
+            or getattr(self.indexer, "relationship_graph", None)
+        )
+        if code_graph is None:
+            logger.error("[UNIFIED] code_graph not available")
+            return None
+
+        repo_name = os.path.basename(repo_root.rstrip("/"))
+
+        # ── Compute page budget (same formula as graph-first path) ────
+        file_count = len(repository_files)
+        file_factor = max(8, min(file_count // 25, 120))
+        unique_dirs: set[str] = set()
+        for p in repository_files:
+            parts = p.split("/")
+            for d in range(1, len(parts)):
+                unique_dirs.add("/".join(parts[:d]))
+        dir_count = len(unique_dirs)
+        dir_factor = max(0, min(dir_count // 10, 80))
+        graph_factor = max(0, min(code_graph.number_of_nodes() // 100, 60))
+        raw_budget = (file_factor + dir_factor + graph_factor) // 3
+        page_budget_cap = int(os.getenv("WIKIS_PAGE_BUDGET_CAP", "200"))
+        page_budget = max(8, min(raw_budget, page_budget_cap))
+
+        effective_depth = detect_effective_depth(repository_files)
+
+        logger.info(
+            "[UNIFIED] repo=%s budget=%d depth=%d files=%d dirs=%d graph_nodes=%d",
+            repo_name,
+            page_budget,
+            effective_depth,
+            file_count,
+            dir_count,
+            code_graph.number_of_nodes(),
+        )
+
+        if self.progress_callback:
+            try:
+                self.progress_callback("planning", 0.29, "Running unified pipeline skeleton...")
+            except Exception:
+                pass
+
+        # ── Phase 1: build skeleton (zero LLM) ───────────────────────
+        try:
+            skeleton = build_skeleton(
+                code_graph=code_graph,
+                repository_files=repository_files,
+                page_budget=page_budget,
+                effective_depth=effective_depth,
+                repo_name=repo_name,
+            )
+        except Exception as exc:
+            logger.error("[UNIFIED] skeleton build failed: %s", exc, exc_info=True)
+            return None
+
+        logger.info(
+            "[UNIFIED] skeleton: %d code clusters, %d doc clusters",
+            len(skeleton.code_clusters),
+            len(skeleton.doc_clusters),
+        )
+
+        # ── Phase 2: build evidence packs ────────────────────────────
+        # ``skeleton.clusters`` is the unified source-kind-aware list.  The
+        # legacy ``build_skeleton`` path populates ``code_clusters`` (which
+        # are ``DirCluster`` — a ``Cluster`` subclass with cluster_id/kind)
+        # AND ``doc_clusters`` (which are ``DocCluster`` — a SEPARATE
+        # dataclass with dir_path/doc_files/file_count and NO cluster_id /
+        # kind / artifacts).  Concatenating them naively would crash the
+        # evidence-pack dispatch on the first ``cluster.cluster_id`` access
+        # of a DocCluster.  So when we fall back, convert each DocCluster
+        # into a proper ``Cluster(kind="doc")`` first.
+        if skeleton.clusters:
+            clusters = list(skeleton.clusters)
+        else:
+            clusters = list(skeleton.code_clusters)
+            # Reserve cluster_ids above any existing DirCluster ids.
+            next_id = max((c.cluster_id for c in skeleton.code_clusters), default=0) + 1
+            for dc in skeleton.doc_clusters:
+                artifacts = [
+                    ArtifactInfo(
+                        kind="doc_section",
+                        name=f"{dc.dir_path}/{fname}" if dc.dir_path else fname,
+                        source_path=f"{dc.dir_path}/{fname}" if dc.dir_path else fname,
+                        summary="",
+                    )
+                    for fname in dc.doc_files
+                ]
+                clusters.append(
+                    Cluster(
+                        cluster_id=next_id,
+                        kind="doc",
+                        dirs=[dc.dir_path] if dc.dir_path else [],
+                        artifacts=artifacts,
+                        total_artifacts=len(artifacts),
+                        primary_languages=[],
+                        depth_range=(0, 0),
+                    )
+                )
+                next_id += 1
+        evidence_packs: dict[int, Any] = {}
+        for cluster in clusters:
+            cid = cluster.cluster_id
+            kind = cluster.kind
+            try:
+                if kind == "code":
+                    evidence_packs[cid] = build_pack(
+                        cluster, kind="code", repo_root=repo_root
+                    )
+                elif kind == "doc":
+                    evidence_packs[cid] = build_md_pack(
+                        cluster, repo_root=repo_root
+                    )
+                elif kind == "confluence":
+                    evidence_packs[cid] = build_confluence_pack(
+                        cluster, repo_root=repo_root
+                    )
+                elif kind == "jira":
+                    evidence_packs[cid] = build_jira_pack(
+                        cluster, repo_root=repo_root
+                    )
+                else:
+                    # Unknown kind — skip evidence pack; planner will use fallback
+                    logger.warning(
+                        "[UNIFIED] unknown cluster kind %r for cluster_id=%d — no evidence pack",
+                        kind,
+                        cid,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[UNIFIED] evidence pack build failed for cluster_id=%d kind=%r: %s",
+                    cid,
+                    kind,
+                    exc,
+                )
+
+        logger.info("[UNIFIED] evidence packs built: %d/%d", len(evidence_packs), len(clusters))
+
+        # ── Build name index from code graph for identifier grounding ─
+        name_index: set[str] = set()
+        try:
+            for _node_id, data in code_graph.nodes(data=True):
+                sym_name = data.get("symbol_name") or data.get("name", "")
+                if sym_name:
+                    name_index.add(sym_name)
+        except Exception as exc:
+            logger.warning("[UNIFIED] name_index build failed: %s", exc)
+
+        if self.progress_callback:
+            try:
+                self.progress_callback(
+                    "planning", 0.32,
+                    f"Running unified pipeline for {len(clusters)} clusters...",
+                )
+            except Exception:
+                pass
+
+        # ── SSE progress bridge ───────────────────────────────────────
+        def _stream_callback(event: dict) -> None:
+            ev_type = event.get("event", "")
+            if ev_type == "planner.done":
+                pages_n = event.get("pages_emitted", 0)
+                if self.progress_callback:
+                    try:
+                        self.progress_callback(
+                            "planning", 0.38,
+                            f"Unified planner done — {pages_n} pages planned",
+                        )
+                    except Exception:
+                        pass
+            elif ev_type == "writer.page_started":
+                title = event.get("title", "")
+                if self.progress_callback:
+                    try:
+                        self.progress_callback(
+                            "generating", 0.40,
+                            f"Writing: {title}",
+                        )
+                    except Exception:
+                        pass
+            elif ev_type == "writer.page_done":
+                title = event.get("title", "")
+                n_paragraphs = event.get("n_paragraphs", 0)
+                if self.progress_callback:
+                    try:
+                        self.progress_callback(
+                            "generating", 0.55,
+                            f"Drafted: {title} ({n_paragraphs} paragraphs)",
+                        )
+                    except Exception:
+                        pass
+            elif ev_type == "gate.page_done":
+                title = event.get("title", "")
+                n_flagged = event.get("n_flagged", 0)
+                n_stripped = event.get("n_stripped", 0)
+                if self.progress_callback and (n_flagged or n_stripped):
+                    try:
+                        self.progress_callback(
+                            "generating", 0.65,
+                            f"Gate: {title} — {n_flagged} flagged, {n_stripped} stripped",
+                        )
+                    except Exception:
+                        pass
+            elif ev_type == "verifier.page_done":
+                title = event.get("title", "")
+                n_kept = event.get("n_kept", 0)
+                n_stripped = event.get("n_stripped", 0)
+                n_partial = event.get("n_partial", 0)
+                if self.progress_callback:
+                    try:
+                        self.progress_callback(
+                            "generating", 0.78,
+                            f"Verified: {title} — kept={n_kept} stripped={n_stripped} partial={n_partial}",
+                        )
+                    except Exception:
+                        pass
+
+        # ── Phase 3: unified pipeline (planner + writer + gate + verifier) ──
+        try:
+            result = run_unified_pipeline(
+                skeleton,
+                evidence_packs,
+                llm=self.llm,
+                verifier_llm=self.llm_low,
+                repo_root=repo_root,
+                name_index=name_index or None,
+                stream_callback=_stream_callback,
+            )
+        except Exception as exc:
+            logger.error("[UNIFIED] pipeline failed: %s", exc, exc_info=True)
+            return None
+
+        elapsed = _time.time() - t0
+        logger.info(
+            "[UNIFIED] pipeline complete in %.2fs: pages=%d",
+            elapsed,
+            len(result.pages),
+        )
+
+        if not result.pages:
+            logger.warning("[UNIFIED] pipeline produced 0 pages — falling back")
+            return None
+
+        # ── Convert GeneratedPage → WikiStructureSpec + WikiPage ──────
+        from ..state.wiki_state import (  # noqa: PLC0415
+            PageSpec as StatePageSpec,
+            SectionSpec,
+            WikiPage,
+            WikiStructureSpec as StateWikiStructureSpec,
+        )
+
+        state_pages: list[StatePageSpec] = []
+        wiki_pages: list[WikiPage] = []
+
+        for idx, gen_page in enumerate(result.pages):
+            page_id = str(gen_page.page_id)
+            sp = StatePageSpec(
+                page_name=gen_page.title,
+                page_order=idx + 1,
+                description=gen_page.description,
+                content_focus=gen_page.description,
+                rationale=f"Generated by unified pipeline (cluster {gen_page.page_id})",
+                target_symbols=gen_page.metadata.get("target_symbols", []),
+                target_folders=gen_page.metadata.get("target_folders", []),
+                target_docs=gen_page.metadata.get("target_docs", []),
+                retrieval_query="",
+            )
+            state_pages.append(sp)
+
+            wiki_pages.append(
+                WikiPage(
+                    page_id=page_id,
+                    title=gen_page.title,
+                    content=gen_page.markdown or f"# {gen_page.title}\n\n{gen_page.description}\n",
+                    status="completed",
+                )
+            )
+
+        section = SectionSpec(
+            section_name=repo_name or "Generated Wiki",
+            section_order=1,
+            description=f"Auto-generated from {len(result.pages)} cluster(s) via unified pipeline.",
+            rationale="Unified pipeline output",
+            pages=state_pages,
+        )
+
+        structure = StateWikiStructureSpec(
+            wiki_title=repo_name or "Generated Wiki",
+            overview=(
+                f"Generated by the unified planner pipeline. "
+                f"Planner budget: {result.plan_report.tool_budget_used}/"
+                f"{result.plan_report.tool_budget_total} tool calls used."
+            ),
+            sections=[section],
+            total_pages=len(result.pages),
+        )
+
+        if self.progress_callback:
+            try:
+                self.progress_callback(
+                    "storing", 0.90,
+                    f"Unified pipeline complete — {len(result.pages)} pages generated",
+                )
+            except Exception:
+                pass
+
+        return {
+            "wiki_structure_spec": structure,
+            "wiki_pages": wiki_pages,
+            "structure_planning_complete": True,
+            "current_phase": "structure_complete",
+        }
 
     def _apply_deepagents_coverage_check(
         self,

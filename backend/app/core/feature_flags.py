@@ -275,6 +275,14 @@ class FeatureFlags:
     #: break IDs on minor churn. Tunable via WIKIS_CLUSTER_STABILITY_THRESHOLD.
     cluster_stability_threshold: float = 0.5
 
+    # ── Unified pipeline (#243) ────────────────────────────────────────
+
+    #: Opt-in: replace the old two planner paths with the unified
+    #: planner → writer → gate → verifier pipeline.  Default **off**
+    #: until the full writer agent ships in a follow-up PR.
+    #: Enable via ``WIKIS_UNIFIED_PIPELINE=1``.
+    unified_pipeline: bool = False
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance from the current environment."""
@@ -321,4 +329,5 @@ def get_feature_flags() -> FeatureFlags:
         cluster_stability_threshold=_env_float(
             "WIKIS_CLUSTER_STABILITY_THRESHOLD", 0.5,
         ),
+        unified_pipeline=_env_bool("WIKIS_UNIFIED_PIPELINE", False),
     )

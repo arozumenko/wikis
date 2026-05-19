@@ -429,6 +429,18 @@ class WikiService:
 
             # Resolve generation options (request overrides → config defaults).
             planner_type = request.planner_type if request.planner_type is not None else self.settings.planner_type
+
+            # When the unified-pipeline feature flag is on (set via
+            # WIKIS_UNIFIED_PIPELINE=1), the unified planner+writer+gate+verifier
+            # pipeline (#243) runs inside the subprocess regardless of planner_type.
+            # The env var is inherited by the subprocess automatically.
+            from app.core.feature_flags import get_feature_flags  # noqa: PLC0415
+            if get_feature_flags().unified_pipeline:
+                logger.info(
+                    "WIKIS_UNIFIED_PIPELINE=1 — unified pipeline will override planner_type=%r in subprocess",
+                    planner_type,
+                )
+
             # exclude_tests only applies to the cluster planner; agent planner ignores it.
             if planner_type == "cluster":
                 exclude_tests = (
