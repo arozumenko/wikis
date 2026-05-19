@@ -643,10 +643,31 @@ class OptimizedWikiGenerationAgent:
         else:
             return 25  # default for small repos
 
-    def dispatch_page_generation(self, state: WikiState, config: RunnableConfig) -> list[Send]:
-        """Dispatch parallel page generation using Send"""
+    def dispatch_page_generation(
+        self, state: WikiState, config: RunnableConfig
+    ) -> list[Send] | str:
+        """Dispatch parallel page generation using Send.
+
+        Returns a list of ``Send`` calls into ``generate_page_content`` for the
+        normal path.  When the unified pipeline has already produced pages
+        upstream (``state["wiki_pages"]`` is non-empty), returns the string
+        ``"finalize_wiki"`` so LangGraph routes directly to the reducer and
+        the legacy per-page generator does NOT run a second pass — re-running
+        it would double every page via ``WikiState.wiki_pages``'s
+        ``operator.add`` accumulator.
+        """
 
         logger.info("📄 Dispatching page generation")
+
+        # Unified pipeline (#243) populates wiki_pages upstream.  Skip the
+        # legacy dispatch entirely so we don't generate every page twice.
+        if state.get("wiki_pages"):
+            logger.info(
+                "[UNIFIED] wiki_pages already populated upstream "
+                "(%d pages); skipping legacy page generation",
+                len(state["wiki_pages"]),
+            )
+            return "finalize_wiki"
 
         if not state.get("wiki_structure_spec"):
             # Raising here propagates cleanly through the LangGraph executor and is caught
@@ -1206,7 +1227,9 @@ class OptimizedWikiGenerationAgent:
 
         # Page Generation (map)
         builder.add_conditional_edges(
-            "generate_wiki_structure", self.dispatch_page_generation, ["generate_page_content"]
+            "generate_wiki_structure",
+            self.dispatch_page_generation,
+            ["generate_page_content", "finalize_wiki"],
         )
 
         # Reduce → finalize → export
@@ -2772,7 +2795,15 @@ class OptimizedWikiGenerationAgent:
         )
 
         # ── Phase 2: build evidence packs ────────────────────────────
-        clusters = skeleton.clusters or list(skeleton.code_clusters)
+        # ``skeleton.clusters`` is the unified list (filled when the new
+        # source-kind-aware path runs). The legacy fallback must merge
+        # BOTH ``code_clusters`` AND ``doc_clusters`` — otherwise a repo
+        # with only markdown / confluence / jira artifacts (no code) ends
+        # up with zero pages even though doc_clusters is populated.
+        if skeleton.clusters:
+            clusters = list(skeleton.clusters)
+        else:
+            clusters = list(skeleton.code_clusters) + list(skeleton.doc_clusters)
         evidence_packs: dict[int, Any] = {}
         for cluster in clusters:
             cid = cluster.cluster_id
