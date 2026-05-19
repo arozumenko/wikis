@@ -207,7 +207,9 @@ class TestBuildJiraPackFull:
         )
 
         story1_fm = {"summary": "Migrate auth to OAuth2", "status": "Done", "issue_type": "Story"}
-        _write_issue_md(tmp_path, "jira/PLAT-2.md", story1_fm, "# PLAT-2: Migrate auth to OAuth2\n\nOAuth2 migration details.\n")
+        _write_issue_md(
+            tmp_path, "jira/PLAT-2.md", story1_fm, "# PLAT-2: Migrate auth to OAuth2\n\nOAuth2 migration details.\n"
+        )
 
         story2_fm = {"summary": "Add rate limiting", "status": "In Progress", "issue_type": "Story"}
         _write_issue_md(tmp_path, "jira/PLAT-3.md", story2_fm, "# PLAT-3: Add rate limiting\n\nRate limit details.\n")
@@ -220,10 +222,14 @@ class TestBuildJiraPackFull:
 
         artifacts = [
             _make_jira_artifact("PLAT-1", "jira/PLAT-1.md", "epic", summary="Platform Modernisation"),
-            _make_jira_artifact("PLAT-2", "jira/PLAT-2.md", "story", epic_key="PLAT-1", summary="Migrate auth to OAuth2"),
+            _make_jira_artifact(
+                "PLAT-2", "jira/PLAT-2.md", "story", epic_key="PLAT-1", summary="Migrate auth to OAuth2"
+            ),
             _make_jira_artifact("PLAT-3", "jira/PLAT-3.md", "story", epic_key="PLAT-1", summary="Add rate limiting"),
             _make_jira_artifact("PLAT-4", "jira/PLAT-4.md", "story", epic_key="PLAT-1", summary="Tenant isolation"),
-            _make_jira_artifact("PLAT-5", "jira/PLAT-5.md", "subtask", epic_key="PLAT-1", summary="Write isolation tests"),
+            _make_jira_artifact(
+                "PLAT-5", "jira/PLAT-5.md", "subtask", epic_key="PLAT-1", summary="Write isolation tests"
+            ),
         ]
         return _make_jira_cluster(artifacts), artifacts
 
@@ -411,9 +417,14 @@ class TestBuildJiraPackBudget:
         cluster = _make_jira_cluster(artifacts)
         pack = build_jira_pack(cluster, repo_root=str(tmp_path), token_budget=1000)
         serialized = pack.serialize()
-        # Rough token estimate (4 chars/token) — allow 2x slack for estimation error
-        approx_tokens = len(serialized) / 4
-        assert approx_tokens < 1000 * 2
+        # Tight assertion (Copilot review): the budget enforcement must
+        # actually trim. 1000 tokens * 4 chars + small overhead for headers.
+        char_budget = 1000 * 4
+        overhead = 500  # header/table-format + ~5 lines per row overhead
+        assert len(serialized) <= char_budget + overhead
+        # And that trimming actually engaged: child rows must have been
+        # dropped from the original 58 stories.
+        assert len(pack.child_issues) < 58
 
     def test_missing_disk_file_does_not_raise(self, tmp_path):
         """Artifact referencing a nonexistent file is tolerated gracefully."""
@@ -468,6 +479,81 @@ class TestFrontmatterParsing:
         pack = build_jira_pack(_make_jira_cluster(artifacts), repo_root=str(tmp_path))
         assert isinstance(pack, JiraEvidencePack)
         assert pack.labels == []
+
+    def test_quoted_scalar_values_stripped(self, tmp_path):
+        # Frontmatter generators often quote special-char scalars.
+        content = "---\nsummary: \"Quoted Summary\"\nstatus: 'In Progress'\nissue_type: epic\n---\n\nBody.\n"
+        p = tmp_path / "jira" / "QS-1.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        artifacts = [_make_jira_artifact("QS-1", "jira/QS-1.md", "epic", summary="QS")]
+        pack = build_jira_pack(_make_jira_cluster(artifacts), repo_root=str(tmp_path))
+        # No leftover quote chars in title.
+        assert pack.epic_title == "Quoted Summary"
+
+    def test_inline_list_syntax_parsed_and_stripped(self, tmp_path):
+        content = (
+            "---\nsummary: Has Lists\nlabels: ['infra', \"security\", 'auth']\n"
+            'components: [api, "core"]\nissue_type: epic\n---\n\nBody.\n'
+        )
+        p = tmp_path / "jira" / "IL-1.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        artifacts = [_make_jira_artifact("IL-1", "jira/IL-1.md", "epic", summary="IL")]
+        pack = build_jira_pack(_make_jira_cluster(artifacts), repo_root=str(tmp_path))
+        assert pack.labels == ["infra", "security", "auth"]
+        assert pack.components == ["api", "core"]
+
+    def test_quoted_list_items_stripped(self, tmp_path):
+        content = (
+            "---\nsummary: Quoted List\nlabels:\n  - 'first'\n  - \"second\"\n  - third\n"
+            "issue_type: epic\n---\n\nBody.\n"
+        )
+        p = tmp_path / "jira" / "QL-1.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        artifacts = [_make_jira_artifact("QL-1", "jira/QL-1.md", "epic", summary="QL")]
+        pack = build_jira_pack(_make_jira_cluster(artifacts), repo_root=str(tmp_path))
+        assert pack.labels == ["first", "second", "third"]
+
+
+# ── Markdown table cell escaping ──────────────────────────────────────────────
+
+
+class TestTableCellEscaping:
+    def _setup_with_summary(self, tmp_path, key: str, summary: str, content: str = "Body.\n") -> ArtifactInfo:
+        path = tmp_path / "jira" / f"{key}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"---\nstatus: Open\n---\n\n# {key}\n\n{content}")
+        return _make_jira_artifact(key, f"jira/{key}.md", "story", summary=summary)
+
+    def test_pipe_in_summary_escaped(self, tmp_path):
+        epic = _make_jira_artifact("E-1", "", "epic", summary="Epic")
+        child = self._setup_with_summary(tmp_path, "C-1", "Cell with | pipe")
+        cluster = _make_jira_cluster([epic, child])
+        pack = build_jira_pack(cluster, repo_root=str(tmp_path))
+        serialized = pack.serialize()
+        # The row line must not contain an unescaped pipe in the summary cell.
+        for line in serialized.splitlines():
+            if "C-1" in line and "|" in line:
+                # Count the pipes — should be exactly 5 (4 separators + 1 escaped).
+                # Unescaped raw pipe + 4 separators would be 5; but the literal
+                # "\|" still appears.
+                assert "\\|" in line
+                break
+
+    def test_newline_in_summary_normalised(self, tmp_path):
+        epic = _make_jira_artifact("E-2", "", "epic", summary="Epic")
+        child = self._setup_with_summary(tmp_path, "C-2", "First line\nSecond line")
+        cluster = _make_jira_cluster([epic, child])
+        pack = build_jira_pack(cluster, repo_root=str(tmp_path))
+        serialized = pack.serialize()
+        # No newline should appear inside a child row.
+        c2_lines = [line for line in serialized.splitlines() if "C-2" in line]
+        for line in c2_lines:
+            assert "\n" not in line
+        # And both fragments still on the same line.
+        assert any("First line Second line" in line for line in c2_lines)
 
 
 # ── Path safety ────────────────────────────────────────────────────────────────

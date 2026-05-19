@@ -135,16 +135,26 @@ class JiraEvidencePack:
             parts.append("| Key | Type | Status | Summary |")
             parts.append("|-----|------|--------|---------|")
             for child in self.child_issues:
-                key = child.get("key", "")
-                ctype = child.get("type", "")
-                status = child.get("status", "")
-                summary = child.get("summary", "")
+                key = _escape_table_cell(child.get("key", ""))
+                ctype = _escape_table_cell(child.get("type", ""))
+                status = _escape_table_cell(child.get("status", ""))
+                summary = _escape_table_cell(child.get("summary", ""))
                 parts.append(f"| {key} | {ctype} | {status} | {summary} |")
 
         return "\n".join(parts)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+
+def _escape_table_cell(value: str) -> str:
+    """Make *value* safe to embed in a Markdown table cell.
+
+    Jira summaries / statuses can contain `|` (column separator) or newlines
+    (row separator); both break the table format and bloat token count. Replace
+    newlines with spaces and escape any literal pipe.
+    """
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
 
 def _read_file_safe(repo_root: str, rel_path: str) -> str | None:
@@ -165,11 +175,35 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 
 
+def _strip_yaml_quotes(value: str) -> str:
+    """Strip optional surrounding single/double quotes from a YAML scalar.
+
+    Confluence/Jira frontmatter generators frequently quote strings that
+    contain special characters; without stripping the quotes leak into
+    titles/labels/etc.
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_inline_list(value: str) -> list[str] | None:
+    """Parse an inline YAML list like ``[a, "b", 'c']``. Returns None if not a list."""
+    if not (value.startswith("[") and value.endswith("]")):
+        return None
+    inner = value[1:-1].strip()
+    if not inner:
+        return []
+    return [_strip_yaml_quotes(item.strip()) for item in inner.split(",") if item.strip()]
+
+
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
     """Extract YAML frontmatter and return (fields_dict, body_text).
 
-    Handles scalar values and YAML list syntax (``- item``).  No external
-    YAML dependency — intentionally minimal so there are no import-time
+    Handles scalar values, multi-line YAML list syntax (``- item`` with
+    indentation), and inline list syntax (``[a, b]``). Optional surrounding
+    quotes on scalar values and list items are stripped. No external YAML
+    dependency — intentionally minimal so there are no import-time
     side-effects and the scanner is predictable in unit tests.
 
     Returns an empty dict and the full text when no frontmatter is present.
@@ -186,10 +220,10 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     current_list: list[str] | None = None
 
     for line in raw_yaml.splitlines():
-        # List continuation
-        list_item = re.match(r"^\s+- (.+)$", line)
+        # List continuation — any positive indent followed by ``- item``.
+        list_item = re.match(r"^\s+-\s+(.+)$", line)
         if list_item and current_key is not None and current_list is not None:
-            current_list.append(list_item.group(1).strip())
+            current_list.append(_strip_yaml_quotes(list_item.group(1).strip()))
             continue
 
         # New key
@@ -203,14 +237,18 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
             value = kv.group(2).strip()
 
             if value == "":
-                # Starts a list block
+                # Starts a multi-line list block
                 current_key = key
                 current_list = []
                 fields[key] = current_list
+            elif (inline := _parse_inline_list(value)) is not None:
+                current_key = None
+                current_list = None
+                fields[key] = inline
             else:
                 current_key = None
                 current_list = None
-                fields[key] = value
+                fields[key] = _strip_yaml_quotes(value)
 
     return fields, body
 
@@ -273,11 +311,6 @@ def _build_child_row(artifact: ArtifactInfo, repo_root: str) -> dict:
         "status": status,
         "summary": summary,
     }
-
-
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate from char count."""
-    return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
 def _pick_epic(artifacts: list[ArtifactInfo]) -> ArtifactInfo | None:
