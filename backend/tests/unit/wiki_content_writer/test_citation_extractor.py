@@ -13,14 +13,11 @@ Covers all citation parsing edge cases:
 
 from __future__ import annotations
 
-import pytest
-
 from app.core.wiki_content_writer.citation_extractor import (
     Citation,
     CitedClaim,
     extract_citations,
 )
-
 
 # ── Single-claim, single-line citation ──────────────────────────────────────
 

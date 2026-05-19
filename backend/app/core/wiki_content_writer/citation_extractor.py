@@ -75,9 +75,7 @@ _CITATION_BRACKET_RE = re.compile(
 # Each comma-separated element inside the bracket: path:N or path:lo-hi
 # path = one or more non-whitespace chars that contain no colon (except the
 #        separator colon) and no brackets.
-_SINGLE_CITE_RE = re.compile(
-    r"^\s*([^:\s\[\]]+)\s*:\s*(\d+)(?:-(\d+))?\s*$"
-)
+_SINGLE_CITE_RE = re.compile(r"^\s*([^:\s\[\]]+)\s*:\s*(\d+)(?:-(\d+))?\s*$")
 
 
 # ── Paragraph splitter ───────────────────────────────────────────────────────
@@ -191,22 +189,13 @@ def _extract_citations_from_masked(masked: str) -> list[Citation]:
 
     for bracket_match in _CITATION_BRACKET_RE.finditer(masked):
         bracket_content = bracket_match.group(1)
-        # Split on commas to get individual path:line tokens
-        parts = bracket_content.split(",")
-        parsed_in_bracket: list[Citation] = []
-        all_valid = True
-
-        for part in parts:
+        # Split on commas to get individual path:line tokens. Invalid
+        # parts are silently skipped — the verifier downstream still gets
+        # the well-formed tokens.
+        for part in bracket_content.split(","):
             cite = _parse_single_token(part)
-            if cite is None:
-                all_valid = False
-                # Don't break — the other parts may still be valid (partial)
-                continue
-            parsed_in_bracket.append(cite)
-
-        # Add whichever individual tokens were valid (partial citation sets
-        # are still useful for the verifier).
-        citations.extend(parsed_in_bracket)
+            if cite is not None:
+                citations.append(cite)
 
     return citations
 
