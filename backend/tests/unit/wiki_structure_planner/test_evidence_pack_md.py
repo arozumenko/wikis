@@ -523,9 +523,9 @@ class TestPathSafety:
             pytest.skip("symlinks not supported on this platform")
         cluster = _make_doc_cluster([_doc_artifact("Evil", "docs/evil.md")])
         pack = build_md_pack(cluster, repo_root=str(tmp_path))
-        for e in pack.doc_entries:
-            assert "root:" not in e.get("first_paragraph", "")
-            assert "root:" not in e.get("toc", [])
+        # The symlink target escapes repo_root — safe_join must reject it entirely,
+        # producing no doc entries at all rather than silently reading /etc/passwd.
+        assert pack.doc_entries == []
 
     def test_safe_paths_work_normally(self, tmp_path):
         _write_md(tmp_path, "docs/safe.md", "# Safe\n\nSafe content.\n")
